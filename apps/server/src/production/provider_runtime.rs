@@ -17899,8 +17899,11 @@ struct ClaudeDriver {
     /// The instance's label, which delivery details name the provider by.
     provider_label: String,
     runtime: Arc<Mutex<ClaudeProviderRuntime>>,
-    writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    writer: ClaudeWriter,
     events: Mutex<mpsc::Receiver<ProviderEvent>>,
+    /// For the events of a request this driver settles. Weak, so the driver does not keep the
+    /// event stream open after Claude's output ended.
+    events_tx: mpsc::WeakSender<ProviderEvent>,
     deferred_events: Mutex<VecDeque<ProviderEvent>>,
     control_responses: ClaudeControlResponseRouter,
     child: SharedChild,
@@ -17982,6 +17985,10 @@ pub struct ClaudeActivitySupport {
     /// The CLI accepts `--thinking-display summarized` (#173). From Claude Opus 4.7 on, the
     /// API omits thinking text unless asked; without the flag those models send none.
     pub thinking_display: bool,
+    /// The CLI's `--help` lists `--permission-prompts`, so it sends a tool that needs approval
+    /// to its host when started with `--permission-prompt-tool stdio`. Without it Claude Code
+    /// denies such a tool by itself and no approval card can open.
+    pub permission_prompts: bool,
 }
 
 /// A value `--thinking-display` rejects: a CLI that knows the flag lists its allowed values,
@@ -18728,6 +18735,7 @@ async fn probe_claude_activity_support_uncached(
             fork_session_id,
             probe_finished: true,
             thinking_display,
+            permission_prompts: has_exact_flag("--permission-prompts"),
         },
     })
 }
@@ -18958,6 +18966,10 @@ fn build_claude_launch_arguments(
     // thinking delta is reasoning, and older models summarize without the flag.
     if support.thinking_display {
         args.extend(["--thinking-display".to_owned(), "summarized".to_owned()]);
+    }
+    // Approvals and questions come to BiBCode over the stream instead of being denied (#383).
+    if support.permission_prompts {
+        args.extend(["--permission-prompt-tool".to_owned(), "stdio".to_owned()]);
     }
     args.extend([
         "--verbose".to_owned(),
@@ -19468,6 +19480,8 @@ impl ClaudeDriver {
         };
         let pending_acknowledgement = ClaudeAcknowledgements::default();
         let control_responses = ClaudeControlResponseRouter::default();
+        let writer: ClaudeWriter = Arc::new(Mutex::new(Box::new(stdin)));
+        let weak_events_tx = events_tx.downgrade();
         let output = spawn_claude_output(
             runtime.clone(),
             request.thread_id.clone(),
@@ -19478,13 +19492,15 @@ impl ClaudeDriver {
             events_tx,
             pending_acknowledgement.clone(),
             control_responses.clone(),
+            writer.clone(),
         );
         Ok(Self {
             provider: request.provider,
             provider_label: request.provider_label,
             runtime,
-            writer: Mutex::new(Box::new(stdin)),
+            writer,
             events: Mutex::new(events_rx),
+            events_tx: weak_events_tx,
             deferred_events: Mutex::new(VecDeque::new()),
             control_responses,
             child: Arc::new(Mutex::new(child)),
@@ -19559,6 +19575,38 @@ impl ClaudeDriver {
             })
             .await;
         refused.then_some(CLAUDE_RESUME_REFUSED)
+    }
+
+    /// Answers Claude's request `request_id` with `response`.
+    async fn reply_to_request(
+        &self,
+        request_id: &str,
+        response: &Value,
+    ) -> Result<(), ProviderRuntimeError> {
+        write_claude_control_reply(
+            &self.writer,
+            &crate::provider::claude::runtime::control_response(request_id, response),
+        )
+        .await
+        .map_err(provider_error(&self.provider))
+    }
+
+    /// Hands the supervisor the events of requests this driver settled, which close their cards.
+    async fn publish_request_events(&self, events: Vec<ClaudeCanonicalEvent>) {
+        let Some(sender) = self.events_tx.upgrade() else {
+            return;
+        };
+        for event in events {
+            if !send_claude_output(
+                &sender,
+                &self.output.cancellation,
+                claude_provider_event(event, None, Vec::new()),
+            )
+            .await
+            {
+                return;
+            }
+        }
     }
 
     fn encode_json_line(&self, value: Value) -> Result<Vec<u8>, ProviderRuntimeError> {
@@ -20083,10 +20131,19 @@ impl ProviderDriver for ClaudeDriver {
         _: Option<String>,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            self.runtime.lock().await.stop_turn_input();
+            // An interrupted turn leaves nobody to answer its requests. Claude withdraws them
+            // too, which then finds nothing pending.
+            let cancelled = {
+                let mut runtime = self.runtime.lock().await;
+                runtime.stop_turn_input();
+                runtime.cancel_pending_requests()
+            };
             let control = ClaudeControlRequest::interrupt(self.next_sequence().await);
-            self.write_json(serde_json::to_value(control).map_err(provider_error(&self.provider))?)
-                .await
+            let written = self
+                .write_json(serde_json::to_value(control).map_err(provider_error(&self.provider))?)
+                .await;
+            self.publish_request_events(cancelled).await;
+            written
         })
     }
     fn approve(
@@ -20098,15 +20155,25 @@ impl ProviderDriver for ClaudeDriver {
             let decision = match decision.as_str() {
                 "accept" => Decision::Accept,
                 "acceptForSession" => Decision::AcceptForSession,
-                _ => Decision::Deny,
+                "cancel" => Decision::Cancel,
+                _ => Decision::Decline,
             };
-            let response = self
+            // Claiming the request is what lets exactly one answer or cancellation win.
+            let Some(resolved) = self
                 .runtime
                 .lock()
                 .await
                 .resolve_permission_request(&request_id, decision)
-                .response;
-            self.write_json(json!({"type":"control_response","response":{"request_id":request_id,"subtype":"success","response":response}})).await
+            else {
+                return Err(ProviderRuntimeError::Provider {
+                    provider: self.provider.clone(),
+                    detail: format!("Unknown pending approval request: {request_id}"),
+                });
+            };
+            self.reply_to_request(&request_id, &resolved.response)
+                .await?;
+            self.publish_request_events(resolved.events).await;
+            Ok(())
         })
     }
     fn answer(
@@ -20115,11 +20182,25 @@ impl ProviderDriver for ClaudeDriver {
         answers: Value,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            self.runtime
+            let Some(resolved) = self
+                .runtime
                 .lock()
                 .await
-                .resolve_user_input_request(&request_id, answers.clone());
-            self.write_json(json!({"type":"control_response","response":{"request_id":request_id,"subtype":"success","response":answers}})).await
+                .resolve_user_input_request(&request_id, answers)
+            else {
+                return Err(ProviderRuntimeError::Provider {
+                    provider: self.provider.clone(),
+                    detail: format!("Unknown pending user-input request: {request_id}"),
+                });
+            };
+            // The answers go back as the tool's input, which is how Claude reads them.
+            self.reply_to_request(
+                &request_id,
+                &json!({ "behavior": "allow", "updatedInput": resolved.updated_input }),
+            )
+            .await?;
+            self.publish_request_events(resolved.events).await;
+            Ok(())
         })
     }
     fn set_mode(&self, mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
@@ -20296,6 +20377,9 @@ impl ProviderDriver for ClaudeDriver {
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.control_responses.close();
+            // The process that asked is going away, so its open requests close with it.
+            let cancelled = self.runtime.lock().await.cancel_pending_requests();
+            self.publish_request_events(cancelled).await;
             // Kill first: a write Claude stopped reading holds the writer until the pipe breaks.
             kill_child(&self.child).await;
             let _ = self.writer.lock().await.shutdown().await;
@@ -20398,6 +20482,7 @@ fn spawn_claude_output(
     sender: mpsc::Sender<ProviderEvent>,
     pending_acknowledgement: ClaudeAcknowledgements,
     control_responses: ClaudeControlResponseRouter,
+    writer: ClaudeWriter,
 ) -> Arc<ClaudeOutputHandle> {
     let cancellation = CancellationToken::new();
     let (recovery_sender, recovery_receiver) =
@@ -20417,6 +20502,8 @@ fn spawn_claude_output(
     let stdout_cancellation = cancellation.clone();
     let stdout_pending_acknowledgement = pending_acknowledgement.clone();
     let stdout_control_responses = control_responses.clone();
+    let stdout_writer = writer.clone();
+    let hook_writer = writer;
     let stdout_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
@@ -20443,6 +20530,7 @@ fn spawn_claude_output(
                 &stdout_recovery_sender,
                 &stdout_cancellation,
                 &stdout_pending_acknowledgement,
+                &stdout_writer,
             )
             .await
             {
@@ -20477,6 +20565,7 @@ fn spawn_claude_output(
                     &hook_recovery_sender,
                     &hook_cancellation,
                     &pending_acknowledgement,
+                    &hook_writer,
                 )
                 .await
                 {
@@ -20566,6 +20655,7 @@ pub async fn claude_output_shutdown_with_open_stream_for_test() -> bool {
         sender,
         ClaudeAcknowledgements::default(),
         ClaudeControlResponseRouter::default(),
+        Arc::new(Mutex::new(Box::new(tokio::io::sink()))),
     );
     let completed = tokio::time::timeout(Duration::from_millis(150), output.shutdown())
         .await
@@ -20874,6 +20964,42 @@ mod claude_recovery_worker_tests {
     }
 }
 
+/// Claude's stdin, shared by the driver and by the output loop, which answers some of Claude's
+/// requests itself.
+type ClaudeWriter = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
+
+#[cfg(test)]
+fn claude_test_writer() -> ClaudeWriter {
+    Arc::new(Mutex::new(Box::new(tokio::io::sink())))
+}
+
+/// How long an answer to Claude's request may wait for Claude to read it. The single supervisor
+/// actor awaits an approval for every session, so the write is bounded like an interrupt.
+const CLAUDE_CONTROL_REPLY_TIMEOUT: Duration = PROVIDER_INTERRUPT_SETTLEMENT_TIMEOUT;
+
+/// Writes one `control_response` frame. A timeout or a failed write is an error: the caller
+/// then knows the answer may not have reached Claude.
+async fn write_claude_control_reply(
+    writer: &ClaudeWriter,
+    response: &Value,
+) -> Result<(), std::io::Error> {
+    let mut bytes = serde_json::to_vec(response)?;
+    bytes.push(b'\n');
+    let write = async {
+        let mut writer = writer.lock().await;
+        writer.write_all(&bytes).await?;
+        writer.flush().await
+    };
+    tokio::time::timeout(CLAUDE_CONTROL_REPLY_TIMEOUT, write)
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Claude did not read the answer in time",
+            )
+        })?
+}
+
 fn claude_provider_event(
     event: ClaudeCanonicalEvent,
     native_event_id: Option<ProviderNativeEventId>,
@@ -20902,6 +21028,7 @@ async fn emit_claude_value(
     recovery_sender: &mpsc::Sender<ClaudeTranscriptRecoveryRequest>,
     cancellation: &CancellationToken,
     pending_acknowledgement: &ClaudeAcknowledgements,
+    writer: &ClaudeWriter,
 ) -> bool {
     let emitted_at_ms = u64::try_from(
         OffsetDateTime::now_utc()
@@ -20943,6 +21070,22 @@ async fn emit_claude_value(
             runtime.handle_raw_value(&value, emitted_at_ms)
         }
     };
+    // Answers the runtime gives by itself to a request from Claude. Written off this loop, so
+    // a slow stdin cannot hold back Claude's output.
+    let control_responses = std::mem::take(&mut output.control_responses);
+    if !control_responses.is_empty() {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            for response in control_responses {
+                if write_claude_control_reply(&writer, &response)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
     if let Some(live_tasks) = output.background_tasks.take()
         && !send_claude_output(
             sender,
@@ -23228,6 +23371,25 @@ done
 "#;
     #[cfg(windows)]
     const CLAUDE_REPLAY_FIXTURE: &str = "claude-replay";
+
+    // Claude Code 2.1's frames for a tool that needs approval (#383): a `can_use_tool` request
+    // after each user message, and a request to leave plan mode once the first one is answered.
+    #[cfg(unix)]
+    const CLAUDE_APPROVAL_FIXTURE: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  case "$line" in
+    *'"type":"user"'*)
+      printf '%s\n' "$line"
+      printf '%s\n' '{"type":"control_request","request_id":"cli-request-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch made.txt"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch made.txt"}],"behavior":"allow","destination":"localSettings"},{"type":"setMode","mode":"acceptEdits","destination":"session"}],"tool_use_id":"tool-1"}}'
+      ;;
+    *'"request_id":"cli-request-1"'*)
+      printf '%s\n' '{"type":"control_request","request_id":"cli-plan-1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"Create hello.txt"},"tool_use_id":"tool-2"}}'
+      printf '%s\n' '{"type":"control_request","request_id":"cli-request-2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm made.txt"},"tool_use_id":"tool-3"}}'
+      ;;
+  esac
+done
+"#;
 
     // Replays each message only after a delay longer than the test's acknowledgement wait.
     #[cfg(unix)]
@@ -25926,6 +26088,7 @@ done
                 &recovery_sender,
                 &cancellation,
                 &slot,
+                &super::claude_test_writer(),
             )
             .await
         );
@@ -25999,6 +26162,7 @@ done
                     &recovery_sender,
                     &cancellation,
                     &slot,
+                    &super::claude_test_writer(),
                 )
                 .await
             );
@@ -27064,6 +27228,7 @@ done
                         &recovery_sender,
                         &cancellation,
                         &slot,
+                        &super::claude_test_writer(),
                     )
                     .await
                 );
@@ -27117,6 +27282,7 @@ done
                     &recovery_sender,
                     &cancellation,
                     &slot,
+                    &super::claude_test_writer(),
                 )
                 .await
             );
@@ -27292,6 +27458,7 @@ done
                         &recovery_sender,
                         &cancellation,
                         &slot,
+                        &super::claude_test_writer(),
                     )
                     .await
                 );
@@ -27337,6 +27504,7 @@ done
                     &recovery_sender,
                     &cancellation,
                     &slot,
+                    &super::claude_test_writer(),
                 )
                 .await
             );
@@ -27494,7 +27662,8 @@ done
                         authenticated,
                         &recovery_sender,
                         &cancellation,
-                        &slot
+                        &slot,
+                        &super::claude_test_writer(),
                     )
                     .await
                 );
@@ -27508,6 +27677,7 @@ done
                 &recovery_sender,
                 &cancellation,
                 &slot,
+                &super::claude_test_writer(),
             ).await);
         }
         let scope = ActivityScopeRef::Thread {
@@ -34520,6 +34690,138 @@ done
         ));
     }
 
+    /// #383, through the real driver: a tool that needs approval opens a card, "Always allow
+    /// this session" answers Claude with session-only rules and closes the card, leaving plan
+    /// mode is denied without a card, and an interrupt closes what is still open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_tool_approval_round_trips_through_the_driver() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let deadline = ProviderFixtureDeadline::integration();
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let capture_path = temp.path().join("provider-requests.jsonl");
+        let fixture = executable_fixture(&temp, "claude-approval", CLAUDE_APPROVAL_FIXTURE);
+        let mut request = native_launch(&temp, "claudeAgent");
+        request.binary_path = fixture.to_string_lossy().into_owned();
+        request.runtime_mode = "approval-required".to_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture_path.to_string_lossy().into_owned(),
+        );
+        let claude = super::ClaudeDriver::spawn(
+            request,
+            factory.attachments.clone(),
+            factory.attribution.clone(),
+            true,
+            factory.claude_probe_cache.clone(),
+            factory.claude_probe_launch_policy,
+            false,
+        )
+        .await
+        .expect("Claude driver should create");
+        claude.start().await.expect("Claude should start");
+        claude
+            .send("run it".to_owned(), Vec::new(), "default".to_owned())
+            .await
+            .expect("Claude turn should send");
+
+        // The next event of the given type, skipping the rest of Claude's output.
+        let next = |event_type: &'static str| {
+            let claude = &claude;
+            async move {
+                deadline
+                    .observe(async {
+                        loop {
+                            let event = claude.next_event().await.expect("Claude event stream");
+                            if event.event_type == event_type {
+                                return event;
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| panic!("no {event_type} event before the deadline"))
+            }
+        };
+        let reply_to = |request_id: &'static str| {
+            let capture_path = capture_path.clone();
+            async move {
+                captured_request(deadline, &capture_path, move |frame| {
+                    frame["type"] == "control_response"
+                        && frame["response"]["request_id"] == request_id
+                })
+                .await
+                .unwrap_or_else(|_| panic!("no reply to {request_id} before the deadline"))
+            }
+        };
+
+        let opened = next("request.opened").await;
+        assert_eq!(opened.request_id.as_deref(), Some("cli-request-1"));
+        assert_eq!(opened.payload["detail"], "touch made.txt");
+
+        claude
+            .approve("cli-request-1".to_owned(), "acceptForSession".to_owned())
+            .await
+            .expect("the session approval is written");
+        assert_eq!(
+            reply_to("cli-request-1").await["response"],
+            json!({
+                "request_id": "cli-request-1",
+                "subtype": "success",
+                "response": {
+                    "behavior": "allow",
+                    "updatedInput": { "command": "touch made.txt" },
+                    // The settings-file destination became the session, and the mode change
+                    // is gone.
+                    "updatedPermissions": [{
+                        "type": "addRules",
+                        "rules": [{ "toolName": "Bash", "ruleContent": "touch made.txt" }],
+                        "behavior": "allow",
+                        "destination": "session"
+                    }]
+                }
+            })
+        );
+        let resolved = next("request.resolved").await;
+        assert_eq!(resolved.request_id.as_deref(), Some("cli-request-1"));
+        assert_eq!(resolved.payload["decision"], "acceptForSession");
+        // The same request cannot be answered twice.
+        assert!(
+            claude
+                .approve("cli-request-1".to_owned(), "accept".to_owned())
+                .await
+                .is_err()
+        );
+
+        // Leaving plan mode is denied by BiBCode itself, and no card opens for it: the next
+        // card is the second command's.
+        let plan_reply = reply_to("cli-plan-1").await;
+        assert_eq!(plan_reply["response"]["response"]["behavior"], "deny");
+        let second = next("request.opened").await;
+        assert_eq!(second.request_id.as_deref(), Some("cli-request-2"));
+        assert_eq!(second.payload["detail"], "rm made.txt");
+
+        // An interrupt leaves nobody to answer the open card, so it closes.
+        claude
+            .interrupt(None)
+            .await
+            .expect("Claude should interrupt");
+        let cancelled = next("request.resolved").await;
+        assert_eq!(cancelled.request_id.as_deref(), Some("cli-request-2"));
+        assert_eq!(cancelled.payload["decision"], "cancel");
+        assert!(
+            claude
+                .approve("cli-request-2".to_owned(), "accept".to_owned())
+                .await
+                .is_err()
+        );
+        let written = std::fs::read_to_string(&capture_path).unwrap_or_default();
+        assert!(
+            !written.contains(r#""request_id":"cli-request-2""#),
+            "nothing is written for a request that was cancelled"
+        );
+        claude.shutdown().await.expect("Claude should shut down");
+    }
+
     #[tokio::test]
     async fn literal_delivery_cursor() {
         literal_delivery_acp("cursor", "cursor-session").await;
@@ -34628,14 +34930,28 @@ done
             .interrupt(None)
             .await
             .expect("Claude should interrupt");
-        claude
-            .approve("approval-1".to_owned(), "acceptForSession".to_owned())
-            .await
-            .expect("Claude approval should resolve");
-        claude
-            .approve("approval-2".to_owned(), "deny".to_owned())
-            .await
-            .expect("Claude denial should resolve");
+        // An approval for a request Claude never made is refused before anything is written,
+        // in the words the client reads as "this card is stale".
+        for decision in ["acceptForSession", "decline"] {
+            let error = claude
+                .approve("approval-1".to_owned(), decision.to_owned())
+                .await
+                .expect_err("an unknown approval is refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Unknown pending approval request"),
+                "{error}"
+            );
+        }
+        assert!(
+            claude
+                .answer("question-0".to_owned(), json!({"answer":"yes"}))
+                .await
+                .expect_err("an unknown question is refused")
+                .to_string()
+                .contains("Unknown pending user-input request")
+        );
         claude.runtime.lock().await.open_user_input_request(
             crate::provider::claude::UserInputRequestInput {
                 tool_name: "AskUserQuestion".to_owned(),

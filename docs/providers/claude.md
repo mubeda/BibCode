@@ -253,6 +253,42 @@ its delivery fails once and the thread shows **Delivery failed** with the
 reason, such as "Fast Mode is not supported by the selected model." Choose
 another model or option, then send the message again.
 
+## Approvals and questions
+
+A Claude chat thread asks before it runs a tool that its permission mode does
+not allow. BiBCode starts Claude Code with `--permission-prompt-tool stdio`, so
+Claude sends such a tool to BiBCode as a `can_use_tool` request and waits for
+the answer. The flag is passed only when Claude's `--help` lists
+`--permission-prompts`. An older Claude Code denies such a tool by itself, and
+no card opens.
+
+| Claude asks about          | What happens                                                                                                                   |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| A tool that needs approval | An approval card opens. It names the command, or the tool and its file or target.                                              |
+| `AskUserQuestion`          | The question card opens. Your answers go back to Claude as the tool's input.                                                   |
+| `ExitPlanMode`             | BiBCode denies it at once and tells Claude to end its turn. You review the plan in BiBCode, which reads it from the tool call. |
+
+The card's buttons answer Claude like this:
+
+- **Approve once** allows this tool use.
+- **Always allow this session** also gives Claude the rules it suggested for the
+  request, limited to the session. BiBCode keeps only allow rules and readable
+  folders, sends each to the session and never to a settings file, and drops a
+  suggested permission-mode change, so the thread keeps the mode it shows. When
+  Claude suggested no such rule, the tool is approved once and the thread says
+  so.
+- **Decline** refuses this tool use, and Claude goes on.
+- **Cancel turn** interrupts the turn.
+
+A request belongs to the Claude process and the turn that asked. Its card
+closes when Claude withdraws the request, when the turn is interrupted, and
+when the session stops or restarts. An answer to a card that is no longer
+waiting is refused and nothing is written to Claude. Session rules end with
+the Claude process: a new session asks again.
+
+Full access runs Claude with `bypassPermissions`, which asks for nothing except
+tools that need you, such as `AskUserQuestion`.
+
 ## Steering a running turn
 
 Steer sends the head queued message to Claude while it is working. Claude can

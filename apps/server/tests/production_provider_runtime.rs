@@ -15186,14 +15186,14 @@ async fn native_claude_driver_supports_the_complete_live_command_surface() {
             .is_some()
     );
     driver.interrupt(None).await.unwrap();
-    driver
-        .approve("approval-1".to_owned(), "acceptForSession".to_owned())
-        .await
-        .unwrap();
-    driver
-        .approve("approval-2".to_owned(), "deny".to_owned())
-        .await
-        .unwrap();
+    // An approval for a request Claude never made is refused before anything is written (#383).
+    for decision in ["acceptForSession", "decline"] {
+        assert!(matches!(
+            driver.approve("approval-1".to_owned(), decision.to_owned()).await,
+            Err(ProviderRuntimeError::Provider { detail, .. })
+                if detail.contains("Unknown pending approval request")
+        ));
+    }
     driver
         .set_mode("auto-accept-edits".to_owned())
         .await
@@ -15714,6 +15714,7 @@ fn claude_launch_arguments_preserve_controls_and_gate_activity_flags() {
             fork_session_id: false,
             probe_finished: true,
             thinking_display: false,
+            permission_prompts: false,
         },
     );
     for required in [
@@ -15844,6 +15845,7 @@ async fn claude_activity_probe_is_cached_by_executable_identity() {
             fork_session_id: false,
             probe_finished: true,
             thinking_display: false,
+            permission_prompts: false,
         }
     );
     assert_eq!(second, first);
@@ -16720,6 +16722,7 @@ async fn claude_activity_probe_singleflights_concurrent_misses() {
                 fork_session_id: false,
                 probe_finished: true,
                 thinking_display: false,
+                permission_prompts: false,
             }
         );
     }
@@ -16839,6 +16842,7 @@ async fn claude_activity_probe_test_contexts_isolate_concurrent_cache_mutation()
                 fork_session_id: false,
                 probe_finished: true,
                 thinking_display: false,
+                permission_prompts: false,
             }
         );
     }
@@ -16895,6 +16899,7 @@ async fn claude_activity_probe_retries_transient_failures_without_poisoning_cach
             fork_session_id: false,
             probe_finished: true,
             thinking_display: false,
+            permission_prompts: false,
         }
     );
     assert_eq!(
@@ -16916,6 +16921,7 @@ fn claude_launch_arguments_ask_for_summarized_thinking_only_when_supported() {
         "session",
         ClaudeActivitySupport {
             thinking_display: true,
+            permission_prompts: false,
             ..ClaudeActivitySupport::default()
         },
     );
@@ -16934,6 +16940,40 @@ fn claude_launch_arguments_ask_for_summarized_thinking_only_when_supported() {
         !without_flag
             .iter()
             .any(|argument| argument == "--thinking-display"),
+        "{without_flag:?}"
+    );
+}
+
+/// #383: a tool that needs approval reaches BiBCode only when Claude is started with
+/// `--permission-prompt-tool stdio`. The flag is passed only to a CLI whose `--help` lists
+/// `--permission-prompts`; an older one keeps denying such tools by itself.
+#[test]
+fn claude_launch_arguments_ask_for_host_permission_prompts_only_when_supported() {
+    let mut request = launch();
+    request.provider = "claudeAgent".to_owned();
+    let with_flag = build_claude_launch_arguments_for_test(
+        &request,
+        "session",
+        ClaudeActivitySupport {
+            permission_prompts: true,
+            ..ClaudeActivitySupport::default()
+        },
+    );
+    assert!(
+        with_flag
+            .windows(2)
+            .any(|window| window == ["--permission-prompt-tool", "stdio"]),
+        "{with_flag:?}"
+    );
+    let without_flag = build_claude_launch_arguments_for_test(
+        &request,
+        "session",
+        ClaudeActivitySupport::default(),
+    );
+    assert!(
+        !without_flag
+            .iter()
+            .any(|argument| argument == "--permission-prompt-tool"),
         "{without_flag:?}"
     );
 }
@@ -16979,6 +17019,7 @@ async fn claude_thinking_display_probe_reads_the_allowed_values() {
                 fork_session_id: false,
                 probe_finished: true,
                 thinking_display: expected,
+                permission_prompts: false,
             },
             "{case}"
         );
@@ -17024,6 +17065,7 @@ async fn claude_thinking_display_probe_timeout_is_not_cached() {
             fork_session_id: false,
             probe_finished: true,
             thinking_display: true,
+            permission_prompts: false,
         }
     );
 }
@@ -17165,6 +17207,7 @@ async fn assert_claude_probe_recovers_after_one_bad_help(case: &str, first_help:
             fork_session_id: false,
             probe_finished: true,
             thinking_display: false,
+            permission_prompts: false,
         },
         "{case}: a later launch of the same working Claude gets the activity flags"
     );

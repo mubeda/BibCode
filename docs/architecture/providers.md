@@ -226,6 +226,15 @@ to the incoming provider connection. The same wire ID can therefore occur on
 another chat or after reconnect without replacing another pending approval in
 the server's global request projection.
 
+Claude is the exception. A Claude approval or question keeps the `request_id`
+of Claude's `can_use_tool` control request, a UUID that Claude generates for
+each request, and the `control_response` echoes it. The Claude runtime owns the
+pending request: a decision, Claude's `control_cancel_request`, an interrupt
+and session shutdown each claim it, and only the first claim writes or
+publishes anything. The driver publishes the `request.resolved` or
+`user-input.resolved` event that closes the card after the reply is written.
+See [Claude approvals and questions](../providers/claude.md#approvals-and-questions).
+
 See [Checkpoint revert](./rpc-and-orchestration.md#checkpoint-revert).
 
 An OpenCode instance with a Server URL also has "Only BiBCode uses this server"
