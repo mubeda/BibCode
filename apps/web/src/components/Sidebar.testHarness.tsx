@@ -112,6 +112,7 @@ const h = vi.hoisted(() => {
       const domProps = new Set([
         "aria-current",
         "aria-describedby",
+        "aria-expanded",
         "aria-label",
         "aria-labelledby",
         "autoFocus",

@@ -734,16 +734,40 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).not.toContain("No threads yet");
   });
 
-  it("collapses a project but keeps the active thread row visible", () => {
-    baseScenario();
-    h.uiStore.setState({
-      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+  // #382: an explicit collapse hides every descendant, the open chat's card included.
+  staticDescribe.each(["environments", "repositories"] as const)("a collapsed card in %s", (view) => {
+    const collapse = () =>
+      h.uiStore.setState({
+        sidebarView: view,
+        projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+      });
+
+    it("hides the open worktree row and every other card", () => {
+      baseScenario();
+      collapse();
+      const markup = render(<Sidebar />);
+      expect(markup).not.toContain("thread-row-thread-active");
+      expect(markup).not.toContain("thread-row-thread-idle");
+      expect(markup).not.toContain('data-testid="primary-card-project-a"');
     });
-    const markup = render(<Sidebar />);
-    // Active thread peeks through even while collapsed; the inactive primary card does not.
-    expect(markup).toContain("thread-row-thread-active");
-    expect(markup).not.toContain("thread-row-thread-idle");
-    expect(markup).not.toContain('data-testid="primary-card-project-a"');
+
+    it("hides the primary card when its chat is the open one", () => {
+      baseScenario();
+      h.state.routeParams = { environmentId: ENV_MAIN, threadId: threadDefault.id };
+      collapse();
+      const markup = render(<Sidebar />);
+      expect(markup).not.toContain('data-testid="primary-card-project-a"');
+      expect(markup).not.toContain("more chat");
+    });
+
+    it("shows the cards again when expanded", () => {
+      baseScenario();
+      h.state.routeParams = { environmentId: ENV_MAIN, threadId: threadDefault.id };
+      h.uiStore.setState({ sidebarView: view });
+      const markup = render(<Sidebar />);
+      expect(markup).toContain('data-testid="primary-card-project-a"');
+      expect(markup).toContain("thread-row-thread-active");
+    });
   });
 
   it("writes only an environment card's own expansion keys, not the repository row's", () => {

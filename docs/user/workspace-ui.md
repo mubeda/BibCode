@@ -230,8 +230,9 @@ The glyph's shape carries the status: a hand (needs approval), a question mark
 (waiting for your answer), a spinner (working or connecting), a warning
 triangle (failed), a checklist (plan ready), a filled dot (finished, not opened
 yet) and a hollow ring (idle). A collapsed project and the **Show more** row
-show the most urgent glyph among the cards they hide. A collapsed project keeps
-only the card you are viewing visible; its other cards and discovered worktrees
+show the most urgent glyph among the cards they hide. A collapsed project hides
+all its cards and discovered worktrees, the card of the chat you are viewing
+included, and its header stays highlighted while it holds that chat. The cards
 appear again when you expand it.
 
 - The primary card represents the project's live checkout. Its title is the
