@@ -18,8 +18,8 @@ pub(crate) use protocol::ClaudeControlResponseFrame;
 pub use protocol::{AssistantMessage, ClaudeMessage};
 pub use runtime::{
     ClaudeControlRequest, ClaudePermissionMode, ClaudeProviderRuntime, Decision, LaunchRequest,
-    LaunchRequestInput, PermissionRequestInput, ReconnectSnapshot, ResolvedUserInput, RuntimeMode,
-    TurnInput, UserInputRequestInput,
+    LaunchRequestInput, PermissionRequestInput, ReconnectSnapshot, ResolvedPermission,
+    ResolvedUserInput, RuntimeMode, TurnInput, UserInputRequestInput,
 };
 #[doc(hidden)]
 pub use transcript::{ClaudeTranscriptFixtureAdapter, ClaudeTranscriptFixtureOutput};

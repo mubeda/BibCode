@@ -2656,13 +2656,114 @@ fn permission_requests_round_trip_through_open_and_resolved_events() {
         runtime.open_permission_request(fixture.request, &fixture.resolution.request_id);
     events.extend(request_event);
     events.extend(
-        runtime.resolve_permission_request(
-            &fixture.resolution.request_id,
-            fixture.resolution.decision,
-        ),
+        runtime
+            .resolve_permission_request(&fixture.resolution.request_id, fixture.resolution.decision)
+            .events,
     );
 
     assert_trace_eq(&events, &fixture.expected_events);
+}
+
+fn runtime_with_bash_approval(suggestions: Value) -> ClaudeProviderRuntime {
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+    runtime.start_session(RuntimeMode::ApprovalRequired, None);
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "run a command".to_owned(),
+    });
+    runtime.open_permission_request(
+        serde_json::from_value(json!({
+            "toolName": "Bash",
+            "input": { "command": "touch made.txt" },
+            "toolUseId": "tool-use-1",
+            "suggestions": suggestions,
+        }))
+        .expect("permission request"),
+        "request-1",
+    );
+    runtime
+}
+
+/// The shape Claude 2.1 sends for a Bash command: one rule it would save to a settings file, the
+/// working folder, and a mode change.
+fn bash_suggestions() -> Value {
+    json!([
+        {
+            "type": "addRules",
+            "rules": [{ "toolName": "Bash", "ruleContent": "touch made.txt" }],
+            "behavior": "allow",
+            "destination": "localSettings"
+        },
+        { "type": "addDirectories", "directories": ["/work"], "destination": "session" },
+        { "type": "setMode", "mode": "acceptEdits", "destination": "session" }
+    ])
+}
+
+#[test]
+fn accept_for_session_applies_the_suggested_rules_to_the_session_only() {
+    let mut runtime = runtime_with_bash_approval(bash_suggestions());
+    let resolved = runtime.resolve_permission_request("request-1", Decision::AcceptForSession);
+
+    // Every rule goes to the session, never to a settings file, and the mode stays as the
+    // thread shows it.
+    assert_eq!(
+        resolved.response,
+        json!({
+            "behavior": "allow",
+            "updatedPermissions": [
+                {
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "touch made.txt" }],
+                    "behavior": "allow",
+                    "destination": "session"
+                },
+                { "type": "addDirectories", "directories": ["/work"], "destination": "session" }
+            ]
+        })
+    );
+    assert_eq!(resolved.events.len(), 1);
+    assert_eq!(
+        resolved.events[0].payload,
+        json!({ "decision": "acceptForSession" })
+    );
+}
+
+#[test]
+fn accept_allows_once_and_adds_no_session_rule() {
+    let mut runtime = runtime_with_bash_approval(bash_suggestions());
+    let resolved = runtime.resolve_permission_request("request-1", Decision::Accept);
+
+    assert_eq!(resolved.response, json!({ "behavior": "allow" }));
+    assert_eq!(resolved.events[0].payload, json!({ "decision": "accept" }));
+}
+
+#[test]
+fn accept_for_session_without_a_usable_rule_allows_once_and_says_so() {
+    for suggestions in [
+        json!([]),
+        json!([{ "type": "setMode", "mode": "acceptEdits", "destination": "session" }]),
+    ] {
+        let mut runtime = runtime_with_bash_approval(suggestions);
+        let resolved = runtime.resolve_permission_request("request-1", Decision::AcceptForSession);
+
+        assert_eq!(resolved.response, json!({ "behavior": "allow" }));
+        assert_eq!(
+            resolved.events[0].payload,
+            json!({
+                "decision": "accept",
+                "reason": "Claude offered no session rule for this request, so it was approved once."
+            })
+        );
+    }
+}
+
+#[test]
+fn deny_refuses_the_tool() {
+    let mut runtime = runtime_with_bash_approval(bash_suggestions());
+    let resolved = runtime.resolve_permission_request("request-1", Decision::Deny);
+
+    assert_eq!(resolved.response["behavior"], "deny");
+    assert_eq!(resolved.events[0].payload, json!({ "decision": "deny" }));
 }
 
 #[test]

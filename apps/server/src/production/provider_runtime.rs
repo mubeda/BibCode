@@ -20034,16 +20034,18 @@ impl ProviderDriver for ClaudeDriver {
         decision: String,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            let accepted = matches!(decision.as_str(), "accept" | "acceptForSession");
-            self.runtime.lock().await.resolve_permission_request(
-                &request_id,
-                if accepted {
-                    Decision::Accept
-                } else {
-                    Decision::Deny
-                },
-            );
-            self.write_json(json!({"type":"control_response","response":{"request_id":request_id,"subtype":"success","response":{"behavior":if accepted {"allow"} else {"deny"}}}})).await
+            let decision = match decision.as_str() {
+                "accept" => Decision::Accept,
+                "acceptForSession" => Decision::AcceptForSession,
+                _ => Decision::Deny,
+            };
+            let response = self
+                .runtime
+                .lock()
+                .await
+                .resolve_permission_request(&request_id, decision)
+                .response;
+            self.write_json(json!({"type":"control_response","response":{"request_id":request_id,"subtype":"success","response":response}})).await
         })
     }
     fn answer(

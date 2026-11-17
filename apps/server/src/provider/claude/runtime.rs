@@ -204,6 +204,8 @@ mod tests {
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
     Accept,
+    #[serde(rename = "acceptForSession")]
+    AcceptForSession,
     Deny,
 }
 
@@ -229,6 +231,13 @@ pub struct UserInputRequestInput {
     pub tool_name: String,
     pub input: Value,
     pub tool_use_id: String,
+}
+
+/// What a resolved approval tells Claude: the body of the `control_response`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPermission {
+    pub response: Value,
+    pub events: Vec<CanonicalEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2585,17 +2594,49 @@ impl ClaudeProviderRuntime {
         &mut self,
         request_id: &str,
         decision: Decision,
-    ) -> Vec<CanonicalEvent> {
-        let Some(pending) = self.pending_approvals.remove(request_id) else {
-            return Vec::new();
+    ) -> ResolvedPermission {
+        let pending = self.pending_approvals.remove(request_id);
+        let session_rules = match decision {
+            Decision::AcceptForSession => pending
+                .as_ref()
+                .map(|pending| session_permission_updates(&pending.raw["suggestions"]))
+                .unwrap_or_default(),
+            Decision::Accept | Decision::Deny => Vec::new(),
         };
-        vec![self.event(
-            "request.resolved",
-            self.current_turn_id.clone(),
-            Some(request_id.to_owned()),
-            Some(json!({ "providerItemId": pending.provider_item_id })),
-            json!({ "decision": decision }),
-        )]
+        let (response, payload) = match decision {
+            Decision::Deny => (
+                json!({ "behavior": "deny" }),
+                json!({ "decision": decision }),
+            ),
+            Decision::AcceptForSession if !session_rules.is_empty() => (
+                json!({ "behavior": "allow", "updatedPermissions": session_rules }),
+                json!({ "decision": decision }),
+            ),
+            // No rule to apply: a one-time allow, recorded as one, with the reason.
+            Decision::AcceptForSession => (
+                json!({ "behavior": "allow" }),
+                json!({
+                    "decision": Decision::Accept,
+                    "reason": "Claude offered no session rule for this request, so it was approved once.",
+                }),
+            ),
+            Decision::Accept => (
+                json!({ "behavior": "allow" }),
+                json!({ "decision": decision }),
+            ),
+        };
+        let events = pending
+            .map(|pending| {
+                vec![self.event(
+                    "request.resolved",
+                    self.current_turn_id.clone(),
+                    Some(request_id.to_owned()),
+                    Some(json!({ "providerItemId": pending.provider_item_id })),
+                    payload,
+                )]
+            })
+            .unwrap_or_default();
+        ResolvedPermission { response, events }
     }
 
     pub fn open_user_input_request(
@@ -3510,6 +3551,25 @@ fn claude_hook_native_event_id(value: &Value) -> Option<String> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Some(format!("claude:hook:{encoded}"))
+}
+
+/// The rules Claude suggested for "always allow", limited to this session.
+///
+/// Claude may suggest saving a rule to a settings file, which would outlive the session, so every
+/// destination becomes `session`. A suggested mode change is dropped: it would move the session
+/// to another permission mode while the thread still shows the one the person chose.
+fn session_permission_updates(suggestions: &Value) -> Vec<Value> {
+    suggestions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|suggestion| suggestion["type"] != "setMode")
+        .filter_map(|suggestion| {
+            let mut update = suggestion.as_object()?.clone();
+            update.insert("destination".to_owned(), json!("session"));
+            Some(Value::Object(update))
+        })
+        .collect()
 }
 
 fn claude_control_fact_native_event_id(value: &Value) -> Option<String> {
