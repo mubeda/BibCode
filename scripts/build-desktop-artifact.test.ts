@@ -403,6 +403,54 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }),
   );
 
+  it.effect("looks for the bundle, the updater app and the symbols in CARGO_TARGET_DIR", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const repoRoot = yield* fs.makeTempDirectoryScoped({ prefix: "bibcode-build-target-dir-" });
+      yield* fs.makeDirectory(path.join(repoRoot, "apps", "desktop"), { recursive: true });
+      yield* fs.writeFileString(
+        path.join(repoRoot, "apps", "desktop", "package.json"),
+        JSON.stringify({ version: "1.2.3" }),
+      );
+      const cargoTargetDir = path.resolve(repoRoot, "..", "shared-cargo-target");
+      const release = path.join(cargoTargetDir, "aarch64-apple-darwin", "release");
+      const plan = yield* resolveTauriBuildPlan(
+        { platform: "mac", target: "dmg", arch: "arm64", updater: true, symbols: true },
+        { CARGO_TARGET_DIR: cargoTargetDir },
+        { platform: "darwin", arch: "arm64" },
+        repoRoot,
+      );
+
+      assert.equal(plan.bundleDir, path.join(release, "bundle", "dmg"));
+      assert.equal(plan.updaterBundleDir, path.join(release, "bundle", "macos"));
+      assert.equal(plan.symbols?.binary, path.join(release, "bibcode-desktop"));
+
+      // An empty value means unset, as it does for Cargo.
+      const unset = yield* resolveTauriBuildPlan(
+        { platform: "mac", target: "dmg", arch: "arm64" },
+        { CARGO_TARGET_DIR: "" },
+        { platform: "darwin", arch: "arm64" },
+        repoRoot,
+      );
+      assert.equal(
+        unset.bundleDir,
+        path.join(repoRoot, "target", "aarch64-apple-darwin", "release", "bundle", "dmg"),
+      );
+
+      // Cargo resolves a relative value against its own working folder, which this wrapper
+      // does not control, so the two could disagree.
+      const error = yield* resolveTauriBuildPlan(
+        { platform: "mac", target: "dmg", arch: "arm64" },
+        { CARGO_TARGET_DIR: "relative-target" },
+        { platform: "darwin", arch: "arm64" },
+        repoRoot,
+      ).pipe(Effect.flip);
+      assert.instanceOf(error, TauriDesktopBuildConfigurationError);
+      assert.include(error.message, "CARGO_TARGET_DIR must be an absolute path");
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("copies Tauri bundle outputs into the artifact directory", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
