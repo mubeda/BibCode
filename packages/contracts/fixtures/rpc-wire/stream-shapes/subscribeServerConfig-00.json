@@ -68,7 +68,7 @@
           "addProjectBaseDirectory": "",
           "textGenerationModelSelection": {
             "instanceId": "codex",
-            "model": "gpt-5.4-mini"
+            "model": "auto"
           },
           "defaultAgent": {
             "kind": "chat",
