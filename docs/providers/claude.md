@@ -238,7 +238,11 @@ The Claude session applies three model options:
   aliases such as `opus`, or, for a model Claude did not report, one BiBCode's
   built-in catalog offers it for. Turning it off is always accepted;
 - **Agent** (`agent`), passed as `--agent` and listed from the agents Claude
-  reports.
+  reports. A chat's first message can leave the agent out and later ones name
+  the default, `claude`. BiBCode treats both as the same launch, so the change
+  does not restart a running session or block a queued message. If Claude's own
+  settings name another default agent, a session started without `--agent`
+  keeps that agent until it restarts.
 
 Models and their options normally come from Claude's session initialization.
 Model labels use Claude's `displayName`; descriptions appear as secondary text.

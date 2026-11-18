@@ -1189,6 +1189,33 @@ export function splitPrimaryAndWorkspaceThreads<T extends WorkspaceRowThreadInpu
  * come first, preserving the caller's existing relative order (typically
  * already sorted via `sortThreads`) within each partition.
  */
+/**
+ * The threads a project card shows, in the order it shows them: the primary thread, which has
+ * its own card, then the worktree rows. Panel chats live in the center panel and get no row,
+ * pinned rows come first, and a folded list shows only its preview. The jump shortcuts and
+ * thread traversal read the same result, so neither can reach a thread the card does not show.
+ */
+export function resolveVisibleProjectThreads<T extends WorkspaceRowThreadInput>(input: {
+  /** The project's unarchived threads, in the order the card receives them. */
+  readonly threads: readonly T[];
+  /** The sidebar's sort order for the rows. */
+  readonly sort: (threads: T[]) => readonly T[];
+  readonly pinnedKeys: ReadonlySet<string> | readonly string[];
+  readonly keyOf: (thread: T) => string;
+  readonly isListExpanded: boolean;
+  readonly previewCount: number;
+}): { primaryThread: T | null; rows: T[] } {
+  // The primary is chosen before sorting, as the card does: a grouped card can hold several
+  // default threads, and the first in member order is the primary whatever the sort order.
+  const { primaryThread, workspaceThreads } = splitPrimaryAndWorkspaceThreads(input.threads);
+  const ordered = orderRowsWithPins(input.sort(workspaceThreads), input.pinnedKeys, input.keyOf);
+  const rows =
+    input.isListExpanded || ordered.length <= input.previewCount
+      ? ordered
+      : ordered.slice(0, input.previewCount);
+  return { primaryThread, rows };
+}
+
 export function orderRowsWithPins<T>(
   items: readonly T[],
   pinnedKeys: ReadonlySet<string> | readonly string[],

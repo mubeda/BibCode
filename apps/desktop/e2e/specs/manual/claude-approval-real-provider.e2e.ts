@@ -219,13 +219,9 @@ describe("real Claude approvals (#383)", function () {
     await chooseSupervised();
     await shot("supervised");
 
-    // A warm-up turn. The composer adds the chat's default options to the second message, which
-    // restarts the Claude process, and a session approval ends with its process. After this turn
-    // the options are settled, so both commands below run in one process.
-    await submitPrompt("Reply with the single word: ok");
-    await browser.pause(45_000);
-    note("warm-up turn sent");
-
+    // No warm-up turn: the approval is given during the chat's first message. The second message
+    // names the default agent the first one left out, which must not restart the Claude process,
+    // because a session approval ends with its process.
     // First command: Claude asks, and the card names the command.
     await submitPrompt(PROMPT);
     const sessionButton = browser.$(SESSION_BUTTON);

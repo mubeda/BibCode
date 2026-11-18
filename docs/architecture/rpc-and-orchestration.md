@@ -5837,7 +5837,9 @@ least one connected environment has `capabilities.profiler` and its
   second animation frame after it;
 - main-thread stalls, from Long Animation Frames where the engine supports them
   (WebView2, Chromium), and elsewhere from a 500 ms heartbeat that counts more
-  than 50 ms of lateness as a stall and pauses while the page is hidden;
+  than 50 ms of lateness as a stall, pauses while the page is hidden, and counts
+  no stalls for a run of beats that each arrive about 500 ms late (WebKit
+  delivering the page's timers 1 s apart);
 - slow interactions from Event Timing, over 104 ms, where supported; and
 - the JavaScript heap where `performance.memory` exists (Chromium).
 

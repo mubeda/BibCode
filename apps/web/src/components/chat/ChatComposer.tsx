@@ -2469,6 +2469,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               <ComposerPendingApprovalPanel
                 approval={activePendingApproval}
                 pendingCount={pendingApprovals.length}
+                showDetail
               />
               <div className="flex flex-wrap items-center justify-end gap-2 px-3 pb-3 sm:px-4">
                 <ComposerPendingApprovalActions

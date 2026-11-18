@@ -268,6 +268,7 @@ import {
   getSidebarThreadIdsToPrewarm,
   orderRowsWithPins,
   resolveAdjacentThreadId,
+  resolveVisibleProjectThreads,
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   resolveSidebarProjectAvailability,
@@ -5245,15 +5246,12 @@ export default function Sidebar() {
     [repositoryGroupExpandedById, repositoryGroups, sortedProjects],
   );
   const isManualProjectSorting = sidebarProjectSortOrder === "manual";
-  const visibleSidebarThreadKeys = useMemo(
+  const pinnedSidebarThreadKeys = useSidebarWorkspaceMetaStore((state) => state.pinnedThreadKeys);
+  // What each expanded project card shows, in card order: the same rows the card renders, so a
+  // jump shortcut or thread traversal never reaches a thread that has no row.
+  const visibleSidebarThreads = useMemo(
     () =>
       visibleProjectsInOrder.flatMap((project) => {
-        const projectThreads = sortThreads(
-          (threadsByProjectKey.get(project.projectKey) ?? []).filter(
-            (thread) => thread.archivedAt === null,
-          ),
-          sidebarThreadSortOrder,
-        );
         const projectExpanded = resolveProjectExpanded(
           projectExpandedById,
           projectExpansionPreferenceKeys(project),
@@ -5261,28 +5259,46 @@ export default function Sidebar() {
         if (!projectExpanded) {
           return [];
         }
-        const isThreadListExpanded = expandedThreadListsByProject.has(project.projectKey);
-        const hasOverflowingThreads = projectThreads.length > sidebarThreadPreviewCount;
-        const previewThreads =
-          isThreadListExpanded || !hasOverflowingThreads
-            ? projectThreads
-            : projectThreads.slice(0, sidebarThreadPreviewCount);
-        return previewThreads.map((thread) =>
-          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
-        );
+        const keyOf = (thread: SidebarThreadSummary) =>
+          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+        const { primaryThread, rows } = resolveVisibleProjectThreads({
+          threads: (threadsByProjectKey.get(project.projectKey) ?? []).filter(
+            (thread) => thread.archivedAt === null,
+          ),
+          sort: (threads) => sortThreads(threads, sidebarThreadSortOrder),
+          pinnedKeys: pinnedSidebarThreadKeys,
+          keyOf,
+          isListExpanded: expandedThreadListsByProject.has(project.projectKey),
+          previewCount: sidebarThreadPreviewCount,
+        });
+        return [
+          ...(primaryThread ? [{ key: keyOf(primaryThread), row: false }] : []),
+          ...rows.map((thread) => ({ key: keyOf(thread), row: true })),
+        ];
       }),
     [
       sidebarThreadSortOrder,
       sidebarThreadPreviewCount,
       expandedThreadListsByProject,
+      pinnedSidebarThreadKeys,
       projectExpandedById,
       threadsByProjectKey,
       visibleProjectsInOrder,
     ],
   );
+  // Traversal and prewarming cover every thread a card shows, the primary card's included.
+  const visibleSidebarThreadKeys = useMemo(
+    () => visibleSidebarThreads.map((thread) => thread.key),
+    [visibleSidebarThreads],
+  );
+  // Jump labels are drawn on rows only, so only rows take a jump number.
+  const jumpableSidebarThreadKeys = useMemo(
+    () => visibleSidebarThreads.filter((thread) => thread.row).map((thread) => thread.key),
+    [visibleSidebarThreads],
+  );
   const threadJumpCommandByKey = useMemo(() => {
     const mapping = new Map<string, NonNullable<ReturnType<typeof threadJumpCommandForIndex>>>();
-    for (const [visibleThreadIndex, threadKey] of visibleSidebarThreadKeys.entries()) {
+    for (const [visibleThreadIndex, threadKey] of jumpableSidebarThreadKeys.entries()) {
       const jumpCommand = threadJumpCommandForIndex(visibleThreadIndex);
       if (!jumpCommand) {
         return mapping;
@@ -5291,7 +5307,7 @@ export default function Sidebar() {
     }
 
     return mapping;
-  }, [visibleSidebarThreadKeys]);
+  }, [jumpableSidebarThreadKeys]);
   const threadJumpThreadKeys = useMemo(
     () => [...threadJumpCommandByKey.keys()],
     [threadJumpCommandByKey],

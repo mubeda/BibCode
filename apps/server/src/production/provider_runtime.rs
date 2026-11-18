@@ -6911,6 +6911,28 @@ fn frozen_delivery_route_fingerprint(
         })
 }
 
+/// Whether `request` is the route a delivery was admitted for. The default Claude agent named or
+/// left out is one route: a chat's first message leaves it out and later ones name it.
+fn delivery_route_matches(
+    expected: &str,
+    request: &ProviderLaunchRequest,
+) -> Result<bool, ProviderRuntimeError> {
+    if expected == delivery_route_fingerprint(request)? {
+        return Ok(true);
+    }
+    if !matches!(request.provider.as_str(), "claude" | "claudeAgent")
+        || claude_agent_changed(request.agent.as_deref(), None)
+    {
+        return Ok(false);
+    }
+    let mut other_spelling = request.clone();
+    other_spelling.agent = match request.agent {
+        Some(_) => None,
+        None => Some(crate::provider::claude::model::DEFAULT_AGENT.to_owned()),
+    };
+    Ok(expected == delivery_route_fingerprint(&other_spelling)?)
+}
+
 fn validate_frozen_delivery_route(
     row: &ProviderTurnDelivery,
     request: &ProviderLaunchRequest,
@@ -6928,8 +6950,7 @@ fn validate_frozen_delivery_route(
         });
     }
     let expected = frozen_delivery_route_fingerprint(row)?;
-    let actual = delivery_route_fingerprint(request)?;
-    if expected == actual {
+    if delivery_route_matches(expected, request)? {
         return Ok(());
     }
     Err(ProviderRuntimeError::Provider {
@@ -11066,7 +11087,8 @@ async fn reconcile_model_selection(
         let target_agent = selection_string_option_from(&selection_options, "agent");
         let launch_only_changed = match entry.launch.provider.as_str() {
             "claude" | "claudeAgent" => {
-                entry.launch.effort != target_effort || entry.launch.agent != target_agent
+                entry.launch.effort != target_effort
+                    || claude_agent_changed(entry.launch.agent.as_deref(), target_agent.as_deref())
             }
             "opencode" => entry.launch.agent != target_agent,
             _ => false,
@@ -11425,6 +11447,25 @@ fn command_thread_id(command: &OrchestrationCommand) -> Option<&str> {
         | OrchestrationCommand::ThreadRevertComplete { thread_id, .. } => Some(thread_id),
         _ => None,
     }
+}
+
+/// Whether a Claude session must restart to run another agent.
+///
+/// The agent named `claude` is Claude Code's own default: `--agent claude` starts the same
+/// session as no `--agent` (measured on Claude Code 2.1.326: the same tools and the same prompt
+/// size). A chat's first message can leave before the agent list has loaded and so names no
+/// agent, and the second names the default. Restarting for that would end the Claude process and
+/// everything that lives in it, a session approval included, for no change.
+fn claude_agent_changed(running: Option<&str>, target: Option<&str>) -> bool {
+    let named = |agent: Option<&str>| {
+        agent
+            .map(str::trim)
+            .filter(|agent| {
+                !agent.is_empty() && *agent != crate::provider::claude::model::DEFAULT_AGENT
+            })
+            .map(str::to_owned)
+    };
+    named(running) != named(target)
 }
 
 /// Whether a Codex session that names a model was switched to "Codex default" (`auto`).
@@ -35786,6 +35827,57 @@ done
         );
         driver.shutdown().await.expect("OpenCode should shut down");
         server.abort();
+    }
+
+    #[test]
+    fn naming_the_default_claude_agent_does_not_restart_the_session() {
+        // The second message of a new chat names the default agent the first one left out.
+        assert!(!super::claude_agent_changed(None, Some("claude")));
+        assert!(!super::claude_agent_changed(Some("claude"), None));
+        assert!(!super::claude_agent_changed(None, None));
+        assert!(!super::claude_agent_changed(
+            Some("reviewer"),
+            Some("reviewer")
+        ));
+        // Another agent is a real change, in both directions.
+        assert!(super::claude_agent_changed(None, Some("reviewer")));
+        assert!(super::claude_agent_changed(Some("reviewer"), None));
+        assert!(super::claude_agent_changed(
+            Some("reviewer"),
+            Some("claude")
+        ));
+        assert!(super::claude_agent_changed(
+            Some("reviewer"),
+            Some("planner")
+        ));
+    }
+
+    /// A message admitted with the default agent named reaches a session launched without it,
+    /// on every path that checks the route: a turn start, a steer and a reconciliation.
+    #[tokio::test]
+    async fn a_named_default_claude_agent_keeps_the_delivery_route() {
+        let launch = |options| {
+            launch_request_for_provider_with_options("claudeAgent", "claude-opus-4-8", options)
+        };
+        let unnamed = launch(vec![]).await;
+        let named = launch(vec![json!({ "id":"agent", "value":"claude" })]).await;
+        let reviewer = launch(vec![json!({ "id":"agent", "value":"reviewer" })]).await;
+        let route = |request: &super::ProviderLaunchRequest| {
+            super::delivery_route_fingerprint(request).expect("route fingerprint")
+        };
+        let matches = |expected: &super::ProviderLaunchRequest,
+                       running: &super::ProviderLaunchRequest| {
+            super::delivery_route_matches(&route(expected), running).expect("route match")
+        };
+        assert_ne!(route(&unnamed), route(&named));
+        assert!(matches(&named, &unnamed));
+        assert!(matches(&unnamed, &named));
+        assert!(matches(&named, &named));
+        // Another agent is another route, in both directions.
+        assert!(!matches(&reviewer, &unnamed));
+        assert!(!matches(&reviewer, &named));
+        assert!(!matches(&unnamed, &reviewer));
+        assert!(!matches(&named, &reviewer));
     }
 
     #[test]

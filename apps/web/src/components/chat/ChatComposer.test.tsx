@@ -3570,6 +3570,8 @@ describe("ChatComposer mobile", () => {
     });
     expect(markup).toContain('data-chat-composer-collapsed-controls="true"');
     expect(markup).toContain('data-mock="ComposerPendingApprovalActions"');
+    // The collapsed composer has no editor, so the panel itself must name what is approved.
+    expect(markup).toContain('data-prop-showdetail="true"');
   });
 
   it("renders the collapsed pending question controls with a custom answer button", () => {

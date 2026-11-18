@@ -1179,7 +1179,7 @@ fn copy_non_empty_string(source: &Value, target: &mut Value, key: &str) {
 fn apply_agent_options(models: &mut [Value], agents: &[Value]) {
     let default_agent = agents
         .iter()
-        .find(|agent| agent["name"] == "claude")
+        .find(|agent| agent["name"] == crate::provider::claude::model::DEFAULT_AGENT)
         .or_else(|| agents.first())
         .and_then(|agent| agent.get("name"))
         .and_then(Value::as_str);
