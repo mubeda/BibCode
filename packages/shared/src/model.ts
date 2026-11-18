@@ -365,34 +365,59 @@ const RETIRED_CODEX_MODELS: ReadonlySet<string> = new Set(["gpt-5.4", "gpt-5.4-m
 
 /**
  * The retired Codex model that a thread stored, when the selection about to be sent replaced it
- * with Codex's default. Codex's live model list no longer offers a retired model under ChatGPT
- * sign-in, so the picker falls back to "auto". Under API-key sign-in the list still offers it,
- * the stored model is sent unchanged, and this returns null.
+ * with Codex's default because Codex no longer offers it. Under ChatGPT sign-in Codex's live
+ * model list leaves a retired model out, so the picker falls back to "auto". Under API-key
+ * sign-in the list still offers it: the stored model is sent unchanged, and a person who then
+ * picks Codex's default did so on purpose. Both return null.
  */
-export function replacedRetiredCodexModel(
-  stored: { readonly instanceId: string; readonly model: string } | null | undefined,
-  sent: { readonly instanceId: string; readonly model: string },
-): string | null {
-  if (!stored || stored.instanceId !== sent.instanceId || sent.model !== CODEX_AUTO_MODEL) {
+export function replacedRetiredCodexModel(input: {
+  readonly driver: ProviderDriverKind;
+  readonly stored: { readonly instanceId: string; readonly model: string } | null | undefined;
+  readonly sent: { readonly instanceId: string; readonly model: string };
+  readonly offered: ReadonlyArray<{ readonly slug: string }>;
+}): string | null {
+  const { driver, offered, sent, stored } = input;
+  if (
+    driver !== CODEX_PROVIDER_DRIVER_KIND ||
+    !stored ||
+    stored.instanceId !== sent.instanceId ||
+    sent.model !== CODEX_AUTO_MODEL
+  ) {
     return null;
   }
   const model = normalizeModelSlug(stored.model, CODEX_PROVIDER_DRIVER_KIND);
-  return model !== null && RETIRED_CODEX_MODELS.has(model) ? model : null;
+  if (model === null || !RETIRED_CODEX_MODELS.has(model)) {
+    return null;
+  }
+  return offered.some((option) => option.slug === model || option.slug === stored.model)
+    ? null
+    : model;
 }
 
 /**
- * The model to fall back to when nothing selectable was chosen: the provider's "auto" entry when
- * it lists one, wherever a saved picker order put it, else the first built-in model.
+ * The model to fall back to when nothing selectable was chosen. For Codex it is the "auto"
+ * entry, wherever a saved picker order put it. Other providers keep their own order: the first
+ * built-in model, else the first model.
  */
 export function fallbackModelOption<
   T extends { readonly slug: string; readonly isCustom?: boolean },
->(models: ReadonlyArray<T>): T | null {
+>(driver: ProviderDriverKind, models: ReadonlyArray<T>): T | null {
   return (
-    models.find((model) => model.slug === CODEX_AUTO_MODEL && !model.isCustom) ??
+    codexAutoModelOption(driver, models) ??
     models.find((model) => !model.isCustom) ??
     models[0] ??
     null
   );
+}
+
+/** Codex's "no model chosen" entry in `models`, or null for another provider or a list without it. */
+export function codexAutoModelOption<
+  T extends { readonly slug: string; readonly isCustom?: boolean },
+>(driver: ProviderDriverKind, models: ReadonlyArray<T>): T | null {
+  if (driver !== CODEX_PROVIDER_DRIVER_KIND) {
+    return null;
+  }
+  return models.find((model) => model.slug === CODEX_AUTO_MODEL && !model.isCustom) ?? null;
 }
 
 export function normalizeModelSlug(

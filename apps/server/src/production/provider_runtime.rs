@@ -7442,6 +7442,7 @@ async fn run_supervisor(
                             thread_id,
                             selection,
                             operational_log.as_ref(),
+                            true,
                         )
                         .await?;
                     }
@@ -10077,6 +10078,9 @@ async fn handle_command(
                 &thread_id,
                 selection,
                 operational_log,
+                // A settings change saved for a queued message must not restart the session
+                // under the turn that is still running. The message's own start applies it.
+                matches!(command, OrchestrationCommand::ThreadTurnStart { .. }),
             )
             .await?;
         }
@@ -11027,6 +11031,7 @@ async fn retire_compaction_session(
     retired
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_model_selection(
     engine: &OrchestrationEngine,
     factory: &Arc<dyn ProviderDriverFactory>,
@@ -11035,6 +11040,7 @@ async fn reconcile_model_selection(
     thread_id: &str,
     selection: &Value,
     operational_log: Option<&ProviderOperationalLog>,
+    starting_turn: bool,
 ) -> Result<(), ProviderRuntimeError> {
     let target_model = model_from_selection(selection);
     let selection_options = selection_options(selection);
@@ -11069,11 +11075,12 @@ async fn reconcile_model_selection(
             .as_ref()
             .is_some_and(|model| entry.launch.model.as_ref() != Some(model));
         let options_changed = entry.launch.options != target_options;
-        let model_cleared = codex_model_cleared(
-            &entry.launch.provider,
-            entry.launch.model.as_deref(),
-            target_model.as_deref(),
-        );
+        let model_cleared = starting_turn
+            && codex_model_cleared(
+                &entry.launch.provider,
+                entry.launch.model.as_deref(),
+                target_model.as_deref(),
+            );
         if !model_changed && !options_changed && !launch_only_changed && !model_cleared {
             return Ok(());
         }
@@ -19583,12 +19590,17 @@ impl ClaudeDriver {
         request_id: &str,
         response: &Value,
     ) -> Result<(), ProviderRuntimeError> {
-        write_claude_control_reply(
+        let written = write_claude_control_reply(
             &self.writer,
             &crate::provider::claude::runtime::control_response(request_id, response),
         )
-        .await
-        .map_err(provider_error(&self.provider))
+        .await;
+        if written.is_err() {
+            // Claude may hold part of the frame and still waits for its answer, which nothing
+            // can deliver now. Ending its output ends the session, so the turn does not hang.
+            self.output.cancellation.cancel();
+        }
+        written.map_err(provider_error(&self.provider))
     }
 
     /// Hands the supervisor the events of requests this driver settled, which close their cards.
@@ -20378,8 +20390,14 @@ impl ProviderDriver for ClaudeDriver {
         Box::pin(async move {
             self.control_responses.close();
             // The process that asked is going away, so its open requests close with it.
+            // Not awaited: the supervisor stops reading events before it shuts a driver down, so
+            // a full queue would never drain.
             let cancelled = self.runtime.lock().await.cancel_pending_requests();
-            self.publish_request_events(cancelled).await;
+            if let Some(sender) = self.events_tx.upgrade() {
+                for event in cancelled {
+                    let _ = sender.try_send(claude_provider_event(event, None, Vec::new()));
+                }
+            }
             // Kill first: a write Claude stopped reading holds the writer until the pipe breaks.
             kill_child(&self.child).await;
             let _ = self.writer.lock().await.shutdown().await;
@@ -21075,12 +21093,15 @@ async fn emit_claude_value(
     let control_responses = std::mem::take(&mut output.control_responses);
     if !control_responses.is_empty() {
         let writer = writer.clone();
+        let cancellation = cancellation.clone();
         tokio::spawn(async move {
             for response in control_responses {
                 if write_claude_control_reply(&writer, &response)
                     .await
                     .is_err()
                 {
+                    // Claude waits for this answer and cannot get it: end the session.
+                    cancellation.cancel();
                     return;
                 }
             }

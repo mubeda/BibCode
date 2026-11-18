@@ -2756,6 +2756,9 @@ fn accept_for_session_without_a_usable_rule_allows_once_and_says_so() {
         json!([{ "type": "addRules", "rules": [], "behavior": "allow" }]),
         json!([{ "type": "addRules", "rules": [{ "toolName": "Bash" }], "behavior": "deny" }]),
         json!([{ "type": "removeRules", "rules": [{ "toolName": "Bash" }], "behavior": "deny" }]),
+        // Entries that are not rules or folders.
+        json!([{ "type": "addRules", "rules": [{}], "behavior": "allow" }]),
+        json!([{ "type": "addDirectories", "directories": [null, ""] }]),
     ] {
         let mut runtime = runtime_with_bash_approval(suggestions);
         let resolved = runtime
@@ -2770,7 +2773,7 @@ fn accept_for_session_without_a_usable_rule_allows_once_and_says_so() {
             resolved.events[0].payload,
             json!({
                 "decision": "accept",
-                "reason": "Claude offered no session rule for this request, so it was approved once."
+                "detail": "Claude offered no session rule for this request, so it was approved once."
             })
         );
     }
@@ -2993,6 +2996,14 @@ fn a_question_opens_the_question_card_and_is_answered_as_the_tool_input() {
         output.events[0].request_id.as_deref(),
         Some("cli-question-1")
     );
+    // The question card requires a description on every option, which Claude may omit.
+    assert_eq!(
+        output.events[0].payload["questions"][0]["options"],
+        json!([
+            { "label": "Red", "description": "" },
+            { "label": "Blue", "description": "" }
+        ])
+    );
 
     let resolved = runtime
         .resolve_user_input_request("cli-question-1", json!({ "Red or blue?": "Blue" }))
@@ -3065,6 +3076,66 @@ fn an_interrupt_or_a_stopped_process_closes_every_open_request() {
         ]
     );
     assert!(runtime.cancel_pending_requests().is_empty());
+}
+
+#[test]
+fn a_turn_that_ends_closes_the_requests_it_left_open() {
+    let mut runtime = runtime_in_turn();
+    runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-request-1",
+            "Bash",
+            json!({ "command": "touch made.txt" }),
+        ),
+        0,
+    );
+    let output = runtime.handle_raw_value(
+        &json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": "end_turn",
+            "session_id": "session-1",
+            "uuid": "result-1"
+        }),
+        0,
+    );
+    let types = output
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>();
+    let closed = types.iter().position(|kind| *kind == "request.resolved");
+    let completed = types.iter().position(|kind| *kind == "turn.completed");
+    assert!(closed.is_some() && closed < completed, "{types:?}");
+    // An answer from another client after the turn ended is refused.
+    assert!(
+        runtime
+            .resolve_permission_request("cli-request-1", Decision::Accept)
+            .is_none()
+    );
+}
+
+#[test]
+fn a_session_rule_keeps_only_its_valid_entries() {
+    let mut runtime = runtime_with_bash_approval(json!([{
+        "type": "addRules",
+        "rules": [{}, { "toolName": "Bash", "ruleContent": "touch made.txt" }],
+        "behavior": "allow",
+        "destination": "userSettings"
+    }]));
+    let resolved = runtime
+        .resolve_permission_request("request-1", Decision::AcceptForSession)
+        .expect("pending approval");
+    assert_eq!(
+        resolved.response["updatedPermissions"],
+        json!([{
+            "type": "addRules",
+            "rules": [{ "toolName": "Bash", "ruleContent": "touch made.txt" }],
+            "behavior": "allow",
+            "destination": "session"
+        }])
+    );
 }
 
 #[test]

@@ -6829,7 +6829,12 @@ function ChatViewContent(props: ChatViewProps) {
           // #380: the thread stored a model Codex retired, and this send replaced it with
           // Codex's default. The thread now stores that choice, so this shows once.
           const retiredModel = ctxSelectedModel
-            ? replacedRetiredCodexModel(activeThread?.modelSelection, ctxSelectedModelSelection)
+            ? replacedRetiredCodexModel({
+                driver: ctxSelectedProvider,
+                stored: activeThread?.modelSelection,
+                sent: ctxSelectedModelSelection,
+                offered: ctxSelectedProviderModels,
+              })
             : null;
           if (retiredModel !== null) {
             toastManager.add(

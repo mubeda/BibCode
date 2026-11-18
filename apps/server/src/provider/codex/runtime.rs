@@ -39,7 +39,7 @@ use super::{
         decode_thread_list_response, decode_thread_read_response, decode_turns_page,
         delivery_key_in_turns, is_recoverable_thread_resume_error, parse_model_list_response,
         parse_skills_list_response, parse_thread_snapshot, reasoning_effort_label,
-        turn_option_label,
+        reported_default_model, turn_option_label,
     },
     protocol::{IncomingEvent, JsonRpcConnection, ProtocolError},
 };
@@ -1144,6 +1144,19 @@ impl CodexSessionRuntime {
             self.publish_initialize_response_ready();
             connection.notify_without_params("initialized").await?;
             let opened = if let Some(resume_thread_id) = resume_thread_id {
+                // A thread resumed without a model keeps the one it ran before (measured on
+                // codex-cli 0.169.0). "No model chosen" means Codex's default, so a resume
+                // names the default Codex reports. A list that cannot be read names none.
+                let resume_model = match self.inner.options.model.clone() {
+                    Some(model) => Some(model),
+                    None => connection
+                        .request("model/list", json!({}))
+                        .await
+                        .ok()
+                        .and_then(|response| {
+                            reported_default_model(response.get("data")?.as_array()?)
+                        }),
+                };
                 match connection
                     .request(
                         "thread/resume",
@@ -1160,7 +1173,7 @@ impl CodexSessionRuntime {
                                 CodexRuntimeMode::AutoAcceptEdits => "workspace-write",
                                 CodexRuntimeMode::FullAccess => "danger-full-access",
                             },
-                            "model": self.inner.options.model,
+                            "model": resume_model,
                             "serviceTier": self.inner.options.service_tier,
                         }),
                     )

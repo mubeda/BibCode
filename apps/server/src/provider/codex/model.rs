@@ -841,7 +841,7 @@ pub fn parse_model_list_response(
             .ok_or_else(|| "model entry missing model".to_owned())?;
         // `auto` is reserved for the entry above: a second row with that slug would give the
         // picker two choices with one value.
-        if slug == AUTO_MODEL {
+        if slug.trim().eq_ignore_ascii_case(AUTO_MODEL) {
             continue;
         }
         let display_name = model
@@ -868,7 +868,8 @@ pub fn parse_model_list_response(
         .unwrap_or(Value::Null);
     for custom in custom_models {
         let slug = custom.trim();
-        if slug.is_empty() || seen.contains(slug) {
+        // Dispatch reads every casing of `auto` as "no model", so none may be a second entry.
+        if slug.is_empty() || seen.contains(slug) || slug.eq_ignore_ascii_case(AUTO_MODEL) {
             continue;
         }
         seen.insert(slug.to_owned());
@@ -1208,6 +1209,16 @@ fn normalize_model_slug(model: &str, preferred_id: Option<&str>) -> String {
         return preferred_id.to_owned();
     }
     normalized
+}
+
+/// The model Codex's `model/list` marks as its default, from one page of that list.
+#[must_use]
+pub fn reported_default_model(data: &[Value]) -> Option<String> {
+    data.iter()
+        .find(|model| model.get("isDefault").and_then(Value::as_bool) == Some(true))
+        .and_then(|model| model.get("model"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// The retired model that `model` names, directly or through an alias.
@@ -1768,10 +1779,24 @@ mod tests {
     }
 
     #[test]
+    fn the_reported_default_is_the_model_marked_is_default() {
+        let data = [
+            json!({ "model": "gpt-other" }),
+            json!({ "model": "gpt-6.2-sol", "isDefault": true }),
+        ];
+        assert_eq!(
+            reported_default_model(&data),
+            Some("gpt-6.2-sol".to_owned())
+        );
+        assert_eq!(reported_default_model(&data[..1]), None);
+        assert_eq!(reported_default_model(&[]), None);
+    }
+
+    #[test]
     fn a_reported_model_named_auto_does_not_duplicate_the_default_entry() {
         let models = parse_model_list_response(
-            &json!({ "data": [{ "model": "auto", "isDefault": true }, { "model": "gpt-other" }] }),
-            &["auto".to_owned()],
+            &json!({ "data": [{ "model": "Auto", "isDefault": true }, { "model": "gpt-other" }] }),
+            &["auto".to_owned(), "AUTO".to_owned()],
         )
         .expect("model list");
         assert_eq!(

@@ -128,7 +128,10 @@ for any other model name that Codex refuses, the name is passed through and
 Codex's own error is shown.
 
 Switching a thread from a named model to **Codex default** restarts its Codex
-session, because a running session cannot be told to drop its model.
+session when the next message starts, because a running session cannot be told
+to drop its model. Codex keeps a thread's previous model when the thread is
+resumed without one, so a resume with no chosen model names the model that
+`model/list` marks as default. A fresh thread names none.
 
 ## Custom endpoints and secrets
 

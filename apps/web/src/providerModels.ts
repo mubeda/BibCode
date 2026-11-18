@@ -118,5 +118,9 @@ export function getDefaultServerModel(
   provider: ProviderDriverKind,
 ): string {
   const models = getProviderModels(providers, provider);
-  return fallbackModelOption(models)?.slug ?? DEFAULT_MODEL_BY_PROVIDER[provider] ?? DEFAULT_MODEL;
+  return (
+    fallbackModelOption(provider, models)?.slug ??
+    DEFAULT_MODEL_BY_PROVIDER[provider] ??
+    DEFAULT_MODEL
+  );
 }

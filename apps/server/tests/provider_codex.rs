@@ -10186,6 +10186,10 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
     peer.expect_request("initialize", build_initialize_params("0.1.1"))
         .respond(json!({}));
     peer.expect_notification("initialized");
+    // A resume names the default Codex reports, because a thread resumed without a
+    // model keeps its old one.
+    peer.expect_request("model/list", json!({}))
+        .respond(json!({ "data": [{ "model": "gpt-default", "isDefault": true }] }));
     peer.expect_request(
         "thread/resume",
         json!({
@@ -10193,7 +10197,7 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
             "cwd": "/tmp/codex-edge",
             "approvalPolicy": "on-request",
             "sandbox": "workspace-write",
-            "model": null,
+            "model": "gpt-default",
             "serviceTier": "fast",
         }),
     )
@@ -10585,6 +10589,11 @@ async fn codex_runtime_and_probe_reject_invalid_provider_payloads() {
         .expect_request("initialize", build_initialize_params("0.1.1"))
         .respond(json!({}));
     resume_peer.expect_notification("initialized");
+    // A resume names the default Codex reports, because a thread resumed without a
+    // model keeps its old one.
+    resume_peer
+        .expect_request("model/list", json!({}))
+        .respond(json!({ "data": [{ "model": "gpt-default", "isDefault": true }] }));
     resume_peer
         .expect_request(
             "thread/resume",
@@ -10593,7 +10602,7 @@ async fn codex_runtime_and_probe_reject_invalid_provider_payloads() {
                 "cwd": "/tmp/codex-invalid",
                 "approvalPolicy": "untrusted",
                 "sandbox": "read-only",
-                "model": null,
+                "model": "gpt-default",
                 "serviceTier": null,
             }),
         )

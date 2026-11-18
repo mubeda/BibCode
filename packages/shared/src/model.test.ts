@@ -828,57 +828,70 @@ describe("applyClaudePromptEffortPrefix", () => {
 
 describe("replacedRetiredCodexModel (#380)", () => {
   const codex = ProviderInstanceId.make("codex");
-  const sentDefault = { instanceId: codex, model: "auto" };
+  const CODEX_DRIVER = ProviderDriverKind.make("codex");
+  const sent = { instanceId: codex, model: "auto" };
+  // ChatGPT sign-in: Codex's list no longer offers the retired models.
+  const chatgptList = [{ slug: "auto" }, { slug: "gpt-6.2-sol" }];
+  const replaced = (model: string, overrides: object = {}) =>
+    replacedRetiredCodexModel({
+      driver: CODEX_DRIVER,
+      stored: { instanceId: codex, model },
+      sent,
+      offered: chatgptList,
+      ...overrides,
+    });
 
   it("names the retired model a thread stored when the send replaced it with Codex's default", () => {
-    expect(replacedRetiredCodexModel({ instanceId: codex, model: "gpt-5.4" }, sentDefault)).toBe(
-      "gpt-5.4",
-    );
-    expect(
-      replacedRetiredCodexModel({ instanceId: codex, model: "gpt-5.4-mini" }, sentDefault),
-    ).toBe("gpt-5.4-mini");
+    expect(replaced("gpt-5.4")).toBe("gpt-5.4");
+    expect(replaced("gpt-5.4-mini")).toBe("gpt-5.4-mini");
     // Through an alias.
-    expect(
-      replacedRetiredCodexModel({ instanceId: codex, model: "gpt-5-codex" }, sentDefault),
-    ).toBe("gpt-5.4");
+    expect(replaced("gpt-5-codex")).toBe("gpt-5.4");
   });
 
-  it("is null when the stored model is kept, as with API-key sign-in", () => {
-    expect(
-      replacedRetiredCodexModel(
-        { instanceId: codex, model: "gpt-5.4" },
-        { instanceId: codex, model: "gpt-5.4" },
-      ),
-    ).toBeNull();
+  it("is null when the stored model is sent unchanged", () => {
+    expect(replaced("gpt-5.4", { sent: { instanceId: codex, model: "gpt-5.4" } })).toBeNull();
   });
 
-  it("is null for a model Codex still runs, no stored model, or another instance", () => {
+  it("is null when Codex still offers the model and the person chose the default", () => {
+    // API-key sign-in: the list still has it, so switching away was deliberate.
+    expect(replaced("gpt-5.4", { offered: [{ slug: "auto" }, { slug: "gpt-5.4" }] })).toBeNull();
+  });
+
+  it("is null for a model Codex still runs, no stored model, another instance or provider", () => {
+    expect(replaced("gpt-6.2-sol")).toBeNull();
+    expect(replaced("auto")).toBeNull();
+    expect(replaced("gpt-5.4", { stored: null })).toBeNull();
     expect(
-      replacedRetiredCodexModel({ instanceId: codex, model: "gpt-6.2-sol" }, sentDefault),
+      replaced("gpt-5.4", {
+        stored: { instanceId: ProviderInstanceId.make("codex-work"), model: "gpt-5.4" },
+      }),
     ).toBeNull();
-    expect(replacedRetiredCodexModel({ instanceId: codex, model: "auto" }, sentDefault)).toBeNull();
-    expect(replacedRetiredCodexModel(null, sentDefault)).toBeNull();
-    expect(
-      replacedRetiredCodexModel(
-        { instanceId: ProviderInstanceId.make("codex-work"), model: "gpt-5.4" },
-        sentDefault,
-      ),
-    ).toBeNull();
+    expect(replaced("gpt-5.4", { driver: ProviderDriverKind.make("cursor") })).toBeNull();
   });
 });
 
 describe("fallbackModelOption (#380)", () => {
+  const CODEX_DRIVER = ProviderDriverKind.make("codex");
+  const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
   const option = (slug: string, isCustom = false) => ({ slug, isCustom });
 
-  it("prefers the auto entry wherever a saved order put it", () => {
-    expect(fallbackModelOption([option("gpt-6.2-sol"), option("auto")])?.slug).toBe("auto");
+  it("prefers Codex's auto entry wherever a saved order put it", () => {
+    expect(fallbackModelOption(CODEX_DRIVER, [option("gpt-6.2-sol"), option("auto")])?.slug).toBe(
+      "auto",
+    );
+  });
+
+  it("keeps the listed order for other providers, even with a model named auto", () => {
+    expect(
+      fallbackModelOption(CLAUDE_DRIVER, [option("claude-sonnet-5"), option("auto")])?.slug,
+    ).toBe("claude-sonnet-5");
   });
 
   it("falls back to the first built-in model, then to the first model", () => {
-    expect(fallbackModelOption([option("mine", true), option("gpt-6.2-sol")])?.slug).toBe(
-      "gpt-6.2-sol",
-    );
-    expect(fallbackModelOption([option("mine", true)])?.slug).toBe("mine");
-    expect(fallbackModelOption([])).toBeNull();
+    expect(
+      fallbackModelOption(CODEX_DRIVER, [option("mine", true), option("gpt-6.2-sol")])?.slug,
+    ).toBe("gpt-6.2-sol");
+    expect(fallbackModelOption(CODEX_DRIVER, [option("mine", true)])?.slug).toBe("mine");
+    expect(fallbackModelOption(CODEX_DRIVER, [])).toBeNull();
   });
 });

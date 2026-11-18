@@ -2724,9 +2724,10 @@ impl ClaudeProviderRuntime {
             // No rule to apply: a one-time allow, recorded as one, with the reason.
             Decision::AcceptForSession => (
                 allow(None),
+                // `detail` is the line the thread shows on the resolved row.
                 json!({
                     "decision": Decision::Accept,
-                    "reason": "Claude offered no session rule for this request, so it was approved once.",
+                    "detail": "Claude offered no session rule for this request, so it was approved once.",
                 }),
             ),
             Decision::Accept => (allow(None), json!({ "decision": decision })),
@@ -3156,6 +3157,9 @@ impl ClaudeProviderRuntime {
         self.stop_turn_input();
         self.turn_open = false;
         let mut events = self.flush_incomplete_tools();
+        // A request belongs to the turn that asked. Claude withdraws it before the turn ends;
+        // one it did not withdraw has nobody left to read an answer.
+        events.extend(self.cancel_pending_requests());
         events.extend(self.end_compaction(None));
         let interrupted = is_interrupted_result(&message);
         let failed = message.is_error && !interrupted;
@@ -3741,22 +3745,46 @@ fn permission_request_detail(tool_name: &str, input: &Value) -> Option<String> {
 fn session_permission_updates(suggestions: &Value) -> Vec<Value> {
     // Only what "always allow" means: more allow rules and more readable folders. Anything else,
     // a malformed entry included, is not a rule to apply.
-    let non_empty = |update: &Value, key: &str| {
-        update[key]
-            .as_array()
-            .is_some_and(|items| !items.is_empty())
+    let items = |update: &Value, key: &str| update[key].as_array().cloned().unwrap_or_default();
+    let is_rule = |rule: &Value| {
+        rule["toolName"]
+            .as_str()
+            .is_some_and(|name| !name.trim().is_empty())
+    };
+    let is_directory = |directory: &Value| {
+        directory
+            .as_str()
+            .is_some_and(|path| !path.trim().is_empty())
     };
     suggestions
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|suggestion| match suggestion["type"].as_str() {
-            Some("addRules") => suggestion["behavior"] == "allow" && non_empty(suggestion, "rules"),
-            Some("addDirectories") => non_empty(suggestion, "directories"),
-            _ => false,
-        })
         .filter_map(|suggestion| {
             let mut update = suggestion.as_object()?.clone();
+            match suggestion["type"].as_str()? {
+                "addRules" if suggestion["behavior"] == "allow" => {
+                    let rules = items(suggestion, "rules")
+                        .into_iter()
+                        .filter(is_rule)
+                        .collect::<Vec<_>>();
+                    if rules.is_empty() {
+                        return None;
+                    }
+                    update.insert("rules".to_owned(), json!(rules));
+                }
+                "addDirectories" => {
+                    let directories = items(suggestion, "directories")
+                        .into_iter()
+                        .filter(is_directory)
+                        .collect::<Vec<_>>();
+                    if directories.is_empty() {
+                        return None;
+                    }
+                    update.insert("directories".to_owned(), json!(directories));
+                }
+                _ => return None,
+            }
             update.insert("destination".to_owned(), json!("session"));
             Some(Value::Object(update))
         })
@@ -4127,10 +4155,23 @@ fn normalize_questions(input: &Value) -> Vec<Value> {
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Question {}", index + 1));
+                    // The question card shows only options with a label and a description, and
+                    // Claude may omit the description.
                     let options = question
                         .get("options")
                         .and_then(Value::as_array)
-                        .cloned()
+                        .map(|options| {
+                            options
+                                .iter()
+                                .map(|option| {
+                                    let mut option = option.clone();
+                                    if option.is_object() && !option["description"].is_string() {
+                                        option["description"] = json!("");
+                                    }
+                                    option
+                                })
+                                .collect::<Vec<_>>()
+                        })
                         .unwrap_or_default();
                     Some(json!({
                         "id": id,

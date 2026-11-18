@@ -111,7 +111,24 @@ Changes to the design:
 - The flag is passed in every permission mode, because Claude sends tools that need the person
   (`AskUserQuestion`) to the host in `bypassPermissions` too.
 
+Changes after the second review:
+
+- A request that is still open when its turn ends is closed with the turn, so a late answer
+  from another client is refused.
+- A reply that cannot be written ends the session instead of leaving Claude waiting. Shutdown
+  hands its cancellations to the event queue without waiting, because the supervisor stops
+  reading events before it shuts a driver down.
+- A session rule keeps only its valid entries. The one-time fallback reason is the `detail` of
+  the resolved row, which is the line the thread shows.
+- A question's options always carry a description, because the question card shows only
+  options that have one.
+
 Known limits:
+
+- If Claude exits after it read a reply and before BiBCode published the resolved event, the
+  card can stay visible until the thread is reloaded.
+- The collapsed approval card on a narrow viewport does not show the command. That is true for
+  every provider.
 
 - The card does not show the scope of the session rule Claude suggested.
 - A reply that times out after part of it was written can leave a broken frame on Claude's

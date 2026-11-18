@@ -126,8 +126,11 @@ function getInvariantProviderModel(
   };
 }
 
-function getFallbackModel(models: ReadonlyArray<ServerProviderModel>): ServerProviderModel | null {
-  return fallbackModelOption(models);
+function getFallbackModel(
+  driver: ProviderDriverKind,
+  models: ReadonlyArray<ServerProviderModel>,
+): ServerProviderModel | null {
+  return fallbackModelOption(driver, models);
 }
 
 function getProviderDefaultModel(driver: ProviderDriverKind): string {
@@ -306,7 +309,7 @@ export function resolveProviderSessionDefault(input: {
   readonly explicitSelection?: ModelSelection | null;
 }): ResolvedProviderSessionDefault {
   const preferredSource = getPreferredSessionDefaultSource(input);
-  const fallbackModel = getFallbackModel(input.models);
+  const fallbackModel = getFallbackModel(input.driver, input.models);
   const configuredModel =
     preferredSource?.model ?? fallbackModel?.slug ?? getProviderDefaultModel(input.driver);
   const configuredServerModel = findSelectableModel(input.driver, input.models, configuredModel);
@@ -351,7 +354,7 @@ export function getProviderSessionDefaultControls(input: {
   readonly models: ReadonlyArray<ServerProviderModel>;
   readonly configuredDefault?: ProviderSessionDefault | null;
 }): ProviderSessionDefaultControls {
-  const fallbackModel = getFallbackModel(input.models);
+  const fallbackModel = getFallbackModel(input.driver, input.models);
   const configuredModel =
     input.configuredDefault?.model ?? fallbackModel?.slug ?? getProviderDefaultModel(input.driver);
   const configuredServerModel = findSelectableModel(input.driver, input.models, configuredModel);
@@ -412,7 +415,7 @@ export function updateProviderSessionDefault(input: {
   readonly current?: ProviderSessionDefault | null;
   readonly change: ProviderSessionDefaultChange;
 }): ProviderSessionDefault {
-  const fallbackModel = getFallbackModel(input.models);
+  const fallbackModel = getFallbackModel(input.driver, input.models);
   const currentModel =
     input.current?.model ?? fallbackModel?.slug ?? getProviderDefaultModel(input.driver);
   const requestedModel =
