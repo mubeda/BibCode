@@ -2639,6 +2639,9 @@ async fn probe_matches_fixture_corpus() {
         .respond(scenario["modelListFirst"].clone());
     peer.expect_request("model/list", json!({ "cursor": "cursor-2" }))
         .respond(scenario["modelListSecond"].clone());
+    // No configured model: the "Codex default" entry is named after the listed default.
+    peer.expect_request("config/read", json!({}))
+        .respond(json!({ "config": { "model": null } }));
     peer.expect_request(
         "skills/list",
         json!({ "cwds": [scenario["cwd"].as_str().expect("cwd")] }),
@@ -10186,10 +10189,10 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
     peer.expect_request("initialize", build_initialize_params("0.1.1"))
         .respond(json!({}));
     peer.expect_notification("initialized");
-    // A resume names the default Codex reports, because a thread resumed without a
+    // A resume names the model Codex's configuration names, because a thread resumed without a
     // model keeps its old one.
-    peer.expect_request("model/list", json!({}))
-        .respond(json!({ "data": [{ "model": "gpt-default", "isDefault": true }] }));
+    peer.expect_request("config/read", json!({}))
+        .respond(json!({ "config": { "model": "gpt-default" } }));
     peer.expect_request(
         "thread/resume",
         json!({
@@ -10589,11 +10592,11 @@ async fn codex_runtime_and_probe_reject_invalid_provider_payloads() {
         .expect_request("initialize", build_initialize_params("0.1.1"))
         .respond(json!({}));
     resume_peer.expect_notification("initialized");
-    // A resume names the default Codex reports, because a thread resumed without a
+    // A resume names the model Codex's configuration names, because a thread resumed without a
     // model keeps its old one.
     resume_peer
-        .expect_request("model/list", json!({}))
-        .respond(json!({ "data": [{ "model": "gpt-default", "isDefault": true }] }));
+        .expect_request("config/read", json!({}))
+        .respond(json!({ "config": { "model": "gpt-default" } }));
     resume_peer
         .expect_request(
             "thread/resume",

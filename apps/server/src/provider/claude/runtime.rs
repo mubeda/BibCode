@@ -3750,6 +3750,7 @@ fn session_permission_updates(suggestions: &Value) -> Vec<Value> {
         rule["toolName"]
             .as_str()
             .is_some_and(|name| !name.trim().is_empty())
+            && (rule.get("ruleContent").is_none() || rule["ruleContent"].is_string())
     };
     let is_directory = |directory: &Value| {
         directory

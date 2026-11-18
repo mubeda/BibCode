@@ -98,11 +98,14 @@ resume the same provider session. Prefer the instance that created the thread.
 
 BiBCode has no built-in Codex model. A thread, an AI Terminal or a setting that
 nobody chose a model for stores `auto`, and BiBCode then starts Codex without
-naming a model, so Codex runs its own recommended one. The model picker lists
-this choice first as **Codex default**, followed by the name of the model that
-Codex's `model/list` marks with `isDefault`, for example **Codex default
-(GPT-6.2-Sol)**. When Codex marks none, or its list cannot be read, the entry
-reads **Codex default**. A model you choose is sent as chosen.
+naming a model, so Codex runs its own default. That default is the `model` in
+Codex's configuration (`config.toml`, read with `config/read`), and otherwise
+the model that `model/list` marks with `isDefault`.
+
+The model picker lists this choice first as **Codex default**, followed by the
+name of that model, for example **Codex default (GPT-6-Sol)**. When Codex
+reports neither, or its list cannot be read, the entry reads **Codex default**.
+A model you choose is sent as chosen.
 
 Codex's collaboration mode (Plan) requires a model name. For a thread with no
 chosen model BiBCode sends the model Codex reported when it opened the thread,
@@ -130,8 +133,9 @@ Codex's own error is shown.
 Switching a thread from a named model to **Codex default** restarts its Codex
 session when the next message starts, because a running session cannot be told
 to drop its model. Codex keeps a thread's previous model when the thread is
-resumed without one, so a resume with no chosen model names the model that
-`model/list` marks as default. A fresh thread names none.
+resumed without one, so a resume with no chosen model names Codex's default as
+described above. The lookup has 5 seconds. If Codex does not answer, the resume
+names no model and the thread keeps its previous one. A fresh thread names none.
 
 ## Custom endpoints and secrets
 

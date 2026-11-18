@@ -389,6 +389,11 @@ export function replacedRetiredCodexModel(input: {
   if (model === null || !RETIRED_CODEX_MODELS.has(model)) {
     return null;
   }
+  // A list with nothing but "auto" is the placeholder shown before Codex's own list is read,
+  // which says nothing about what Codex offers.
+  if (!offered.some((option) => option.slug !== CODEX_AUTO_MODEL)) {
+    return null;
+  }
   return offered.some((option) => option.slug === model || option.slug === stored.model)
     ? null
     : model;

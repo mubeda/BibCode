@@ -3120,7 +3120,11 @@ fn a_turn_that_ends_closes_the_requests_it_left_open() {
 fn a_session_rule_keeps_only_its_valid_entries() {
     let mut runtime = runtime_with_bash_approval(json!([{
         "type": "addRules",
-        "rules": [{}, { "toolName": "Bash", "ruleContent": "touch made.txt" }],
+        "rules": [
+            {},
+            { "toolName": "Bash", "ruleContent": 42 },
+            { "toolName": "Bash", "ruleContent": "touch made.txt" }
+        ],
         "behavior": "allow",
         "destination": "userSettings"
     }]));

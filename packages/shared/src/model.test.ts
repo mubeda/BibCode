@@ -857,6 +857,11 @@ describe("replacedRetiredCodexModel (#380)", () => {
     expect(replaced("gpt-5.4", { offered: [{ slug: "auto" }, { slug: "gpt-5.4" }] })).toBeNull();
   });
 
+  it("is null before Codex's own list is read", () => {
+    expect(replaced("gpt-5.4", { offered: [{ slug: "auto" }] })).toBeNull();
+    expect(replaced("gpt-5.4", { offered: [] })).toBeNull();
+  });
+
   it("is null for a model Codex still runs, no stored model, another instance or provider", () => {
     expect(replaced("gpt-6.2-sol")).toBeNull();
     expect(replaced("auto")).toBeNull();

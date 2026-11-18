@@ -35,11 +35,11 @@ use super::{
         CodexProviderSnapshot, CodexRuntimeMode, ReconciliationThread,
         ThreadBackgroundTerminalsListParams, ThreadListParams, ThreadReadParams,
         ThreadReadResponse, TurnsPager, build_initialize_params, build_turn_start_params,
-        build_turn_steer_params, decode_background_terminals_list_response,
+        build_turn_steer_params, configured_model, decode_background_terminals_list_response,
         decode_thread_list_response, decode_thread_read_response, decode_turns_page,
         delivery_key_in_turns, is_recoverable_thread_resume_error, parse_model_list_response,
-        parse_skills_list_response, parse_thread_snapshot, reasoning_effort_label,
-        reported_default_model, turn_option_label,
+        parse_model_list_with_default, parse_skills_list_response, parse_thread_snapshot,
+        reasoning_effort_label, reported_default_model, turn_option_label,
     },
     protocol::{IncomingEvent, JsonRpcConnection, ProtocolError},
 };
@@ -642,6 +642,35 @@ struct PendingRequest {
     turn_id: Option<String>,
 }
 
+/// The model Codex runs for a request that names none: the one its configuration names, else
+/// the one `model/list` marks as default. `None` when Codex reports neither.
+async fn effective_default_model(connection: &JsonRpcConnection) -> Option<String> {
+    if let Some(model) = bounded_lookup(connection, "config/read")
+        .await
+        .as_ref()
+        .and_then(configured_model)
+    {
+        return Some(model);
+    }
+    let list = bounded_lookup(connection, "model/list").await?;
+    reported_default_model(list.get("data")?.as_array()?)
+}
+
+/// How long a lookup made while a session opens may take. The provider supervisor awaits the
+/// open for every session, so a Codex that does not answer must not hold it.
+const DEFAULT_MODEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One request whose failure or silence means "unknown", never a failed launch.
+async fn bounded_lookup(connection: &JsonRpcConnection, method: &str) -> Option<Value> {
+    tokio::time::timeout(
+        DEFAULT_MODEL_LOOKUP_TIMEOUT,
+        connection.request(method, json!({})),
+    )
+    .await
+    .ok()?
+    .ok()
+}
+
 pub async fn probe_provider(
     connection: &JsonRpcConnection,
     version: &str,
@@ -678,8 +707,18 @@ pub async fn probe_provider(
             break;
         }
     }
-    let models = parse_model_list_response(&json!({ "data": raw_models }), custom_models)
-        .map_err(|message| RuntimeError::InvalidPayload { message })?;
+    // What the "Codex default" entry is named after. A Codex without `config/read` names the
+    // listed default.
+    let configured = bounded_lookup(connection, "config/read")
+        .await
+        .as_ref()
+        .and_then(configured_model);
+    let models = parse_model_list_with_default(
+        &json!({ "data": raw_models }),
+        custom_models,
+        configured.as_deref(),
+    )
+    .map_err(|message| RuntimeError::InvalidPayload { message })?;
 
     let skills_response = connection
         .request("skills/list", json!({ "cwds": [cwd] }))
@@ -1146,16 +1185,10 @@ impl CodexSessionRuntime {
             let opened = if let Some(resume_thread_id) = resume_thread_id {
                 // A thread resumed without a model keeps the one it ran before (measured on
                 // codex-cli 0.169.0). "No model chosen" means Codex's default, so a resume
-                // names the default Codex reports. A list that cannot be read names none.
+                // names the model a new thread would run. When Codex reports none, it names none.
                 let resume_model = match self.inner.options.model.clone() {
                     Some(model) => Some(model),
-                    None => connection
-                        .request("model/list", json!({}))
-                        .await
-                        .ok()
-                        .and_then(|response| {
-                            reported_default_model(response.get("data")?.as_array()?)
-                        }),
+                    None => effective_default_model(&connection).await,
                 };
                 match connection
                     .request(

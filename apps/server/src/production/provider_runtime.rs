@@ -11075,12 +11075,16 @@ async fn reconcile_model_selection(
             .as_ref()
             .is_some_and(|model| entry.launch.model.as_ref() != Some(model));
         let options_changed = entry.launch.options != target_options;
-        let model_cleared = starting_turn
-            && codex_model_cleared(
-                &entry.launch.provider,
-                entry.launch.model.as_deref(),
-                target_model.as_deref(),
-            );
+        let model_cleared = codex_model_cleared(
+            &entry.launch.provider,
+            entry.launch.model.as_deref(),
+            target_model.as_deref(),
+        );
+        if model_cleared && !starting_turn {
+            // Saved for a queued message while a turn may still run. The options belong to the
+            // default model, so they wait with the switch for that message's own start.
+            return Ok(());
+        }
         if !model_changed && !options_changed && !launch_only_changed && !model_cleared {
             return Ok(());
         }

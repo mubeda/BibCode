@@ -806,6 +806,17 @@ pub fn parse_model_list_response(
     response: &Value,
     custom_models: &[String],
 ) -> Result<Vec<CodexProviderModel>, String> {
+    parse_model_list_with_default(response, custom_models, None)
+}
+
+/// As [`parse_model_list_response`], with the model Codex's own configuration names
+/// (`config/read`). A configured model is what Codex runs when a request names none, so it wins
+/// over the model the list marks with `isDefault`.
+pub fn parse_model_list_with_default(
+    response: &Value,
+    custom_models: &[String],
+    configured_default: Option<&str>,
+) -> Result<Vec<CodexProviderModel>, String> {
     let data = response
         .get("data")
         .and_then(Value::as_array)
@@ -813,9 +824,17 @@ pub fn parse_model_list_response(
     let mut models = Vec::with_capacity(data.len() + custom_models.len() + 1);
     // "No model chosen" is the first entry, named after the default Codex reports, so the picker
     // shows what Codex will run and the request names no model.
-    let default_model = data
-        .iter()
-        .find(|model| model.get("isDefault").and_then(Value::as_bool) == Some(true));
+    let configured_default = configured_default
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let default_model = match configured_default {
+        Some(configured) => data
+            .iter()
+            .find(|model| model.get("model").and_then(Value::as_str) == Some(configured)),
+        None => data
+            .iter()
+            .find(|model| model.get("isDefault").and_then(Value::as_bool) == Some(true)),
+    };
     models.push(CodexProviderModel {
         slug: AUTO_MODEL.to_owned(),
         name: default_model
@@ -825,6 +844,8 @@ pub fn parse_model_list_response(
                     .or_else(|| model.get("model"))
                     .and_then(Value::as_str)
             })
+            // A configured model the list does not offer is still what Codex runs.
+            .or(configured_default)
             .map_or_else(
                 || AUTO_MODEL_NAME.to_owned(),
                 |name| format!("{AUTO_MODEL_NAME} ({})", to_display_name(name)),
@@ -941,14 +962,15 @@ pub fn fallback_models(
     let mut seen = std::collections::HashSet::from([model.to_owned()]);
     models.extend(custom_models.iter().filter_map(|custom| {
         let slug = custom.trim();
-        (!slug.is_empty() && seen.insert(slug.to_owned())).then(|| {
-            json!({
-                "slug": slug,
-                "name": slug,
-                "isCustom": true,
-                "capabilities": null,
+        (!slug.is_empty() && !slug.eq_ignore_ascii_case(AUTO_MODEL) && seen.insert(slug.to_owned()))
+            .then(|| {
+                json!({
+                    "slug": slug,
+                    "name": slug,
+                    "isCustom": true,
+                    "capabilities": null,
+                })
             })
-        })
     }));
     models
 }
@@ -1209,6 +1231,19 @@ fn normalize_model_slug(model: &str, preferred_id: Option<&str>) -> String {
         return preferred_id.to_owned();
     }
     normalized
+}
+
+/// The model Codex's own configuration names, from a `config/read` response. Codex runs it when
+/// a request names no model, whatever `model/list` marks as default.
+#[must_use]
+pub fn configured_model(config_response: &Value) -> Option<String> {
+    config_response
+        .get("config")?
+        .get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
 }
 
 /// The model Codex's `model/list` marks as its default, from one page of that list.
@@ -1776,6 +1811,37 @@ mod tests {
             models.iter().map(|model| &model.slug).collect::<Vec<_>>(),
             ["auto", "gpt-other", "gpt-6.2-sol"]
         );
+    }
+
+    #[test]
+    fn a_configured_model_names_the_default_entry_before_the_listed_default() {
+        let list = json!({ "data": [
+            { "model": "gpt-6.2-sol", "displayName": "GPT-6.2-Sol", "isDefault": true },
+            { "model": "gpt-6-sol", "displayName": "GPT-6-Sol" },
+        ]});
+        // Codex's config.toml names gpt-6-sol: that is what a request with no model runs.
+        let configured =
+            parse_model_list_with_default(&list, &[], Some("gpt-6-sol")).expect("model list");
+        assert_eq!(configured[0].name, "Codex default (GPT-6-Sol)");
+        assert_eq!(configured[0].capabilities, configured[2].capabilities);
+        // A configured model the list does not offer is still named.
+        let unlisted =
+            parse_model_list_with_default(&list, &[], Some("gpt-private")).expect("model list");
+        assert_eq!(unlisted[0].name, "Codex default (GPT-Private)");
+        // No configured model: the listed default.
+        let listed = parse_model_list_with_default(&list, &[], Some("  ")).expect("model list");
+        assert_eq!(listed[0].name, "Codex default (GPT-6.2-Sol)");
+
+        assert_eq!(
+            configured_model(&json!({ "config": { "model": " gpt-6-sol " } })),
+            Some("gpt-6-sol".to_owned())
+        );
+        assert_eq!(
+            configured_model(&json!({ "config": { "model": null } })),
+            None
+        );
+        assert_eq!(configured_model(&json!({ "config": {} })), None);
+        assert_eq!(configured_model(&json!({})), None);
     }
 
     #[test]
