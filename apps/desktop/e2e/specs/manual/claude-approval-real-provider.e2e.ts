@@ -138,10 +138,70 @@ async function waitForCommand(maxMs: number): Promise<{ ran: boolean; cardSeen: 
   return { ran: false, cardSeen };
 }
 
-describe("real Claude approvals (#383)", function () {
-  this.timeout(900_000);
+/** Claude's question opens the question card, and the chosen answer reaches Claude. */
+async function questionStep(): Promise<void> {
+  await submitPrompt(
+    "Use the AskUserQuestion tool to ask me whether I prefer red or blue, with exactly those two options. Then tell me in one short sentence which one I chose.",
+  );
+  const option = composerForm().$('//button[.//*[normalize-space()="Blue"]]');
+  await option.waitForDisplayed({
+    timeout: 180_000,
+    timeoutMsg: "No question card with a Blue option opened.",
+  });
+  await shot("question-card");
+  note(`question card: ${(await composerForm().getText()).replaceAll(/\s+/g, " ").slice(0, 200)}`);
+  await option.click();
+  await option.waitForExist({ reverse: true, timeout: 30_000 });
+  // Claude read the answer when its reply names the chosen option. The prompt names both
+  // colors, so the check reads what follows the last "Worked for" row.
+  await browser.waitUntil(
+    async () => {
+      const text = await browser.$(surface).getText();
+      return /blue/i.test(text.slice(text.lastIndexOf("Worked for")));
+    },
+    { timeout: 120_000, timeoutMsg: "Claude's reply did not name the chosen answer." },
+  );
+  note("the question card closed and Claude's reply names the chosen answer");
+  await shot("question-answered");
+}
 
-  it("asks once, then honors the session approval", async function () {
+/** Plan review stays in BiBCode: the plan shows, no approval card opens, the turn ends. */
+async function planStep(): Promise<void> {
+  await browser.pause(20_000);
+  const planToggle = composerForm().$('[aria-label="Enable plan mode"]');
+  await planToggle.waitForDisplayed({ timeout: 30_000 });
+  await planToggle.click();
+  await composerForm().$('[aria-label="Disable plan mode"]').waitForExist({ timeout: 10_000 });
+  await submitPrompt(
+    "Plan how to create a file named hello.txt with one line of text. Keep the plan to two steps and do not ask questions.",
+  );
+  let cardSeen = false;
+  const deadline = Date.now() + 240_000;
+  let settled = false;
+  while (Date.now() < deadline) {
+    cardSeen ||= await browser.$(SESSION_BUTTON).isExisting();
+    const text = await browser.$(surface).getText();
+    const running = await composerForm().$('button[aria-label="Stop generation"]').isExisting();
+    if (/hello\.txt/.test(text.slice(-1_500)) && !running && Date.now() > deadline - 200_000) {
+      settled = true;
+      break;
+    }
+    await browser.pause(5_000);
+  }
+  await shot("plan");
+  note(`plan turn settled: ${settled}; approval card seen: ${cardSeen}`);
+  note(
+    `plan text tail: ${(await browser.$(surface).getText()).replaceAll(/\s+/g, " ").slice(-400)}`,
+  );
+  expect(cardSeen).toBe(false);
+  expect(settled).toBe(true);
+  expect(NodeFS.existsSync(NodePath.join(realProject!, "hello.txt"))).toBe(false);
+}
+
+describe("real Claude approvals (#383)", function () {
+  this.timeout(1_500_000);
+
+  it("asks once, honors the session approval, shows a question and keeps plan review", async function () {
     NodeFS.writeFileSync(evidencePath, "");
     NodeFS.rmSync(probeFile, { force: true });
     const settingsBefore = NodeFS.existsSync(settingsFile);
@@ -203,5 +263,11 @@ describe("real Claude approvals (#383)", function () {
     note(`settings.local.json existed before: ${settingsBefore}; after: ${settingsAfter}`);
     expect(settingsAfter).toBe(settingsBefore);
     NodeFS.rmSync(probeFile, { force: true });
+
+    // The harness reloads the document between tests, so the question and the plan run here,
+    // in the same chat.
+    await browser.pause(20_000);
+    await questionStep();
+    await planStep();
   });
 });
