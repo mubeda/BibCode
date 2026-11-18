@@ -2129,6 +2129,35 @@ from `apps/web`.
 Record the agent versions, the protocol version each negotiated and every
 message shown in the execution report.
 
+## Claude approvals
+
+Run this on every native desktop after a change to the Claude driver's launch
+arguments, its handling of Claude's `can_use_tool` requests, the approval or
+question card, or the session approval reply. The focused gates are:
+
+```sh
+cargo test -p bibcode-server --test provider_claude
+cargo test -p bibcode-server --lib claude_tool_approval_round_trips_through_the_driver
+cargo test -p bibcode-server --test production_provider_runtime claude_launch_arguments
+```
+
+Those run against a scripted Claude. The check against the installed Claude
+Code is the manual spec `specs/manual/claude-approval-real-provider.e2e.ts`. It
+runs the machine's own `claude` and its sign-in, so it spends a little of that
+account. Set `BIBCODE_E2E_REAL_PROVIDERS=1`, `BIBCODE_E2E_REAL_PROJECT` to a
+disposable Git folder and `BIBCODE_E2E_SPEC` to the spec, then run the packaged
+UI suite. It writes `real-claude-approval-evidence.txt` and four screenshots to
+the artifact directory, and it passes when:
+
+1. A Supervised Claude chat opens an approval card for a shell command, and the
+   command has not run yet.
+2. **Always allow this session** runs the command and closes the card.
+3. The same command sent again runs with no card.
+4. No `.claude/settings.local.json` appears in the project.
+
+A Claude Code whose `--help` does not list `--permission-prompts` opens no
+card: record that version as not covered.
+
 ## Send to agent and agent messaging
 
 Run this on every native desktop after a change to `send_requests`,
