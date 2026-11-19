@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## [v0.17.0] - 2026-11-19
+
+BiBCode v0.17.0 adds Send to agent and agent messaging, approval, question and plan-review cards for Claude chats, read-only Codex chat reviews, a "Codex default" model that follows Codex's own choice, the server's own terminal and new branch and merge actions in the Git Manager, and fixes a Claude turn that stayed "running" after a background task, a chat timeline that jumped to the top and a blank PDF preview on macOS. This release includes PRs #370, #373, #379 and #387 since v0.16.0.
 
 ### Send to agent and agent messaging
 
@@ -18,10 +20,46 @@
 - AI Terminal agent calls (`bibcode agent`) appear in the Profiler's request timings as `agent.<operation>`.
 - When the server restarts, a turn that was still running is failed and replies left streaming are settled, so a thread no longer shows a turn that never ends.
 
+### Chats and providers
+
+- A Claude chat on a Claude Code that supports it now asks instead of denying: a tool that needs approval opens the approval card, a question from Claude opens the question card, and plan review stays in BiBCode. **Always allow this session** applies to that session only. (#383)
+- A Claude background task that Claude answers inside the current turn no longer leaves a turn "running" with nothing happening. An answer Claude gives by itself after a background agent finishes completes its text, tools and subagent rows without opening a turn, and the working timer restarts when a new turn follows a finished one. (#389)
+- Codex no longer names a fixed model. A thread, terminal or setting with no chosen model shows **Codex default** and lets Codex pick. A thread or a saved default that names a retired model moves to the default when it is used, and says so once. (#380)
+- A Codex chat review runs in Codex's read-only sandbox without asking before commands, on every launch, restart and resume. The composer shows a disabled **Read-only review** lock. (#376)
+- The chat timeline no longer jumps to the top when a turn finishes, and an opened or closed Thinking row or work step keeps its place.
+- Opening a Markdown file no longer draws its diagram twice.
+- When the desktop app's connection storage does not answer at launch, BiBCode says "Quit BiBCode and open it again" instead of loading forever. (#381)
+- A client whose expired or revoked session is pruned is told so. (#374)
+
+### Git, Source Control and worktrees
+
+- The Git Manager toolbar has **New branch** and **Merge <branch> into…**, with disabled states that say why and loading and refresh states. (#388)
+- When a pull-request or pipeline read is refused, the Git Manager hides the stale data, on every page and across a reload, until a newer read succeeds. (#377)
+- Source Control has a labelled **Review** button, and the **Send to agent** button is prominent in the toolbar. (#382, #386)
+- Collapsing a project or environment card in the sidebar hides every card inside it. (#371)
+- Planning, removing or detaching a worktree that was already removed says "This worktree was already removed." instead of reporting an error. (#391)
+- Source-control discovery probes its tools together, so one slow tool no longer adds its timeout to the others.
+
+### Files and terminals
+
+- The Files panel loads a large project's entries page by page and still shows the whole tree, and a history page with a very large first commit lists its first changed files and counts the rest. (#390)
+- The PDF preview is no longer blank on macOS.
+- The server's own terminal and dashboard open from the Local rail icon and the server card, and removing a workspace never closes that terminal. (#378)
+
+### Reliability
+
+- Settings, keybindings, the provider list and tools each carry a version in the config stream, so a resync after a lag never shows an older value.
+- The Profiler no longer reports stalls for a page that macOS slows down while it is visually idle.
+
 ### Providers
 
-- Claude AI Terminals keep status hooks on Claude Code up to 2.1.325.
+- Claude AI Terminals keep status hooks on Claude Code up to 2.1.328.
 - A Claude AI Terminal in a BiBCode started from inside a Claude Code session saves its transcript again, so Send to agent attaches its conversation instead of the recent output, because terminals no longer inherit `CLAUDE_CODE_CHILD_SESSION`.
+
+### CI and tests
+
+- CI measures where its build time goes and splits the Windows server tests into their own rows. (#370)
+- The auth revoke test waits for the whole reconcile batch instead of racing it. (#373)
 
 ## [v0.16.0] - 2026-11-14
 
