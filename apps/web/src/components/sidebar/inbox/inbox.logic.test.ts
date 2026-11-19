@@ -103,6 +103,18 @@ describe("inbox category mapping", () => {
 });
 
 describe("inbox data readiness", () => {
+  it("is failed, not loading, when the connection runtime could not start", () => {
+    const failed = summary({ catalogReady: false, catalogFailed: true });
+    expect(resolveInboxDataState(failed)).toBe("failed");
+    expect(
+      resolveInboxSelection({
+        persisted: null,
+        counts: { all: 0, attention: 0, working: 0, done: 0 },
+        dataState: "failed",
+      }),
+    ).toEqual({ category: "all", settle: null });
+  });
+
   it("is loading until the catalog and a snapshot arrive", () => {
     expect(resolveInboxDataState(summary({ catalogReady: false }))).toBe("loading");
     expect(

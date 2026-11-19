@@ -157,6 +157,9 @@ struct State {
     running: HashMap<String, u64>,
     update_states: HashMap<String, Value>,
     next_run: u64,
+    /// Counts publications, each taking its number with the tools it reads, so a config stream
+    /// can tell a tools event older than its snapshot.
+    publications: u64,
 }
 
 struct Inner {
@@ -276,8 +279,14 @@ impl ToolMaintenance {
 
     /// The published tools: the last probe of each, with any update state on top.
     pub(crate) fn snapshots(&self) -> Vec<Value> {
+        self.snapshots_with_version().0
+    }
+
+    /// The published tools and the number of the last publication that read them: a tools
+    /// event numbered at or below it holds these tools or older ones.
+    pub(crate) fn snapshots_with_version(&self) -> (Vec<Value>, u64) {
         let state = self.lock();
-        Self::overlay(&state)
+        (Self::overlay(&state), state.publications)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -305,13 +314,26 @@ impl ToolMaintenance {
             .collect()
     }
 
+    /// Replaces the probed tools with `snapshots` and publishes them, as a probe does.
+    #[cfg(test)]
+    pub(crate) async fn publish_snapshots_for_tests(&self, snapshots: Vec<Value>) {
+        self.lock().snapshots = snapshots;
+        self.publish().await;
+    }
+
     async fn publish(&self) {
-        let tools = self.snapshots();
+        let (tools, version) = {
+            let mut state = self.lock();
+            state.publications += 1;
+            (Self::overlay(&state), state.publications)
+        };
         let providers = self.inner.publisher.providers.read().await.clone();
         let _ = self.inner.publisher.events.send(json!({
             "version": 1,
             "type": "providerStatuses",
             "payload": { "providers": providers, "tools": tools },
+            // Read and removed by each config stream before it sends the event.
+            "sectionVersion": version,
         }));
     }
 

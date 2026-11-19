@@ -27,12 +27,14 @@ import { DEFAULT_PULL_REQUESTS_FILTERS, usePullRequestsStore } from "../../../pu
 import { pullRequestsEnvironment } from "../../../state/pullRequests";
 import { useEnvironmentQuery, type EnvironmentQueryView } from "../../../state/query";
 import { Button } from "../../ui/button";
+import { LoadingState, RefreshRegion } from "../../ui/loading-state";
 import { Skeleton } from "../../ui/skeleton";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
 import { useVisibleModuleRefresh } from "../../repositoryModule/useVisibleModuleRefresh";
 import { shownCopy, type ShownCopy } from "../../repositoryModule/snapshotDisplay.logic";
+import { type ResourceRefusal, useResourceRefusal } from "../../repositoryModule/resourceRefusal";
 import { useDocumentVisible } from "../useDocumentVisible";
 import { PullRequestsFilters } from "./PullRequestsFilters";
 import { PullRequestsRow } from "./PullRequestsRow";
@@ -74,11 +76,17 @@ function PullRequestsPages({
   input,
   firstQuery,
   hasFilters,
+  firstRefused,
+  onPageRefused,
   onClear,
 }: PullRequestsListViewProps & {
   input: PullRequestsListInput;
   firstQuery: EnvironmentQueryView<PullRequestsListPage>;
   hasFilters: boolean;
+  /** The host refused this list: every page loaded here stays hidden too. */
+  firstRefused: boolean;
+  /** A later page was refused: the whole list is, as for a first-page refusal. */
+  onPageRefused: (event: { readonly refused: ResourceRefusal }) => void;
   onClear: () => void;
 }) {
   const [cursors, setCursors] = useState<readonly (string | null)[]>([null]);
@@ -95,18 +103,31 @@ function PullRequestsPages({
     [cursor, input, scope.environmentId],
   );
   const nextQuery = usePullRequestsQuery(nextAtom);
-  const query = cursor === null ? firstQuery : nextQuery;
+  // One report per failed read: a Retry the host refuses again is a new refusal.
+  const nextEmission = nextQuery.emission;
+  useEffect(() => {
+    const failure = nextEmission._tag === "Failure" ? squashAtomCommandFailure(nextEmission) : null;
+    if (
+      isPullRequestsOperationError(failure) &&
+      (failure.code === "forbidden" || failure.code === "not_found")
+    )
+      onPageRefused({ refused: failure.code });
+  }, [nextEmission, onPageRefused]);
+  // Any first-page failure owns the alert and its Retry.
+  const query = cursor === null || firstQuery.error !== null ? firstQuery : nextQuery;
+  const firstData = firstRefused ? null : firstQuery.data;
   const rows = useMemo(() => {
+    if (firstRefused) return EMPTY_ROWS;
     const combined =
       cursor === null
-        ? (firstQuery.data?.rows ?? EMPTY_ROWS)
+        ? (firstData?.rows ?? EMPTY_ROWS)
         : [
-            ...(firstQuery.data?.rows ?? EMPTY_ROWS),
+            ...(firstData?.rows ?? EMPTY_ROWS),
             ...earlierRows,
             ...(nextQuery.data?.rows ?? EMPTY_ROWS),
           ];
     return [...new Map(combined.map((row) => [row.number, row])).values()];
-  }, [cursor, earlierRows, firstQuery.data, nextQuery.data]);
+  }, [cursor, earlierRows, firstData, firstRefused, nextQuery.data]);
   const savedScrollTop = usePullRequestsStore(
     (state) => state.byProjectKey[projectKey(projectRef)]?.scrollTop ?? 0,
   );
@@ -135,17 +156,31 @@ function PullRequestsPages({
   }, [input, projectRef, scope.cwd]);
   const refreshFirstPage = firstQuery.refresh;
   const environmentId = scope.environmentId;
-  const refresh = useCallback(() => {
-    restorationTarget.current = null;
+  // A manual Refresh keeps the loaded pages, selection and scroll until its read succeeds.
+  const resetFromRef = useRef<{ readonly data: unknown } | null>(null);
+  const resetPages = useCallback(() => {
     setCursors([null]);
     setEarlierRows(EMPTY_ROWS);
     scrollTopRef.current = 0;
     usePullRequestsStore.getState().setScrollTop(projectRef, 0);
     scrollRef.current?.scrollToOffset({ offset: 0, animated: false });
+  }, [projectRef]);
+  const refresh = useCallback(() => {
+    restorationTarget.current = null;
+    resetFromRef.current = { data: firstQuery.data };
     // An explicit Refresh also re-reads the repository-wide tab totals.
     pullRequestsEnvironment.requestListTotalsRefresh({ environmentId, input });
     refreshFirstPage();
-  }, [environmentId, input, refreshFirstPage, projectRef]);
+  }, [environmentId, firstQuery.data, input, refreshFirstPage]);
+  useEffect(() => {
+    // The same data means the read has not answered yet; a failed read leaves the reset
+    // waiting for the next successful one.
+    const from = resetFromRef.current;
+    if (from === null || firstQuery.isPending || firstQuery.error !== null) return;
+    if (firstQuery.data === from.data) return;
+    resetFromRef.current = null;
+    resetPages();
+  }, [firstQuery.data, firstQuery.error, firstQuery.isPending, resetPages]);
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
   const renderRow = useCallback(
     ({ item }: { item: PullRequestsListRow }) => (
@@ -162,6 +197,9 @@ function PullRequestsPages({
   }, [refreshContext, typedError]);
   const message = typedError?.message ?? query.error;
   const nextCursor = query.data?.nextCursor ?? null;
+  // A zero-row page is a resolved page: only the absence of one is a first load.
+  const rereading = firstQuery.isPending || nextQuery.isPending;
+  const pluralLongName = resolveChangeRequestPresentationForKind(context.provider).pluralLongName;
   const loadMore = () => {
     if (query.isPending || nextCursor === null || cursors.includes(nextCursor)) return;
     if (cursor !== null && nextQuery.data) {
@@ -209,7 +247,8 @@ function PullRequestsPages({
             <Button
               size="sm"
               variant="outline"
-              onClick={query.refresh}
+              // A refused later page re-reads the list from its first page, which lifts it.
+              onClick={firstRefused && query === nextQuery ? refresh : query.refresh}
               disabled={query.isPending}
               title={query.isPending ? "Loading…" : undefined}
             >
@@ -223,64 +262,69 @@ function PullRequestsPages({
           </div>
         </div>
       ) : null}
-      {rows.length > 0 ? (
-        <LegendList<PullRequestsListRow>
-          ref={scrollRef}
-          className="min-h-0 flex-1 overflow-x-hidden"
-          role="list"
-          aria-label={resolveChangeRequestPresentationForKind(context.provider).pluralLongName}
-          data={rows}
-          estimatedItemSize={56}
-          getFixedItemSize={getRowSize}
-          keyExtractor={rowKey}
-          initialScrollOffset={savedScrollTop}
-          renderItem={renderRow}
-          onWheel={() => {
-            restorationTarget.current = null;
-          }}
-          onTouchMove={() => {
-            restorationTarget.current = null;
-          }}
-          onScroll={(event) => {
-            scrollTopRef.current = event.nativeEvent.contentOffset.y;
-          }}
-        />
-      ) : null}
-      {query.isPending ? (
-        <div role="status" className="space-y-2 p-4">
-          <span className="sr-only">
-            Loading {resolveChangeRequestPresentationForKind(context.provider).pluralLongName}…
-          </span>
+      {rereading && firstData === null ? (
+        <LoadingState label={`Loading ${pluralLongName}…`}>
           <Skeleton className="h-14 w-full" />
-        </div>
+          <Skeleton className="h-14 w-full" />
+          <Skeleton className="h-14 w-full" />
+        </LoadingState>
       ) : null}
-      {rows.length === 0 && !query.isPending && message === null && query.data !== null ? (
-        <div className="space-y-3 p-6 text-sm text-muted-foreground">
-          <p>
-            {hasFilters
-              ? "Nothing matches these filters"
-              : `No ${input.state === "all" ? "" : `${input.state} `}${resolveChangeRequestPresentationForKind(context.provider).pluralLongName}`}
-          </p>
-          {hasFilters ? (
-            <Button size="sm" variant="outline" onClick={onClear}>
-              Clear filters
+      <RefreshRegion
+        className="flex min-h-0 flex-1 flex-col"
+        refreshing={rereading && firstData !== null}
+        status={`${firstQuery.isPending ? "Refreshing" : "Loading more"} ${pluralLongName}…`}
+      >
+        {rows.length > 0 ? (
+          <LegendList<PullRequestsListRow>
+            ref={scrollRef}
+            className="min-h-0 flex-1 overflow-x-hidden"
+            role="list"
+            aria-label={resolveChangeRequestPresentationForKind(context.provider).pluralLongName}
+            data={rows}
+            estimatedItemSize={56}
+            getFixedItemSize={getRowSize}
+            keyExtractor={rowKey}
+            initialScrollOffset={savedScrollTop}
+            renderItem={renderRow}
+            onWheel={() => {
+              restorationTarget.current = null;
+            }}
+            onTouchMove={() => {
+              restorationTarget.current = null;
+            }}
+            onScroll={(event) => {
+              scrollTopRef.current = event.nativeEvent.contentOffset.y;
+            }}
+          />
+        ) : null}
+        {rows.length === 0 && firstData !== null && message === null ? (
+          <div className="space-y-3 p-6 text-sm text-muted-foreground">
+            <p>
+              {hasFilters
+                ? "Nothing matches these filters"
+                : `No ${input.state === "all" ? "" : `${input.state} `}${resolveChangeRequestPresentationForKind(context.provider).pluralLongName}`}
+            </p>
+            {hasFilters ? (
+              <Button size="sm" variant="outline" onClick={onClear}>
+                Clear filters
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+        {nextCursor !== null && !cursors.includes(nextCursor) && message === null ? (
+          <div className="border-t border-border p-3">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={query.isPending}
+              title={query.isPending ? "Loading…" : undefined}
+              onClick={loadMore}
+            >
+              Load more
             </Button>
-          ) : null}
-        </div>
-      ) : null}
-      {nextCursor !== null && !cursors.includes(nextCursor) && message === null ? (
-        <div className="border-t border-border p-3">
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={query.isPending}
-            title={query.isPending ? "Loading…" : undefined}
-            onClick={loadMore}
-          >
-            Load more
-          </Button>
-        </div>
-      ) : null}
+          </div>
+        ) : null}
+      </RefreshRegion>
     </div>
   );
 }
@@ -357,15 +401,30 @@ export function PullRequestsListView({
     paused,
     revalidate: firstQuery.revalidate,
   });
-  const displayedFirstPage = nextShownList?.payload ?? null;
-  const displayedFirstQuery: EnvironmentQueryView<PullRequestsListPage> =
-    displayedFirstPage === null
-      ? firstQuery
-      : {
-          ...firstQuery,
-          data: displayedFirstPage,
-          isPending: firstQuery.data === null ? false : firstQuery.isPending,
-        };
+  // A refusal hides every copy of this list, the stored one and the tab counts included,
+  // until the host answers a later read of the same list.
+  const [pageRefusal, setPageRefusal] = useState<{ readonly refused: ResourceRefusal } | null>(
+    null,
+  );
+  const liveFailure =
+    firstQuery.emission._tag === "Failure" ? squashAtomCommandFailure(firstQuery.emission) : null;
+  const refused =
+    useResourceRefusal(
+      `pullRequests.list:${context.host}/${context.repository}:${environmentRpcKey({ environmentId: scope.environmentId, input })}`,
+      firstQuery,
+      isPullRequestsOperationError(liveFailure) &&
+        (liveFailure.code === "forbidden" || liveFailure.code === "not_found")
+        ? liveFailure.code
+        : null,
+      pageRefusal,
+    ) !== null;
+  const displayedFirstPage = refused ? null : (nextShownList?.payload ?? null);
+  // The stored copy's read is what a change event updates the screen from.
+  const displayedFirstQuery: EnvironmentQueryView<PullRequestsListPage> = {
+    ...firstQuery,
+    data: refused ? null : (displayedFirstPage ?? firstQuery.data),
+    isPending: firstQuery.isPending || snapshotQuery.isPending,
+  };
   useEffect(() => {
     if (freshPageKey != null) onFreshPageConsumed?.(freshPageKey);
   }, [freshPageKey, onFreshPageConsumed]);
@@ -433,6 +492,8 @@ export function PullRequestsListView({
             input={input}
             firstQuery={displayedFirstQuery}
             hasFilters={hasFilters}
+            firstRefused={refused}
+            onPageRefused={setPageRefusal}
             onClear={clear}
           />
         </TabsPanel>

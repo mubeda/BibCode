@@ -21,6 +21,7 @@ import {
 } from "react";
 
 import { Button } from "~/components/ui/button";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 import {
   Combobox,
   ComboboxEmpty,
@@ -91,6 +92,8 @@ export interface GitManagerMergeDialogProps {
   readonly mergeIntoAvailable?: boolean;
   /** "current-branch" merges only into the checked-out branch and hides the Into picker. */
   readonly targetMode?: "any-target" | "current-branch";
+  /** Fixes the source to this local branch; the person only picks the Into branch. */
+  readonly sourceBranch?: string | null;
   /** Remotes the Fetch button refreshes; no Fetch button when empty. */
   readonly remotes?: ReadonlyArray<string>;
   /** Why the owner's refs failed to load; shown with Retry (`onRefsStale`) when no source is listed. */
@@ -138,6 +141,7 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
   disabledReason: capabilityDisabledReason = null,
   mergeIntoAvailable = false,
   targetMode = "any-target",
+  sourceBranch = null,
   remotes = NO_REMOTES,
   refsError = null,
   onOpenChange,
@@ -172,10 +176,18 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
 
   // `entry`, not `ref`: the compiler's refs lint would read `ref.current` as a React ref.
   const currentName = useMemo(() => refs.find((entry) => entry.current)?.name ?? null, [refs]);
-  const targetNames = useMemo(() => refs.map((ref) => ref.name), [refs]);
+  const targetNames = useMemo(
+    () => refs.map((ref) => ref.name).filter((name) => name !== sourceBranch),
+    [refs, sourceBranch],
+  );
   const showTargetPicker = mergeIntoAvailable && targetMode !== "current-branch";
-  const target = (showTargetPicker ? targetName : null) ?? currentName;
-  const intoOtherBranch = showTargetPicker && target !== null && target !== currentName;
+  // A fixed source never defaults Into to the checked-out branch: that is the source itself.
+  const target =
+    (showTargetPicker ? targetName : null) ?? (sourceBranch === null ? currentName : null);
+  // A fixed source always merges into the chosen branch, even if that branch becomes the
+  // checked-out one after the choice; confirmation is then blocked instead.
+  const intoOtherBranch =
+    showTargetPicker && target !== null && (sourceBranch !== null || target !== currentName);
 
   const deferredFilter = useDeferredValue(filter);
   const grouped = useMemo(
@@ -186,7 +198,10 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
     (): ReadonlyArray<MergeSourceOption> =>
       // The target cannot be its own source; the checked-out branch is a source for
       // another target.
-      [...grouped.default, ...grouped.recent, ...grouped.other]
+      (sourceBranch === null
+        ? [...grouped.default, ...grouped.recent, ...grouped.other]
+        : refs.filter((branch) => branch.name === sourceBranch)
+      )
         .filter((branch) => branch.name !== target)
         .map((entry) => ({
           ref: `refs/heads/${entry.name}`,
@@ -194,17 +209,17 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
           entry,
           remote: false,
         })),
-    [grouped.default, grouped.other, grouped.recent, target],
+    [grouped.default, grouped.other, grouped.recent, refs, sourceBranch, target],
   );
   const remoteSourceOptions = useMemo(
     (): ReadonlyArray<MergeSourceOption> =>
-      grouped.remote.map((entry) => ({
+      (sourceBranch === null ? grouped.remote : []).map((entry) => ({
         ref: `refs/remotes/${entry.name}`,
         label: entry.name,
         entry,
         remote: true,
       })),
-    [grouped.remote],
+    [grouped.remote, sourceBranch],
   );
   const selectedOption =
     localSourceOptions.find((option) => option.ref === selectedSourceRef) ??
@@ -214,7 +229,8 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
     null;
   const selectedSource = selectedOption?.ref ?? null;
   // Merge into another branch, and the Source Control entry, record a merge commit only.
-  const mergeCommitOnly = intoOtherBranch || targetMode === "current-branch";
+  const mergeCommitOnly =
+    intoOtherBranch || sourceBranch !== null || targetMode === "current-branch";
   const effectiveMode = mergeCommitOnly ? "merge" : mode;
   const operationTag = intoOtherBranch
     ? "merge-into"
@@ -230,20 +246,23 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
         ) ?? null,
     [operationTag, refs],
   );
-  const blockedReason = intoOtherBranch
-    ? (refs
-        .find((ref) => ref.name === target)
-        ?.blocked.find((reason) => reason.operation === "merge-into") ?? null)
-    : selectedOption === null
-      ? null
-      : selectedOption.remote
-        ? repositoryBlockedReason
-        : (selectedOption.entry.blocked.find((reason) => reason.operation === operationTag) ??
-          null);
+  const awaitingTarget = sourceBranch !== null && target === null;
+  const blockedReason = awaitingTarget
+    ? null
+    : intoOtherBranch
+      ? (refs
+          .find((ref) => ref.name === target)
+          ?.blocked.find((reason) => reason.operation === "merge-into") ?? null)
+      : selectedOption === null
+        ? null
+        : selectedOption.remote
+          ? repositoryBlockedReason
+          : (selectedOption.entry.blocked.find((reason) => reason.operation === operationTag) ??
+            null);
 
   const previewAtom = useMemo(
     () =>
-      !open || selectedSource === null || capabilityDisabledReason !== null
+      !open || selectedSource === null || awaitingTarget || capabilityDisabledReason !== null
         ? null
         : gitManagerEnvironment.previewMerge({
             environmentId,
@@ -253,7 +272,16 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
               ...(intoOtherBranch && target !== null ? { target } : {}),
             },
           }),
-    [capabilityDisabledReason, cwd, environmentId, intoOtherBranch, open, selectedSource, target],
+    [
+      awaitingTarget,
+      capabilityDisabledReason,
+      cwd,
+      environmentId,
+      intoOtherBranch,
+      open,
+      selectedSource,
+      target,
+    ],
   );
   const previewQuery = useEnvironmentQuery(previewAtom);
   const refreshPreview = previewQuery.refresh;
@@ -265,29 +293,43 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
       ? previewQuery.data
       : null;
   const summary = preview === null ? null : summarizeMergePreview(preview, { intoOtherBranch });
-  const copy = resolveMergeConfirmCopy(effectiveMode, intoOtherBranch ? target : null);
+  const copy =
+    sourceBranch !== null && target === null
+      ? { title: `Merge ${sourceBranch} into another branch`, confirmLabel: "Merge" }
+      : resolveMergeConfirmCopy(effectiveMode, intoOtherBranch ? target : null);
+  const fixedSourceInvalidReason =
+    sourceBranch === null || target === null
+      ? null
+      : !refs.some((ref) => ref.name === sourceBranch)
+        ? `${sourceBranch} no longer exists.`
+        : !refs.some((ref) => ref.name === target)
+          ? `${target} no longer exists.`
+          : target === currentName
+            ? `${target} is now checked out. Use Merge… to merge into the checked-out branch.`
+            : null;
   // Below Git 2.38 there is no preview, but merging into the checked-out branch still works.
   const previewUnsupported =
     !intoOtherBranch && previewQuery.error?.startsWith(MERGE_PREVIEW_GIT_TOO_OLD_PREFIX) === true;
   const disabledReason =
     capabilityDisabledReason ??
+    fixedSourceInvalidReason ??
     blockedReason?.message ??
     (operationRunning
       ? "The selected Git operation is running."
       : selectedSource === null
         ? "Choose a source branch."
-        : previewUnsupported
-          ? null
-          : preview === null && previewQuery.error !== null
-            ? previewQuery.error
-            : previewQuery.isPending || preview === null
-              ? "Loading merge preview."
-              : summary?.mergeEnabled === false
-                ? summary.message
-                : null);
+        : awaitingTarget
+          ? "Choose a branch to merge into."
+          : previewUnsupported
+            ? null
+            : preview === null && previewQuery.error !== null
+              ? previewQuery.error
+              : previewQuery.isPending || preview === null
+                ? "Loading merge preview."
+                : summary?.mergeEnabled === false
+                  ? summary.message
+                  : null);
   const confirmDisabled = disabledReason !== null;
-  const disabledReasonId =
-    disabledReason === null ? undefined : "git-manager-merge-disabled-reason";
 
   const changeFilter = useCallback(
     (event: ChangeEvent<HTMLInputElement>) => setFilter(event.currentTarget.value),
@@ -445,7 +487,9 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
         <DialogHeader>
           <DialogTitle>{copy.title}</DialogTitle>
           <DialogDescription>
-            Select a source branch and review the server-computed merge preview.
+            {sourceBranch === null
+              ? "Select a source branch and review the server-computed merge preview."
+              : `Choose the branch to merge ${sourceBranch} into and review the server-computed merge preview.`}
           </DialogDescription>
         </DialogHeader>
         <div className="min-h-0 space-y-3 px-6 pb-4">
@@ -506,68 +550,57 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
               </Button>
             )}
           </div>
-          <div className="flex items-center gap-2">
-            <label className="relative block min-w-0 flex-1">
-              <SearchIcon
-                aria-hidden="true"
-                className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
-              />
-              <span className="sr-only">Filter source branches</span>
-              <Input
-                aria-label="Filter source branches"
-                className="[&_input]:pl-7"
-                placeholder="Filter branches…"
-                disabled={operationRunning}
-                size="sm"
-                type="search"
-                value={filter}
-                onChange={changeFilter}
-              />
-            </label>
-            {remotes.length === 0 ? null : (
-              <Button
-                disabled={operationRunning || capabilityDisabledReason !== null}
-                size="sm"
-                title={capabilityDisabledReason ?? "Fetch the latest branches from the remote"}
-                variant="outline"
-                onClick={fetchRemotes}
-              >
-                Fetch
-              </Button>
-            )}
-          </div>
-          <div
-            aria-label="Source branches"
-            className="max-h-44 overflow-auto rounded-md border border-border"
-          >
-            {localSourceOptions.length === 0 &&
-            remoteSourceOptions.length === 0 &&
-            refsError !== null ? (
-              <div className="space-y-2 p-3 text-xs" role="alert">
-                <p className="text-destructive">{refsError}</p>
-                <Button size="xs" variant="outline" onClick={onRefsStale}>
-                  Retry
-                </Button>
-              </div>
-            ) : localSourceOptions.length === 0 && remoteSourceOptions.length === 0 ? (
-              <p className="p-3 text-xs text-muted-foreground">No source branches found.</p>
-            ) : (
-              <>
-                {localSourceOptions.map((option) => (
-                  <MergeSourceButton
-                    key={option.ref}
-                    option={option}
-                    selected={option.ref === selectedSource}
-                    disabled={operationRunning}
-                    onSelect={setSelectedSourceRef}
+          {sourceBranch === null ? (
+            <>
+              <div className="flex items-center gap-2">
+                <label className="relative block min-w-0 flex-1">
+                  <SearchIcon
+                    aria-hidden="true"
+                    className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
                   />
-                ))}
-                {remoteSourceOptions.length === 0 ? null : (
+                  <span className="sr-only">Filter source branches</span>
+                  <Input
+                    aria-label="Filter source branches"
+                    className="[&_input]:pl-7"
+                    placeholder="Filter branches…"
+                    disabled={operationRunning}
+                    size="sm"
+                    type="search"
+                    value={filter}
+                    onChange={changeFilter}
+                  />
+                </label>
+                {remotes.length === 0 ? null : (
+                  <GitManagerDisabledReasonButton
+                    disabled={operationRunning}
+                    disabledReason={capabilityDisabledReason}
+                    enabledTitle="Fetch the latest branches from the remote"
+                    size="sm"
+                    variant="outline"
+                    onClick={fetchRemotes}
+                  >
+                    Fetch
+                  </GitManagerDisabledReasonButton>
+                )}
+              </div>
+              <div
+                aria-label="Source branches"
+                className="max-h-44 overflow-auto rounded-md border border-border"
+              >
+                {localSourceOptions.length === 0 &&
+                remoteSourceOptions.length === 0 &&
+                refsError !== null ? (
+                  <div className="space-y-2 p-3 text-xs" role="alert">
+                    <p className="text-destructive">{refsError}</p>
+                    <Button size="xs" variant="outline" onClick={onRefsStale}>
+                      Retry
+                    </Button>
+                  </div>
+                ) : localSourceOptions.length === 0 && remoteSourceOptions.length === 0 ? (
+                  <p className="p-3 text-xs text-muted-foreground">No source branches found.</p>
+                ) : (
                   <>
-                    <p className="px-3 pt-2 pb-1 text-xs font-medium text-muted-foreground uppercase">
-                      Remote
-                    </p>
-                    {remoteSourceOptions.map((option) => (
+                    {localSourceOptions.map((option) => (
                       <MergeSourceButton
                         key={option.ref}
                         option={option}
@@ -576,16 +609,38 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
                         onSelect={setSelectedSourceRef}
                       />
                     ))}
+                    {remoteSourceOptions.length === 0 ? null : (
+                      <>
+                        <p className="px-3 pt-2 pb-1 text-xs font-medium text-muted-foreground uppercase">
+                          Remote
+                        </p>
+                        {remoteSourceOptions.map((option) => (
+                          <MergeSourceButton
+                            key={option.ref}
+                            option={option}
+                            selected={option.ref === selectedSource}
+                            disabled={operationRunning}
+                            onSelect={setSelectedSourceRef}
+                          />
+                        ))}
+                      </>
+                    )}
                   </>
                 )}
-              </>
-            )}
-          </div>
+              </div>
+            </>
+          ) : (
+            <p className="text-sm">
+              Source: <span className="font-mono">{sourceBranch}</span>
+            </p>
+          )}
           <div aria-live="polite" className="min-h-10 rounded-md bg-muted/35 p-3 text-xs">
             {previewQuery.error !== null && preview === null ? (
               <p className="text-destructive">{previewQuery.error}</p>
             ) : summary === null ? (
-              <p className="text-muted-foreground">Loading merge preview…</p>
+              <p className="text-muted-foreground">
+                {awaitingTarget ? "Choose a branch to merge into." : "Loading merge preview…"}
+              </p>
             ) : (
               <>
                 <p>{summary.message}</p>
@@ -604,24 +659,14 @@ export const GitManagerMergeDialog = memo(function GitManagerMergeDialog({
             </p>
           )}
           <GitManagerOperationBanner operation={operationEvent} onCancel={cancelOperation} />
-          {disabledReason === null ? null : (
-            <span className="sr-only" id={disabledReasonId}>
-              {disabledReason}
-            </span>
-          )}
         </div>
         <DialogFooter>
           <Button disabled={operationRunning} variant="outline" onClick={close}>
             Cancel
           </Button>
-          <Button
-            aria-describedby={disabledReasonId}
-            disabled={confirmDisabled}
-            title={disabledReason ?? undefined}
-            onClick={confirm}
-          >
+          <GitManagerDisabledReasonButton disabledReason={disabledReason} onClick={confirm}>
             {copy.confirmLabel}
-          </Button>
+          </GitManagerDisabledReasonButton>
         </DialogFooter>
       </DialogPopup>
     </Dialog>

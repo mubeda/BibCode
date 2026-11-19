@@ -234,7 +234,7 @@ describe("packaged composer message queue", () => {
     await openInitialCodexDraft();
     await setDesktopUiWindowSize(1_100, 900);
     await expect(composerForm().$('[data-chat-provider-model-picker="true"]')).toHaveText(
-      expect.stringContaining("GPT-5.4"),
+      expect.stringContaining("Codex default"),
     );
     const baseline = readProviderInputLog(preparedProviderInputLogPath).length;
     const prompt = "first [[slow]]";

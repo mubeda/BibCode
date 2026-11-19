@@ -82,18 +82,50 @@ function loadMermaidRenderer(): Promise<MermaidRenderer> {
   return rendererModule;
 }
 
-/** Test seam: replaces the renderer import, or restores it when given nothing. */
+/**
+ * Test seam: replaces the renderer import, or restores it when given nothing. Inert outside unit
+ * tests, so no script in another build can swap what draws diagrams.
+ */
 export function __setMermaidRendererLoaderForTests(loader?: () => Promise<MermaidRenderer>): void {
+  if (import.meta.env.MODE !== "test") return;
   rendererLoader = loader ?? importMermaidRenderer;
   rendererModule = null;
 }
 
-/** Test seam: forgets every drawn diagram, pending job and the measured fonts. */
+/** Draws queued while a test holds them, started in order on release; null when not held. */
+let heldDraws: Array<() => void> | null = null;
+
+/**
+ * Test seam: holds every diagram draw that is not already cached until the returned release
+ * runs, so a test can act between a block showing its source and its diagram drawing. Inert
+ * outside unit tests and the packaged UI suite's build, whose page uses it below.
+ */
+export function __holdMermaidDrawsForTests(): () => void {
+  if (import.meta.env.MODE !== "test" && import.meta.env.VITE_BIBCODE_DESKTOP_E2E !== "1") {
+    return () => {};
+  }
+  heldDraws ??= [];
+  return () => {
+    const held = heldDraws ?? [];
+    heldDraws = null;
+    for (const start of held) start();
+  };
+}
+
+// The packaged UI suite holds draws from the page; other builds drop this branch.
+if (import.meta.env.VITE_BIBCODE_DESKTOP_E2E === "1" && typeof window !== "undefined") {
+  (window as Window & { __bibcodeHoldMermaidDraws?: () => () => void }).__bibcodeHoldMermaidDraws =
+    __holdMermaidDrawsForTests;
+}
+
+/** Test seam: forgets every drawn diagram, pending job and the measured fonts. Inert outside unit tests. */
 export function __resetMermaidDiagramsForTests(): void {
+  if (import.meta.env.MODE !== "test") return;
   diagramCache.clear();
   drawnDiagramHeights.clear();
   for (const job of pendingDiagramJobs.values()) job.cancel();
   pendingDiagramJobs.clear();
+  heldDraws = null;
   diagramFonts = null;
   rendererModule = null;
 }
@@ -165,18 +197,29 @@ function subscribeToDiagramJob(
     diagramIdCounter += 1;
     const idPrefix = `bibcode-mmd-${diagramIdCounter}`;
     const created: PendingDiagramJob = { subscribers: new Set(), cancel: () => undefined };
-    created.cancel = scheduleRender(
-      () => renderer.renderMermaidDiagram(source, fonts, idPrefix),
-      (diagram) => finishDiagramJob(key, created, { kind: "diagram", diagram, idPrefix }),
-      (error) => {
-        const problem = renderer.describeMermaidProblem(error);
-        // Pele's messages can quote the source: log the failure's class only.
-        if (problem.kind === "failed") {
-          reportMarkdownActionFailure({ operation: "render-diagram", code: problem.code });
-        }
-        finishDiagramJob(key, created, { kind: "problem", problem });
-      },
-    );
+    let cancelled = false;
+    let cancelRender: () => void = () => {};
+    const start = () => {
+      if (cancelled) return;
+      cancelRender = scheduleRender(
+        () => renderer.renderMermaidDiagram(source, fonts, idPrefix),
+        (diagram) => finishDiagramJob(key, created, { kind: "diagram", diagram, idPrefix }),
+        (error) => {
+          const problem = renderer.describeMermaidProblem(error);
+          // Pele's messages can quote the source: log the failure's class only.
+          if (problem.kind === "failed") {
+            reportMarkdownActionFailure({ operation: "render-diagram", code: problem.code });
+          }
+          finishDiagramJob(key, created, { kind: "problem", problem });
+        },
+      );
+    };
+    created.cancel = () => {
+      cancelled = true;
+      cancelRender();
+    };
+    if (heldDraws) heldDraws.push(start);
+    else start();
     pendingDiagramJobs.set(key, created);
     job = created;
   }

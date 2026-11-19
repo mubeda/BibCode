@@ -205,7 +205,7 @@ const ChangedFileList = memo(function ChangedFileList({
     <div
       ref={containerRef}
       aria-label="Changed files"
-      className="min-h-0 overflow-hidden border-r border-panel-separator"
+      className="min-h-0 flex-1 overflow-hidden"
       role="listbox"
       onKeyDown={handleKeyDown}
     >
@@ -358,17 +358,22 @@ export const GitManagerCommitDetail = memo(function GitManagerCommitDetail({
       </header>
 
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(160px,30%)_minmax(0,1fr)]">
-        {commit.changedFiles.length > 0 ? (
-          <ChangedFileList
-            paths={commit.changedFiles}
-            selectedPath={selectedFilePath}
-            onSelect={onSelectFile}
-          />
-        ) : (
-          <div className="border-r border-panel-separator">
+        <div className="flex min-h-0 flex-col border-r border-panel-separator">
+          {commit.changedFiles.length > 0 ? (
+            <ChangedFileList
+              paths={commit.changedFiles}
+              selectedPath={selectedFilePath}
+              onSelect={onSelectFile}
+            />
+          ) : commit.changedFilesOmitted ? null : (
             <p className="p-3 text-xs text-muted-foreground">No changed files.</p>
-          </div>
-        )}
+          )}
+          {commit.changedFilesOmitted ? (
+            <p className="shrink-0 border-t border-border p-3 text-xs text-muted-foreground">
+              {commit.changedFilesOmitted.toLocaleString()} more files not listed
+            </p>
+          ) : null}
+        </div>
 
         <div className="min-h-0 overflow-auto p-2" aria-live="polite">
           {selectedFilePath === null ? (

@@ -228,6 +228,81 @@ afterEach(async () => {
 });
 
 describe("WorktreeRemovalDialog", () => {
+  const alreadyRemovedFailure = () => ({
+    _tag: "Failure",
+    cause: Cause.fail(
+      new WorktreeRemovalError({
+        reason: "thread-not-found",
+        message: "The workspace thread was not found.",
+        alreadyRemoved: true,
+      }),
+    ),
+  });
+
+  it("treats a plan for an already removed worktree as done and refreshes the caller", async () => {
+    h.commands.set("get-plan", async () => alreadyRemovedFailure());
+    const onRemoved = vi.fn();
+    await renderDialog({ onRemoved });
+
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "This worktree was already removed.",
+    );
+    expect(button("Close")).toBeDefined();
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+    expect(onRemoved).toHaveBeenCalledWith(
+      target,
+      expect.objectContaining({ threadRemoved: true }),
+    );
+  });
+
+  it("treats a removal that finds the target already removed after a stale plan as done", async () => {
+    h.commands.set("remove", async () => alreadyRemovedFailure());
+    const onRemoved = vi.fn();
+    await renderDialog({ onRemoved });
+
+    await click("Delete Git worktree and remove");
+
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "This worktree was already removed.",
+    );
+    expect(button("Close")).toBeDefined();
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+    expect(h.calls.filter((call) => call.label === "remove")).toHaveLength(1);
+  });
+
+  it("treats a detach that finds the target already removed as done", async () => {
+    h.commands.set("detach", async () => alreadyRemovedFailure());
+    const onRemoved = vi.fn();
+    await renderDialog({ onRemoved });
+
+    await click("Remove from BiBCode");
+
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "This worktree was already removed.",
+    );
+    expect(button("Close")).toBeDefined();
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+    expect(h.calls.filter((call) => call.label === "detach")).toHaveLength(1);
+  });
+
+  it("still reports a missing thread as an error", async () => {
+    h.commands.set("get-plan", async () => ({
+      _tag: "Failure",
+      cause: Cause.fail(
+        new WorktreeRemovalError({
+          reason: "thread-not-found",
+          message: "The workspace thread was not found.",
+        }),
+      ),
+    }));
+    await renderDialog();
+
+    expect(container.textContent).toContain("The workspace thread was not found.");
+  });
+
   it("shows a session-running refusal once as a status without an error or plan retry", async () => {
     const onRemoved = vi.fn();
     h.commands.set("remove", async () => ({

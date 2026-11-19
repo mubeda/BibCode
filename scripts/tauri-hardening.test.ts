@@ -447,6 +447,8 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
         const connectSource = /connect-src ([^;]*)/.exec(policy ?? "")?.[1] ?? "";
         assert.match(connectSource, /(^|\s)http:(\s|$)/, "connect-src must allow off-host http:");
         assert.match(connectSource, /(^|\s)ws:(\s|$)/, "connect-src must allow off-host ws:");
+        // WebKit's macOS PDF viewer reads a PDF <embed>'s blob: URL as a connect-src load.
+        assert.match(connectSource, /(^|\s)blob:(\s|$)/, "connect-src must allow blob:");
       }
       assert.match(tauri.app.security.csp ?? "", /script-src 'self';/);
       // macOS App Transport Security refuses plain-HTTP loads from web content

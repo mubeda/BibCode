@@ -164,6 +164,14 @@ afterEach(async () => {
   container.remove();
 });
 describe("PullRequestsPanel", () => {
+  it("shows a pending environment as loading, not unavailable", async () => {
+    h.connection = null;
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "Waiting for the environment connection state.",
+    );
+    expect(container.querySelector('[aria-label="Pull Requests unavailable"]')).toBeNull();
+  });
   it("stops the worktree loading status after the live catalog emits", async () => {
     h.catalogPending = true;
     h.catalogData = null;

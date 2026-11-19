@@ -26,6 +26,10 @@ const DPOP_DATABASE_VERSION = 1;
 const DPOP_KEY_STORE_NAME = "keys";
 const DPOP_KEY_ID = "relay-dpop-proof-key";
 const decodeDpopPublicJwk = Schema.decodeUnknownEffect(DpopPublicJwk);
+/** How long one DPoP key storage request may stay silent before it fails. */
+const DPOP_STORAGE_DEADLINE_MS = 10_000;
+const DPOP_STORAGE_SILENT_MESSAGE =
+  "DPoP key storage did not answer in time, so the relay request was not signed. Quit BiBCode and open it again.";
 
 export const browserCryptoLayer = Layer.succeed(
   Crypto.Crypto,
@@ -44,8 +48,44 @@ function dpopError(message: string, cause?: unknown) {
   return new BrowserDpopError({ message, ...(cause === undefined ? {} : { cause }) });
 }
 
+/**
+ * Settles one DPoP storage request once and fails it when IndexedDB stays
+ * silent. A timeout never substitutes weaker key storage. `resume` returns
+ * false once the deadline settled the request.
+ */
+function withDpopDeadline<A>(
+  register: (
+    resume: (effect: Effect.Effect<A, BrowserDpopError>) => boolean,
+  ) => IDBTransaction | void,
+): Effect.Effect<A, BrowserDpopError> {
+  return Effect.callback<A, BrowserDpopError>((resume) => {
+    let settled = false;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const transaction = register((effect) => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(deadline);
+      resume(effect);
+      return true;
+    });
+    if (settled) return;
+    // @effect-diagnostics-next-line globalTimersInEffect:off
+    deadline = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        // A key write that lands later could race the next key the relay generates.
+        transaction?.abort();
+      } catch {
+        // The transaction already committed or finished.
+      }
+      resume(Effect.fail(dpopError(DPOP_STORAGE_SILENT_MESSAGE)));
+    }, DPOP_STORAGE_DEADLINE_MS);
+  });
+}
+
 function openDpopDatabase(name = DPOP_DATABASE_NAME): Effect.Effect<IDBDatabase, BrowserDpopError> {
-  return Effect.callback<IDBDatabase, BrowserDpopError>((resume) => {
+  return withDpopDeadline<IDBDatabase>((resume) => {
     const request = indexedDB.open(name, DPOP_DATABASE_VERSION);
     request.addEventListener("error", () =>
       resume(
@@ -57,7 +97,10 @@ function openDpopDatabase(name = DPOP_DATABASE_NAME): Effect.Effect<IDBDatabase,
         request.result.createObjectStore(DPOP_KEY_STORE_NAME);
       }
     });
-    request.addEventListener("success", () => resume(Effect.succeed(request.result)));
+    request.addEventListener("success", () => {
+      // An open that answers after its deadline is closed, because nobody uses it.
+      if (!resume(Effect.succeed(request.result))) request.result.close();
+    });
   });
 }
 
@@ -67,7 +110,7 @@ function readStoredBrowserDpopKeyFrom(
   return Effect.acquireUseRelease(
     openDpopDatabase(databaseName),
     (database) =>
-      Effect.callback<BrowserDpopKey | null, BrowserDpopError>((resume) => {
+      withDpopDeadline<BrowserDpopKey | null>((resume) => {
         const request = database
           .transaction(DPOP_KEY_STORE_NAME, "readonly")
           .objectStore(DPOP_KEY_STORE_NAME)
@@ -90,7 +133,7 @@ function writeStoredBrowserDpopKeyTo(
   return Effect.acquireUseRelease(
     openDpopDatabase(databaseName),
     (database) =>
-      Effect.callback<void, BrowserDpopError>((resume) => {
+      withDpopDeadline<void>((resume) => {
         const transaction = database.transaction(DPOP_KEY_STORE_NAME, "readwrite");
         transaction.addEventListener("error", () =>
           resume(
@@ -99,6 +142,7 @@ function writeStoredBrowserDpopKeyTo(
         );
         transaction.addEventListener("complete", () => resume(Effect.void));
         transaction.objectStore(DPOP_KEY_STORE_NAME).put(key, DPOP_KEY_ID);
+        return transaction;
       }),
     (database) => Effect.sync(() => database.close()),
   );

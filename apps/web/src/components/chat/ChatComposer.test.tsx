@@ -1458,6 +1458,26 @@ describe("ChatComposer rendering", () => {
     expect(supervised.markup).not.toContain("text-destructive");
   });
 
+  it("shows a Codex review thread's read-only policy instead of its stored mode (#376)", () => {
+    const review = renderComposer({
+      activeThread: makeThread({ codeReview: true }),
+      readOnlyCodexReviews: true,
+    });
+    expect(filterCaptures("SelectTrigger")).toHaveLength(0);
+    const locked = captureByLabel("Button", "Read-only review");
+    expect(locked["aria-disabled"]).toBe(true);
+    expect(review.markup).toContain(
+      "Codex runs reviews on their own in its read-only sandbox, so the mode does not apply.",
+    );
+    expect(review.markup).not.toContain("Ask before commands and file changes.");
+
+    // An older server, or a thread that is not a review, keeps the picker.
+    renderComposer({ activeThread: makeThread({ codeReview: true }) });
+    captureByLabel("SelectTrigger", "Supervised");
+    renderComposer({ activeThread: makeThread(), readOnlyCodexReviews: true });
+    captureByLabel("SelectTrigger", "Supervised");
+  });
+
   it("keeps mode controls left and send actions fixed when the footer is compact", () => {
     h.stateSeeds.set(STATE.footerCompact, true);
     h.stateSeeds.set(STATE.primaryActionsCompact, true);

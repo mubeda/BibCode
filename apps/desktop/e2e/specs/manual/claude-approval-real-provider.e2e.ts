@@ -3,6 +3,7 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
+import { captureStuckConnectionState } from "../../support/connection-state.ts";
 import { ensureMainSidebarOpen, mockDesktopUiFolderPicker } from "../../support/ui-state.ts";
 
 /**
@@ -58,7 +59,14 @@ async function importProject(): Promise<void> {
   const loading = browser.$("//*[normalize-space()='Project data is still loading']");
   await browser.pause(1_000);
   if (await loading.isExisting()) {
-    await loading.waitForDisplayed({ reverse: true, timeout: 60_000 });
+    try {
+      await loading.waitForDisplayed({ reverse: true, timeout: 60_000 });
+    } catch (error) {
+      // #381: keep what the client held, for the next diagnosis.
+      const state = await captureStuckConnectionState().catch((reason: unknown) => String(reason));
+      note(`project data never loaded; client state: ${JSON.stringify(state)}`);
+      throw error;
+    }
   }
   const addProject = browser.$('[data-testid="sidebar-add-project-trigger"]');
   await addProject.waitForDisplayed();
@@ -165,6 +173,137 @@ async function questionStep(): Promise<void> {
   await shot("question-answered");
 }
 
+/** The text of the working row ("Waiting for 3s"), or null when no turn shows as running. */
+async function workingRowText(): Promise<string | null> {
+  return browser.execute((selector) => {
+    const dots = document.querySelector(`${selector} [data-working-indicator]`);
+    return dots?.parentElement?.textContent ?? null;
+  }, surface);
+}
+
+/**
+ * A background task that ends inside a turn (#389): Claude answers its notification in that
+ * turn, so the thread must be idle afterwards, and the next turn's timer starts from zero.
+ */
+async function backgroundTaskStep(): Promise<void> {
+  await submitPrompt(
+    "Use the Bash tool to run `sleep 8` with run_in_background set to true. Then use the Bash tool to run `sleep 20` in the foreground. Then reply with exactly: background step finished",
+  );
+  const stop = () => composerForm().$('button[aria-label="Stop generation"]');
+  const turnDeadline = Date.now() + 300_000;
+  let replied = false;
+  while (Date.now() < turnDeadline) {
+    const sessionButton = browser.$(SESSION_BUTTON);
+    if (await sessionButton.isExisting()) await sessionButton.click();
+    const text = await browser.$(surface).getText();
+    // The prompt holds the phrase too, so the reply is the second occurrence.
+    replied = text.split("background step finished").length > 2;
+    if (replied && !(await stop().isExisting())) break;
+    await browser.pause(3_000);
+  }
+  note(`background step replied: ${replied}`);
+  expect(replied).toBe(true);
+  // Nothing may claim a running turn while Claude is silent.
+  const quietDeadline = Date.now() + 60_000;
+  let phantom: string | null = null;
+  while (Date.now() < quietDeadline && phantom === null) {
+    if (await stop().isExisting()) phantom = "stop button";
+    else phantom = await workingRowText();
+    await browser.pause(3_000);
+  }
+  await shot("background-task-idle");
+  note(`after the background task's turn, a running turn showed: ${phantom ?? "no"}`);
+  expect(phantom).toBeNull();
+  // The next turn counts from its own start.
+  await submitPrompt("Reply with exactly: timer check");
+  let firstTimer: string | null = null;
+  await browser.waitUntil(
+    async () => {
+      firstTimer = await workingRowText();
+      return firstTimer !== null && /\d+s/.test(firstTimer);
+    },
+    { timeout: 60_000, interval: 250, timeoutMsg: "The next turn showed no working row." },
+  );
+  note(`next turn's first timer text: ${firstTimer}`);
+  expect(firstTimer).not.toMatch(/\dm /);
+  await browser.waitUntil(async () => !(await stop().isExisting()), { timeout: 180_000 });
+}
+
+/**
+ * A background task that outlives its turn: it finishes while no turn runs and Claude answers it
+ * by itself, with no replay (Claude Code 2.1.326). The answer's text shows and ends, the thread
+ * is idle afterwards, and the next message runs normally.
+ */
+async function idleAnswerStep(): Promise<void> {
+  const marker = "idle answer arrived";
+  // As before the plan step: a prompt sent the moment the previous turn ends can stay in the
+  // composer.
+  await browser.pause(20_000);
+  await submitPrompt(
+    `Use the Bash tool to run \`sleep 25\` with run_in_background set to true. Do not wait for it: reply at once with exactly: background started. Later, when that background command finishes, reply with exactly: ${marker}`,
+  );
+  const stop = () => composerForm().$('button[aria-label="Stop generation"]');
+  // The prompt holds each phrase once, so a reply is a second occurrence.
+  const replies = async (phrase: string) =>
+    (await browser.$(surface).getText()).split(phrase).length - 2;
+  const turnDeadline = Date.now() + 180_000;
+  let started = false;
+  while (Date.now() < turnDeadline) {
+    const sessionButton = browser.$(SESSION_BUTTON);
+    if (await sessionButton.isExisting()) await sessionButton.click();
+    started = (await replies("background started")) > 0;
+    if (started && !(await stop().isExisting())) break;
+    await browser.pause(1_000);
+  }
+  const turnEndedAt = Date.now();
+  // The answer must come after the turn, from the task finishing while no turn runs.
+  const answeredInTurn = (await replies(marker)) > 0;
+  note(
+    `idle answer step: the turn ended with its reply: ${started}; marker already answered: ${answeredInTurn}`,
+  );
+  expect(started).toBe(true);
+  expect(answeredInTurn).toBe(false);
+  const answerDeadline = Date.now() + 180_000;
+  let answered = false;
+  while (Date.now() < answerDeadline && !answered) {
+    answered = (await replies(marker)) > 0;
+    if (!answered) await browser.pause(1_000);
+  }
+  note(
+    `idle answer step: Claude answered by itself: ${answered}, ${Math.round((Date.now() - turnEndedAt) / 1000)}s after the turn ended`,
+  );
+  expect(answered).toBe(true);
+  await browser.pause(30_000);
+  const phantom = (await stop().isExisting()) ? "stop button" : await workingRowText();
+  // A streaming reply has no copy button; the last reply of a turn gets one once its text ends.
+  const ended = (phrase: string) =>
+    browser.execute(
+      (selector, text) => {
+        const rows = [
+          ...document.querySelectorAll(`${selector} [data-message-role="assistant"]`),
+        ].filter((row) => row.textContent?.includes(text));
+        return rows.at(-1)?.querySelector('button[aria-label="Copy link"]') != null;
+      },
+      surface,
+      phrase,
+    );
+  const answerEnded = await ended(marker);
+  // Control: the finished reply of the previous step's turn shows the same button.
+  const controlEnded = await ended("timer check");
+  await shot("idle-answer");
+  note(
+    `30s after the idle answer: running turn shown: ${phantom ?? "no"}; answer ended: ${answerEnded}; control reply ended: ${controlEnded}`,
+  );
+  expect(phantom).toBeNull();
+  expect(answerEnded).toBe(true);
+  await submitPrompt("Reply with exactly: after the idle answer");
+  await browser.waitUntil(
+    async () => (await replies("after the idle answer")) > 0 && !(await stop().isExisting()),
+    { timeout: 180_000, interval: 1_000, timeoutMsg: "The next message did not run normally." },
+  );
+  note("idle answer step: the next message ran and its turn ended");
+}
+
 /** Plan review stays in BiBCode: the plan shows, no approval card opens, the turn ends. */
 async function planStep(): Promise<void> {
   await browser.pause(20_000);
@@ -264,6 +403,8 @@ describe("real Claude approvals (#383)", function () {
     // in the same chat.
     await browser.pause(20_000);
     await questionStep();
+    await backgroundTaskStep();
+    await idleAnswerStep();
     await planStep();
   });
 });

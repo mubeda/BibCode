@@ -757,6 +757,7 @@ async fn probe_one_snapshot(
         "codex" => {
             if include_slow_capabilities
                 && let Some(inventory) = probe_codex(
+                    &definition.instance_id,
                     &executable,
                     cwd,
                     &definition.custom_models,
@@ -1391,7 +1392,37 @@ async fn run_command(
     })
 }
 
+/// Logs why a Codex inventory probe learned no sign-in type: the step and the kind of failure,
+/// never the reply, the account or its email. A launch then cannot tell whether a stored model
+/// is retired under a ChatGPT sign-in.
+fn warn_codex_sign_in_unknown(instance_id: &str, step: &str, failure: &str) {
+    tracing::warn!(
+        instance_id,
+        step,
+        failure,
+        "the Codex inventory probe learned no sign-in type"
+    );
+}
+
+/// The step a Codex inventory probe failed at and the kind of failure, without the reply.
+fn codex_probe_failure(error: &codex::runtime::RuntimeError) -> (String, String) {
+    use codex::ProtocolError;
+    use codex::runtime::RuntimeError;
+    match error {
+        RuntimeError::Protocol(ProtocolError::RemoteRequest { method, code, .. }) => {
+            (method.clone(), format!("error {code}"))
+        }
+        RuntimeError::Protocol(ProtocolError::Closed { .. }) => {
+            ("probe".to_owned(), "connection closed".to_owned())
+        }
+        RuntimeError::Protocol(_) => ("probe".to_owned(), "protocol failure".to_owned()),
+        RuntimeError::InvalidPayload { .. } => ("probe".to_owned(), "invalid reply".to_owned()),
+        _ => ("probe".to_owned(), "failed".to_owned()),
+    }
+}
+
 async fn probe_codex(
+    instance_id: &str,
     executable: &Path,
     cwd: &Path,
     custom_models: &[String],
@@ -1406,20 +1437,45 @@ async fn probe_codex(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = supervised_command(command).spawn().ok()?;
+    // The launch error names local paths, so only the kind of failure is logged.
+    let Ok(mut child) = supervised_command(command).spawn() else {
+        warn_codex_sign_in_unknown(instance_id, "launch", "could not start");
+        return None;
+    };
     let stdout = child.stdout().take()?;
     let stdin = child.stdin().take()?;
     let stderr = child.stderr().take()?;
     let (connection, _incoming) =
         codex::JsonRpcConnection::spawn(stdout, stdin, stderr, codex::ConnectionConfig::default());
     let cwd = cwd.to_string_lossy().into_owned();
-    let result = timeout(
+    let result = match timeout(
         PROBE_TIMEOUT,
         codex::probe_provider(&connection, env!("CARGO_PKG_VERSION"), &cwd, custom_models),
     )
     .await
-    .ok()
-    .and_then(Result::ok);
+    {
+        Ok(Ok(snapshot)) => {
+            let auth = codex_auth(&snapshot.account);
+            if auth.get("type").is_none() {
+                let failure = if auth["status"] == "authenticated" {
+                    "no sign-in type in the reply"
+                } else {
+                    "no account in the reply"
+                };
+                warn_codex_sign_in_unknown(instance_id, "account/read", failure);
+            }
+            Some(snapshot)
+        }
+        Ok(Err(error)) => {
+            let (step, failure) = codex_probe_failure(&error);
+            warn_codex_sign_in_unknown(instance_id, &step, &failure);
+            None
+        }
+        Err(_) => {
+            warn_codex_sign_in_unknown(instance_id, "probe", "timed out");
+            None
+        }
+    };
     connection.close().await;
     stop_supervised_child(&mut *child).await;
     result
@@ -2096,13 +2152,130 @@ mod tests {
         );
     }
 
+    /// In a process of its own, so no sibling test can turn the callsite off for this capture.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_codex_probe_that_learns_no_sign_in_logs_why_without_the_account() {
+        let Some(child) = crate::test_support::in_own_process(
+            "production::provider_inventory::tests::a_codex_probe_that_learns_no_sign_in_logs_why_without_the_account",
+        ) else {
+            return;
+        };
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        const EMAIL: &str = "secret-person@example.test";
+        let sandbox = crate::test_support::TestSandbox::new("codex-sign-in-log");
+        // `account/read` answers with `$1`: an error, nothing at all, or a reply without account.
+        let fake = |name: &str, account_reply: &str| {
+            sandbox.executable_script(
+                name,
+                &format!(
+                    r#"
+while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialized"'*) ;;
+    *'"method":"account/read"'*) {account_reply} ;;
+    *'"method":"model/list"'*) printf '{{"id":%s,"result":{{"data":[{{"model":"gpt-6.2-sol","displayName":"gpt-6.2-sol","supportedReasoningEfforts":[{{"reasoningEffort":"medium"}}],"defaultReasoningEffort":"medium"}}],"nextCursor":null}}}}\n' "$id" ;;
+    *'"method":"skills/list"'*) printf '{{"id":%s,"result":{{"data":[]}}}}\n' "$id" ;;
+    *) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done
+"#
+                ),
+                "",
+            )
+        };
+        let refused = fake(
+            "codex-refused",
+            &format!(
+                r#"printf '{{"id":%s,"error":{{"code":-32001,"message":"cannot read {EMAIL}"}}}}\n' "$id""#
+            ),
+        );
+        let silent = fake("codex-silent", ":");
+        let no_account = fake(
+            "codex-no-account",
+            r#"printf '{"id":%s,"result":{"account":null,"requiresOpenaiAuth":false}}\n' "$id""#,
+        );
+        // Resolves and is executable, but its interpreter does not exist, so it cannot start.
+        let unstartable = sandbox.path("codex-unstartable");
+        crate::test_support::TestSandbox::write_executable(
+            &unstartable,
+            "#!/nonexistent/interpreter\n",
+        );
+        let cwd = sandbox.root().to_path_buf();
+        assert!(
+            probe_codex("codex-unstartable", &unstartable, &cwd, &[], &[])
+                .await
+                .is_none()
+        );
+        assert!(
+            probe_codex("codex-refused", &refused, &cwd, &[], &[])
+                .await
+                .is_none()
+        );
+        assert!(
+            probe_codex("codex-silent", &silent, &cwd, &[], &[])
+                .await
+                .is_none()
+        );
+        let answered = probe_codex("codex-no-account", &no_account, &cwd, &[], &[])
+            .await
+            .is_some();
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(answered, "{text}");
+
+        for (instance, step, failure) in [
+            ("codex-unstartable", "launch", "could not start"),
+            ("codex-refused", "account/read", "error -32001"),
+            ("codex-silent", "probe", "timed out"),
+            (
+                "codex-no-account",
+                "account/read",
+                "no account in the reply",
+            ),
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.contains("learned no sign-in type")
+                        && line.contains(&format!("instance_id=\"{instance}\""))
+                        && line.contains(&format!("step=\"{step}\""))
+                        && line.contains(&format!("failure=\"{failure}\""))),
+                "{instance}: {text}"
+            );
+        }
+        assert!(!text.contains(EMAIL), "{text}");
+        assert!(!text.contains("cannot read"), "{text}");
+        child.complete();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn codex_inventory_probe_ignores_appimage_environment() {
         check_inventory_probe_appimage_environment(
             "production::provider_inventory::tests::codex_inventory_probe_ignores_appimage_environment",
             |executable, cwd, environment| async move {
-                probe_codex(&executable, &cwd, &[], &environment)
+                probe_codex("codex", &executable, &cwd, &[], &environment)
                     .await
                     .is_some()
             },

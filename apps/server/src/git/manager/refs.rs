@@ -870,6 +870,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_ref_names_the_branch_when_a_tag_shares_its_name() {
+        let repository = repository_with_one_commit();
+        let branch =
+            String::from_utf8(git_output(repository.path(), &["branch", "--show-current"]).stdout)
+                .expect("UTF-8 branch")
+                .trim()
+                .to_owned();
+        // `symbolic-ref --short` would say `heads/<branch>` once the tag exists.
+        git(repository.path(), &["tag", &branch]);
+
+        let snapshot = snapshot(&repository).await;
+        assert_eq!(snapshot.head_ref.as_deref(), Some(branch.as_str()));
+        assert!(
+            snapshot
+                .local_branches
+                .iter()
+                .any(|entry| entry.current && entry.name == branch)
+        );
+    }
+
+    /// What the New branch dialog relies on before the first commit: no start point,
+    /// and Git can start the branch only by switching to it.
+    #[tokio::test]
+    async fn an_unborn_branch_starts_a_new_branch_only_by_switching() {
+        let repository = TempDir::new().expect("temporary repository");
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        let before = snapshot(&repository).await;
+        assert_eq!(before.head_ref.as_deref(), Some("main"));
+        assert!(before.local_branches.is_empty());
+        assert_eq!(before.detached_sha, None);
+
+        let git_repository = GitRepository::default();
+        let cancellation = CancellationToken::new();
+        for (checkout, succeeds) in [(false, false), (true, true)] {
+            let result = git_repository
+                .git_manager_create_branch(
+                    repository.path(),
+                    "topic",
+                    None,
+                    checkout,
+                    &cancellation,
+                )
+                .await;
+            let created = matches!(&result, Ok(output) if output.exit_code == 0);
+            assert_eq!(created, succeeds, "checkout {checkout}: {result:?}");
+        }
+        assert_eq!(
+            snapshot(&repository).await.head_ref.as_deref(),
+            Some("topic")
+        );
+    }
+
+    #[tokio::test]
     async fn detached_head_sets_sha_without_a_head_ref() {
         let repository = repository_with_one_commit();
         git(repository.path(), &["checkout", "-q", "--detach"]);

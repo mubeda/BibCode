@@ -859,6 +859,7 @@ fn launch() -> ProviderLaunchRequest {
         open_url: None,
         host_thread_id: None,
         side_chat_host_thread_id: None,
+        code_review: false,
     }
 }
 
@@ -15688,6 +15689,26 @@ cat >/dev/null
     );
 }
 
+/// The default agent takes no flag, so Claude's own settings can name its default and a selection
+/// that names `claude` launches like one that names no agent.
+#[test]
+fn claude_launch_arguments_leave_the_default_agent_to_claude() {
+    let mut request = launch();
+    request.provider = "claudeAgent".to_owned();
+    for agent in [None, Some("claude")] {
+        request.agent = agent.map(str::to_owned);
+        let arguments = build_claude_launch_arguments_for_test(
+            &request,
+            "session",
+            ClaudeActivitySupport::default(),
+        );
+        assert!(
+            !arguments.iter().any(|argument| argument == "--agent"),
+            "{agent:?}: {arguments:?}"
+        );
+    }
+}
+
 #[test]
 fn claude_launch_arguments_preserve_controls_and_gate_activity_flags() {
     let mut request = launch();
@@ -20316,4 +20337,397 @@ async fn checkpoint_revert_refuses_while_the_session_runs_background_work() {
         supervisor.shutdown().await.unwrap();
         engine.shutdown().await;
     }
+}
+
+/// A fake `codex app-server` for the code review panel tests (#376). It captures every line it
+/// reads. With `@REQUESTS@` set to 1 it asks for a command approval, a file-change approval and
+/// an answer on the first turn, and completes that turn once the last of them is answered.
+#[cfg(unix)]
+const CODE_REVIEW_CODEX_FIXTURE: &str = r#"#!/bin/sh
+capture='@CAPTURE@'
+send_requests='@REQUESTS@'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$capture"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"review-native"}}}\n' "$id" ;;
+    *'"method":"thread/read"'*) printf '{"id":%s,"result":{"thread":{"id":"review-native","createdAt":1,"updatedAt":1,"status":{"type":"idle"},"turns":[]}}}\n' "$id" ;;
+    *'"method":"thread/turns/list"'*|*'"method":"thread/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}\n' "$id" ;;
+    *'"method":"thread/backgroundTerminals/list"'*|*'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      # Counted across processes, so a restarted session's turn gets a new id.
+      turns=$(($(cat "$capture.turns" 2>/dev/null || echo 0) + 1))
+      printf '%s\n' "$turns" > "$capture.turns"
+      printf '{"id":%s,"result":{"turn":{"id":"review-turn-%s"}}}\n' "$id" "$turns"
+      if [ "$send_requests" = 1 ] && [ "$turns" = 1 ]; then
+        printf '%s\n' '{"id":9001,"method":"item/commandExecution/requestApproval","params":{"threadId":"review-native","turnId":"review-turn-1","itemId":"command-1","command":"node --test"}}'
+        printf '%s\n' '{"id":9002,"method":"item/fileChange/requestApproval","params":{"threadId":"review-native","turnId":"review-turn-1","itemId":"change-1","reason":"write a file"}}'
+        printf '%s\n' '{"id":9003,"method":"item/tool/requestUserInput","params":{"threadId":"review-native","turnId":"review-turn-1","itemId":"question-1","questions":[{"id":"q1","header":"Scope","question":"Which files?","options":[{"label":"All","description":"Every file"}]}]}}'
+      else
+        # After BiBCode has accepted the turn, as a real turn ends.
+        (sleep 0.3; printf '{"method":"turn/completed","params":{"threadId":"review-native","turn":{"id":"review-turn-%s","status":"completed","completedAt":3}}}\n' "$turns") &
+      fi ;;
+    *'"id":9003'*) printf '%s\n' '{"method":"turn/completed","params":{"threadId":"review-native","turn":{"id":"review-turn-1","status":"completed","completedAt":3}}}' ;;
+    *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"shutdown"'*) printf '{"id":%s,"result":null}\n' "$id" ;;
+  esac
+done
+"#;
+
+/// A server with one Codex host thread and one chat panel on it, created the way the Source
+/// Control review creates its panel (`worktree.createPanel`), with `stored_mode` as the panel's
+/// runtime mode.
+#[cfg(unix)]
+struct CodexPanelRun {
+    _state: TempDir,
+    capture: PathBuf,
+    handle: bibcode_server::ServerHandle,
+    socket: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    next_id: u64,
+}
+
+#[cfg(unix)]
+impl CodexPanelRun {
+    async fn start(code_review: bool, stored_mode: &str, send_requests: bool) -> Self {
+        let state = TempDir::new().expect("state");
+        let capture = state.path().join("codex-review-requests.ndjson");
+        let script = CODE_REVIEW_CODEX_FIXTURE
+            .replace("@CAPTURE@", &capture.display().to_string())
+            .replace("@REQUESTS@", if send_requests { "1" } else { "0" });
+        let executable = executable_fixture(&state, "codex-review", &script, "");
+        let config = test_config(&state);
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({
+                "providerInstances": {
+                    "codex-review": {
+                        "driver": "codex",
+                        "enabled": true,
+                        "config": { "binaryPath": executable }
+                    }
+                }
+            }),
+        );
+        let workspace = state.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let handle = ServerRuntime::start(config)
+            .await
+            .expect("production RPC server");
+        let (socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket");
+        let mut run = Self {
+            _state: state,
+            capture,
+            handle,
+            socket,
+            next_id: 1000,
+        };
+        let selection = json!({"instanceId":"codex-review","model":"gpt-5"});
+        run.rpc(
+            "orchestration.dispatchCommand",
+            json!({
+                "type":"project.create","commandId":"review-project","projectId":"review-project",
+                "title":"Review","workspaceRoot":workspace,"defaultModelSelection":null,"createdAt":NOW
+            }),
+        )
+        .await
+        .expect("project created");
+        run.rpc(
+            "orchestration.dispatchCommand",
+            json!({
+                "type":"thread.create","commandId":"review-host","threadId":"review-host",
+                "projectId":"review-project","title":"Host","modelSelection":selection,
+                "runtimeMode":"full-access","interactionMode":"default","branch":null,
+                "worktreePath":null,"createdAt":NOW
+            }),
+        )
+        .await
+        .expect("host thread created");
+        let mut panel = json!({
+            "commandId":"review-panel","hostThreadId":"review-host","threadId":"review-thread",
+            "title":"Code review",
+            "threadDefaults":{
+                "modelSelection":selection,"runtimeMode":stored_mode,"interactionMode":"default"
+            }
+        });
+        if code_review {
+            panel["codeReview"] = json!(true);
+        }
+        run.rpc("worktree.createPanel", panel)
+            .await
+            .expect("panel created");
+        run
+    }
+
+    async fn rpc(&mut self, tag: &str, payload: Value) -> Result<Value, Value> {
+        self.next_id += 1;
+        tagged_rpc_request(&mut self.socket, &self.next_id.to_string(), tag, payload).await
+    }
+
+    async fn turn(&mut self, message_id: &str, text: &str, runtime_mode: &str) {
+        self.rpc(
+            "orchestration.dispatchCommand",
+            json!({
+                "type":"thread.turn.start","commandId":format!("command-{message_id}"),
+                "threadId":"review-thread",
+                "message":{"messageId":message_id,"role":"user","text":text,"attachments":[]},
+                "modelSelection":{"instanceId":"codex-review","model":"gpt-5"},
+                "runtimeMode":runtime_mode,"interactionMode":"default","createdAt":NOW
+            }),
+        )
+        .await
+        .expect("turn admitted");
+    }
+
+    async fn shell_until(&mut self, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let shells = self
+                .rpc(
+                    "orchestration.getThreadShells",
+                    json!({"threadIds":["review-thread"]}),
+                )
+                .await
+                .expect("thread shells");
+            let shell = shells["threads"][0].clone();
+            if done(&shell) {
+                return shell;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: shell={shell}; capture={:?}",
+                std::fs::read_to_string(&self.capture).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn turn_completed_after(&mut self, previous: Option<&Value>) -> Value {
+        self.shell_until("turn completes", |shell| {
+            shell["latestTurn"]["state"] == "completed"
+                && previous.is_none_or(|turn_id| &shell["latestTurn"]["turnId"] != turn_id)
+                && shell["session"]["activeTurnId"].is_null()
+        })
+        .await["latestTurn"]["turnId"]
+            .clone()
+    }
+
+    fn captured(&self) -> Vec<Value> {
+        std::fs::read_to_string(&self.capture)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect()
+    }
+
+    async fn wait_for_method(&self, method: &str) {
+        timeout(Duration::from_secs(20), async {
+            while !self.captured().iter().any(|line| line["method"] == method) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Codex never received {method}: {:?}", self.captured()));
+    }
+
+    /// First turn, a runtime-mode change that restarts and resumes the session, second turn.
+    async fn two_turns_across_a_restart(&mut self, stored_mode: &str, next_mode: &str) {
+        self.turn("review-message-1", "first review turn", stored_mode)
+            .await;
+        let first = self.turn_completed_after(None).await;
+        self.rpc(
+            "orchestration.dispatchCommand",
+            json!({
+                "type":"thread.runtime-mode.set","commandId":"review-mode-change",
+                "threadId":"review-thread","runtimeMode":next_mode,"createdAt":NOW
+            }),
+        )
+        .await
+        .expect("mode change admitted");
+        self.wait_for_method("thread/resume").await;
+        self.turn("review-message-2", "second review turn", next_mode)
+            .await;
+        self.turn_completed_after(Some(&first)).await;
+    }
+
+    async fn finish(mut self) {
+        self.socket.close(None).await.expect("close WebSocket");
+        self.handle.shutdown();
+        self.handle.join().await.expect("RPC server joins");
+    }
+}
+
+#[cfg(unix)]
+fn codex_wire_policy(mode: &str) -> (&'static str, &'static str, &'static str) {
+    match mode {
+        "approval-required" => ("untrusted", "read-only", "readOnly"),
+        "auto-accept-edits" => ("on-request", "workspace-write", "workspaceWrite"),
+        "full-access" => ("never", "danger-full-access", "dangerFullAccess"),
+        other => panic!("unexpected runtime mode {other}"),
+    }
+}
+
+/// The policy each Codex request of the two-turn sequence carries, in order: `thread/start`,
+/// `thread/resume`, the first `turn/start` and the second, each turn found by its own text.
+#[cfg(unix)]
+fn codex_policies(captured: &[Value]) -> [(String, Value); 4] {
+    let only = |method: &str| {
+        let matching = captured
+            .iter()
+            .filter(|line| line["method"] == method)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "one {method}: {captured:?}");
+        matching[0].clone()
+    };
+    let turn = |text: &str| {
+        let matching = captured
+            .iter()
+            .filter(|line| {
+                line["method"] == "turn/start"
+                    && line["params"]["input"]
+                        .as_array()
+                        .is_some_and(|input| input.iter().any(|part| part["text"] == text))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "one turn/start for {text:?}: {captured:?}"
+        );
+        matching[0].clone()
+    };
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|line| line["method"] == "turn/start")
+            .count(),
+        2,
+        "exactly two turns: {captured:?}"
+    );
+    let policy = |request: Value, sandbox: &str| {
+        (
+            request["params"]["approvalPolicy"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            request["params"]
+                .pointer(sandbox)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    };
+    [
+        policy(only("thread/start"), "/sandbox"),
+        policy(only("thread/resume"), "/sandbox"),
+        policy(turn("first review turn"), "/sandboxPolicy/type"),
+        policy(turn("second review turn"), "/sandboxPolicy/type"),
+    ]
+}
+
+#[cfg(unix)]
+const RUNTIME_MODE_CYCLE: [(&str, &str); 3] = [
+    ("approval-required", "auto-accept-edits"),
+    ("auto-accept-edits", "full-access"),
+    // A review row stored as Full access, as a person could switch one before #376.
+    ("full-access", "approval-required"),
+];
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_review_codex_panel_never_asks_in_the_read_only_sandbox_across_restart_and_resume() {
+    for (stored_mode, next_mode) in RUNTIME_MODE_CYCLE {
+        let mut run = CodexPanelRun::start(true, stored_mode, false).await;
+        run.two_turns_across_a_restart(stored_mode, next_mode).await;
+        assert_eq!(
+            codex_policies(&run.captured()),
+            [
+                ("never".to_owned(), json!("read-only")),
+                ("never".to_owned(), json!("read-only")),
+                ("never".to_owned(), json!("readOnly")),
+                ("never".to_owned(), json!("readOnly")),
+            ],
+            "stored mode {stored_mode}"
+        );
+        run.finish().await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_codex_panel_keeps_the_wire_policy_of_each_runtime_mode() {
+    for (stored_mode, next_mode) in RUNTIME_MODE_CYCLE {
+        let mut run = CodexPanelRun::start(false, stored_mode, false).await;
+        run.two_turns_across_a_restart(stored_mode, next_mode).await;
+        let (first_approval, first_sandbox, first_turn_sandbox) = codex_wire_policy(stored_mode);
+        let (next_approval, next_sandbox, next_turn_sandbox) = codex_wire_policy(next_mode);
+        assert_eq!(
+            codex_policies(&run.captured()),
+            [
+                (first_approval.to_owned(), json!(first_sandbox)),
+                (next_approval.to_owned(), json!(next_sandbox)),
+                (first_approval.to_owned(), json!(first_turn_sandbox)),
+                (next_approval.to_owned(), json!(next_turn_sandbox)),
+            ],
+            "stored mode {stored_mode}"
+        );
+        run.finish().await;
+    }
+}
+
+/// The replies BiBCode sent to the fixture's three requests, by request id.
+#[cfg(unix)]
+fn replies_to_fixture_requests(captured: &[Value]) -> Vec<(Value, Value)> {
+    captured
+        .iter()
+        .filter(|line| {
+            line.get("method").is_none()
+                && [json!(9001), json!(9002), json!(9003)].contains(&line["id"])
+        })
+        .map(|line| (line["id"].clone(), line["result"].clone()))
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_review_codex_panel_declines_approvals_and_questions_at_once() {
+    let mut run = CodexPanelRun::start(true, "approval-required", true).await;
+    run.turn("review-message-1", "first review turn", "approval-required")
+        .await;
+    let shell = run
+        .shell_until("the turn completes with no card", |shell| {
+            shell["latestTurn"]["state"] == "completed"
+        })
+        .await;
+    assert_eq!(shell["hasPendingApprovals"], false, "{shell}");
+    assert_eq!(shell["hasPendingUserInput"], false, "{shell}");
+    assert_eq!(
+        replies_to_fixture_requests(&run.captured()),
+        [
+            (json!(9001), json!({"decision":"decline"})),
+            (json!(9002), json!({"decision":"decline"})),
+            (json!(9003), json!({"answers":{}})),
+        ]
+    );
+    run.finish().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_codex_panel_still_opens_cards_for_approvals_and_questions() {
+    let mut run = CodexPanelRun::start(false, "approval-required", true).await;
+    run.turn("review-message-1", "first review turn", "approval-required")
+        .await;
+    let shell = run
+        .shell_until("the cards open", |shell| {
+            shell["hasPendingApprovals"] == true && shell["hasPendingUserInput"] == true
+        })
+        .await;
+    assert_ne!(shell["latestTurn"]["state"], "completed", "{shell}");
+    assert!(
+        replies_to_fixture_requests(&run.captured()).is_empty(),
+        "nothing answers a card before the person does"
+    );
+    run.finish().await;
 }

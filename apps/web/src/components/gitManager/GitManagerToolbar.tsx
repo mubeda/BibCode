@@ -28,7 +28,7 @@ import {
   type GitManagerBranchDialogSubmission,
 } from "./dialogs/GitManagerBranchDialogs";
 import { GitManagerSwitchWithChangesDialog } from "./dialogs/GitManagerSwitchWithChangesDialog";
-import { resolveBranchCreateBase } from "./toolbar/branchCreateBase";
+import { newBranchDialog } from "./toolbar/branchCreateBase";
 import { GitManagerBranchDropdown } from "./toolbar/GitManagerBranchDropdown";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 import {
@@ -453,18 +453,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     },
     [checkoutBranch, snapshot?.isDirty],
   );
-  const createBranch = useCallback(
-    () =>
-      setBranchDialog({
-        kind: "create",
-        baseBranch: resolveBranchCreateBase({
-          currentBranchName,
-          defaultBranch: snapshot?.defaultBranch ?? null,
-        }),
-        baseCommit: null,
-      }),
-    [currentBranchName, snapshot?.defaultBranch],
-  );
+  const createBranch = useCallback(() => setBranchDialog(newBranchDialog(snapshot)), [snapshot]);
   const renameBranch = useCallback(
     (branch: GitManagerRefEntry) => setBranchDialog({ kind: "rename", branch }),
     [],
@@ -703,17 +692,20 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             onSwitchWorktree={onSelectedWorktreeChange}
           />
           <Menu>
-            <MenuTrigger
-              aria-describedby={
-                tagMenuDisabledReason === null ? undefined : "git-manager-tag-trigger-reason"
-              }
-              className="inline-flex min-h-7 items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:pointer-events-none disabled:opacity-50"
-              disabled={tagMenuDisabledReason !== null}
-              title={tagMenuDisabledReason ?? "Create, delete, or push a tag"}
-            >
-              <TagIcon aria-hidden="true" className="size-3.5" />
-              Tags…
-            </MenuTrigger>
+            {/* The disabled trigger has pointer-events-none, so its reason sits on a wrapper. */}
+            <span className="inline-flex" title={tagMenuDisabledReason ?? undefined}>
+              <MenuTrigger
+                aria-describedby={
+                  tagMenuDisabledReason === null ? undefined : "git-manager-tag-trigger-reason"
+                }
+                className="inline-flex min-h-7 items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:pointer-events-none disabled:opacity-50"
+                disabled={tagMenuDisabledReason !== null}
+                title={tagMenuDisabledReason === null ? "Create, delete, or push a tag" : undefined}
+              >
+                <TagIcon aria-hidden="true" className="size-3.5" />
+                Tags…
+              </MenuTrigger>
+            </span>
             <MenuPopup align="start" side="bottom" className="min-w-52">
               <MenuItem
                 aria-label="Create tag"

@@ -30,7 +30,7 @@ export type SidebarNewThreadEnvMode = "local" | "worktree";
 
 export type SidebarProjectAvailabilityView =
   | {
-      readonly kind: "available" | "empty-confirmed" | "loading";
+      readonly kind: "available" | "empty-confirmed" | "loading" | "runtime-failed";
       readonly environmentId: null;
       readonly error: null;
     }
@@ -59,6 +59,8 @@ const SIDEBAR_PROJECT_AVAILABILITY_PRIORITY = [
 export function resolveSidebarProjectAvailability(input: {
   readonly projectCount: number;
   readonly catalogReady: boolean;
+  /** The connection runtime failed to build, so the catalog never becomes ready. */
+  readonly catalogFailed?: boolean | undefined;
   readonly catalogHealth?: ConnectionCatalogHealth;
   readonly environments: ReadonlyArray<EnvironmentShellAvailability>;
 }): SidebarProjectAvailabilityView {
@@ -71,7 +73,11 @@ export function resolveSidebarProjectAvailability(input: {
     };
   }
   if (!input.catalogReady) {
-    return { kind: "loading", environmentId: null, error: null };
+    return {
+      kind: input.catalogFailed === true ? "runtime-failed" : "loading",
+      environmentId: null,
+      error: null,
+    };
   }
 
   const everyEnvironmentIsAuthoritative =

@@ -38,9 +38,11 @@ import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import {
+  CONNECTION_DATABASE_DEADLINE_MS,
   CONNECTION_DATABASE_NAME,
   CONNECTION_DATABASE_VERSION,
   monitorConnectionDatabaseOpenRequest,
+  reportConnectionDatabaseTimedOut,
   reportConnectionDatabaseUnavailable,
 } from "./databaseHealth";
 
@@ -124,7 +126,66 @@ function catalogResetPersistenceError() {
   });
 }
 
-const CONNECTION_DATABASE_BLOCKED_OPEN_TIMEOUT_MS = 10_000;
+type DeadlineOperation = "open" | "read" | "write" | "compare" | "compare and set" | "remove";
+const WRITE_OPERATIONS: ReadonlySet<DeadlineOperation> = new Set([
+  "write",
+  "compare and set",
+  "remove",
+]);
+
+/**
+ * Runs one IndexedDB request and fails it when it stays silent past the
+ * deadline, because WebKit can leave a request pending without any event.
+ * `register` starts the request and returns its transaction, which a missed
+ * deadline aborts. `resume` returns false once the deadline settled the
+ * request, so a late event is never reported a second time. A host timer is
+ * used because callers run these requests inside uninterruptible regions.
+ */
+function withDeadline<A>(
+  operation: DeadlineOperation,
+  register: (
+    resume: (effect: Effect.Effect<A, ConnectionTransientError>) => boolean,
+  ) => IDBTransaction | undefined,
+  wasBlocked: () => boolean = () => false,
+) {
+  return Effect.callback<A, ConnectionTransientError>((resume) => {
+    let settled = false;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const transaction = register((effect) => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(deadline);
+      resume(effect);
+      return true;
+    });
+    if (settled) return;
+    // @effect-diagnostics-next-line globalTimersInEffect:off
+    deadline = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        transaction?.abort();
+      } catch {
+        // The transaction already committed or finished.
+      }
+      const seconds = CONNECTION_DATABASE_DEADLINE_MS / 1_000;
+      reportConnectionDatabaseTimedOut(
+        wasBlocked()
+          ? `The local connection store did not open within ${seconds} seconds, because another BiBCode tab or window holds an older version of it open.`
+          : `The local connection store did not answer within ${seconds} seconds (${operation}).`,
+      );
+      const detail = `the local connection store did not answer within ${seconds} seconds`;
+      resume(
+        Effect.fail(
+          catalogError(
+            operation,
+            WRITE_OPERATIONS.has(operation) ? `${detail}, so the outcome is unknown` : detail,
+          ),
+        ),
+      );
+    }, CONNECTION_DATABASE_DEADLINE_MS);
+  });
+}
 
 /**
  * Whether the connection catalog itself lives in IndexedDB. On protected
@@ -143,81 +204,68 @@ export function connectionCatalogLivesInIndexedDb(): boolean {
 const openDatabase = Effect.fn("web.connectionStorage.openDatabase")(function* (
   databaseName = CONNECTION_DATABASE_NAME,
 ) {
-  return yield* Effect.callback<IDBDatabase, ConnectionTransientError>((resume) => {
-    if (typeof indexedDB === "undefined") {
-      if (databaseName === CONNECTION_DATABASE_NAME) {
-        reportConnectionDatabaseUnavailable("IndexedDB is unavailable in this browser context.");
-      }
-      resume(
-        Effect.fail(catalogError("open", "IndexedDB is unavailable in this browser context.")),
-      );
-      return;
-    }
-    const request = indexedDB.open(databaseName, CONNECTION_DATABASE_VERSION);
-    if (databaseName === CONNECTION_DATABASE_NAME) {
-      monitorConnectionDatabaseOpenRequest(request);
-    }
-    // A blocked open (another tab holds an older version) may still complete
-    // once the blocker closes, but it must not stall the storage layer
-    // forever: fail after a bounded wait so the fault surfaces.
-    let blockedTimer: ReturnType<typeof setTimeout> | undefined;
-    const clearBlockedTimer = () => {
-      if (blockedTimer !== undefined) {
-        clearTimeout(blockedTimer);
-        blockedTimer = undefined;
-      }
-    };
-    request.addEventListener("blocked", () => {
-      if (blockedTimer !== undefined) return;
-      blockedTimer = setTimeout(() => {
+  let blocked = false;
+  return yield* withDeadline<IDBDatabase>(
+    "open",
+    (resume) => {
+      if (typeof indexedDB === "undefined") {
+        if (databaseName === CONNECTION_DATABASE_NAME) {
+          reportConnectionDatabaseUnavailable("IndexedDB is unavailable in this browser context.");
+        }
         resume(
-          Effect.fail(
-            catalogError(
-              "open",
-              "Another tab or process kept an older connection database open past the wait deadline.",
-            ),
-          ),
+          Effect.fail(catalogError("open", "IndexedDB is unavailable in this browser context.")),
         );
-      }, CONNECTION_DATABASE_BLOCKED_OPEN_TIMEOUT_MS);
-    });
-    request.addEventListener("upgradeneeded", () => {
-      if (!request.result.objectStoreNames.contains(CATALOG_STORE_NAME)) {
-        request.result.createObjectStore(CATALOG_STORE_NAME);
+        return undefined;
       }
-      if (!request.result.objectStoreNames.contains(SHELL_STORE_NAME)) {
-        request.result.createObjectStore(SHELL_STORE_NAME);
+      const request = indexedDB.open(databaseName, CONNECTION_DATABASE_VERSION);
+      if (databaseName === CONNECTION_DATABASE_NAME) {
+        monitorConnectionDatabaseOpenRequest(request);
       }
-      if (!request.result.objectStoreNames.contains(THREAD_STORE_NAME)) {
-        request.result.createObjectStore(THREAD_STORE_NAME);
-      }
-    });
-    request.addEventListener("error", () => {
-      clearBlockedTimer();
-      resume(Effect.fail(catalogError("open", request.error ?? "Unknown IndexedDB error")));
-    });
-    request.addEventListener("success", () => {
-      clearBlockedTimer();
-      const database = request.result;
-      // Close this connection when another context upgrades or deletes the
-      // database, so one tab can never hold every other tab's recovery
-      // hostage; later operations surface as transient errors.
-      database.addEventListener("versionchange", () => {
-        database.close();
+      request.addEventListener("blocked", () => {
+        blocked = true;
       });
-      resume(Effect.succeed(database));
-    });
-  });
+      request.addEventListener("upgradeneeded", () => {
+        if (!request.result.objectStoreNames.contains(CATALOG_STORE_NAME)) {
+          request.result.createObjectStore(CATALOG_STORE_NAME);
+        }
+        if (!request.result.objectStoreNames.contains(SHELL_STORE_NAME)) {
+          request.result.createObjectStore(SHELL_STORE_NAME);
+        }
+        if (!request.result.objectStoreNames.contains(THREAD_STORE_NAME)) {
+          request.result.createObjectStore(THREAD_STORE_NAME);
+        }
+      });
+      request.addEventListener("error", () => {
+        resume(Effect.fail(catalogError("open", request.error ?? "Unknown IndexedDB error")));
+      });
+      request.addEventListener("success", () => {
+        const database = request.result;
+        // Close this connection when another context upgrades or deletes the
+        // database, so one tab can never hold every other tab's recovery
+        // hostage; later operations surface as transient errors.
+        database.addEventListener("versionchange", () => {
+          database.close();
+        });
+        // An open that answers after its deadline is closed, because the runtime already failed.
+        if (!resume(Effect.succeed(database))) database.close();
+      });
+      return undefined;
+    },
+    () => blocked,
+  );
 });
 
 function readDatabaseValue(database: IDBDatabase, storeName: string, key: IDBValidKey) {
-  return Effect.callback<unknown, ConnectionTransientError>((resume) => {
-    const request = database.transaction(storeName, "readonly").objectStore(storeName).get(key);
+  return withDeadline<unknown>("read", (resume) => {
+    const transaction = database.transaction(storeName, "readonly");
+    const request = transaction.objectStore(storeName).get(key);
     request.addEventListener("error", () => {
       resume(Effect.fail(catalogError("read", request.error ?? "Unknown IndexedDB read error")));
     });
     request.addEventListener("success", () => {
       resume(Effect.succeed(request.result));
     });
+    return transaction;
   }).pipe(Effect.withSpan("web.connectionStorage.readDatabaseValue"));
 }
 
@@ -227,7 +275,7 @@ function writeDatabaseValue(
   key: IDBValidKey,
   value: unknown,
 ) {
-  return Effect.callback<void, ConnectionTransientError>((resume) => {
+  return withDeadline<void>("write", (resume) => {
     const transaction = database.transaction(storeName, "readwrite");
     transaction.addEventListener("error", () => {
       resume(
@@ -237,7 +285,14 @@ function writeDatabaseValue(
     transaction.addEventListener("complete", () => {
       resume(Effect.void);
     });
+    // An aborted transaction rolled back, so nothing was saved and the store still answers.
+    transaction.addEventListener("abort", () => {
+      resume(
+        Effect.fail(catalogError("save", "the transaction was aborted, so nothing was saved")),
+      );
+    });
     transaction.objectStore(storeName).put(value, key);
+    return transaction;
   }).pipe(Effect.withSpan("web.connectionStorage.writeDatabaseValue"));
 }
 
@@ -248,7 +303,7 @@ function compareAndSetDatabaseValue(
   expected: string | null,
   next: string,
 ) {
-  return Effect.callback<boolean, ConnectionTransientError>((resume) => {
+  return withDeadline<boolean>("compare and set", (resume) => {
     const transaction = database.transaction(storeName, "readwrite");
     let matched = false;
     transaction.addEventListener("error", () => {
@@ -283,6 +338,7 @@ function compareAndSetDatabaseValue(
       matched = true;
       store.put(next, key);
     });
+    return transaction;
   }).pipe(Effect.withSpan("web.connectionStorage.compareAndSetDatabaseValue"));
 }
 
@@ -292,7 +348,7 @@ function compareDatabaseValue(
   key: IDBValidKey,
   expected: string | null,
 ) {
-  return Effect.callback<boolean, ConnectionTransientError>((resume) => {
+  return withDeadline<boolean>("compare", (resume) => {
     const transaction = database.transaction(storeName, "readwrite");
     let matched = false;
     transaction.addEventListener("error", () => {
@@ -318,11 +374,12 @@ function compareDatabaseValue(
       const current = typeof request.result === "string" ? request.result : null;
       matched = current === expected;
     });
+    return transaction;
   }).pipe(Effect.withSpan("web.connectionStorage.compareDatabaseValue"));
 }
 
 function removeDatabaseValue(database: IDBDatabase, storeName: string, key: IDBValidKey) {
-  return Effect.callback<void, ConnectionTransientError>((resume) => {
+  return withDeadline<void>("remove", (resume) => {
     const transaction = database.transaction(storeName, "readwrite");
     transaction.addEventListener("error", () => {
       resume(
@@ -332,12 +389,19 @@ function removeDatabaseValue(database: IDBDatabase, storeName: string, key: IDBV
     transaction.addEventListener("complete", () => {
       resume(Effect.void);
     });
+    // An aborted transaction rolled back, so nothing was saved and the store still answers.
+    transaction.addEventListener("abort", () => {
+      resume(
+        Effect.fail(catalogError("save", "the transaction was aborted, so nothing was saved")),
+      );
+    });
     transaction.objectStore(storeName).delete(key);
+    return transaction;
   }).pipe(Effect.withSpan("web.connectionStorage.removeDatabaseValue"));
 }
 
 function removeDatabaseValuesInRange(database: IDBDatabase, storeName: string, range: IDBKeyRange) {
-  return Effect.callback<void, ConnectionTransientError>((resume) => {
+  return withDeadline<void>("remove", (resume) => {
     const transaction = database.transaction(storeName, "readwrite");
     transaction.addEventListener("error", () => {
       resume(
@@ -346,6 +410,12 @@ function removeDatabaseValuesInRange(database: IDBDatabase, storeName: string, r
     });
     transaction.addEventListener("complete", () => {
       resume(Effect.void);
+    });
+    // An aborted transaction rolled back, so nothing was saved and the store still answers.
+    transaction.addEventListener("abort", () => {
+      resume(
+        Effect.fail(catalogError("save", "the transaction was aborted, so nothing was saved")),
+      );
     });
     const request = transaction.objectStore(storeName).openCursor(range);
     request.addEventListener("error", () => {
@@ -361,6 +431,7 @@ function removeDatabaseValuesInRange(database: IDBDatabase, storeName: string, r
       cursor.delete();
       cursor.continue();
     });
+    return transaction;
   }).pipe(Effect.withSpan("web.connectionStorage.removeDatabaseValuesInRange"));
 }
 

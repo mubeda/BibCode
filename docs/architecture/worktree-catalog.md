@@ -358,7 +358,16 @@ refresh, inventory, status inspection, or prune preview. After the read it
 takes the project and repository locks only long enough to confirm that no
 catalog mutation landed and the catalog generation did not move. Otherwise it
 reads once more, and a second miss answers `stale-generation`. The plan stays
-advisory: execution plans again under the lock and compares the token. A plan
+advisory: execution plans again under the lock and compares the token. When
+the target's thread is gone, the plan answers `thread-not-found`, flagged with
+the optional `alreadyRemoved: true` when the thread's row survives with a
+deletion mark (a removal finished first, including during the plan's last
+read, which would otherwise answer `stale-generation`). The flag is a field,
+not a reason, so a client that predates it still decodes the failure.
+`worktree.remove` and `worktree.removeFromBibCode` answer the same way when
+their target was removed first. The client treats the flagged answer as done,
+not as an error, whether it comes from the plan load, the plan refresh after a
+`stale-plan`, a removal or a detach. A plan
 that takes a second or more logs `worktree removal plan was slow` with each
 step's duration and no paths.
 

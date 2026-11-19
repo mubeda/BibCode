@@ -157,4 +157,38 @@ describe("GitManagerCommitDetail", () => {
     expect(container.querySelectorAll("img")).toHaveLength(2);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
+
+  it("says how many changed files the server left out of a huge commit", async () => {
+    await act(async () =>
+      root?.render(
+        <GitManagerCommitDetail
+          environmentId={"env-a" as EnvironmentId}
+          cwd="/repo"
+          commit={{ ...commit, changedFilesOmitted: 4_321 }}
+          selectedFilePath="src/large.ts"
+          onSelectFile={() => undefined}
+        />,
+      ),
+    );
+
+    expect(container.textContent).toContain("4,321 more files not listed");
+    // The note sits outside the listbox, so it is not read as a file.
+    expect(container.querySelector('[role="listbox"]')?.textContent).not.toContain("more files");
+  });
+
+  it("shows no omitted-files note for a commit that lists every file", async () => {
+    await act(async () =>
+      root?.render(
+        <GitManagerCommitDetail
+          environmentId={"env-a" as EnvironmentId}
+          cwd="/repo"
+          commit={commit}
+          selectedFilePath="src/large.ts"
+          onSelectFile={() => undefined}
+        />,
+      ),
+    );
+
+    expect(container.textContent).not.toContain("more files");
+  });
 });

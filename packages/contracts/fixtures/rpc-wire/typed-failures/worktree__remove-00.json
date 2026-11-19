@@ -8,9 +8,10 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeRemovalError",
-          "reason": "replacement-conflict",
-          "message": "😀",
-          "currentGeneration": 2
+          "reason": "thread-not-found",
+          "message": "<",
+          "currentGeneration": 99,
+          "alreadyRemoved": true
         }
       }
     ]

@@ -669,7 +669,7 @@ the MCP server above: it needs no pairing, and an outside agent cannot use it.
   row of the same agent activity log, with the two thread titles and the state, never the text.
 - **AI Terminals.** BiBCode never types a message into a terminal. When its agent waits for a
   prompt, BiBCode pastes one line, "BiBCode: you have new messages. Run `bibcode agent inbox`
-  to read them.", and the agent reads its mail with that command. A Claude Code terminal counts
+  to read them, and answer each one that asks for a reply.", and the agent reads its mail with that command. A Claude Code terminal counts
   as waiting only after Claude's own idle notice, which comes once the prompt has waited a while, so its
   line can come late or not at all while you are typing in it; the command still works. The command
   needs the credential BiBCode puts in that terminal's environment, so it works in no other

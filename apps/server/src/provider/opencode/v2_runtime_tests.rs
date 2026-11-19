@@ -1170,6 +1170,7 @@ async fn the_driver_speaks_v2_to_an_opencode_2_server_url() {
             open_url: None,
             host_thread_id: None,
             side_chat_host_thread_id: None,
+            code_review: false,
         })
         .await
         .unwrap_or_else(|error| panic!("driver: {error}"));

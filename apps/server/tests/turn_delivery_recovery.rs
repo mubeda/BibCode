@@ -734,6 +734,7 @@ fn crash_launch(provider: &str, state: &Path) -> ProviderLaunchRequest {
         open_url: None,
         host_thread_id: None,
         side_chat_host_thread_id: None,
+        code_review: false,
     }
 }
 

@@ -5,6 +5,7 @@ import {
   getConnectionDatabaseHealth,
   subscribeConnectionDatabaseHealth,
 } from "../connection/databaseHealth";
+import { useConnectionStoreReadinessAttribute } from "../connection/connectionStoreReadiness";
 import { connectionCatalogLivesInIndexedDb } from "../connection/storage";
 import { Button } from "./ui/button";
 import {
@@ -60,6 +61,10 @@ export function ConnectionDatabaseRecoveryDialog({
   const [error, setError] = useState<string | null>(null);
   const acknowledgementRef = useRef<HTMLInputElement>(null);
   const open = health.status !== "ready";
+  // A store that did not answer recovers on restart, so only safe actions are offered.
+  const timedOut = health.timedOut === true;
+  // Mounted on every route, so the store's readiness is published here.
+  useConnectionStoreReadinessAttribute(timedOut);
 
   useEffect(() => {
     if (confirmReset) acknowledgementRef.current?.focus();
@@ -75,7 +80,9 @@ export function ConnectionDatabaseRecoveryDialog({
       setConfirmReset(false);
       setResetAcknowledged(false);
       const message = `The connection database could not be deleted: ${String(cause)}`;
-      if (getConnectionDatabaseHealth().message !== message) setError(message);
+      const current = getConnectionDatabaseHealth();
+      // A deletion that timed out already switched the dialog to its own explanation.
+      if (current.timedOut !== true && current.message !== message) setError(message);
     } finally {
       setBusy(false);
     }
@@ -96,18 +103,25 @@ export function ConnectionDatabaseRecoveryDialog({
       <DialogPopup showCloseButton={false}>
         <DialogHeader>
           <DialogTitle>
-            {health.status === "incompatible"
-              ? "Connection database needs reset"
-              : health.status === "blocked"
-                ? "Connection database is blocked"
-                : "Connection storage is unavailable"}
+            {timedOut
+              ? "Connection storage is not responding"
+              : health.status === "incompatible"
+                ? "Connection database needs reset"
+                : health.status === "blocked"
+                  ? "Connection database is blocked"
+                  : "Connection storage is unavailable"}
           </DialogTitle>
           <DialogDescription role={health.status === "unavailable" ? "alert" : undefined}>
             {health.message}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4 text-sm">
-          {health.status === "incompatible" ? (
+          {timedOut ? (
+            <p>
+              Quit BiBCode and open it again. If it happens again, copy diagnostics before reporting
+              it.
+            </p>
+          ) : health.status === "incompatible" ? (
             <>
               <p>Resetting deletes only this browser&apos;s connection-runtime data:</p>
               <ul className="list-disc space-y-1 pl-5">
@@ -184,7 +198,7 @@ export function ConnectionDatabaseRecoveryDialog({
               Reset saved connection data
             </Button>
           ) : null}
-          <Button onClick={reloadPage}>Reload</Button>
+          {timedOut ? null : <Button onClick={reloadPage}>Reload</Button>}
         </DialogFooter>
       </DialogPopup>
     </Dialog>

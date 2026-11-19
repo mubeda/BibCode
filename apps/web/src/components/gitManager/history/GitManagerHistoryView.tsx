@@ -37,8 +37,12 @@ import { GitManagerCommitDetail } from "./GitManagerCommitDetail";
 import { GitManagerCommitList } from "./GitManagerCommitList";
 import { Button } from "../../ui/button";
 import { RetryButton } from "../../ui/retry-button";
+import { LoadingState, RefreshRegion } from "../../ui/loading-state";
+import { Skeleton } from "../../ui/skeleton";
+import { cn } from "../../../lib/utils";
 
 const HISTORY_PAGE_SIZE = 100;
+const REFRESH_STATUS = "Refreshing history…";
 const COMMIT_LOOKUP_MAX_ENTRIES = 1_000;
 const COMMIT_LOOKUP_MAX_MEMORY_BYTES = 32 * 1024 * 1024;
 const EMPTY_COMMITS: ReadonlyArray<GitManagerCommitEntry> = Object.freeze([]);
@@ -372,6 +376,8 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
         cwd,
         offset: pageLoadOffset,
         limit: HISTORY_PAGE_SIZE,
+        // The commit detail shows changedFilesOmitted, so a huge first commit may be cut.
+        fitFirstCommit: true,
         ...(pinnedTips.length > 0 ? { pinnedTips } : {}),
       },
     });
@@ -839,7 +845,7 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
     if (current.exhausted || current.nextOffset === null) return;
     setLoadingOffset(current.nextOffset);
   }, [loadMoreError, pageLoadOffset, retryNextPage]);
-  const handleRefresh = useCallback(() => {
+  const resetForRefresh = useCallback(() => {
     commitLookup.clear();
     const reset = emptyHistoryPages();
     pagesRef.current = reset;
@@ -858,10 +864,8 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
     setLoadedPageCursors(currentProjectRef, []);
     setLoadedPageCount(currentProjectRef, 0);
     setRefreshEpoch((epoch) => epoch + 1);
-    refreshFirstPage();
   }, [
     commitLookup,
-    refreshFirstPage,
     projectEnvironmentId,
     projectId,
     setLoadedPageCount,
@@ -870,12 +874,30 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
     setSelectedCommit,
     setSelectedFile,
   ]);
+  // A manual Refresh keeps the loaded commits, selection and scroll until its read
+  // succeeds; a failed read leaves them, and the reset waits for the next success.
+  const refreshFromRef = useRef<{ readonly page: unknown } | null>(null);
+  const handleRefresh = useCallback(() => {
+    refreshFromRef.current = { page: firstPage };
+    refreshFirstPage();
+  }, [firstPage, refreshFirstPage]);
+  useEffect(() => {
+    const from = refreshFromRef.current;
+    if (from === null || firstPageQuery.isPending || firstPageQuery.error !== null) return;
+    if (firstPage === from.page) return;
+    refreshFromRef.current = null;
+    resetForRefresh();
+  }, [firstPage, firstPageQuery.error, firstPageQuery.isPending, resetForRefresh]);
 
-  if ((firstPageAtom === null || firstPageQuery.isPending) && pages.commits.length === 0) {
+  // A settled empty history is a result, not a first load: Refresh keeps it on screen.
+  const firstLoad = pages.commits.length === 0 && pages.processedFirstPage === null;
+  if ((firstPageAtom === null || firstPageQuery.isPending) && firstLoad) {
     return (
-      <p role="status" className="p-4 text-sm text-muted-foreground">
-        Loading commit history…
-      </p>
+      <LoadingState label="Loading commit history…">
+        <Skeleton className="h-8 w-full" />
+        <Skeleton className="h-8 w-full" />
+        <Skeleton className="h-8 w-full" />
+      </LoadingState>
     );
   }
   if (firstPageQuery.error !== null && pages.commits.length === 0) {
@@ -889,6 +911,8 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
     );
   }
 
+  // The retained pages are reread too: the line stays until both reads settle.
+  const rereading = firstPageQuery.isPending || retainedQuery.isPending;
   return (
     <section aria-label="Repository history" className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
@@ -904,7 +928,10 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
           className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
           onClick={handleRefresh}
         >
-          <RefreshCwIcon aria-hidden="true" className="size-3.5" />
+          <RefreshCwIcon
+            aria-hidden="true"
+            className={cn("size-3.5", rereading && "motion-safe:animate-spin")}
+          />
         </button>
       </div>
       {pages.degradedToAllPaging ? (
@@ -945,21 +972,32 @@ export const GitManagerHistoryView = memo(function GitManagerHistoryView({
         </p>
       )}
       {pages.commits.length === 0 ? (
-        <p className="p-4 text-sm text-muted-foreground">This repository has no commits yet.</p>
+        <RefreshRegion refreshing={rereading} status={REFRESH_STATUS}>
+          <p className="p-4 text-sm text-muted-foreground">This repository has no commits yet.</p>
+        </RefreshRegion>
       ) : (
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(220px,34%)_minmax(0,1fr)] overflow-hidden rounded-lg border border-border/70">
-          <GitManagerCommitList
-            commits={pages.commits}
-            rewriteDisabledReason={rewriteDisabledReason}
-            selectedSha={effectiveSelectedSha}
-            onSelect={handleSelectCommit}
-            onReachEnd={handleReachEnd}
-            isLoadingMore={isLoadingMore}
-            multiCommitSelection={multiCommitSelection}
-            onCommitDrop={handleCommitDrop}
-            onContextMenu={handleContextMenu}
-            onMultiSelect={handleMultiSelect}
-          />
+          {/* The commit list is what the reread replaces; the detail pane has its own read. */}
+          <div className="flex min-h-0 min-w-0 flex-col">
+            <RefreshRegion
+              className="flex min-h-0 flex-1 flex-col"
+              refreshing={rereading}
+              status={REFRESH_STATUS}
+            >
+              <GitManagerCommitList
+                commits={pages.commits}
+                rewriteDisabledReason={rewriteDisabledReason}
+                selectedSha={effectiveSelectedSha}
+                onSelect={handleSelectCommit}
+                onReachEnd={handleReachEnd}
+                isLoadingMore={isLoadingMore}
+                multiCommitSelection={multiCommitSelection}
+                onCommitDrop={handleCommitDrop}
+                onContextMenu={handleContextMenu}
+                onMultiSelect={handleMultiSelect}
+              />
+            </RefreshRegion>
+          </div>
           {selectedCommit === null ? (
             <p className="p-4 text-sm text-muted-foreground">Select a commit to inspect it.</p>
           ) : (

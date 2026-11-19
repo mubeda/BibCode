@@ -48,6 +48,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     agentMessaging: false,
     sideChats: false,
     codeReviews: false,
+    readOnlyCodexReviews: false,
     conversationOnlyRewind: false,
     threadDeleteOnlyIfUnused: false,
     hostMetrics: false,

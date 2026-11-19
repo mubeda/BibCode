@@ -66,6 +66,14 @@ describe("@wdio/tauri-service compatibility", () => {
       "[desktopUiSpecFiles.filter((spec) => spec !== closingSpec), closingSpec]",
     );
     expect(wdioConfig).toContain("connectionRetryCount: 0");
+    // Only the final spec's teardown, after it ends the app, accepts the runner's refused DELETE.
+    expect(wdioConfig).toContain(
+      "await stopRelaunchedDesktopUiApplication();\n    acceptEndedApplicationSessionDelete();",
+    );
+    expect(wdioConfig.match(/acceptEndedApplicationSessionDelete\(\)/g)).toHaveLength(1);
+    expect(wdioConfig.indexOf("isFinalDesktopUiSpec(currentSpecs")).toBeLessThan(
+      wdioConfig.indexOf("acceptEndedApplicationSessionDelete();"),
+    );
     expect(wdioConfig).toContain("commandTimeout: 60_000");
     expect(wdioConfig).toContain("beforeTest: async () =>");
     expect(wdioConfig).toContain("await refreshDesktopUiDocument()");

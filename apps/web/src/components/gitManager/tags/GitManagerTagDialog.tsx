@@ -33,6 +33,7 @@ import { runGitManagerOperation, type GitManagerOperationHandle } from "~/state/
 
 import { GitManagerOperationBanner } from "../toolbar/GitManagerOperationBanner";
 import { resolveTagDeleteDialogCopy, validateTagName } from "./GitManagerTagDialog.logic";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 
 const noop = () => undefined;
 
@@ -273,15 +274,13 @@ export const GitManagerTagDialog = memo(function GitManagerTagDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button
-            aria-describedby={disabledReason === null ? undefined : "git-manager-tag-name-reason"}
-            disabled={disabledReason !== null}
-            title={disabledReason ?? undefined}
+          <GitManagerDisabledReasonButton
+            disabledReason={disabledReason}
             variant={action === "delete" ? "destructive" : "default"}
             onClick={confirm}
           >
             {confirmLabel}
-          </Button>
+          </GitManagerDisabledReasonButton>
         </DialogFooter>
       </DialogPopup>
     </Dialog>

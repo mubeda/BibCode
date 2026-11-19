@@ -385,7 +385,15 @@ export function replacedRetiredCodexModel(input: {
   ) {
     return null;
   }
-  const model = normalizeModelSlug(stored.model, CODEX_PROVIDER_DRIVER_KIND);
+  return retiredCodexModelNotOffered(stored.model, offered);
+}
+
+/** The retired model `stored` names, when Codex's live list is known and leaves it out. */
+function retiredCodexModelNotOffered(
+  stored: string,
+  offered: ReadonlyArray<{ readonly slug: string }>,
+): string | null {
+  const model = normalizeModelSlug(stored, CODEX_PROVIDER_DRIVER_KIND);
   if (model === null || !RETIRED_CODEX_MODELS.has(model)) {
     return null;
   }
@@ -394,9 +402,19 @@ export function replacedRetiredCodexModel(input: {
   if (!offered.some((option) => option.slug !== CODEX_AUTO_MODEL)) {
     return null;
   }
-  return offered.some((option) => option.slug === model || option.slug === stored.model)
-    ? null
-    : model;
+  return offered.some((option) => option.slug === model || option.slug === stored) ? null : model;
+}
+
+/**
+ * The retired model a saved Codex default names, when Codex no longer offers it (ChatGPT
+ * sign-in). The caller then saves Codex's default in its place (#380, R4). Null under API-key
+ * sign-in, where the list still offers the model, and before Codex's list is read.
+ */
+export function retiredCodexSessionDefault(input: {
+  readonly saved: { readonly model: string } | null | undefined;
+  readonly offered: ReadonlyArray<{ readonly slug: string }>;
+}): string | null {
+  return input.saved ? retiredCodexModelNotOffered(input.saved.model, input.offered) : null;
 }
 
 /**

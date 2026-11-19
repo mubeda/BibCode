@@ -22,12 +22,17 @@ vi.mock("./ui/dialog", () => {
     DialogTitle: passthrough,
   };
 });
+// The readiness attribute reads the live connection runtime, which these tests do not build.
+vi.mock("../connection/connectionStoreReadiness", () => ({
+  useConnectionStoreReadinessAttribute: () => undefined,
+}));
 vi.mock("./ui/button", () => ({
   Button: (props: React.ButtonHTMLAttributes<HTMLButtonElement>) => <button {...props} />,
 }));
 
 import {
   monitorConnectionDatabaseOpenRequest,
+  reportConnectionDatabaseTimedOut,
   reportConnectionDatabaseUnavailable,
   resetConnectionDatabaseHealthForTest,
 } from "../connection/databaseHealth";
@@ -255,6 +260,52 @@ describe("ConnectionDatabaseRecoveryDialog", () => {
     expect(container.textContent).toContain("could not be deleted");
     expect(container.querySelectorAll('[role="alert"]')).toHaveLength(1);
     expect(reloadPage).not.toHaveBeenCalled();
+  });
+
+  it("explains a reset whose deletion did not answer once, with no reset left", async () => {
+    publishOpenEvent("error", new DOMException("newer database", "VersionError"));
+    const message = "The local connection store did not answer the request to delete it.";
+    const deleteDatabase = vi.fn(async (): Promise<"deleted"> => {
+      reportConnectionDatabaseTimedOut(message);
+      throw new Error(message);
+    });
+    const reloadPage = vi.fn();
+    await act(async () => {
+      root.render(
+        <ConnectionDatabaseRecoveryDialog
+          deleteDatabase={deleteDatabase}
+          reloadPage={reloadPage}
+        />,
+      );
+    });
+    await act(async () => button("Reset saved connection data").click());
+    await act(async () => acknowledgementCheckbox().click());
+    await act(async () => button("Delete saved connection data").click());
+
+    expect(container.textContent).toContain("Connection storage is not responding");
+    expect(container.textContent?.split(message)).toHaveLength(2);
+    expect(container.textContent).not.toContain("Reset saved connection data");
+    expect(reloadPage).not.toHaveBeenCalled();
+  });
+
+  it("tells the user to restart when the store did not answer, and offers no reset", async () => {
+    const reloadPage = vi.fn();
+    const copyText = vi.fn(async () => undefined);
+    await act(async () => {
+      reportConnectionDatabaseTimedOut(
+        "The local connection store did not answer within 10 seconds while opening it.",
+      );
+      root.render(<ConnectionDatabaseRecoveryDialog reloadPage={reloadPage} copyText={copyText} />);
+    });
+
+    expect(container.textContent).toContain("Connection storage is not responding");
+    expect(container.textContent).toContain("Quit BiBCode and open it again");
+    const labels = Array.from(container.querySelectorAll("button")).map(
+      (entry) => entry.textContent,
+    );
+    expect(labels).toEqual(["Copy diagnostics"]);
+    await act(async () => button("Copy diagnostics").click());
+    expect(copyText).toHaveBeenCalledWith(expect.stringContaining("did not answer"));
   });
 
   it("keeps blocked and generic unavailable recovery non-destructive", async () => {

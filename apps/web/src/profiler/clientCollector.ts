@@ -19,9 +19,11 @@ const RECORD_OVER_MS = 250;
 const STALL_OVER_MS = 50;
 const HEARTBEAT_MS = 500;
 /**
- * WebKit can deliver a visible, focused page's timers 1 s apart while frames keep rendering, so
- * the main thread is free: every heartbeat then arrives this late (499 to 519 ms measured in a
- * packaged macOS run). Two such beats in a row are an aligned run, not stalls.
+ * WebKit delivers a page's timers 1 s apart when the page is visible but visually idle: nothing
+ * on screen has changed for about a minute (measured in a packaged macOS run; a visible
+ * animation stops it at once). Frames keep rendering, so the main thread is free, and every
+ * heartbeat arrives this late (499 to 519 ms). Two such beats in a row are an aligned run, not
+ * stalls.
  */
 const ALIGNED_PERIOD_MS = 1_000;
 const ALIGNED_LATENESS_MS = ALIGNED_PERIOD_MS - HEARTBEAT_MS;

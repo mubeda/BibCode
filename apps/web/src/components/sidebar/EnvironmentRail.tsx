@@ -1,7 +1,7 @@
 import { useNavigate } from "@tanstack/react-router";
 import { MonitorIcon, PlusIcon, Settings2Icon } from "lucide-react";
 import * as React from "react";
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 
 import type { EnvironmentId } from "@bibcode/contracts";
 import { isRemoteUpdateAvailable } from "@bibcode/client-runtime/state/remoteUpdates";
@@ -10,12 +10,25 @@ import {
   resolveEnvironmentCompatVerdict,
   selectRemoteUpdateControlCapability,
 } from "../../connection/environmentCompat";
+import { markKeyboardContextMenuOpened } from "../../contextMenuKeyboard";
 import { cn } from "../../lib/utils";
+import { readLocalApi } from "../../localApi";
 import { setActiveEnvironmentId, useActiveEnvironmentId } from "../../state/entities";
 import { type EnvironmentPresentation, useEnvironments } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import { remoteUpdateEnvironment } from "../../state/remoteUpdates";
+import {
+  contextMenuAnchorForRect,
+  isContextMenuShortcut,
+  isKeyboardContextMenuEcho,
+} from "../Sidebar.logic";
+import {
+  serverCommandMenuItems,
+  serverCommandTarget,
+  useRunServerCommand,
+} from "../serverCommands/serverCommands";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
+import { toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   buildEnvironmentRailModel,
@@ -64,12 +77,20 @@ export function EnvironmentStatusDot({
   );
 }
 
+/** Right-click, Shift+F10 and the Menu key open a rail icon's server commands. */
+interface ServerMenuHandlers {
+  readonly onContextMenu: (event: React.MouseEvent<HTMLButtonElement>) => void;
+  readonly onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => void;
+}
+
 function RemoteEntryButton({
   entry,
   onSelect,
+  menuHandlers,
 }: {
   readonly entry: EnvironmentRailEntry;
   readonly onSelect: (environmentId: EnvironmentId) => void;
+  readonly menuHandlers: ServerMenuHandlers;
 }) {
   return (
     <Tooltip>
@@ -85,6 +106,7 @@ function RemoteEntryButton({
             data-testid={`environment-rail-entry-${entry.environmentId}`}
             className={cn(RAIL_BUTTON_CLASS, entry.selected && RAIL_BUTTON_SELECTED_CLASS)}
             onClick={() => onSelect(entry.environmentId)}
+            {...menuHandlers}
           />
         }
       >
@@ -109,10 +131,12 @@ function RemoteEntryButtonWithUpdate({
   entry,
   environment,
   onSelect,
+  menuHandlers,
 }: {
   readonly entry: EnvironmentRailEntry;
   readonly environment: EnvironmentPresentation;
   readonly onSelect: (environmentId: EnvironmentId) => void;
+  readonly menuHandlers: ServerMenuHandlers;
 }) {
   const remoteUpdateControl = selectRemoteUpdateControlCapability(environment.serverConfig);
   const updateQuery = useEnvironmentQuery(
@@ -136,6 +160,7 @@ function RemoteEntryButtonWithUpdate({
     <RemoteEntryButton
       entry={{ ...entry, status: resolveEnvironmentRailStatus(candidate) }}
       onSelect={onSelect}
+      menuHandlers={menuHandlers}
     />
   );
 }
@@ -171,6 +196,56 @@ export function EnvironmentRail() {
   const selectEnvironment = useCallback((environmentId: EnvironmentId) => {
     setActiveEnvironmentId(environmentId);
   }, []);
+
+  const runServerCommand = useRunServerCommand();
+  const keyboardMenuOpenedAtRef = useRef(Number.NEGATIVE_INFINITY);
+  // The menu never changes the rail selection: it acts on the clicked server only.
+  const openServerMenu = useCallback(
+    async (environmentId: EnvironmentId, position: { x: number; y: number }) => {
+      const environment = environments.find(
+        (candidate) => candidate.environmentId === environmentId,
+      );
+      const api = readLocalApi();
+      if (environment === undefined || !api) return;
+      try {
+        const clicked = await api.contextMenu.show(
+          serverCommandMenuItems(serverCommandTarget(environment)),
+          position,
+        );
+        if (clicked !== null) runServerCommand(clicked, environmentId);
+      } catch (error) {
+        toastManager.add({
+          type: "error",
+          title: "Could not open server actions",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        });
+      }
+    },
+    [environments, runServerCommand],
+  );
+  const serverMenuHandlers = useCallback(
+    (environmentId: EnvironmentId | null): ServerMenuHandlers => ({
+      onContextMenu: (event) => {
+        event.preventDefault();
+        if (environmentId === null) return;
+        // Chromium and WebView2 follow Shift+F10 and the Menu key with a contextmenu event.
+        if (isKeyboardContextMenuEcho(keyboardMenuOpenedAtRef.current, performance.now())) return;
+        void openServerMenu(environmentId, { x: event.clientX, y: event.clientY });
+      },
+      onKeyDown: (event) => {
+        if (!isContextMenuShortcut(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (environmentId === null) return;
+        keyboardMenuOpenedAtRef.current = markKeyboardContextMenuOpened();
+        void openServerMenu(
+          environmentId,
+          contextMenuAnchorForRect(event.currentTarget.getBoundingClientRect()),
+        );
+      },
+    }),
+    [openServerMenu],
+  );
 
   useEffect(() => {
     if (!isReady || activeEnvironmentId === null) {
@@ -214,6 +289,10 @@ export function EnvironmentRail() {
     "aria-label": "Local (this machine)",
     "data-testid": "environment-rail-local",
     className: cn(RAIL_BUTTON_CLASS, model.localSelected && RAIL_BUTTON_SELECTED_CLASS),
+    // The Local icon's commands act on the local backend in view, or on this device.
+    ...serverMenuHandlers(
+      (model.localSelected ? activeEnvironmentId : null) ?? model.localTargetEnvironmentId,
+    ),
   };
 
   return (
@@ -290,6 +369,7 @@ export function EnvironmentRail() {
               entry={entry}
               environment={environment}
               onSelect={selectEnvironment}
+              menuHandlers={serverMenuHandlers(entry.environmentId)}
             />
           );
         })}

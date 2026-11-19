@@ -35,6 +35,31 @@ Cursor mode selection in
 in
 [`build_permission_rules`](../../apps/server/src/provider/opencode/runtime.rs).
 
+A Codex runtime-mode string other than the three above starts Codex in
+Supervised and logs a warning. It never becomes Full access.
+
+### Codex code reviews
+
+A thread created as a code review panel (`code_review` on the thread row, set by
+`worktree.createPanel` with `codeReview: true`) runs Codex with
+`approvalPolicy: never` and the read-only sandbox (`sandbox: read-only` on
+`thread/start` and `thread/resume`, `sandboxPolicy: readOnly` on every
+`turn/start`), whatever runtime mode the thread stores or a turn carries. This
+is the policy the Codex AI Terminal reviewer starts with (`--sandbox read-only
+--ask-for-approval never`). The server owns it: `build_launch_request` copies the
+marker into `ProviderLaunchRequest.code_review`, so the first turn, follow-up
+turns, a restart after a mode or model change, a resume and a reconnect all
+carry it. The internal `CodexRuntimeMode::CodeReview` is never read from a
+string, and the thread's stored runtime mode is unchanged, so the composer's
+picker still shows it (Supervised for a review the client started).
+
+If Codex still sends a command approval, a file-change approval or a question on
+such a session, BiBCode answers at once (`decision: decline`, or no answers) and
+records nothing pending, so no card opens and the turn goes on. The server
+advertises this with the `readOnlyCodexReviews` capability. A review panel
+switched to another provider follows the stored mode as before. Claude, Cursor,
+Grok and OpenCode reviews are unchanged.
+
 ## Interaction mode
 
 Runtime mode is separate from interaction mode. `default` versus `plan`

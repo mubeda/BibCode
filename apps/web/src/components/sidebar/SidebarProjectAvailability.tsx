@@ -6,6 +6,7 @@ import type { EnvironmentId } from "@bibcode/contracts";
 
 import type { SidebarProjectAvailabilityView } from "../Sidebar.logic";
 import { Button } from "../ui/button";
+import { ConnectionRuntimeFailedNotice } from "./ConnectionRuntimeFailedNotice";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 
 export interface SidebarProjectAvailabilityProps {
@@ -25,6 +26,8 @@ export interface SidebarProjectAvailabilityProps {
   readonly onViewDiagnostics: (environmentId: EnvironmentId | null) => void;
   readonly onAdoptStorage: (environmentId: EnvironmentId) => void;
   readonly onRecoverData?: ((environmentId: EnvironmentId) => void) | undefined;
+  /** Builds the connection runtime again after it failed to start. */
+  readonly onReload?: (() => void) | undefined;
 }
 
 /**
@@ -59,6 +62,8 @@ function availabilityCopy(view: SidebarProjectAvailabilityView): string | null {
       return "Projects are unavailable";
     case "configuration-error":
       return "Project data configuration needs attention";
+    case "runtime-failed":
+      return "Connections could not start";
   }
 }
 
@@ -73,7 +78,11 @@ export function SidebarProjectAvailability({
   onViewDiagnostics,
   onAdoptStorage,
   onRecoverData,
+  onReload,
 }: SidebarProjectAvailabilityProps) {
+  if (view.kind === "runtime-failed") {
+    return <ConnectionRuntimeFailedNotice onReload={onReload} />;
+  }
   // Only the environment's live connection says whether it is down; the shell
   // kind alone can also mean a failed project sync on a live connection.
   const connectionDown =

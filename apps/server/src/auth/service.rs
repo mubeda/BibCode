@@ -142,6 +142,8 @@ pub(crate) struct AuthTestHooks {
     pub(crate) before_session_upsert_event: std::sync::Mutex<Option<TestHold>>,
     /// Gives `mcp-client` sessions random ids, as a server before #281 did.
     pub(crate) random_mcp_session_ids: AtomicBool,
+    /// Makes the authority watcher skip its ticks, so a test sees what a prune alone sends.
+    pub(crate) pause_watcher: AtomicBool,
 }
 
 #[cfg(test)]
@@ -857,6 +859,8 @@ impl AuthService {
         let access_events = Arc::downgrade(&self.access_events);
         let access_revision = Arc::downgrade(&self.access_revision);
         let watcher_running = Arc::downgrade(&self.authority_watcher_running);
+        #[cfg(test)]
+        let hooks = Arc::downgrade(&self.test_hooks);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(AUTHORITY_CONVERGENCE_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -867,6 +871,13 @@ impl AuthService {
             let mut next_expiry_ms = None;
             'watcher: loop {
                 interval.tick().await;
+                #[cfg(test)]
+                if hooks
+                    .upgrade()
+                    .is_some_and(|hooks| hooks.pause_watcher.load(Ordering::Acquire))
+                {
+                    continue;
+                }
                 let (
                     Some(state),
                     Some(access_events),
@@ -1433,6 +1444,32 @@ impl AuthService {
         drop(state);
         self.ensure_authority_watcher();
         Ok(())
+    }
+
+    /// Drops expired or revoked sessions from the cache and sends their `ClientRemoved` under
+    /// the same lock, so the watcher's later diff cannot miss them (#374). An expired remote
+    /// grant stays for the watcher: a refresh rotation commits its new expiry before the cache
+    /// follows, so only the store knows whether the grant is still valid.
+    fn prune_dead_sessions(&self, state: &mut AuthState, now: i64) {
+        let renewable = self.repositories.is_some();
+        let dead = state
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.revoked_at_ms.is_some()
+                    || (session.expires_at_ms <= now
+                        && !(renewable && session.mcp_resource.is_some()))
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        if dead.is_empty() {
+            return;
+        }
+        for session_id in dead {
+            state.sessions.remove(&session_id);
+            self.emit_access_change(state, AuthAccessChange::ClientRemoved { session_id });
+        }
+        state.bump_authority_generation();
     }
 
     async fn remove_cached_session(&self, session_id: &str) {
@@ -2095,9 +2132,7 @@ impl AuthService {
     pub async fn list_clients(&self, current_session_id: &str) -> Vec<ClientSessionView> {
         let now = now_ms();
         let mut state = self.state.lock().await;
-        state
-            .sessions
-            .retain(|_, session| session.revoked_at_ms.is_none() && session.expires_at_ms > now);
+        self.prune_dead_sessions(&mut state, now);
         let mut sessions = state
             .sessions
             .values()
@@ -2217,9 +2252,7 @@ impl AuthService {
         let issued_at = now_ms();
         {
             let mut state = self.state.lock().await;
-            state.sessions.retain(|_, session| {
-                session.revoked_at_ms.is_none() && session.expires_at_ms > issued_at
-            });
+            self.prune_dead_sessions(&mut state, issued_at);
             if state.sessions.len() >= MAX_ACTIVE_SESSIONS {
                 return Err(AuthError::Internal(
                     "active session capacity exceeded".to_owned(),
@@ -2935,9 +2968,7 @@ impl AuthService {
         };
         {
             let mut state = self.state.lock().await;
-            state.sessions.retain(|_, session| {
-                session.revoked_at_ms.is_none() && session.expires_at_ms > issued_at
-            });
+            self.prune_dead_sessions(&mut state, issued_at);
             // Sessions the desktop bootstrap is about to supersede do not hold
             // capacity against the session that replaces them.
             let occupied = if desktop_bootstrap {
@@ -8261,6 +8292,154 @@ mod tests {
             assert_eq!(
                 removed, expected,
                 "one removal per run, sent with the revoke"
+            );
+        }
+
+        enum Prune {
+            ListClients,
+            IssueSession,
+            MintGrant,
+        }
+
+        /// #374: a session that expired and was revoked before the watcher reconciled must
+        /// reach an access-stream consumer as a `ClientRemoved` from the prune itself. The
+        /// watcher is held, so it cannot send the removal in the prune's place.
+        async fn assert_pruned_expired_revoked_client_is_removed(prune: Prune) {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            service
+                .test_hooks()
+                .pause_watcher
+                .store(true, std::sync::atomic::Ordering::Release);
+            let gone = run(&service, &repositories, "builder").await;
+            let mut events = service.access_events.subscribe();
+            assert!(
+                service
+                    .access_snapshot("")
+                    .await
+                    .2
+                    .iter()
+                    .any(|client| client.session_id == gone),
+                "the consumer's snapshot holds the live client"
+            );
+            let past = now_ms() - 1;
+            service
+                .state
+                .lock()
+                .await
+                .sessions
+                .get_mut(&gone)
+                .expect("the run is cached")
+                .expires_at_ms = past;
+            repositories
+                .revoke_auth_session(gone.clone(), format_iso(now_ms()))
+                .await
+                .unwrap();
+            let expired = format_iso(past);
+            let id = gone.clone();
+            repositories
+                .database()
+                .call(move |connection| {
+                    connection.execute(
+                        "UPDATE auth_sessions SET expires_at = ? WHERE session_id = ?",
+                        rusqlite::params![expired, id],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+
+            match prune {
+                Prune::ListClients => {
+                    service.list_clients("").await;
+                }
+                Prune::IssueSession => {
+                    run(&service, &repositories, "reviewer").await;
+                }
+                Prune::MintGrant => {
+                    super::minted_remote_grant(&service, &repositories, "refresh-1").await;
+                }
+            }
+            assert!(
+                !service.state.lock().await.sessions.contains_key(&gone),
+                "the prune dropped the cached row"
+            );
+            let mut removed = false;
+            while let Ok(event) = events.try_recv() {
+                removed |= matches!(&event.change,
+                    AuthAccessChange::ClientRemoved { session_id } if *session_id == gone);
+            }
+            service
+                .test_hooks()
+                .pause_watcher
+                .store(false, std::sync::atomic::Ordering::Release);
+            assert!(
+                removed,
+                "a stream consumer never hears that the pruned client is gone"
+            );
+        }
+
+        #[tokio::test]
+        async fn listing_clients_sends_the_removal_of_an_expired_revoked_one() {
+            assert_pruned_expired_revoked_client_is_removed(Prune::ListClients).await;
+        }
+
+        #[tokio::test]
+        async fn issuing_a_session_sends_the_removal_of_an_expired_revoked_one() {
+            assert_pruned_expired_revoked_client_is_removed(Prune::IssueSession).await;
+        }
+
+        #[tokio::test]
+        async fn minting_a_grant_sends_the_removal_of_an_expired_revoked_one() {
+            assert_pruned_expired_revoked_client_is_removed(Prune::MintGrant).await;
+        }
+
+        /// A rotation commits the moved expiry before it updates the cache. A prune in that gap
+        /// must not announce the removal of a grant that is still valid.
+        #[tokio::test]
+        async fn a_prune_between_a_rotation_commit_and_its_cache_update_keeps_the_grant() {
+            let (service, repositories, _secrets) = mcp_test_service().await;
+            service
+                .test_hooks()
+                .pause_watcher
+                .store(true, std::sync::atomic::Ordering::Release);
+            let tokens = super::minted_remote_grant(&service, &repositories, "refresh-1").await;
+            let session_id = service
+                .authenticate_mcp_client(&tokens.access_token)
+                .await
+                .unwrap()
+                .principal
+                .session_id;
+            let mut events = service.access_events.subscribe();
+            // The database holds the grant's new expiry; the cache still has the old, passed one.
+            service
+                .state
+                .lock()
+                .await
+                .sessions
+                .get_mut(&session_id)
+                .expect("the grant is cached")
+                .expires_at_ms = now_ms() - 1;
+
+            service.list_clients("").await;
+            service
+                .refresh_session_from_repository(&session_id, now_ms())
+                .await
+                .unwrap();
+
+            while let Ok(event) = events.try_recv() {
+                assert!(
+                    !matches!(&event.change, AuthAccessChange::ClientRemoved { .. }),
+                    "the consumer saw a valid grant disappear: {:?}",
+                    event.change
+                );
+            }
+            assert!(
+                service
+                    .list_clients("")
+                    .await
+                    .iter()
+                    .any(|client| client.session_id == session_id),
+                "the grant is listed again once the cache follows the database"
             );
         }
 

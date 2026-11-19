@@ -18,6 +18,7 @@ import { AgentsShowOlder } from "../../agents/AgentsShowOlder";
 import { Button } from "../../ui/button";
 import { SidebarContent, SidebarGroup, SidebarMenu, useSidebar } from "../../ui/sidebar";
 import { agentRowUnreadKey } from "../agentsSection.logic";
+import { ConnectionRuntimeFailedNotice } from "../ConnectionRuntimeFailedNotice";
 import { InboxCategoryTiles } from "./InboxCategoryTiles";
 import {
   INBOX_CATEGORIES,
@@ -56,9 +57,14 @@ const PARTIAL_ATTENTION_EMPTY_STATE: InboxEmptyState = {
 export interface SidebarInboxViewProps {
   /** App-level notices every left-panel view shows above its content. */
   readonly notices?: ReactNode;
+  /** Builds the connection runtime again after it failed to start. */
+  readonly onReload?: (() => void) | undefined;
 }
 
-export const SidebarInboxView = memo(function SidebarInboxView({ notices }: SidebarInboxViewProps) {
+export const SidebarInboxView = memo(function SidebarInboxView({
+  notices,
+  onReload,
+}: SidebarInboxViewProps) {
   const navigate = useNavigate();
   const { openPanelThread } = usePanelThreadOpener();
   const setSidebarView = useUiStateStore((state) => state.setSidebarView);
@@ -168,14 +174,17 @@ export const SidebarInboxView = memo(function SidebarInboxView({ notices }: Side
   return (
     <SidebarContent className="min-h-full gap-0" data-testid="sidebar-inbox-view">
       {notices}
-      <SidebarGroup className="px-2 pt-2 pb-1">
-        <InboxCategoryTiles
-          counts={counts}
-          loading={dataState === "loading"}
-          selected={category}
-          onSelect={setInboxCategory}
-        />
-      </SidebarGroup>
+      {/* With no runtime the counts are unknown, so the tiles would claim loading or zero. */}
+      {dataState === "failed" ? null : (
+        <SidebarGroup className="px-2 pt-2 pb-1">
+          <InboxCategoryTiles
+            counts={counts}
+            loading={dataState === "loading"}
+            selected={category}
+            onSelect={setInboxCategory}
+          />
+        </SidebarGroup>
+      )}
       <SidebarGroup className="px-2 py-1">
         <div className="min-w-0" data-text-surface="card">
           {partialNotice !== null ? (
@@ -191,7 +200,9 @@ export const SidebarInboxView = memo(function SidebarInboxView({ notices }: Side
               ) : null}
             </div>
           ) : null}
-          {dataState === "loading" ? (
+          {dataState === "failed" ? (
+            <ConnectionRuntimeFailedNotice onReload={onReload} />
+          ) : dataState === "loading" ? (
             <p className="px-2 py-3 text-xs text-muted-foreground">Loading agents…</p>
           ) : visibleRows.length === 0 ? (
             <p className="px-2 py-3 text-xs text-muted-foreground" data-testid="inbox-empty">
@@ -215,7 +226,9 @@ export const SidebarInboxView = memo(function SidebarInboxView({ notices }: Side
               ))}
             </SidebarMenu>
           )}
-          {category === "done" && dataState !== "loading" ? <AgentsShowOlder /> : null}
+          {category === "done" && dataState !== "loading" && dataState !== "failed" ? (
+            <AgentsShowOlder />
+          ) : null}
         </div>
       </SidebarGroup>
     </SidebarContent>

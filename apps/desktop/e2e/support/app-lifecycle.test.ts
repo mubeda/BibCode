@@ -12,6 +12,7 @@ import {
   type RecoveryDeadline,
   dispatchDesktopUiApplicationExit,
   isDeadDesktopUiWebviewError,
+  isEndedApplicationSessionDelete,
   isFinalDesktopUiSpec,
   prepareRelaunchedDesktopUiSession,
   recoverDeadDesktopUiWebview,
@@ -85,6 +86,26 @@ describe("isDeadDesktopUiWebviewError", () => {
   it("leaves an ordinary script failure alone", () => {
     expect(isDeadDesktopUiWebviewError(new Error("TypeError: x is not a function"))).toBe(false);
     expect(isDeadDesktopUiWebviewError("invalid session id")).toBe(false);
+  });
+});
+
+describe("isEndedApplicationSessionDelete", () => {
+  const refused = new Error(
+    'WebDriverError: Request failed with error code ECONNREFUSED when running "http://127.0.0.1:4445/session/s" with method "DELETE"',
+  );
+
+  it("accepts a refused DELETE once the app no longer runs", async () => {
+    expect(await isEndedApplicationSessionDelete(refused, async () => false)).toBe(true);
+  });
+
+  it("keeps a refused DELETE while the app still runs a failure", async () => {
+    expect(await isEndedApplicationSessionDelete(refused, async () => true)).toBe(false);
+  });
+
+  it("keeps any other DELETE error a failure", async () => {
+    expect(
+      await isEndedApplicationSessionDelete(new Error("unknown error: boom"), async () => false),
+    ).toBe(false);
   });
 });
 

@@ -1081,7 +1081,8 @@ describe("refresh", () => {
 
     expect(testState.commandCalls.find((call) => call.label === "refreshEntries")?.input).toEqual({
       environmentId,
-      input: { cwd: "/workspace/demo", refresh: true },
+      // One entry: the rescan only rebuilds; the paged query re-reads the list (#390).
+      input: { cwd: "/workspace/demo", refresh: true, limit: 1 },
     });
     expect(refresh).toHaveBeenCalled();
   });

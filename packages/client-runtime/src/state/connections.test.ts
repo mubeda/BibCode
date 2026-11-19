@@ -1,6 +1,10 @@
 import { EnvironmentId } from "@bibcode/contracts";
 import { it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
+import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 import { beforeEach, describe, expect, vi } from "vite-plus/test";
 
@@ -27,6 +31,8 @@ import { EnvironmentRegistry } from "../connection/registry.ts";
 import { AVAILABLE_CONNECTION_STATE } from "../connection/model.ts";
 import { createEnvironmentCatalogAtoms, EMPTY_ENVIRONMENT_CATALOG_STATE } from "./connections.ts";
 
+class StorageOpenError extends Data.TaggedError("StorageOpenError")<{}> {}
+
 beforeEach(() => {
   harness.commandConfigs.length = 0;
   harness.followStream.mockClear();
@@ -52,6 +58,49 @@ describe("createEnvironmentCatalogAtoms", () => {
     registry.set(runtimeAtoms[1]!, AsyncResult.initial(false) as never);
     expect(registry.get(atoms.catalogValueAtom)).toBe(EMPTY_ENVIRONMENT_CATALOG_STATE);
     expect(registry.get(atoms.networkStatusValueAtom)).toBe("unknown");
+    registry.dispose();
+  });
+
+  it("marks the catalog failed when a real runtime layer cannot build", async () => {
+    const runtime = Atom.runtime(
+      Layer.effect(EnvironmentRegistry, Effect.fail(new StorageOpenError())),
+    );
+    const atoms = createEnvironmentCatalogAtoms(runtime);
+    const registry = AtomRegistry.make();
+    const release = registry.mount(atoms.catalogValueAtom);
+    for (
+      let turn = 0;
+      turn < 20 && registry.get(atoms.catalogValueAtom).failed !== true;
+      turn += 1
+    ) {
+      // @effect-diagnostics-next-line globalTimers:off
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    expect(registry.get(atoms.catalogValueAtom)).toMatchObject({ isReady: false, failed: true });
+    release();
+    registry.dispose();
+  });
+
+  it("marks the catalog failed even when the failure keeps an earlier value", () => {
+    const runtimeAtoms: Array<Atom.Writable<never, never>> = [];
+    const runtime = {
+      atom: vi.fn((_stream: unknown, options: { initialValue: unknown }) => {
+        const atom = Atom.make(AsyncResult.success(options.initialValue));
+        runtimeAtoms.push(atom as never);
+        return atom;
+      }),
+    } as never;
+    const atoms = createEnvironmentCatalogAtoms(runtime);
+    const registry = AtomRegistry.make();
+
+    registry.set(
+      runtimeAtoms[0]!,
+      AsyncResult.failure<unknown, StorageOpenError>(Cause.fail(new StorageOpenError()), {
+        previousSuccess: Option.some(AsyncResult.success(EMPTY_ENVIRONMENT_CATALOG_STATE)),
+      }) as never,
+    );
+    expect(registry.get(atoms.catalogValueAtom)).toMatchObject({ isReady: false, failed: true });
     registry.dispose();
   });
 

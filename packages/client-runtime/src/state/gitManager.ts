@@ -91,7 +91,12 @@ export function createGitManagerEnvironmentAtoms<R, E>(
           readonly limit: number;
           /** Local query-cache identity, unique per read and never reused; never sent over RPC. */
           readonly refreshCacheKey: string;
-        }) => request(WS_METHODS.gitManagerGetCommits, { cwd: input.cwd, limit: input.limit }),
+        }) =>
+          request(WS_METHODS.gitManagerGetCommits, {
+            cwd: input.cwd,
+            limit: input.limit,
+            fitFirstCommit: true,
+          }),
       }),
     ),
     getRetainedCommitPages: createEnvironmentQueryAtomFamily(runtime, {
@@ -120,6 +125,7 @@ export function createGitManagerEnvironmentAtoms<R, E>(
               pinnedTips: input.pinnedTips,
               offset,
               limit: input.limit,
+              fitFirstCommit: true,
             }),
           { concurrency: 2 },
         ),

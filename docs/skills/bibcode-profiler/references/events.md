@@ -260,10 +260,10 @@ figures go to every connected environment whose profiler is on.
     BiBCode's window is visible and has focus, because WebKit keeps a covered
     window, or one on another Space, visible while macOS throttles its timers.
     It also counts nothing for 20 s after a sleep, while the system catches up.
-    Builds through v0.9.2 counted both cases as stalls (#99). WebKit can also
-    deliver a visible, focused page's timers 1 s apart while frames keep
-    rendering. Two beats in a row that arrive about 500 ms late (475 to 525 ms)
-    are such an aligned run and count as no stalls; a single one, or a beat
+    Builds through v0.9.2 counted both cases as stalls (#99). WebKit also
+    delivers a visible, focused page's timers 1 s apart once nothing on screen
+    has changed for about a minute, while frames keep rendering. Two beats in
+    a row that arrive about 500 ms late (475 to 525 ms) are such an aligned run and count as no stalls; a single one, or a beat
     later than that inside a run, still counts. Builds through v0.16.0 counted
     every beat of a run, 11 stalls of about 500 ms in each window;
   - `event` when Event Timing reports interactions;

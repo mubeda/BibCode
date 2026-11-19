@@ -60,6 +60,10 @@ vi.mock("./rpc/atomRegistry", () => ({
   AppAtomRegistryProvider: ({ children }: { readonly children?: React.ReactNode }) => children,
 }));
 
+vi.mock("./connection/connectionStoreReadiness", () => ({
+  useConnectionStoreReadinessAttribute: () => undefined,
+}));
+
 vi.mock("./diagnostics/DiagnosticLogsRelayHost", () => ({
   DiagnosticLogsRelayHost: () => null,
 }));

@@ -35,9 +35,10 @@ use crate::{
     },
     rpc::{RpcRegistry, RpcResult, RpcStreamChunk},
     terminal::{
-        AttachmentItem, InputReadmissionScope, TerminalAttachInput, TerminalError, TerminalEvent,
-        TerminalInputAdmission, TerminalInputOrigin, TerminalLaunchCommand, TerminalManager,
-        TerminalMetadataEvent, TerminalOpenInput, TerminalSessionIdentity,
+        AttachmentItem, InputReadmissionScope, SERVER_TERMINAL_THREAD_ID, TerminalAttachInput,
+        TerminalError, TerminalEvent, TerminalInputAdmission, TerminalInputOrigin,
+        TerminalLaunchCommand, TerminalManager, TerminalMetadataEvent, TerminalOpenInput,
+        TerminalSessionIdentity,
     },
     worktree_catalog::{
         WorkspaceAdmissionCancellation, WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry,
@@ -325,6 +326,10 @@ impl ServerTerminalServices {
     }
 
     pub async fn close_thread_terminals(&self, thread_id: &str) {
+        // No thread owns the server terminal, so no thread's cleanup ends it.
+        if thread_id == SERVER_TERMINAL_THREAD_ID {
+            return;
+        }
         let _ = self.terminal.close(thread_id, None).await;
     }
 
@@ -1115,12 +1120,21 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
     });
 }
 
+/// The server terminal (#378) has no thread and no workspace: a thread row with its id, left
+/// by an older server, must neither lend it a workspace nor block it.
+fn workspace_admission_for<'a>(
+    admission: Option<&'a WorkspaceAdmissionController>,
+    thread_id: &str,
+) -> Option<&'a WorkspaceAdmissionController> {
+    admission.filter(|_| thread_id != SERVER_TERMINAL_THREAD_ID)
+}
+
 async fn acquire_terminal_start(
     admission: Option<&WorkspaceAdmissionController>,
     thread_id: &str,
     cwd: &str,
 ) -> Result<Option<WorkspaceAdmissionLease>, Value> {
-    let Some(admission) = admission else {
+    let Some(admission) = workspace_admission_for(admission, thread_id) else {
         return Ok(None);
     };
     admission
@@ -1134,7 +1148,7 @@ async fn acquire_terminal_attach(
     admission: Option<&WorkspaceAdmissionController>,
     input: &TerminalAttachPayload,
 ) -> Result<Option<WorkspaceAdmissionLease>, Value> {
-    let Some(admission) = admission else {
+    let Some(admission) = workspace_admission_for(admission, &input.thread_id) else {
         return Ok(None);
     };
     if let Some(cwd) = input.cwd.as_deref() {
@@ -1325,7 +1339,7 @@ async fn acquire_terminal_thread(
     admission: Option<&WorkspaceAdmissionController>,
     thread_id: &str,
 ) -> Result<Option<WorkspaceAdmissionLease>, Value> {
-    let Some(admission) = admission else {
+    let Some(admission) = workspace_admission_for(admission, thread_id) else {
         return Ok(None);
     };
     admission
@@ -1370,7 +1384,7 @@ async fn acquire_terminal_input(
     admission: Option<&WorkspaceAdmissionController>,
     thread_id: &str,
 ) -> Result<Option<(WorkspaceAdmissionLease, Option<String>)>, Value> {
-    let Some(admission) = admission else {
+    let Some(admission) = workspace_admission_for(admission, thread_id) else {
         return Ok(None);
     };
     admission

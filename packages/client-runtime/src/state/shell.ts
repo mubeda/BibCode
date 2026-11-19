@@ -447,6 +447,8 @@ export function shellStateChanges(environmentId: EnvironmentId) {
 export interface EnvironmentShellSummary {
   readonly catalogHealth: ConnectionCatalogHealth;
   readonly catalogReady: boolean;
+  /** The connection runtime failed to build, so the catalog never becomes ready. */
+  readonly catalogFailed?: boolean;
   readonly desiredEnvironmentCount: number;
   readonly statuses: ReadonlyArray<EnvironmentShellAvailability>;
   readonly canShowEmptyProjects: boolean;
@@ -491,6 +493,7 @@ function shellSummariesEqual(
       (right.catalogHealth.status === "recovery-required" &&
         left.catalogHealth.message === right.catalogHealth.message)) &&
     left.catalogReady === right.catalogReady &&
+    left.catalogFailed === right.catalogFailed &&
     left.desiredEnvironmentCount === right.desiredEnvironmentCount &&
     left.canShowEmptyProjects === right.canShowEmptyProjects &&
     left.statuses.length === right.statuses.length &&
@@ -572,6 +575,7 @@ export function createEnvironmentShellSummaryAtom(input: {
     const next: EnvironmentShellSummary = {
       catalogHealth,
       catalogReady: catalog.isReady,
+      catalogFailed: catalog.failed === true,
       desiredEnvironmentCount: catalog.entries.size,
       statuses,
       canShowEmptyProjects:

@@ -1157,7 +1157,10 @@ describe("packaged desktop UI smoke contract", () => {
     expect(commands).toMatch(/vp install --frozen-lockfile/);
     expect(commands).toMatch(/test:ui:build/);
     expect(commands).toMatch(/test:ui:desktop/);
-    expect(commands).toMatch(/xvfb-run/);
+    // The specs ask for exact viewports up to 1800x1050; a smaller screen silently shrinks them.
+    expect(commands).toContain(
+      "xvfb-run --auto-servernum -s '-screen 0 1920x1080x24' vp run test:ui:desktop",
+    );
     expect(commands).toMatch(/hdiutil attach/);
     expect(commands).toMatch(/hdiutil detach/);
     expect(commands).toContain("-name 'BiBCode.app'");

@@ -1,5 +1,5 @@
 import { projectKey } from "@bibcode/client-runtime/state/entities";
-import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
+import { environmentRpcKey, squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
 import {
   PullRequestsOperationError,
   type PipelinesDetail,
@@ -30,10 +30,12 @@ import { usePullRequestsQuery } from "../../pullRequests/shared/usePullRequestsQ
 import { useDocumentVisible } from "../../pullRequests/useDocumentVisible";
 import { useRepositoryModule } from "../../repositoryModule/RepositoryModule";
 import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
+import { useResourceRefusal } from "../../repositoryModule/resourceRefusal";
 import { keepNewestCopy, type KeptCopy } from "../../repositoryModule/snapshotDisplay.logic";
 import { useVisibleModuleRefresh } from "../../repositoryModule/useVisibleModuleRefresh";
 import { PermissionButton } from "../../ui/permission-button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
+import { LoadingState, RefreshRegion } from "../../ui/loading-state";
 import { Skeleton } from "../../ui/skeleton";
 import { PipelineActions, type PipelineActionOutcome } from "../actions/PipelineActions";
 import { pipelineActionDestination } from "../actions/pipelineActions.logic";
@@ -277,19 +279,17 @@ export function PipelinesDetailView({
   // Any success on the stream, even its first all-false event, stands the timer down
   // until the stream fails or waits again.
   const paused = isGitlab && subscribeQuery.emission._tag === "Success";
-  // The poller's read of this pipeline was refused and its stored row dropped: the
-  // refusal replaces the copy on screen until a Refresh reads the host again.
-  const [refusal, setRefusal] = useState<{
-    readonly request: typeof request;
-    readonly code: PipelinesRefusal;
-  } | null>(null);
-  // Each event is a new object: a refusal is taken from the event that carries it.
-  const [seenChange, setSeenChange] = useState<typeof subscribeQuery.data>(null);
-  if (subscribeQuery.data !== seenChange) {
-    setSeenChange(subscribeQuery.data);
-    if (subscribeQuery.data?.refused) setRefusal({ request, code: subscribeQuery.data.refused });
-  }
-  const refused = refusal !== null && refusal.request === request ? refusal.code : null;
+  // A refusal, by this read or by the poller's (which also dropped the stored row), hides
+  // every copy of this pipeline until a later read of it succeeds.
+  const error = operationError(detailQuery);
+  const liveRefusal: PipelinesRefusal | null =
+    error?.code === "forbidden" || error?.code === "not_found" ? error.code : null;
+  const refused = useResourceRefusal(
+    `pipelines.get:${context.host}/${context.repository}:${environmentRpcKey(request)}`,
+    detailQuery,
+    liveRefusal,
+    subscribeQuery.data,
+  );
   const applySubscribedChange = useEffectEvent(
     (changed: NonNullable<typeof subscribeQuery.data>) => {
       // The poller already stored the new detail: paint it, never read the host again.
@@ -332,7 +332,6 @@ export function PipelinesDetailView({
     revalidate: timerRead,
   });
 
-  const error = operationError(detailQuery);
   const refreshContext = use(PullRequestsContextRefresh);
   useEffect(() => {
     if (error?.code === "not_authenticated") refreshContext?.();
@@ -343,10 +342,8 @@ export function PipelinesDetailView({
     onBackoffChange(backedOff);
   }, [backedOff, onBackoffChange]);
   const refreshDetail = detailQuery.refresh;
-  const refresh = useCallback(() => {
-    setRefusal(null);
-    refreshDetail();
-  }, [refreshDetail]);
+  // A refusal stays in force until the read this starts succeeds.
+  const refresh = refreshDetail;
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
   // A GitLab job retry opens the new job; a GitHub re-run of an earlier attempt opens
@@ -400,7 +397,7 @@ export function PipelinesDetailView({
           detail.pipeline.reason,
         );
   const announcement = useFinishedAnnouncement(
-    detail === null
+    detail === null || refused !== null
       ? null
       : {
           id: detail.pipeline.id,
@@ -413,8 +410,8 @@ export function PipelinesDetailView({
 
   // A refused or missing pipeline is about this resource only: say so here, and keep
   // the shared sign-in state for a lost login.
-  const resourceCode =
-    error?.code === "forbidden" || error?.code === "not_found" ? error.code : refused;
+  // A later failure of another kind, such as a timeout on Retry, is said as itself.
+  const resourceCode = liveRefusal ?? (detailQuery.error === null ? refused : null);
   const resourceError = resourceCode !== null;
   const message =
     resourceCode === "forbidden"
@@ -462,7 +459,7 @@ export function PipelinesDetailView({
         )}
       </div>
     );
-  const shown = resourceError ? null : detail;
+  const shown = refused !== null ? null : detail;
   const attemptOptions =
     provider === "github" && shown !== null
       ? pipelineAttemptOptions(
@@ -493,6 +490,8 @@ export function PipelinesDetailView({
     onJobChange(null);
   }, [onJobChange]);
   const logShown = selectedJobId !== null && shown !== null;
+  // The stored copy's read is what a change event updates the screen from.
+  const refreshing = detailQuery.isPending || snapshotQuery.isPending;
   return (
     <PipelineActions.Provider
       scope={scope}
@@ -525,7 +524,7 @@ export function PipelinesDetailView({
             </div>
             {alert}
             {shown !== null ? (
-              <>
+              <RefreshRegion refreshing={refreshing} status="Refreshing pipeline…">
                 <PipelineDetailHeader
                   detail={shown}
                   provider={provider}
@@ -562,13 +561,14 @@ export function PipelinesDetailView({
                   )}
                   <PipelineArtifacts detail={shown} />
                 </div>
-              </>
-            ) : message === null ? (
-              <div role="status" className="space-y-3 p-4">
-                <span className="sr-only">Loading pipeline…</span>
+              </RefreshRegion>
+            ) : message === null || refreshing ? (
+              // A held refusal or failure keeps its alert; the read that may answer it is named.
+
+              <LoadingState label="Loading pipeline…">
                 <Skeleton className="h-16 w-full" />
                 <Skeleton className="h-40 w-full" />
-              </div>
+              </LoadingState>
             ) : null}
           </div>
           {logShown ? (

@@ -1303,6 +1303,18 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
  * turn's end, while one with a later tool call or thought does not, although each step of a
  * work group is its own list row (#351).
  */
+/** The id of the work row that shows `entryId`, or null when no row shows it. */
+export function findWorkRowId(
+  rows: ReadonlyArray<MessagesTimelineRow>,
+  entryId: string,
+): string | null {
+  const row = rows.find(
+    (candidate) =>
+      candidate.kind === "work" && candidate.groupedEntries.some((entry) => entry.id === entryId),
+  );
+  return row?.id ?? null;
+}
+
 export function isNewestWorkEntry(
   rows: ReadonlyArray<MessagesTimelineRow>,
   entryId: string,

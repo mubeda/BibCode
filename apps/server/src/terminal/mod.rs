@@ -28,3 +28,7 @@ pub use pty::{
     ExhaustedResize, PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput,
 };
 pub use writer::WriteGuard;
+
+/// The thread id of the terminal each server owns in its user's home folder (#378). The
+/// engine refuses to create a thread with it, so no thread terminal shares that session.
+pub const SERVER_TERMINAL_THREAD_ID: &str = "server-terminal";

@@ -283,15 +283,33 @@ fn cleanup_runtime_process_identities(
     mut signal: impl FnMut(ProcessIdentity) -> Result<(), SignalError>,
 ) -> ProcessCleanupReport {
     let mut report = ProcessCleanupReport::default();
+    let mut unsupported = 0_usize;
+    let mut unsupported_pids = Vec::new();
     for identity in identities {
         match signal(*identity) {
             Ok(()) | Err(SignalError::NotFound(_) | SignalError::StaleIdentity(_)) => {
                 report.record_success();
             }
+            // macOS has no identity-bound signal, so nothing was attempted. The sample also
+            // lists processes that shutdown already killed and that have not been reaped yet,
+            // which is why this is no failure.
+            Err(SignalError::Unsupported) => {
+                unsupported += 1;
+                if unsupported_pids.len() < 8 {
+                    unsupported_pids.push(identity.pid);
+                }
+            }
             Err(error) => {
                 report.record_failure(format!("process {}: {error}", identity.pid));
             }
         }
+    }
+    if unsupported > 0 {
+        tracing::debug!(
+            unsupported,
+            pids = ?unsupported_pids,
+            "left runtime-owned processes to exit: this platform has no identity-bound signal"
+        );
     }
     report
 }
@@ -1304,6 +1322,17 @@ mod tests {
             ),
             SignalError::Read(message) if message.contains("GetProcessTimes")
         ));
+    }
+
+    #[test]
+    fn cleanup_reports_no_failure_where_the_platform_cannot_signal() {
+        let identities = [1, 2].map(|pid| ProcessIdentity {
+            pid,
+            started_at: 100,
+        });
+        let report =
+            cleanup_runtime_process_identities(&identities, |_| Err(SignalError::Unsupported));
+        assert_eq!(report, ProcessCleanupReport::default());
     }
 
     #[test]

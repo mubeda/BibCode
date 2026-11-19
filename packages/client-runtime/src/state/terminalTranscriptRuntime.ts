@@ -281,6 +281,15 @@ export function createTerminalTranscriptRuntime(
       processClosed = true;
       return true;
     }
+    // An exit names its process: another process's exit must not mark this one exited.
+    if (
+      event.type === "exited" &&
+      event.generation !== undefined &&
+      processKey?.generation !== undefined &&
+      !sameProcess(generationKey(event.generation), processKey)
+    ) {
+      return false;
+    }
     // A stream still on an earlier process (it has not seen the restart yet).
     if (!sameProcess(sourceProcesses.get(source), processKey)) return false;
     const sequence = event.sequence;

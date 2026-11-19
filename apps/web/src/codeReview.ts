@@ -62,11 +62,14 @@ const INSTRUCTED_GUARD_LINE = "Told not to edit. BiBCode cannot block edits for 
 export function codeReviewGuardLine(reviewer: {
   readonly kind: "chat" | "terminal";
   readonly driver: ProviderDriverKind;
+  /** The server's `readOnlyCodexReviews` capability (#376); absent on an older server. */
+  readonly readOnlyCodexReviews?: boolean;
 }): string {
   if (reviewer.driver === "claudeAgent") return "Starts in Claude's plan mode.";
   if (reviewer.driver === "codex") {
-    return reviewer.kind === "terminal"
-      ? "Runs in Codex's read-only sandbox."
+    if (reviewer.kind === "terminal") return "Runs in Codex's read-only sandbox.";
+    return reviewer.readOnlyCodexReviews === true
+      ? "Runs on its own in Codex's read-only sandbox, like the Codex terminal review."
       : "Runs in Codex's read-only sandbox. Writes ask for your approval.";
   }
   if (reviewer.driver === "opencode" && reviewer.kind === "chat") {
@@ -132,12 +135,17 @@ export interface CodeReviewMenuReviewer {
 export function buildCodeReviewMenuReviewers(
   actions: ReadonlyArray<ProviderAgentAction>,
   reasonFor: (action: ProviderAgentAction) => string | null,
+  readOnlyCodexReviews = false,
 ): ReadonlyArray<CodeReviewMenuReviewer> {
   return codeReviewerActions(actions).map((action) => ({
     value: action.value,
     label: action.label,
     selection: action.selection,
-    guardLine: codeReviewGuardLine({ kind: action.kind, driver: action.entry.driverKind }),
+    guardLine: codeReviewGuardLine({
+      kind: action.kind,
+      driver: action.entry.driverKind,
+      readOnlyCodexReviews,
+    }),
     disabledReason: reasonFor(action),
   }));
 }

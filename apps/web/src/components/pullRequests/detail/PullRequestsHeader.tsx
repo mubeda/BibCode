@@ -12,6 +12,7 @@ import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
 import { PermissionButton } from "../../ui/permission-button";
 import { PullRequestsStateIcon } from "../shared/PullRequestsStateIcon";
 import { headerSentence } from "./pullRequestsDetail.logic";
+import { cn } from "../../../lib/utils";
 export interface PullRequestsHeaderProps {
   scope: PullRequestsScope;
   projectRef: ScopedProjectRef;
@@ -134,8 +135,11 @@ export const PullRequestsHeader = memo(function PullRequestsHeader({
           variant="outline"
           size="sm"
         >
-          <RefreshCwIcon aria-hidden="true" />
-          Refresh
+          <RefreshCwIcon
+            aria-hidden="true"
+            className={cn(refreshing && "motion-safe:animate-spin")}
+          />
+          {refreshing ? "Refreshing…" : "Refresh"}
         </PermissionButton>
         <PullRequestsSecondaryActions detail={detail} live={live} context={context} />
       </div>

@@ -639,6 +639,21 @@ pub enum OrchestrationCommand {
         )]
         worktree_path: OptionalNullable<String>,
     },
+    /// Server only (#380 R4): stores Codex's default in place of the retired model a session
+    /// dropped, decided on the thread's selection when the command runs, so a selection another
+    /// client committed meanwhile is kept.
+    #[serde(rename = "thread.retired-model.clear")]
+    ThreadRetiredModelClear {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        /// The provider instance whose session dropped the model.
+        #[serde(rename = "instanceId")]
+        instance_id: String,
+        /// The canonical retired model the session dropped.
+        retired: String,
+    },
     #[serde(rename = "thread.runtime-mode.set")]
     ThreadRuntimeModeSet {
         #[serde(rename = "commandId")]
@@ -1270,6 +1285,9 @@ impl TestHooks {
         Ok(())
     }
 }
+
+/// Why a retired-model clear changes nothing: the thread no longer names that model.
+pub const RETIRED_MODEL_ALREADY_REPLACED: &str = "the thread no longer names the retired model";
 
 #[derive(Debug, Error, Clone)]
 pub enum OrchestrationError {
@@ -4976,6 +4994,7 @@ async fn plan_command(
             created_at,
         } => {
             require_project(model, command, project_id)?;
+            refuse_reserved_thread_id(command, thread_id)?;
             if *side_chat && (kind.as_deref() != Some("panel") || host_thread_id.is_none()) {
                 return invariant(
                     command,
@@ -5160,6 +5179,51 @@ async fn plan_command(
                 json!({"threadId":thread_id,"updatedAt":occurred_at}),
             )])
         }
+        OrchestrationCommand::ThreadRetiredModelClear {
+            command_id,
+            thread_id,
+            instance_id,
+            retired,
+        } => {
+            require_thread(model, command, thread_id)?;
+            let mut selection = repositories
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+                .map(|thread| thread.model_selection)
+                .unwrap_or(Value::Null);
+            // Only while the thread still names the dropped model on the instance that dropped
+            // it: a selection committed since the session launched, the same model on another
+            // instance included, stays as it is, and the command is refused as a no-op.
+            let selected_instance = selection
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .filter(|instance| !instance.trim().is_empty())
+                .unwrap_or("codex");
+            if selected_instance != instance_id
+                || !selection
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .is_some_and(|selected| {
+                        crate::provider::codex::model::same_model(selected, retired)
+                    })
+            {
+                return Err(OrchestrationError::Invariant {
+                    command_type: command.command_type().to_owned(),
+                    detail: RETIRED_MODEL_ALREADY_REPLACED.to_owned(),
+                });
+            }
+            selection["model"] = json!("auto");
+            Ok(vec![make_event(
+                "thread.meta-updated",
+                "thread",
+                thread_id,
+                occurred_at,
+                command_id,
+                metadata,
+                json!({"threadId":thread_id,"modelSelection":selection,"updatedAt":occurred_at}),
+            )])
+        }
         OrchestrationCommand::ThreadMetaUpdate {
             command_id,
             thread_id,
@@ -5281,6 +5345,7 @@ async fn plan_command(
                         );
                     };
                     require_project(model, command, &create.project_id)?;
+                    refuse_reserved_thread_id(command, thread_id)?;
                     if create
                         .purpose
                         .as_deref()
@@ -6114,6 +6179,21 @@ async fn compact_policy_baseline(
         }
     }
     *baseline = retained;
+    Ok(())
+}
+
+/// The server terminal's thread id (#378) names no thread, so its session never mixes with a
+/// thread's terminals or their cleanup.
+fn refuse_reserved_thread_id(
+    command: &OrchestrationCommand,
+    thread_id: &str,
+) -> Result<(), OrchestrationError> {
+    if thread_id == crate::terminal::SERVER_TERMINAL_THREAD_ID {
+        return invariant(
+            command,
+            format!("Thread id '{thread_id}' is reserved for the server terminal."),
+        );
+    }
     Ok(())
 }
 
@@ -9295,6 +9375,7 @@ impl OrchestrationCommand {
             Self::ThreadArchive { .. } => "thread.archive",
             Self::ThreadUnarchive { .. } => "thread.unarchive",
             Self::ThreadMetaUpdate { .. } => "thread.meta.update",
+            Self::ThreadRetiredModelClear { .. } => "thread.retired-model.clear",
             Self::ThreadRuntimeModeSet { .. } => "thread.runtime-mode.set",
             Self::ThreadInteractionModeSet { .. } => "thread.interaction-mode.set",
             Self::ThreadTurnStart { .. } => "thread.turn.start",
@@ -9335,6 +9416,7 @@ impl OrchestrationCommand {
             | Self::ThreadArchive { command_id, .. }
             | Self::ThreadUnarchive { command_id, .. }
             | Self::ThreadMetaUpdate { command_id, .. }
+            | Self::ThreadRetiredModelClear { command_id, .. }
             | Self::ThreadRuntimeModeSet { command_id, .. }
             | Self::ThreadInteractionModeSet { command_id, .. }
             | Self::ThreadTurnStart { command_id, .. }
@@ -9372,7 +9454,8 @@ impl OrchestrationCommand {
             | Self::ThreadDelete { .. }
             | Self::ThreadArchive { .. }
             | Self::ThreadUnarchive { .. }
-            | Self::ThreadMetaUpdate { .. } => None,
+            | Self::ThreadMetaUpdate { .. }
+            | Self::ThreadRetiredModelClear { .. } => None,
             Self::ProjectCreate { created_at, .. }
             | Self::ThreadCreate { created_at, .. }
             | Self::ThreadRuntimeModeSet { created_at, .. }
@@ -9415,6 +9498,7 @@ impl OrchestrationCommand {
             | Self::ThreadArchive { thread_id, .. }
             | Self::ThreadUnarchive { thread_id, .. }
             | Self::ThreadMetaUpdate { thread_id, .. }
+            | Self::ThreadRetiredModelClear { thread_id, .. }
             | Self::ThreadRuntimeModeSet { thread_id, .. }
             | Self::ThreadInteractionModeSet { thread_id, .. }
             | Self::ThreadTurnStart { thread_id, .. }
@@ -9450,6 +9534,7 @@ impl OrchestrationCommand {
                 | Self::WorktreeBranchReconcileResolved { .. }
                 | Self::ThreadHistoryImport { .. }
                 | Self::ThreadCompactionSettle { .. }
+                | Self::ThreadRetiredModelClear { .. }
         ) || matches!(
             self,
             Self::ThreadCompact {
@@ -11600,6 +11685,42 @@ mod tests {
             Err(OrchestrationError::Invariant { detail, .. }) => detail,
             other => panic!("expected an invariant refusal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_thread_cannot_take_the_server_terminal_thread_id() {
+        let (engine, _host_id) = delivery_engine(TestHooks::default()).await;
+        let mut create = side_chat_create("reserved", "server-terminal", None, None);
+        if let OrchestrationCommand::ThreadCreate { side_chat, .. } = &mut create {
+            *side_chat = false;
+        }
+        let turn = serde_json::from_value::<OrchestrationCommand>(json!({
+            "type":"thread.turn.start", "commandId":"reserved-turn",
+            "threadId":"server-terminal",
+            "message":{"messageId":"reserved-message","role":"user","text":"hi","attachments":[]},
+            "bootstrap":{"createThread":{
+                "projectId":"delivery-project", "title":"Reserved",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "interactionMode":"default",
+                "branch":null, "worktreePath":null, "createdAt":"2026-11-02T00:00:01Z"
+            }},
+            "createdAt":"2026-11-02T00:00:01Z"
+        }))
+        .expect("bootstrap command");
+        for command in [create, turn] {
+            assert_eq!(
+                invariant_detail(engine.dispatch(command).await),
+                "Thread id 'server-terminal' is reserved for the server terminal."
+            );
+        }
+        assert!(
+            engine
+                .repositories()
+                .get_thread("server-terminal".to_owned())
+                .await
+                .expect("thread read")
+                .is_none()
+        );
     }
 
     #[tokio::test]

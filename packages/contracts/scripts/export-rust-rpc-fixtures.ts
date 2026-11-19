@@ -1095,6 +1095,12 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
       }
       throw cause;
     }
+    // The server sets alreadyRemoved only on thread-not-found; the sample keeps the field on
+    // the wire with the one reason it travels with.
+    const sampled = error as { _tag?: unknown; reason?: unknown; alreadyRemoved?: unknown };
+    if (sampled._tag === "WorktreeRemovalError" && sampled.alreadyRemoved !== undefined) {
+      sampled.reason = "thread-not-found";
+    }
     dynamicFixtures.set(
       relativePath,
       serializeWireFixture({

@@ -187,6 +187,7 @@ import {
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
 import { AgentsUnreadTracker } from "./sidebar/AgentsUnreadTracker";
 import { SendRequestsUnreadTracker } from "./sendToAgent/SendRequestsUnreadTracker";
+import { ServerCommandButtons } from "./serverCommands/ServerCommandButtons";
 import { EnvironmentCardHeader } from "./sidebar/EnvironmentCardHeader";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
 import {
@@ -675,14 +676,19 @@ export const PROJECT_HEADER_ACTION_PADDING = {
 
 export type ProjectHeaderActionCount = keyof typeof PROJECT_HEADER_ACTION_PADDING;
 
-/** Project actions, New worktree and Git Manager always show; Pull Requests and Pipelines may. */
+/**
+ * Project actions, New worktree and Git Manager always show; Pull Requests and Pipelines may.
+ * A server card adds Open terminal and Dashboard (two icons) and never shows the other two.
+ */
 export function projectHeaderActionCount(input: {
   readonly showsPullRequests: boolean;
   readonly showsPipelines: boolean;
+  readonly showsServerCommands: boolean;
 }): ProjectHeaderActionCount {
   return (3 +
     Number(input.showsPullRequests) +
-    Number(input.showsPipelines)) as ProjectHeaderActionCount;
+    Number(input.showsPipelines) +
+    2 * Number(input.showsServerCommands)) as ProjectHeaderActionCount;
 }
 
 export function projectHeaderButtonClassName(input: {
@@ -3374,6 +3380,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             actionCount: projectHeaderActionCount({
               showsPullRequests: showsPullRequestsAction,
               showsPipelines: showsPipelinesAction,
+              showsServerCommands: environmentCard !== null,
             }),
           })}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.attributes : {})}
@@ -3493,6 +3500,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             </TooltipTrigger>
             <TooltipPopup side="top">Git Manager</TooltipPopup>
           </Tooltip>
+          {environmentCard ? (
+            <ServerCommandButtons
+              environmentId={environmentCard.environmentId}
+              target={{ label: environmentCard.label, connected: environmentCard.available }}
+              className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+            />
+          ) : null}
           {showsPullRequestsAction ? (
             <Tooltip>
               <TooltipTrigger
@@ -4822,10 +4836,17 @@ export default function Sidebar() {
       resolveSidebarProjectAvailability({
         projectCount: projects.length,
         catalogReady: shellSummary.catalogReady,
+        catalogFailed: shellSummary.catalogFailed,
         catalogHealth: shellSummary.catalogHealth,
         environments: shellSummary.statuses,
       }),
-    [projects.length, shellSummary.catalogHealth, shellSummary.catalogReady, shellSummary.statuses],
+    [
+      projects.length,
+      shellSummary.catalogFailed,
+      shellSummary.catalogHealth,
+      shellSummary.catalogReady,
+      shellSummary.statuses,
+    ],
   );
   const projectAvailabilityEnvironment = useMemo(() => {
     if (projectAvailability.environmentId === null) {

@@ -1,10 +1,16 @@
-import { type EnvironmentId, type ProjectReadFileResult, WS_METHODS } from "@bibcode/contracts";
+import {
+  type EnvironmentId,
+  type ProjectListEntriesInput,
+  type ProjectReadFileResult,
+  WS_METHODS,
+} from "@bibcode/contracts";
 import * as Crypto from "effect/Crypto";
 import { Atom } from "effect/reactivity";
 
 import {
   createAtomCommandScheduler,
   createEnvironmentCommand,
+  createEnvironmentQueryAtomFamily,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
@@ -18,6 +24,8 @@ import {
   updateProject,
 } from "../operations/commands.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
+import { request } from "../rpc/client.ts";
+import { readProjectEntryPages } from "./projectEntryPages.ts";
 
 export type {
   CreateProjectInput,
@@ -88,15 +96,18 @@ export function createProjectEnvironmentAtoms<R, E>(
       idleTtlMs: 5 * 60_000,
     }),
     /**
-     * The Files panel's full list. The panel mounts it only once `subscribeEntries` has resynced
-     * the server's index, and that mount is its read: a list read earlier could predate the resync
-     * and would have to be read again. Nothing keeps it once the panel lets go, so every mount is a
-     * fresh read rather than a list cached while no panel handled the change signals.
+     * The Files panel's full list, read page by page so no reply carries all of it (#390). The
+     * panel mounts it only once `subscribeEntries` has resynced the server's index, and that mount
+     * is its read: a list read earlier could predate the resync and would have to be read again.
+     * Nothing keeps it once the panel lets go, so every mount is a fresh read rather than a list
+     * cached while no panel handled the change signals. A re-read keeps the previous list until
+     * every page of the new one has arrived.
      */
-    fileTreeEntries: createEnvironmentRpcQueryAtomFamily(runtime, {
+    fileTreeEntries: createEnvironmentQueryAtomFamily(runtime, {
       label: "environment-data:projects:file-tree-entries",
-      tag: WS_METHODS.projectsListEntries,
       idleTtlMs: 0,
+      execute: (input: ProjectListEntriesInput) =>
+        readProjectEntryPages(input, (page) => request(WS_METHODS.projectsListEntries, page)),
     }),
     readFile: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:projects:read-file",

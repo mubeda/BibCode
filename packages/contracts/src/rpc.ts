@@ -265,7 +265,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
-import { ProviderInstanceId } from "./providerInstance.ts";
+import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import {
   RemoteUpdateActiveWork,
   RemoteUpdateActiveWorkError,
@@ -886,7 +886,15 @@ export const WsServerGetSettingsRpc = Rpc.make(WS_METHODS.serverGetSettings, {
 });
 
 export const WsServerUpdateSettingsRpc = Rpc.make(WS_METHODS.serverUpdateSettings, {
-  payload: Schema.Struct({ patch: ServerSettingsPatch }),
+  payload: Schema.Struct({
+    patch: ServerSettingsPatch,
+    /**
+     * Providers whose saved session defaults this write owns: the server sets each one from
+     * `patch.providerSessionDefaults`, removes it when that map leaves it out, and keeps every
+     * other provider's default. Absent, that map replaces the whole saved map.
+     */
+    ownedProviderSessionDefaults: Schema.optionalKey(Schema.Array(ProviderDriverKind)),
+  }),
   success: ServerSettings,
   error: Schema.Union([ServerSettingsError, WorktreeWorkspaceError, EnvironmentRpcError]),
 });

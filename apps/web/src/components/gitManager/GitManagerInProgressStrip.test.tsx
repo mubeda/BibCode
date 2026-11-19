@@ -57,10 +57,10 @@ describe("GitManagerInProgressStrip", () => {
       ),
     );
 
-    expect(buttonWithText("Commit merge")).toMatchObject({
-      disabled: true,
-      title: "Resolve and stage every conflicted file first.",
-    });
+    expect(buttonWithText("Commit merge").disabled).toBe(true);
+    expect(buttonWithText("Commit merge").parentElement?.title).toBe(
+      "Resolve and stage every conflicted file first.",
+    );
     expect(buttonWithText("Abort").disabled).toBe(false);
     expect(container.textContent).toContain("Resolve and stage every conflicted file first.");
   });
@@ -79,13 +79,9 @@ describe("GitManagerInProgressStrip", () => {
       ),
     );
 
-    expect(buttonWithText("Continue")).toMatchObject({
-      disabled: true,
-      title: "A merge is running.",
-    });
-    expect(buttonWithText("Abort")).toMatchObject({
-      disabled: true,
-      title: "A merge is running.",
-    });
+    for (const label of ["Continue", "Abort"]) {
+      expect(buttonWithText(label).disabled).toBe(true);
+      expect(buttonWithText(label).parentElement?.title).toBe("A merge is running.");
+    }
   });
 });

@@ -283,9 +283,32 @@ describe("packaged Source Control review", () => {
     const prompt = await waitForReviewStart("codex", baseline);
     expect(prompt).toContain(UNCOMMITTED_SCOPE);
 
-    // The review starts supervised (approval required), the Codex read-only sandbox.
+    // Codex runs the review in its own read-only sandbox, so the composer shows a disabled lock
+    // with the reason instead of a mode picker (#376).
     await waitForComposerDisplayed();
-    await expect(composerForm().$('[aria-label="Supervised"]')).toExist();
+    const reviewLock = composerForm().$('button[aria-label="Read-only review"]');
+    await expect(reviewLock).toBeDisplayed();
+    await expect(reviewLock).toHaveAttribute("aria-disabled", "true");
+    await expect(composerForm().$('[aria-label="Supervised"]')).not.toExist();
+    // The embedded driver's pointer move does not reach the page, so the hover the tooltip
+    // opens on is dispatched to the lock itself.
+    await browser.execute((form: string) => {
+      const lock = document.querySelector(`${form} button[aria-label="Read-only review"]`);
+      if (!lock) throw new Error("The read-only review lock is missing.");
+      const init = { bubbles: true, pointerType: "mouse" };
+      lock.dispatchEvent(new PointerEvent("pointerover", init));
+      lock.dispatchEvent(new PointerEvent("pointerenter", { ...init, bubbles: false }));
+      lock.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      lock.dispatchEvent(new MouseEvent("mouseenter"));
+      lock.dispatchEvent(new PointerEvent("pointermove", init));
+      lock.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
+    }, visibleComposerFormSelector);
+    // Another trigger's tooltip can still be in the page, so the lock's is found by its text.
+    await expect(
+      browser.$(
+        '//*[@data-slot="tooltip-popup" and normalize-space()="Codex runs reviews on their own in its read-only sandbox, so the mode does not apply."]',
+      ),
+    ).toBeDisplayed();
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "review-codex-panel.png"),
     );

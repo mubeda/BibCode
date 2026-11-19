@@ -53,6 +53,7 @@ vi.mock("~/components/ui/collapsible", () => ({
 }));
 
 import { GitManagerTagsView } from "./GitManagerTagsView";
+import { expectLoadingModel } from "~/components/ui/loading-state.testing";
 
 const SHA_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -177,6 +178,71 @@ describe("GitManagerTagsView", () => {
     expect(sections.map((section) => section.getAttribute("data-open"))).toEqual(["true", "false"]);
     sections[0]!.querySelector("button")!.click();
     expect(onSectionCollapsedChange).toHaveBeenCalledWith("local", true);
+  });
+
+  it("shows a loading state, not empty-tag copy, while the refs snapshot is pending", async () => {
+    await renderView({ refsPending: true, tags: [], remotes: [] });
+    expectLoadingModel(container, ["Loading tags…"]);
+    expect(container.textContent).not.toContain("No local tags");
+    expect(container.textContent).not.toContain("No remote configured");
+    expect(h.getRemoteTags).not.toHaveBeenCalled();
+  });
+
+  it("says a failed first refs read failed, offers Retry, and lists no tags or remotes", async () => {
+    const onRetryRefs = vi.fn();
+    await renderView({
+      refsLoaded: false,
+      refsError: "Could not read refs.",
+      onRetryRefs,
+      tags: [],
+      remotes: [],
+    });
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Could not read refs.",
+    );
+    expect(container.textContent).not.toContain("No local tags");
+    expect(container.textContent).not.toContain("No remote configured");
+    await act(async () => container.querySelector("button")!.click());
+    expect(onRetryRefs).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the last tags beside a refresh label while the refs reread", async () => {
+    await renderView({ refsRefreshing: true });
+    // Two reads, each named once: the refs reread and the remote's first listing.
+    expectLoadingModel(container, ["Refreshing tags…", "Loading tags from origin…"]);
+    expect(container.querySelector('[data-testid="git-manager-local-tag-v1"]')).not.toBeNull();
+  });
+
+  it("shows refresh feedback for a remote that has no tags", async () => {
+    h.remoteTags = { remote: "origin", status: "available", reason: null, tags: [] };
+    await renderView();
+    expect(container.textContent).toContain("No tags on origin.");
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    h.pending = true;
+    await renderView();
+    expectLoadingModel(container, ["Refreshing tags from origin…"]);
+  });
+
+  it("keeps a disabled tag action's reason on a wrapper that still receives hover", async () => {
+    await renderView({ tagDisabledReason: "Tag actions need a newer server." });
+    const del = container.querySelector<HTMLButtonElement>('[aria-label="Delete tag v1"]');
+    expect(del?.disabled).toBe(true);
+    expect(del?.parentElement?.title).toBe("Tag actions need a newer server.");
+    const push = container.querySelector<HTMLButtonElement>('[aria-label="Push tag v1"]');
+    expect(push?.parentElement?.title).toBe("Tag actions need a newer server.");
+    // Assistive technology reads the same reason as the button's description.
+    for (const button of [del, push]) {
+      const id = button?.getAttribute("aria-describedby") ?? "";
+      expect(document.getElementById(id)?.textContent).toBe("Tag actions need a newer server.");
+    }
+  });
+
+  it("stops the remote refresh icon spinning under reduced motion", async () => {
+    h.pending = true;
+    await renderView();
+    const icon = container.querySelector('[aria-label="Refresh tags from origin"] svg');
+    expect(icon?.getAttribute("class")).toContain("motion-safe:animate-spin");
+    expect(icon?.getAttribute("class")).not.toMatch(/(^|\s)animate-spin/);
   });
 
   it("explains the absence of remotes and hides push actions", async () => {

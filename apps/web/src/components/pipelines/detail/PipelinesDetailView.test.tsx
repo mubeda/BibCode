@@ -20,6 +20,8 @@ import {
   RepositoryModule,
   type RepositoryModuleValue,
 } from "../../repositoryModule/RepositoryModule";
+import { clearResourceRefusals } from "../../repositoryModule/resourceRefusal";
+import { expectLoadingModel } from "../../ui/loading-state.testing";
 import { buildPipelinesListInput } from "../list/pipelinesList.logic";
 import { pipelinesModule } from "../pipelinesModule";
 import { pipelineJobDetail } from "../job/testFixtures";
@@ -32,6 +34,8 @@ const h = vi.hoisted(() => ({
   onAnswer: null as ((detail: PipelinesDetail) => PipelinesDetail) | null,
   error: null as PullRequestsOperationError | null,
   pending: false,
+  // The stored copy's read is in flight, as after a change event.
+  snapshotPending: false,
   failures: new Map<object, unknown>(),
   snapshot: null as PipelinesSnapshot | null,
   // What the latest attempt's stored copy holds, for an earlier attempt's page.
@@ -94,7 +98,7 @@ vi.mock("../../../state/query", () => ({
         data: value,
         emission,
         error: null,
-        isPending: false,
+        isPending: atom.kind === "readSnapshot" && h.snapshotPending,
         refresh: read,
         revalidate: read,
         requiresRetry: false,
@@ -265,11 +269,14 @@ async function render(
     wrap?: (node: ReactNode) => ReactNode;
     /** The server serves `pipelines.runAction`. */
     actions?: boolean;
+    /** The repository the checkout points at. */
+    repository?: string;
   } = {},
 ) {
   const view = <RoutedView attempt={options.attempt ?? null} />;
+  const base = options.provider === "github" ? githubContext : gitlabContext;
   const value = moduleValue(
-    options.provider === "github" ? githubContext : gitlabContext,
+    options.repository === undefined ? base : { ...base, repository: options.repository },
     options.actions ? null : SERVER_TOO_OLD,
   );
   await act(async () =>
@@ -321,11 +328,13 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   usePipelinesStore.setState({ byProjectKey: {} });
+  clearResourceRefusals();
   localStorage.clear();
   h.detail = pipelineDetail();
   h.onAnswer = null;
   h.error = null;
   h.pending = false;
+  h.snapshotPending = false;
   h.failures.clear();
   h.snapshot = null;
   h.latestSnapshot = null;
@@ -775,6 +784,130 @@ describe("PipelinesDetailView errors", () => {
     expect(refreshContext).not.toHaveBeenCalled();
   });
 
+  it("keeps the refusal in force while a Refresh runs, and lifts it only on a successful read", async () => {
+    await render();
+    h.changed = { list: false, pipeline: true, refused: "forbidden" };
+    h.nextSnapshot = { list: null, detail: null, job: null };
+    await render();
+    expect(container.querySelector("header")).toBeNull();
+    await act(async () => handle.current!.refresh());
+    // The read is in flight: the retained detail and its actions stay hidden.
+    expect(container.querySelector("header")).toBeNull();
+    expect(container.textContent).not.toContain("Retry rspec");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "You can't view this pipeline.",
+    );
+    await settle();
+    expect(container.querySelector("header")).not.toBeNull();
+  });
+
+  it("does not bring a lifted refusal back on the next refresh", async () => {
+    await render();
+    h.changed = { list: false, pipeline: true, refused: "forbidden" };
+    h.nextSnapshot = { list: null, detail: null, job: null };
+    await render();
+    await act(async () => handle.current!.refresh());
+    await settle();
+    expect(container.querySelector("header")).not.toBeNull();
+    await act(async () => handle.current!.refresh());
+    // The second read is in flight: the authorized detail stays, with no old refusal.
+    expect(container.querySelector("header")).not.toBeNull();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  describe("a refusal stays in force until a later read of the pipeline succeeds", () => {
+    const steps = {
+      refusal: async () => {
+        h.error = operationError("forbidden", "No access.");
+        await render();
+      },
+      // The poller's read was refused and its stored row dropped.
+      pollerRefusal: async () => {
+        h.changed = { list: false, pipeline: true, refused: "forbidden" };
+        h.nextSnapshot = { list: null, detail: null, job: null };
+        await render();
+      },
+      timeout: async () => {
+        h.error = operationError("provider_error", "Host timed out");
+        await render();
+      },
+      // The list filter re-keys the stored copy this page reads.
+      filterChange: async () => {
+        usePipelinesStore
+          .getState()
+          .setFilters(projectRef, { ...DEFAULT_PIPELINES_FILTERS, ref: "release" });
+        await render();
+      },
+      pendingRefresh: async () => {
+        h.error = null;
+        await act(async () => handle.current!.refresh());
+      },
+      reopen: async () => {
+        await act(async () => root.unmount());
+        root = createRoot(container);
+        await render();
+      },
+    };
+    it.each<[string, (keyof typeof steps)[]]>([
+      ["refusal, then a timeout", ["refusal", "timeout"]],
+      ["timeout, then refusal, then timeout", ["timeout", "refusal", "timeout"]],
+      ["the poller's refusal, then a timeout", ["pollerRefusal", "timeout"]],
+      ["refusal, then a timeout, then a filter change", ["refusal", "timeout", "filterChange"]],
+      ["refusal, then a refresh still in flight", ["refusal", "pendingRefresh"]],
+      ["refusal, then a timeout, then reopening the page", ["refusal", "timeout", "reopen"]],
+    ])("%s", async (_name, order) => {
+      await render();
+      expect(container.querySelector("header")).not.toBeNull();
+      for (const step of order) await steps[step]();
+      expect(container.querySelector("header")).toBeNull();
+      expect(container.textContent).not.toContain("Retry rspec");
+      // Only a read the host answers lifts it.
+      h.error = null;
+      await act(async () => handle.current!.refresh());
+      await settle();
+      expect(container.querySelector("header")).not.toBeNull();
+    });
+  });
+
+  it("does not carry a refusal into another repository at the same checkout path", async () => {
+    h.detail = null;
+    h.error = operationError("not_found", "Gone.");
+    await render({ repository: "example-group/sample-project" });
+    expect(container.textContent).toContain("This pipeline no longer exists.");
+    // The remote now points at another repository: its pipeline 4821 has not answered yet.
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    h.error = null;
+    h.pending = true;
+    await render({ repository: "example-group/other-project" });
+    expect(container.textContent).not.toContain("This pipeline no longer exists.");
+    expectLoadingModel(container, ["Loading pipeline…"]);
+  });
+
+  it("names the pending read when a refused pipeline is opened again", async () => {
+    h.detail = null;
+    h.error = operationError("not_found", "Gone.");
+    await render();
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    h.error = null;
+    h.pending = true;
+    await render();
+    // The refusal stays in force, and the read that may lift it is announced.
+    expect(container.textContent).toContain("This pipeline no longer exists.");
+    expectLoadingModel(container, ["Loading pipeline…"]);
+  });
+
+  it("shows the refresh label while a change event's stored read is pending", async () => {
+    await render();
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    h.snapshotPending = true;
+    await render();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "Refreshing pipeline…",
+    );
+  });
+
   it("says a pipeline the poller found gone no longer exists", async () => {
     await render();
     h.changed = { list: false, pipeline: true, refused: "not_found" };
@@ -784,6 +917,22 @@ describe("PipelinesDetailView errors", () => {
       "This pipeline no longer exists.",
     );
     expect(container.querySelector("header")).toBeNull();
+  });
+});
+
+describe("PipelinesDetailView loading feedback", () => {
+  it("labels a first load, then keeps the detail beside a refresh label", async () => {
+    h.detail = null;
+    h.pending = true;
+    await render();
+    expectLoadingModel(container, ["Loading pipeline…"]);
+    h.detail = pipelineDetail({ pipeline: { title: "Loaded title" } });
+    await render();
+    expect(container.querySelector("header h2")?.textContent).toBe("Loaded title");
+    expectLoadingModel(container, ["Refreshing pipeline…"]);
+    h.pending = false;
+    await render();
+    expect(container.querySelector('[role="status"]')).toBeNull();
   });
 });
 

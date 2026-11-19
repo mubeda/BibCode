@@ -1371,9 +1371,13 @@ describe("GitManagerCreatePullRequestDialog", () => {
     await act(async () => button("Publish and create pull request").click());
 
     expect(text("create-pr-status")).toBe("Publishing feature/reviewed…");
+    // The progress status is heard as it changes, not held back by a busy dialog.
+    expect(
+      document.querySelector('[data-testid="create-pr-status"]')?.closest('[aria-busy="true"]'),
+    ).toBeNull();
     const cancel = button("Cancel");
     expect(cancel.disabled).toBe(true);
-    expect(cancel.title).toBe("Wait for the pull request to finish.");
+    expect(cancel.parentElement?.title).toBe("Wait for the pull request to finish.");
     expect(button("Working…").disabled).toBe(true);
     expect(input("git-manager-create-pr-title").disabled).toBe(true);
     await act(async () => cancel.click());

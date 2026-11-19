@@ -82,7 +82,7 @@ import { RichMarkdownLinkPopover } from "./richMarkdown/RichMarkdownLinkPopover"
 import { useInsertImage } from "./richMarkdown/useInsertImage";
 import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 import { FileMediaPreview } from "./FileMediaPreview";
-import { RichMarkdownView } from "./RichMarkdownView";
+import { preloadRichMarkdownSurface, RichMarkdownView } from "./RichMarkdownView";
 import { explainUndeliveredEdit, saveFile, useFileSaveShortcut } from "./useFileSaveShortcut";
 import {
   filePreviewKind,
@@ -847,6 +847,11 @@ export default function FilePreviewPanel({
   const [explorerOpen, setExplorerOpen] = useState(initialExplorerOpen);
   const breadcrumbRef = useRef<HTMLDivElement>(null);
   const isMarkdown = relativePath ? isMarkdownPreviewFile(relativePath) : false;
+  // Loads the editor when the panel opens, ahead of the first Markdown file; reading the file
+  // alone is too short a head start. A failed load reaches the view's error boundary.
+  useEffect(() => {
+    preloadRichMarkdownSurface().catch(() => undefined);
+  }, []);
   const renderMarkdownSource =
     isMarkdown && (sourceView.path === relativePath || revealLine !== null);
   const renderMarkdown = isMarkdown && !renderMarkdownSource && !file.data?.truncated;

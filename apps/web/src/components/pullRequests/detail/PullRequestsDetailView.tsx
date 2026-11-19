@@ -3,17 +3,19 @@ import {
   formatChangeRequestNumber,
 } from "@bibcode/shared/sourceControl";
 import { useAtomRefresh } from "@effect/atom-react";
+import { environmentRpcKey, squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime";
 import { projectKey } from "@bibcode/client-runtime/state/entities";
-import type {
-  EnvironmentId,
-  PullRequestsChecks as PullRequestsChecksData,
-  PullRequestsCommits as PullRequestsCommitsData,
-  PullRequestsContext,
-  PullRequestsDetail,
-  PullRequestsFiles as PullRequestsFilesData,
-  PullRequestsPipelineCopy,
-  PullRequestsTimeline,
-  ScopedProjectRef,
+import {
+  PullRequestsOperationError,
+  type EnvironmentId,
+  type PullRequestsChecks as PullRequestsChecksData,
+  type PullRequestsCommits as PullRequestsCommitsData,
+  type PullRequestsContext,
+  type PullRequestsDetail,
+  type PullRequestsFiles as PullRequestsFilesData,
+  type PullRequestsPipelineCopy,
+  type PullRequestsTimeline,
+  type ScopedProjectRef,
 } from "@bibcode/contracts";
 import {
   lazy,
@@ -48,12 +50,16 @@ import {
   type KeptCopy,
 } from "../../repositoryModule/snapshotDisplay.logic";
 import { PullRequestsQueryState } from "./PullRequestsQueryState";
+import { RefreshRegion } from "../../ui/loading-state";
 import { PullRequestsHeader } from "./PullRequestsHeader";
 import { PullRequestsConversation } from "./PullRequestsConversation";
 import { PullRequestsSideColumn } from "./PullRequestsSideColumn";
 import { PullRequestsCommits } from "./PullRequestsCommits";
 import { PullRequestsChecks } from "./PullRequestsChecks";
 import { usePullRequestsNavigation } from "./pullRequestsNavigation";
+import { useResourceRefusal } from "../../repositoryModule/resourceRefusal";
+import * as Schema from "effect/Schema";
+const isPullRequestsOperationError = Schema.is(PullRequestsOperationError);
 const PullRequestsFiles = lazy(() =>
   import("./PullRequestsFiles").then((module) => ({ default: module.PullRequestsFiles })),
 );
@@ -264,9 +270,33 @@ export function PullRequestsDetailView({
   // window: the atom still holds its own live value then, just a stale one.
   const liveDetail =
     detailQuery.data !== null && detailQuery.error === null ? detailQuery.data : null;
-  const displayedDetailData = detailQuery.data ?? paintedDetail?.payload ?? null;
-  const displayedDetailQuery: EnvironmentQueryView<PullRequestsDetail> =
-    detailQuery.data !== null || paintedDetail === null
+  // A refusal hides every copy of this request, live, stored and painted, until a later
+  // read of it succeeds: the same rule as the pipeline detail.
+  const detailFailure =
+    detailQuery.emission._tag === "Failure" ? squashAtomCommandFailure(detailQuery.emission) : null;
+  const refusal = useResourceRefusal(
+    `pullRequests.get:${context.host}/${context.repository}:${environmentRpcKey(request)}`,
+    detailQuery,
+    isPullRequestsOperationError(detailFailure) &&
+      (detailFailure.code === "forbidden" || detailFailure.code === "not_found")
+      ? detailFailure.code
+      : null,
+  );
+  const refused = refusal !== null;
+  const requestName = resolveChangeRequestPresentationForKind(context.provider).longName;
+  const displayedDetailData = refused ? null : (detailQuery.data ?? paintedDetail?.payload ?? null);
+  const displayedDetailQuery: EnvironmentQueryView<PullRequestsDetail> = refused
+    ? {
+        ...detailQuery,
+        data: null,
+        // A refusal held from an earlier read still says why nothing is shown.
+        error:
+          detailQuery.error ??
+          (refusal === "forbidden"
+            ? `You can't view this ${requestName}.`
+            : `This ${requestName} no longer exists.`),
+      }
+    : detailQuery.data !== null || paintedDetail === null
       ? detailQuery
       : { ...detailQuery, data: paintedDetail.payload, isPending: false };
   const paintedActivePayload = paintedTab?.tab === tab ? paintedTab.payload : null;
@@ -345,7 +375,15 @@ export function PullRequestsDetailView({
     files: vocabulary.filesChanged,
   };
   const detail = displayedDetailData;
-  const refreshing = detailQuery.isPending || activeQuery.isPending;
+  // Every read that updates what is shown: the Files tab also waits on its review threads.
+  // A tab with nothing on screen yet announces its own first load instead.
+  const refreshing =
+    detailQuery.isPending ||
+    // A pipeline-change event updates the shown copy through the stored read. Opening a
+    // cold tab also starts that read, and the tab's own first load names it.
+    (snapshotQuery.isPending && detail !== null && displayedActiveData !== null) ||
+    (activeQuery.isPending && displayedActiveData !== null) ||
+    (tab === "files" && timelineQuery.isPending && displayedTimeline !== null);
   const refreshDetail = detailQuery.refresh;
   const refreshTab = activeQuery.refresh;
   const refreshTimeline = timelineQuery.refresh;
@@ -385,15 +423,22 @@ export function PullRequestsDetailView({
         >
           {detail ? (
             <>
-              <PullRequestsHeader
-                scope={scope}
-                projectRef={projectRef}
-                detail={detail}
-                live={liveDetail}
-                context={context}
-                onRefresh={refresh}
+              {/* One status names the reread; the header, the shown tab and the side column
+                  are its busy regions, and a tab still loading announces itself instead. */}
+              <RefreshRegion
                 refreshing={refreshing}
-              />
+                status={`Refreshing ${presentation.longName} ${formatChangeRequestNumber(context.provider, number)}…`}
+              >
+                <PullRequestsHeader
+                  scope={scope}
+                  projectRef={projectRef}
+                  detail={detail}
+                  live={liveDetail}
+                  context={context}
+                  onRefresh={refresh}
+                  refreshing={refreshing}
+                />
+              </RefreshRegion>
               <Tabs
                 value={tab}
                 className="min-h-0 flex-1 gap-0"
@@ -424,6 +469,8 @@ export function PullRequestsDetailView({
                       key={tab}
                       query={displayedActiveQuery}
                       label={labels[tab]}
+                      // Files marks its review threads busy instead, below its own first load.
+                      busy={tab === "files" ? undefined : refreshing}
                     >
                       {tab === "conversation" && displayedTimeline ? (
                         <PullRequestsConversation
@@ -454,7 +501,11 @@ export function PullRequestsDetailView({
                             </p>
                           }
                         >
-                          <PullRequestsQueryState query={timelineQuery} label="Review threads">
+                          <PullRequestsQueryState
+                            query={timelineQuery}
+                            label="Review threads"
+                            busy={refreshing}
+                          >
                             {displayedTimeline ? (
                               <PullRequestsFiles
                                 timeline={displayedTimeline}
@@ -474,14 +525,16 @@ export function PullRequestsDetailView({
                     data-pull-request-side-column="wide"
                     className="hidden w-64 shrink-0 overflow-auto border-l border-border @3xl/pull-request:block"
                   >
-                    <PullRequestsSideColumn
-                      detail={detail}
-                      live={liveDetail}
-                      context={context}
-                      scope={scope}
-                      projectRef={projectRef}
-                      detailsRefreshing={detailQuery.isPending}
-                    />
+                    <RefreshRegion refreshing={refreshing}>
+                      <PullRequestsSideColumn
+                        detail={detail}
+                        live={liveDetail}
+                        context={context}
+                        scope={scope}
+                        projectRef={projectRef}
+                        detailsRefreshing={detailQuery.isPending}
+                      />
+                    </RefreshRegion>
                   </div>
                 </div>
               </Tabs>

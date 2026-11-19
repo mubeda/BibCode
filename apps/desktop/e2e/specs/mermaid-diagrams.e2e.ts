@@ -15,6 +15,7 @@ import { startKeyboardSamples, type KeyboardSample } from "../support/timeline-k
 import { desktopUiFixture } from "../support/test-project.ts";
 import {
   ensureMainSidebarOpen,
+  expectRightPanelBesideChat,
   mockDesktopUiFolderPicker,
   setDesktopUiWindowSize,
 } from "../support/ui-state.ts";
@@ -722,7 +723,9 @@ async function scrollTimelineToEnd(lastLine: string): Promise<void> {
 describe("packaged Mermaid diagrams", () => {
   it("draws, refuses and sanitizes diagrams in the rendered Markdown view", async () => {
     prepareMermaidFixtureFiles(preparedProjectPath);
-    await setDesktopUiWindowSize(1_600, 1_000);
+    // The case needs only the Files panel beside the chat, and this size fits a laptop screen.
+    await setDesktopUiWindowSize(1_200, 720);
+    await expectRightPanelBesideChat();
     await watchSecurityPolicyViolations();
     await openFixtureWorkspace();
     await openFilesSurface();
@@ -733,6 +736,19 @@ describe("packaged Mermaid diagrams", () => {
       expect.stringContaining("Fixture draw"),
     );
     await saveEvidence("mermaid-file-valid");
+    // The file view can draw the diagram again right after the first draw, so the svg seen above
+    // may be one whose nodes are not drawn yet.
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (viewQuery: string) =>
+            !!document
+              .querySelector(`${viewQuery} .chat-markdown-mermaid svg`)
+              ?.querySelector(".pele-node rect, .pele-node polygon, .pele-node path"),
+          fileViewSelector,
+        ),
+      { timeout: 10_000, timeoutMsg: "The drawn fixture diagram never showed a node shape." },
+    );
 
     // A theme switch recolors the drawn diagram without drawing or replacing it. Timers, not
     // animation frames, wait for React: frames can stop in an occluded macOS webview.
@@ -1388,6 +1404,32 @@ describe("packaged Mermaid diagrams", () => {
     );
     await expectPaintingWebview();
     await waitForRowsReplyUnmount({ width: 1_400, height: 900 }, "Fixture draw");
+    // The remounted row would draw within a task of mounting, often before the line being read
+    // scrolls into view. Draws that miss the cache are held until that line is chosen, so every
+    // run sees the row's source with the line chosen, then the draw.
+    const held = await browser.execute(() => {
+      const page = window as Window & {
+        __bibcodeHoldMermaidDraws?: () => () => void;
+        __bibcodeReleaseMermaidDraws?: () => void;
+      };
+      if (!page.__bibcodeHoldMermaidDraws) return false;
+      page.__bibcodeReleaseMermaidDraws = page.__bibcodeHoldMermaidDraws();
+      return true;
+    });
+    expect(held).toBe(true);
+    try {
+      await holdLineThenDrawCold();
+    } finally {
+      await browser.execute(() =>
+        (
+          window as Window & { __bibcodeReleaseMermaidDraws?: () => void }
+        ).__bibcodeReleaseMermaidDraws?.(),
+      );
+    }
+  }).timeout(900_000);
+
+  /** The cold-draw case from the held draw on: scroll to the line, release, check the line. */
+  async function holdLineThenDrawCold(): Promise<void> {
     // The step-by-step scroll up takes over a minute on a slow runner (Linux arm64), so the
     // samples run until the row has drawn rather than stopping at the usual minute.
     await startReadingLineSamples(
@@ -1403,10 +1445,26 @@ describe("packaged Mermaid diagrams", () => {
           const reachedBlock = [
             ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
           ].some((element) => element.textContent?.includes(diagramLabel));
-          if (reachedBlock) return true;
           const scroller = document.querySelector<HTMLElement>(
             `${surface} [class*='overflow-anchor']`,
           );
+          // The list can mount the rows reply well above the view, before the reply below it,
+          // whose paragraph is the line being read, is in view; scrolling on brings that line
+          // in. The test is the sampler's own choice of line.
+          const viewport = scroller?.parentElement?.getBoundingClientRect();
+          const lineInView =
+            !!viewport &&
+            [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)].some(
+              (element) => {
+                const box = element.getBoundingClientRect();
+                return (
+                  element.textContent?.startsWith("Following reply paragraph ") &&
+                  box.top >= viewport.top + 16 &&
+                  box.bottom <= viewport.bottom - 16
+                );
+              },
+            );
+          if (reachedBlock && lineInView) return true;
           if (scroller) scroller.scrollTop -= 300;
           return false;
         },
@@ -1416,6 +1474,15 @@ describe("packaged Mermaid diagrams", () => {
       if (reached) break;
       await browser.pause(250);
     }
+    await browser.waitUntil(
+      async () => (await readReadingLineSamples()).painted.some((entry) => entry.target !== null),
+      { timeoutMsg: "The sampler never chose a reading line while the draw was held." },
+    );
+    await browser.execute(() =>
+      (
+        window as Window & { __bibcodeReleaseMermaidDraws?: () => void }
+      ).__bibcodeReleaseMermaidDraws?.(),
+    );
     await browser.pause(1_500);
     const coldDraw = await readReadingLineSamples();
     await browser.execute(() =>
@@ -1444,10 +1511,11 @@ describe("packaged Mermaid diagrams", () => {
     const drew = coldDraw.painted.findIndex(
       (entry, index) => index >= appeared && entry.diagramDrawn,
     );
-    // A row remounted in the buffer can draw from the cache before its first painted frame, so
-    // the check needs the diagram drawn by the end, not a frame of its source first.
+    // With the draw held, a painted frame shows the row's source and the chosen line before
+    // the diagram draws.
     expect(appeared).toBeGreaterThanOrEqual(0);
-    expect(drew).toBeGreaterThanOrEqual(appeared);
+    expect(coldDraw.painted[appeared]!.diagramDrawn).toBe(false);
+    expect(drew).toBeGreaterThan(appeared);
     const readingLine = coldDraw.painted[appeared]!.target!;
     // The diagram's row ends where the read row begins. A display scaled 200% lays the two out
     // a fraction of a pixel apart, so the row counts as above within the same 1 px as below.
@@ -1463,7 +1531,7 @@ describe("packaged Mermaid diagrams", () => {
         ),
     ).toBe(true);
     await saveEvidence("mermaid-timeline-cold-draw");
-  }).timeout(900_000);
+  }
 
   it("follows the end while a streamed reply's diagram draws", async () => {
     await setDesktopUiWindowSize(1_400, 900);
@@ -1743,7 +1811,16 @@ describe("packaged Mermaid diagrams", () => {
             );
             if (above) {
               above.dataset.bibcodeKeyboardGrown = "true";
-              above.style.paddingTop = "160px";
+              // A style rule, not an inline style: the list can unmount the row before the key and
+              // mount it again, and the growth must come back with it as a real row's would.
+              const row = above.closest<HTMLElement>("[data-message-id]")?.dataset.messageId;
+              const nth = [...above.parentElement!.children]
+                .filter((element) => element.tagName === "P")
+                .indexOf(above);
+              const grown = document.createElement("style");
+              grown.dataset.bibcodeKeyboardGrown = "true";
+              grown.textContent = `[data-message-id="${CSS.escape(row ?? "")}"] p:nth-of-type(${nth + 1}) { padding-top: 160px; }`;
+              document.head.append(grown);
             }
             frames(2, () => {
               const button = [
@@ -1995,8 +2072,8 @@ describe("packaged Mermaid diagrams", () => {
       for (const element of document.querySelectorAll<HTMLElement>(
         "[data-bibcode-keyboard-grown]",
       )) {
-        element.style.paddingTop = "";
-        element.removeAttribute("data-bibcode-keyboard-grown");
+        if (element instanceof HTMLStyleElement) element.remove();
+        else element.removeAttribute("data-bibcode-keyboard-grown");
       }
     });
     const endAt = (await readKeyboardSamples()).samples.at(-1)!.at;
@@ -2375,7 +2452,16 @@ async function pressNativePageUpDuringGlide(
           );
           if (above) {
             above.dataset.bibcodeKeyboardGrown = "true";
-            above.style.paddingTop = "160px";
+            // A style rule, not an inline style: the list can unmount the row before the key and
+            // mount it again, and the growth must come back with it as a real row's would.
+            const row = above.closest<HTMLElement>("[data-message-id]")?.dataset.messageId;
+            const nth = [...above.parentElement!.children]
+              .filter((element) => element.tagName === "P")
+              .indexOf(above);
+            const grown = document.createElement("style");
+            grown.dataset.bibcodeKeyboardGrown = "true";
+            grown.textContent = `[data-message-id="${CSS.escape(row ?? "")}"] p:nth-of-type(${nth + 1}) { padding-top: 160px; }`;
+            document.head.append(grown);
           }
           requestAnimationFrame(() =>
             requestAnimationFrame(() => {

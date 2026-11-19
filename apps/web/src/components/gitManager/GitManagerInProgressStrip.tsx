@@ -3,6 +3,7 @@ import { AlertTriangleIcon } from "lucide-react";
 import { memo, useCallback, useState } from "react";
 
 import { Button } from "~/components/ui/button";
+import { GitManagerDisabledReasonButton } from "./GitManagerDisabledReasonButton";
 import {
   Dialog,
   DialogDescription,
@@ -42,8 +43,6 @@ export const GitManagerInProgressStrip = memo(function GitManagerInProgressStrip
   const presentation = describeInProgressOperation(operation);
   const continueReason = disabledReason ?? continueDisabledReason;
   const blockedReason = continueReason ?? resolveInProgressBlockedReason(blocked);
-  const disabledReasonId =
-    continueReason === null ? undefined : "git-manager-in-progress-disabled-reason";
   const requestAbort = useCallback(() => setAbortConfirmationOpen(true), []);
   const confirmAbort = useCallback(() => {
     setAbortConfirmationOpen(false);
@@ -68,31 +67,25 @@ export const GitManagerInProgressStrip = memo(function GitManagerInProgressStrip
               </span>
             )}
           </span>
-          <Button
-            aria-describedby={disabledReasonId}
-            disabled={continueReason !== null}
+          <GitManagerDisabledReasonButton
+            disabledReason={continueReason}
             size="xs"
-            title={continueReason ?? undefined}
             variant="outline"
             onClick={onContinue}
           >
             {continueLabel}
-          </Button>
-          <Button
-            aria-describedby={disabledReason === null ? undefined : disabledReasonId}
-            disabled={disabledReason !== null}
+          </GitManagerDisabledReasonButton>
+          <GitManagerDisabledReasonButton
+            disabledReason={disabledReason}
             size="xs"
-            title={disabledReason ?? undefined}
             variant="destructive-outline"
             onClick={requestAbort}
           >
             Abort
-          </Button>
+          </GitManagerDisabledReasonButton>
         </div>
         {blockedReason === null ? null : (
-          <p className="mt-1 text-xs text-muted-foreground" id={disabledReasonId}>
-            {blockedReason}
-          </p>
+          <p className="mt-1 text-xs text-muted-foreground">{blockedReason}</p>
         )}
       </section>
       <Dialog open={abortConfirmationOpen} onOpenChange={setAbortConfirmationOpen}>

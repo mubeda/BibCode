@@ -95,6 +95,8 @@ describe("CenterTerminalPanel", () => {
     expect(h.panelProps?.["onSplitTerminal"]).toBeUndefined();
     expect(h.panelProps?.["onSplitTerminalVertical"]).toBeUndefined();
     expect(h.panelProps?.["onCloseTerminal"]).toBe(onClose);
+    expect(h.panelProps?.["chatThread"]).toBe(true);
+    expect(h.panelProps?.["attachOnly"]).toBe(false);
     expect(
       (h.panelProps!["terminalCommandsById"] as ReadonlyMap<string, unknown>).get("term-1"),
     ).toEqual(surface.command);

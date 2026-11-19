@@ -1130,9 +1130,7 @@ impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
             if !registry.removal_is_current(&identity) {
                 return Ok(());
             }
-            let terminals_to_close = terminals
-                .capture_thread_terminal_identities(&thread_id)
-                .await;
+            let terminals_to_close = workspace_terminal_identities(&terminals, &thread_id).await;
             let Some(_signal) = registry.begin_removal_terminal_signal(&identity).await else {
                 return Ok(());
             };
@@ -1141,6 +1139,20 @@ impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
                 .await
         })
     }
+}
+
+/// The terminals a workspace's loss or removal stops for `thread_id`. The server terminal
+/// (#378) has no workspace, so a thread row left with its id by an older server never reaches it.
+async fn workspace_terminal_identities(
+    terminals: &ServerTerminalServices,
+    thread_id: &str,
+) -> Vec<crate::terminal::TerminalSessionIdentity> {
+    if thread_id == crate::terminal::SERVER_TERMINAL_THREAD_ID {
+        return Vec::new();
+    }
+    terminals
+        .capture_thread_terminal_identities(thread_id)
+        .await
 }
 
 async fn quiesce_terminals_for_transition(
@@ -1152,9 +1164,7 @@ async fn quiesce_terminals_for_transition(
     if !registry.transition_is_current(transition) {
         return Ok(());
     }
-    let identities = terminals
-        .capture_thread_terminal_identities(thread_id)
-        .await;
+    let identities = workspace_terminal_identities(terminals, thread_id).await;
     let Some(_signal_permit) = registry.begin_terminal_signal(transition).await else {
         return Ok(());
     };
@@ -1755,6 +1765,7 @@ mod tests {
                 open_url: None,
                 host_thread_id: None,
                 side_chat_host_thread_id: None,
+                code_review: false,
             })
             .await
             .expect("provider launches");
@@ -1872,6 +1883,90 @@ mod tests {
                 .last_error
                 .unwrap()
                 .contains("workspace became unavailable")
+        );
+        provider.shutdown().await.unwrap();
+        terminals.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    /// A workspace thread row with the server terminal's id, left by an older server, is
+    /// detached: the removal's terminal cleanup collects that thread's terminals and must leave
+    /// the server's home shell running.
+    #[tokio::test]
+    async fn production_workspace_removal_leaves_the_server_terminal_running() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::open_in_memory().await.unwrap();
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let activity = ActivityProjection::new(ActivityRepository::new(database.clone()));
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .unwrap();
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(RuntimeTestProvider),
+            activity,
+            SupervisorOptions::default(),
+        ));
+        let backend = Arc::new(RuntimeTestPtyBackend::default());
+        let terminals = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
+        terminals
+            .open(TerminalOpenInput::new(
+                crate::terminal::SERVER_TERMINAL_THREAD_ID,
+                crate::terminal::SERVER_TERMINAL_THREAD_ID,
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("server terminal opens");
+        let shell = backend.processes()[0].clone();
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let removal = registry
+            .mark_removing(crate::terminal::SERVER_TERMINAL_THREAD_ID, root.path())
+            .await
+            .expect("physical identity resolves");
+        let actions = super::ProductionWorktreeRuntimeActions {
+            orchestration: engine.clone(),
+            provider: provider.clone(),
+            terminals: runtime_terminal_services(terminals.clone()),
+            registry,
+        };
+
+        actions
+            .close_terminals_for_removal(
+                crate::terminal::SERVER_TERMINAL_THREAD_ID.into(),
+                removal.identity(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!shell.is_killed(), "the removal killed the server shell");
+        drop(removal);
+
+        // The same row's workspace going missing does not reach it either.
+        let loss = WorkspaceLossTransition {
+            thread_id: crate::terminal::SERVER_TERMINAL_THREAD_ID.to_owned(),
+            path: std::fs::canonicalize(root.path()).unwrap(),
+            ..transition(1)
+        };
+        actions
+            .registry
+            .mark_unavailable(loss.clone())
+            .await
+            .unwrap();
+        actions
+            .close_terminals(crate::terminal::SERVER_TERMINAL_THREAD_ID.into(), loss)
+            .await
+            .unwrap();
+        assert!(
+            !shell.is_killed(),
+            "the workspace loss killed the server shell"
         );
         provider.shutdown().await.unwrap();
         terminals.shutdown().await;
@@ -4120,6 +4215,7 @@ pub(super) mod removal_test_support {
             open_url: None,
             host_thread_id: None,
             side_chat_host_thread_id: None,
+            code_review: false,
         }
     }
 

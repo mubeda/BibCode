@@ -189,6 +189,7 @@ const ProviderRuntimeEventType = Schema.Literals([
   "item.updated",
   "item.completed",
   "content.delta",
+  "assistant.message.completed",
   "request.opened",
   "request.resolved",
   "user-input.requested",
@@ -239,6 +240,7 @@ const ItemStartedType = Schema.Literal("item.started");
 const ItemUpdatedType = Schema.Literal("item.updated");
 const ItemCompletedType = Schema.Literal("item.completed");
 const ContentDeltaType = Schema.Literal("content.delta");
+const AssistantMessageCompletedType = Schema.Literal("assistant.message.completed");
 const RequestOpenedType = Schema.Literal("request.opened");
 const RequestResolvedType = Schema.Literal("request.resolved");
 const UserInputRequestedType = Schema.Literal("user-input.requested");
@@ -454,6 +456,13 @@ const ContentDeltaPayload = Schema.Struct({
   summaryIndex: Schema.optional(Schema.Int),
 });
 export type ContentDeltaPayload = typeof ContentDeltaPayload.Type;
+
+// Ends assistant text that no turn completion settles: an answer Claude gives with no turn open.
+const AssistantMessageCompletedPayload = Schema.Struct({
+  // More of the same answer's text follows; only the last completion ends the answer.
+  answerContinues: Schema.optional(Schema.Boolean),
+});
+export type AssistantMessageCompletedPayload = typeof AssistantMessageCompletedPayload.Type;
 
 const RequestOpenedPayload = Schema.Struct({
   requestType: CanonicalRequestType,
@@ -844,6 +853,14 @@ const ProviderRuntimeContentDeltaEvent = Schema.Struct({
 });
 export type ProviderRuntimeContentDeltaEvent = typeof ProviderRuntimeContentDeltaEvent.Type;
 
+const ProviderRuntimeAssistantMessageCompletedEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: AssistantMessageCompletedType,
+  payload: AssistantMessageCompletedPayload,
+});
+export type ProviderRuntimeAssistantMessageCompletedEvent =
+  typeof ProviderRuntimeAssistantMessageCompletedEvent.Type;
+
 const ProviderRuntimeRequestOpenedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: RequestOpenedType,
@@ -1042,6 +1059,7 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeItemUpdatedEvent,
   ProviderRuntimeItemCompletedEvent,
   ProviderRuntimeContentDeltaEvent,
+  ProviderRuntimeAssistantMessageCompletedEvent,
   ProviderRuntimeRequestOpenedEvent,
   ProviderRuntimeRequestResolvedEvent,
   ProviderRuntimeUserInputRequestedEvent,

@@ -968,6 +968,96 @@ describe("MessagesTimeline", () => {
     expect(container.textContent).toContain("Waiting for 2s");
   });
 
+  it("does not move backward when the sent message's turn starts", async () => {
+    const animationFrameHarness = installAnimationFrameHarness();
+    const MessagesTimeline = await loadMessagesTimeline();
+    const container = await mountTimeline({
+      isWorking: true,
+      runningTurnId: null,
+      activeTurnStartedAt: null,
+      timelineEntries: [],
+    });
+    await animationFrameHarness.advanceBy(1_250);
+    expect(container.textContent).toContain("Waiting for 1s");
+
+    const mounted = mountedTrees.at(-1)!;
+    await act(async () =>
+      mounted.root.render(
+        <MessagesTimeline
+          {...buildProps()}
+          isWorking
+          runningTurnId={TurnId.make("turn-sent")}
+          activeTurnStartedAt={new Date().toISOString()}
+          timelineEntries={[]}
+        />,
+      ),
+    );
+    expect(container.textContent).toContain("Waiting for 1s");
+  });
+
+  it("restarts the waiting timer for a new turn that follows a finished one (#389)", async () => {
+    const animationFrameHarness = installAnimationFrameHarness();
+    const MessagesTimeline = await loadMessagesTimeline();
+    const container = await mountTimeline({
+      isWorking: true,
+      runningTurnId: TurnId.make("turn-old"),
+      activeTurnStartedAt: new Date(Date.now() - 65_000).toISOString(),
+      timelineEntries: [],
+    });
+    expect(container.textContent).toContain("Waiting for 1m 5s");
+
+    const mounted = mountedTrees.at(-1)!;
+    await act(async () =>
+      mounted.root.render(
+        <MessagesTimeline
+          {...buildProps()}
+          isWorking
+          runningTurnId={TurnId.make("turn-new")}
+          activeTurnStartedAt={new Date().toISOString()}
+          timelineEntries={[]}
+        />,
+      ),
+    );
+    expect(container.textContent).toContain("Waiting for 0s");
+
+    await animationFrameHarness.advanceBy(1_100);
+    expect(container.textContent).toContain("Waiting for 1s");
+  });
+
+  it("restarts the waiting timer for a new turn reached through a pending send", async () => {
+    const animationFrameHarness = installAnimationFrameHarness();
+    const MessagesTimeline = await loadMessagesTimeline();
+    const container = await mountTimeline({
+      isWorking: true,
+      runningTurnId: TurnId.make("turn-old"),
+      activeTurnStartedAt: new Date(Date.now() - 65_000).toISOString(),
+      timelineEntries: [],
+    });
+    expect(container.textContent).toContain("Waiting for 1m 5s");
+
+    const mounted = mountedTrees.at(-1)!;
+    const renderWith = (runningTurnId: TurnId | null, activeTurnStartedAt: string | null) =>
+      act(async () =>
+        mounted.root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            isWorking
+            runningTurnId={runningTurnId}
+            activeTurnStartedAt={activeTurnStartedAt}
+            timelineEntries={[]}
+          />,
+        ),
+      );
+    // Between the turns a send is pending: no turn id, the row stays mounted. That is a new wait.
+    await renderWith(null, new Date().toISOString());
+    expect(container.textContent).toContain("Waiting for 0s");
+    await animationFrameHarness.advanceBy(1_100);
+    expect(container.textContent).toContain("Waiting for 1s");
+    // The sent message's turn continues that wait without moving backward.
+    await renderWith(TurnId.make("turn-new"), new Date().toISOString());
+    expect(container.textContent).toContain("Waiting for 1s");
+  });
+
   it("renders a failure marker for failed tool lifecycle entries", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const markup = renderToStaticMarkup(

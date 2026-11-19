@@ -1153,11 +1153,13 @@ impl CodexSessionRuntime {
                 CodexRuntimeMode::ApprovalRequired => "untrusted",
                 CodexRuntimeMode::AutoAcceptEdits => "on-request",
                 CodexRuntimeMode::FullAccess => "never",
+                CodexRuntimeMode::CodeReview => "never",
             },
             "sandbox": match self.inner.options.runtime_mode {
                 CodexRuntimeMode::ApprovalRequired => "read-only",
                 CodexRuntimeMode::AutoAcceptEdits => "workspace-write",
                 CodexRuntimeMode::FullAccess => "danger-full-access",
+                CodexRuntimeMode::CodeReview => "read-only",
             },
             "model": self.inner.options.model,
             "serviceTier": self.inner.options.service_tier,
@@ -1200,11 +1202,13 @@ impl CodexSessionRuntime {
                                 CodexRuntimeMode::ApprovalRequired => "untrusted",
                                 CodexRuntimeMode::AutoAcceptEdits => "on-request",
                                 CodexRuntimeMode::FullAccess => "never",
+                                CodexRuntimeMode::CodeReview => "never",
                             },
                             "sandbox": match self.inner.options.runtime_mode {
                                 CodexRuntimeMode::ApprovalRequired => "read-only",
                                 CodexRuntimeMode::AutoAcceptEdits => "workspace-write",
                                 CodexRuntimeMode::FullAccess => "danger-full-access",
+                                CodexRuntimeMode::CodeReview => "read-only",
                             },
                             "model": resume_model,
                             "serviceTier": self.inner.options.service_tier,
@@ -3008,6 +3012,26 @@ impl CodexSessionRuntime {
         params: Value,
     ) -> Result<(), RuntimeError> {
         match method.as_str() {
+            // A code review runs on its own (#376): nobody answers a card, so it is declined at
+            // once and never recorded as pending, and the turn goes on.
+            "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/tool/requestUserInput"
+                if self.inner.options.runtime_mode == CodexRuntimeMode::CodeReview =>
+            {
+                let reply = if method == "item/tool/requestUserInput" {
+                    json!({ "answers": {} })
+                } else {
+                    json!({ "decision": "decline" })
+                };
+                tracing::info!(
+                    provider = PROVIDER,
+                    method = method.as_str(),
+                    "declined a Codex request in a code review"
+                );
+                connection.respond(wire_id, reply).await?;
+                Ok(())
+            }
             "item/commandExecution/requestApproval" => {
                 let request_id = request_scope.approval_id(&correlation_id);
                 let turn_id = params
@@ -5388,6 +5412,69 @@ mod tests {
         let second = runtime.next_event().await.expect("second event");
         assert_eq!(second.event_type, "request.opened");
         assert_ne!(first.request_id, second.request_id);
+    }
+
+    #[tokio::test]
+    async fn code_review_session_declines_codex_requests_without_a_pending_card() {
+        let requests = [
+            ("1", "item/commandExecution/requestApproval"),
+            ("2", "item/fileChange/requestApproval"),
+            ("3", "item/tool/requestUserInput"),
+        ];
+        for code_review in [true, false] {
+            let (connection, _protocol, _peer_stdout, peer_stdin, _peer_stderr) =
+                runtime_test_connection();
+            let (sender, incoming) = mpsc::unbounded_channel();
+            let mut options = reconciliation_test_options();
+            if code_review {
+                options.runtime_mode = CodexRuntimeMode::CodeReview;
+            }
+            let runtime = CodexSessionRuntime::new(options, connection, incoming);
+            for (id, method) in requests {
+                sender
+                    .send(IncomingEvent::Request {
+                        correlation_id: id.to_owned(),
+                        wire_id: json!(id.parse::<u64>().unwrap()),
+                        method: method.to_owned(),
+                        params: json!({"turnId":"turn-1","reason":"Approve","questions":[]}),
+                    })
+                    .expect("request");
+            }
+            if code_review {
+                let mut reader = BufReader::new(peer_stdin);
+                let mut replies = Vec::new();
+                for _ in requests {
+                    let reply = read_runtime_test_json(&mut reader).await;
+                    replies.push((reply["id"].as_u64().unwrap(), reply["result"].clone()));
+                }
+                replies.sort_by_key(|(id, _)| *id);
+                assert_eq!(
+                    replies,
+                    [
+                        (1, json!({"decision":"decline"})),
+                        (2, json!({"decision":"decline"})),
+                        (3, json!({"answers":{}})),
+                    ]
+                );
+                assert!(runtime.inner.pending_requests.lock().await.is_empty());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), runtime.next_event())
+                        .await
+                        .is_err(),
+                    "a declined request publishes no request.opened"
+                );
+            } else {
+                let mut kinds = Vec::new();
+                for _ in requests {
+                    kinds.push(runtime.next_event().await.expect("event").event_type);
+                }
+                assert_eq!(
+                    kinds,
+                    ["request.opened", "request.opened", "user-input.requested"]
+                );
+                assert_eq!(runtime.inner.pending_requests.lock().await.len(), 3);
+            }
+        }
     }
 
     #[tokio::test]

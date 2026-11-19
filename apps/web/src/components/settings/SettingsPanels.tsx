@@ -1212,8 +1212,9 @@ function CodeReviewSettingsSection({
 }) {
   const settings = usePrimarySettings();
   const updateSettings = useUpdatePrimarySettings();
+  const primaryEnvironment = usePrimaryEnvironment();
   const supported =
-    usePrimaryEnvironment()?.serverConfig?.environment.capabilities?.codeReviews === true;
+    primaryEnvironment?.serverConfig?.environment.capabilities?.codeReviews === true;
   const unsupportedStatus = supported ? null : CODE_REVIEW_SERVER_UPDATE_REASON;
   // An older server ignores or refuses these keys (D47), so nothing here sends them there.
   const updateReviewSettings = (patch: Parameters<typeof updateSettings>[0]) => {
@@ -1264,6 +1265,9 @@ function CodeReviewSettingsSection({
             ? codeReviewGuardLine({
                 kind: saved.kind,
                 driver: savedReviewer.action.entry.driverKind,
+                readOnlyCodexReviews:
+                  primaryEnvironment?.serverConfig?.environment.capabilities
+                    ?.readOnlyCodexReviews === true,
               })
             : savedReviewer.reason)
         }

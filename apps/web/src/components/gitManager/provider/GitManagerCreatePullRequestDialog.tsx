@@ -78,6 +78,7 @@ import {
   type CreatePullRequestProgress,
   type CreatePullRequestProviderHint,
 } from "./GitManagerPullRequestPanel.logic";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 
 function safeExternalUrl(value: string | null): string | null {
   if (value === null) return null;
@@ -428,11 +429,7 @@ function CreatePullRequestReviewDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogPopup
-        aria-busy={busy ? "true" : "false"}
-        className="max-w-xl"
-        data-testid="git-manager-create-pr-dialog"
-      >
+      <DialogPopup className="max-w-xl" data-testid="git-manager-create-pr-dialog">
         <DialogHeader className="pb-4">
           <DialogTitle>Create {noun}</DialogTitle>
           <DialogDescription>
@@ -661,14 +658,13 @@ function CreatePullRequestReviewDialog({
             </Button>
           ) : (
             <>
-              <Button
-                disabled={busy}
-                title={busy ? waitReason : undefined}
+              <GitManagerDisabledReasonButton
+                disabledReason={busy ? waitReason : null}
                 variant="outline"
                 onClick={() => handleOpenChange(false)}
               >
                 Cancel
-              </Button>
+              </GitManagerDisabledReasonButton>
               <PermissionButton
                 permission={{
                   allowed: primaryDisabledReason === null,

@@ -185,6 +185,9 @@ pub struct ProviderLaunchRequest {
     /// The host of a side chat (#265), whose messages the side chat's first delivered turn
     /// carries. `None` for any other thread.
     pub side_chat_host_thread_id: Option<String>,
+    /// The thread is a code review panel (#376), from the thread row. Read by Codex only, which
+    /// then never asks and stays in its read-only sandbox, whatever `runtime_mode` says.
+    pub code_review: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -400,6 +403,11 @@ pub trait ProviderDriver: Send + Sync {
     /// what its previous process reported until the new one reports its own.
     fn startup_activity_capabilities_are_final(&self) -> bool {
         false
+    }
+    /// The retired model this driver dropped from its launch (#380 R4): it starts with the
+    /// provider's default instead, and the thread stops naming the retired model.
+    fn retired_model(&self) -> Option<&'static str> {
+        None
     }
     fn send(
         &self,
@@ -948,6 +956,9 @@ type SessionPublicationFence = Arc<Mutex<SessionPublicationState>>;
 
 struct SessionEntry {
     launch: ProviderLaunchRequest,
+    /// The retired Codex model the launch dropped, spelled as it was requested (#380 R4): the
+    /// turns admitted before the drop fingerprint that spelling.
+    dropped_model: Option<String>,
     driver: Arc<dyn ProviderDriver>,
     /// Holds queued messages while a resumed session reads the asks its provider kept (#187);
     /// released by that read finishing or by the session ending.
@@ -6642,6 +6653,7 @@ async fn build_launch_request(
         open_url: None,
         host_thread_id: thread.host_thread_id.clone(),
         side_chat_host_thread_id: thread.host_thread_id.clone().filter(|_| thread.side_chat),
+        code_review: thread.code_review,
     })
 }
 
@@ -8039,7 +8051,23 @@ fn validate_active_delivery_identity(
             ),
         });
     }
-    validate_frozen_delivery_route(row, &entry.launch)?;
+    match &entry.dropped_model {
+        // The session dropped the retired model a turn was admitted naming (#380 R4); that turn
+        // still matches the launch as it was requested. Its route holds the spelling it was
+        // admitted with, which may be another spelling of the same model.
+        Some(dropped) => {
+            let mut admitted = entry.launch.clone();
+            admitted.model = row
+                .payload
+                .get("modelSelection")
+                .and_then(model_from_selection)
+                .filter(|model| crate::provider::codex::model::same_model(model, dropped))
+                .or_else(|| Some(dropped.clone()));
+            validate_frozen_delivery_route(row, &entry.launch)
+                .or_else(|_| validate_frozen_delivery_route(row, &admitted))?;
+        }
+        None => validate_frozen_delivery_route(row, &entry.launch)?,
+    }
     if row.provider_session_id.is_none() {
         return Ok(());
     }
@@ -9765,6 +9793,10 @@ async fn launch_session(
             .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
             .is_some_and(|runtime| saved_context_handoff(runtime.runtime_payload.as_ref()));
     let driver = factory.create(request.clone()).await?;
+    let retired_model = driver.retired_model();
+    // The session runs Codex's default, so the thread's "auto" below is no model change to
+    // restart for.
+    let dropped_model = retired_model.and_then(|_| request.model.take());
     persist_runtime(
         &engine.repositories(),
         &request,
@@ -9953,10 +9985,24 @@ async fn launch_session(
         #[cfg(test)]
         idle_deadline_test_observer.clone(),
     );
+    if let Some(retired) = retired_model {
+        clear_retired_codex_selection(
+            engine.clone(),
+            retired_codex_selection_clear(
+                &request.thread_id,
+                request
+                    .provider_instance_id
+                    .as_deref()
+                    .unwrap_or(request.provider.as_str()),
+                retired,
+            ),
+        );
+    }
     sessions.insert(
         request.thread_id.clone(),
         SessionEntry {
             launch: request,
+            dropped_model,
             driver,
             _ask_recovery: ask_recovery,
             engine: engine.clone(),
@@ -9994,6 +10040,40 @@ async fn launch_session(
         },
     );
     Ok(released)
+}
+
+/// #380 R4: once a session started without a model Codex retired, the thread stops naming it,
+/// so its warning shows once. Off the supervisor's turn, as an ordinary orchestration command;
+/// a failure leaves the warning to show again at the next start.
+fn clear_retired_codex_selection(engine: OrchestrationEngine, command: OrchestrationCommand) {
+    tokio::spawn(async move {
+        let thread_id = command.aggregate_ref().1.to_owned();
+        match engine.dispatch(command).await {
+            Ok(_) => {}
+            // Another client chose a model meanwhile; there is nothing left to clear.
+            Err(crate::orchestration::OrchestrationError::Invariant { detail, .. })
+                if detail == crate::orchestration::RETIRED_MODEL_ALREADY_REPLACED => {}
+            Err(error) => {
+                tracing::warn!(%thread_id, %error, "could not clear a thread's retired Codex model");
+            }
+        }
+    });
+}
+
+/// The command that stops `thread_id` naming `retired` on `instance_id`. The engine decides on
+/// the thread's selection when the command runs and keeps the rest of it, so a selection another
+/// client committed meanwhile is not overwritten.
+fn retired_codex_selection_clear(
+    thread_id: &str,
+    instance_id: &str,
+    retired: &'static str,
+) -> OrchestrationCommand {
+    OrchestrationCommand::ThreadRetiredModelClear {
+        command_id: format!("retired-codex-model:{}", Uuid::new_v4()),
+        thread_id: thread_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        retired: retired.to_owned(),
+    }
 }
 
 /// Moves a frozen start whose conversation the provider no longer has to the replacement, before
@@ -11093,9 +11173,15 @@ async fn reconcile_model_selection(
             "opencode" => entry.launch.agent != target_agent,
             _ => false,
         };
-        let model_changed = target_model
-            .as_ref()
-            .is_some_and(|model| entry.launch.model.as_ref() != Some(model));
+        // A turn still naming the retired model this session dropped at launch (#380 R4) asks
+        // for no change: switching to it would restart into a route the turn was not admitted for.
+        let retired = entry.driver.retired_model();
+        let model_changed = target_model.as_ref().is_some_and(|model| {
+            entry.launch.model.as_ref() != Some(model)
+                && !retired.is_some_and(|retired| {
+                    crate::provider::codex::model::same_model(model, retired)
+                })
+        });
         let options_changed = entry.launch.options != target_options;
         let model_cleared = codex_model_cleared(
             &entry.launch.provider,
@@ -15068,7 +15154,15 @@ fn runtime_mode(value: &str) -> CodexRuntimeMode {
     match value {
         "approval-required" => CodexRuntimeMode::ApprovalRequired,
         "auto-accept-edits" => CodexRuntimeMode::AutoAcceptEdits,
-        _ => CodexRuntimeMode::FullAccess,
+        "full-access" => CodexRuntimeMode::FullAccess,
+        unknown => {
+            // Fail closed (#376): a mode this server does not know asks before acting.
+            tracing::warn!(
+                runtime_mode = unknown,
+                "unknown runtime mode for Codex; starting it Supervised"
+            );
+            CodexRuntimeMode::ApprovalRequired
+        }
     }
 }
 
@@ -15209,7 +15303,11 @@ impl CodexDriver {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 thread_id: request.thread_id,
                 cwd: request.cwd.to_string_lossy().into_owned(),
-                runtime_mode: runtime_mode(&request.runtime_mode),
+                runtime_mode: if request.code_review {
+                    CodexRuntimeMode::CodeReview
+                } else {
+                    runtime_mode(&request.runtime_mode)
+                },
                 model: request.model,
                 service_tier: None,
                 effort: None,
@@ -15324,6 +15422,9 @@ fn is_codex_compaction(text: &str, attachments: &[Value]) -> bool {
 }
 
 impl ProviderDriver for CodexDriver {
+    fn retired_model(&self) -> Option<&'static str> {
+        self.retired_model
+    }
     /// `thread/compact/start`: Codex answers, then reports the compaction as a root turn of its
     /// own with a `contextCompaction` item, which the runtime tags with the compaction id.
     fn compact(&self, compaction_id: String) -> BoxRuntimeFuture<'_, ProviderCompactionStart> {
@@ -16785,6 +16886,10 @@ fn claude_replayed_user_text(value: &Value) -> Option<&str> {
     if value.get("type").and_then(Value::as_str) != Some("user") {
         return None;
     }
+    // Claude's own notification replay is never a delivered message's echo, whatever its text.
+    if value.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification") {
+        return None;
+    }
     match value.pointer("/message/content")? {
         Value::String(text) => Some(text),
         Value::Array(blocks) => {
@@ -17070,9 +17175,15 @@ async fn query_claude_control(
     }
 }
 
+/// The turn whose context reading Claude is asked for: a completed turn, or the last turn when
+/// an answer Claude gave with no turn open ends (the Claude runtime emits
+/// `assistant.message.completed` only then, its last text unmarked). The answer is dropped if
+/// another turn started before it arrived.
 fn claude_completion_query_turn_id(event: &ProviderEvent) -> Option<&str> {
     if event.event_type == "turn.completed"
         && event.payload.get("state").and_then(Value::as_str) == Some("completed")
+        || event.event_type == "assistant.message.completed"
+            && event.payload.get("answerContinues").is_none()
     {
         event.turn_id.as_deref()
     } else {
@@ -17747,6 +17858,14 @@ mod claude_context_query_tests {
         let mut non_completion = completion("completed");
         non_completion.event_type = "item.completed".to_owned();
         assert_eq!(claude_completion_query_turn_id(&non_completion), None);
+        // Claude emits this only when an answer it gave with no turn open ends (its text).
+        let mut idle_answer = completion("completed");
+        idle_answer.event_type = "assistant.message.completed".to_owned();
+        idle_answer.payload = json!({});
+        assert_eq!(
+            claude_completion_query_turn_id(&idle_answer),
+            Some("turn-1")
+        );
     }
 
     #[test]
@@ -17957,6 +18076,8 @@ struct ClaudeDriver {
     /// event stream open after Claude's output ended.
     events_tx: mpsc::WeakSender<ProviderEvent>,
     deferred_events: Mutex<VecDeque<ProviderEvent>>,
+    /// The turn whose context reading to ask for once an idle answer's text completion is out.
+    idle_context_query: Mutex<Option<String>>,
     control_responses: ClaudeControlResponseRouter,
     child: SharedChild,
     session_id: String,
@@ -19046,7 +19167,13 @@ fn build_claude_launch_arguments(
     if let Some(effort) = request.effort.as_ref() {
         args.extend(["--effort".to_owned(), effort.clone()]);
     }
-    if let Some(agent) = request.agent.as_ref() {
+    // The default agent takes no flag: Claude then runs its own default, which its settings
+    // can name, and a selection that names the default launches like one that names none.
+    if let Some(agent) = request
+        .agent
+        .as_ref()
+        .filter(|agent| agent.as_str() != crate::provider::claude::model::DEFAULT_AGENT)
+    {
         args.extend(["--agent".to_owned(), agent.clone()]);
     }
     if let Some(settings) = claude_session_settings(request, hook_settings) {
@@ -19554,6 +19681,7 @@ impl ClaudeDriver {
             events: Mutex::new(events_rx),
             events_tx: weak_events_tx,
             deferred_events: Mutex::new(VecDeque::new()),
+            idle_context_query: Mutex::new(None),
             control_responses,
             child: Arc::new(Mutex::new(child)),
             session_id,
@@ -20376,14 +20504,26 @@ impl ProviderDriver for ClaudeDriver {
             if let Some(event) = deferred_events.pop_front() {
                 return Some(event);
             }
-            let Some(completion) = self.events.lock().await.recv().await else {
-                // Decided before the pump sees the end, so it can record a refused resume.
-                let _ = self.launch_refusal().await;
-                return None;
-            };
-            let Some(turn_id) = claude_completion_query_turn_id(&completion).map(str::to_owned)
-            else {
-                return Some(completion);
+            // An idle answer's text completion went out first: no turn holds the idle deadline
+            // off, so a query it waited on could outlive the session and lose it.
+            let idle_query = self.idle_context_query.lock().await.take();
+            let (turn_id, completion) = if let Some(turn_id) = idle_query {
+                (turn_id, None)
+            } else {
+                let Some(completion) = self.events.lock().await.recv().await else {
+                    // Decided before the pump sees the end, so it can record a refused resume.
+                    let _ = self.launch_refusal().await;
+                    return None;
+                };
+                let Some(turn_id) = claude_completion_query_turn_id(&completion).map(str::to_owned)
+                else {
+                    return Some(completion);
+                };
+                if completion.event_type == "assistant.message.completed" {
+                    *self.idle_context_query.lock().await = Some(turn_id);
+                    return Some(completion);
+                }
+                (turn_id, Some(completion))
             };
             let response = query_claude_context_usage(
                 &self.provider,
@@ -20415,12 +20555,15 @@ impl ProviderDriver for ClaudeDriver {
                 updates.push_back(claude_provider_event(status, None, Vec::new()));
             }
             drop(runtime);
-            let Some(first) = updates.pop_front() else {
-                return Some(completion);
-            };
             deferred_events.extend(updates);
-            deferred_events.push_back(completion);
-            Some(first)
+            deferred_events.extend(completion);
+            match deferred_events.pop_front() {
+                Some(first) => Some(first),
+                None => {
+                    drop(deferred_events);
+                    self.next_event().await
+                }
+            }
         })
     }
     fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
@@ -21672,6 +21815,7 @@ mod tests {
         set_mode_unsupported: bool,
         interaction_modes: Vec<String>,
         models: Vec<String>,
+        retired_model: Option<&'static str>,
         rollbacks: Vec<i64>,
         exited: Option<(u32, std::process::ExitStatus)>,
         shutdowns: usize,
@@ -21934,6 +22078,9 @@ mod tests {
     }
 
     impl ProviderDriver for SupervisorDriver {
+        fn retired_model(&self) -> Option<&'static str> {
+            self.state.lock().unwrap().retired_model
+        }
         fn holds_unsettled_work(&self) -> super::BoxRuntimeFuture<'_, bool> {
             Box::pin(std::future::ready(
                 self.state.lock().unwrap().unsettled_work,
@@ -22324,6 +22471,7 @@ mod tests {
             open_url: None,
             host_thread_id: None,
             side_chat_host_thread_id: None,
+            code_review: false,
         }
     }
 
@@ -23542,6 +23690,184 @@ while IFS= read -r line; do
 done
 "#;
 
+    /// The context fixture, then an answer Claude gives with no turn open (Claude Code 2.1.326
+    /// answering a finished background task): it starts once the turn's queries are answered,
+    /// and the context reading Claude reports afterwards is larger.
+    #[cfg(unix)]
+    const CLAUDE_IDLE_ANSWER_CONTEXT_FIXTURE: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  case "$line" in
+    *'"type":"user"'*)
+      printf '%s\n' "$line"
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"errors":[],"stop_reason":"end_turn","session_id":"fixture-session","uuid":"result-1"}'
+      ;;
+    *'"subtype":"get_context_usage"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      tokens=31251
+      [ "$request_id" = "bibcode-1" ] || tokens=42000
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":%s,"maxTokens":200000,"isAutoCompactEnabled":true}}}\n' "$request_id" "$tokens"
+      ;;
+    *'"subtype":"mcp_status"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"mcpServers":[]}}}\n' "$request_id"
+      if [ "$request_id" = "bibcode-2" ]; then
+        printf '%s\n' '{"type":"system","subtype":"init","session_id":"fixture-session","uuid":"idle-init"}'
+        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"idle-delta","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The background task finished."}}}'
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"errors":[],"stop_reason":"end_turn","origin":{"kind":"task-notification"},"session_id":"fixture-session","uuid":"idle-result"}'
+      fi
+      ;;
+  esac
+done
+"#;
+
+    /// After an answer Claude gives with no turn open, the context reading is refreshed by the
+    /// same query a completed turn runs, after the answer's text completes (so a session
+    /// suspended meanwhile never loses that completion), and no turn completes for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_idle_answer_refreshes_the_context_reading() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("claude-idle-context-query.jsonl");
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-idle-context-query",
+            CLAUDE_IDLE_ANSWER_CONTEXT_FIXTURE,
+            &capture_path,
+            None,
+            None,
+        )
+        .await;
+        driver.start().await.expect("Claude fixture should start");
+        let deadline = ProviderFixtureDeadline::integration();
+        let outcome = deadline
+            .observe(driver.deliver(
+                "measure context".to_owned(),
+                Vec::new(),
+                "default".to_owned(),
+                "unused-no-id-key".to_owned(),
+            ))
+            .await
+            .expect("delivery outcome");
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Accepted { .. }
+        ));
+        let mut events: Vec<ProviderEvent> = Vec::new();
+        let answer_ended = |events: &[ProviderEvent]| {
+            events
+                .iter()
+                .position(|event| event.event_type == "assistant.message.completed")
+        };
+        while answer_ended(&events).is_none_or(|ended| {
+            !events[ended..]
+                .iter()
+                .any(|event| event.event_type == "thread.token-usage.updated")
+        }) {
+            let event = deadline
+                .observe(driver.next_event())
+                .await
+                .expect("next event")
+                .expect("an event");
+            events.push(event);
+        }
+        driver.shutdown().await.expect("Claude fixture shutdown");
+
+        let completions = events
+            .iter()
+            .filter(|event| event.event_type == "turn.completed")
+            .count();
+        assert_eq!(completions, 1, "only the delivered turn completes");
+        let readings: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "thread.token-usage.updated")
+            .map(|event| event.payload["usage"]["usedTokens"].clone())
+            .collect();
+        assert_eq!(
+            readings.last(),
+            Some(&json!(42_000)),
+            "the idle answer's context reading: {readings:?}"
+        );
+    }
+
+    /// An idle answer that streams text, calls a tool, and streams more text under a second
+    /// message: both texts complete, and the context reading is asked for once, after both.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_idle_answer_in_two_messages_completes_both_and_queries_once() {
+        let two_messages = CLAUDE_IDLE_ANSWER_CONTEXT_FIXTURE.replace(
+            r#"        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"idle-delta","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The background task finished."}}}'"#,
+            r#"        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"start-a","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"answer-a"}}}'
+        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"delta-a","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Checking the output."}}}'
+        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"tool-start","parent_tool_use_id":null,"event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash","input":{}}}}'
+        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"tool-stop","parent_tool_use_id":null,"event":{"type":"content_block_stop","index":1}}'
+        printf '%s\n' '{"type":"user","parent_tool_use_id":null,"session_id":"fixture-session","uuid":"tool-result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"ok"}]}}'
+        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"start-b","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"answer-b"}}}'
+        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"delta-b","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The background task finished."}}}'"#,
+        );
+        assert!(two_messages.contains("answer-b"));
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("claude-idle-two-messages.jsonl");
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-idle-two-messages",
+            &two_messages,
+            &capture_path,
+            None,
+            None,
+        )
+        .await;
+        driver.start().await.expect("Claude fixture should start");
+        let deadline = ProviderFixtureDeadline::integration();
+        deadline
+            .observe(driver.deliver(
+                "measure context".to_owned(),
+                Vec::new(),
+                "default".to_owned(),
+                "unused-no-id-key".to_owned(),
+            ))
+            .await
+            .expect("delivery outcome");
+        let mut events: Vec<ProviderEvent> = Vec::new();
+        let last_completion = |events: &[ProviderEvent]| {
+            events
+                .iter()
+                .filter(|event| event.event_type == "assistant.message.completed")
+                .count()
+                == 2
+        };
+        while !last_completion(&events)
+            || !events
+                .iter()
+                .rev()
+                .take_while(|event| event.event_type != "assistant.message.completed")
+                .any(|event| event.event_type == "thread.token-usage.updated")
+        {
+            let event = deadline
+                .observe(driver.next_event())
+                .await
+                .expect("next event")
+                .expect("an event");
+            events.push(event);
+        }
+        driver.shutdown().await.expect("Claude fixture shutdown");
+
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "assistant.message.completed")
+            .map(|event| event.item_id.clone())
+            .collect();
+        assert_eq!(
+            completed,
+            [Some("answer-a".to_owned()), Some("answer-b".to_owned())]
+        );
+        let queries = std::fs::read_to_string(&capture_path)
+            .unwrap()
+            .matches("\"subtype\":\"get_context_usage\"")
+            .count();
+        assert_eq!(queries, 2, "one for the delivered turn, one for the answer");
+    }
+
     async fn claude_delivery_fixture(
         temp: &TempDir,
         name: &str,
@@ -24569,6 +24895,272 @@ done
         }
     }
 
+    /// #380 R4: a message from outside the app (an agent message, an MCP client) launches a
+    /// thread that names a retired Codex model. The session starts without it, the thread then
+    /// stores Codex's default so the warning shows once, and the next turn does not restart.
+    #[tokio::test]
+    async fn a_session_started_without_a_retired_codex_model_stops_the_thread_naming_it() {
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.meta.update","commandId":"retired","threadId":"t1",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5.4"}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            retired_model: Some("gpt-5.4"),
+            ..SupervisorDriverState::default()
+        }));
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        launch.model = Some("gpt-5.4".to_owned());
+        supervisor.launch(launch).await.expect("launch runtime");
+
+        let stored_model = || async {
+            engine
+                .repositories()
+                .get_thread("t1".to_owned())
+                .await
+                .expect("read thread")
+                .expect("thread")
+                .model_selection["model"]
+                .clone()
+        };
+        timeout(Duration::from_secs(5), async {
+            while stored_model().await != json!("auto") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the thread stores Codex's default");
+
+        let next: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"next", "threadId":"t1",
+            "message":{"messageId":"user-next","role":"user","text":"next","attachments":[]},
+            "modelSelection":{"instanceId":"codex","model":"auto"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:01Z"
+        }))
+        .unwrap();
+        supervisor.handle_orchestration(next).await.unwrap();
+        let (launches, shutdowns) = {
+            let state = state.lock().unwrap();
+            (state.launches, state.shutdowns)
+        };
+        assert_eq!(launches, 1, "the session already runs Codex's default");
+        assert_eq!(shutdowns, 0);
+        engine.shutdown().await;
+    }
+
+    /// #380 R4: the turn that launched the session, or one queued before the thread stored
+    /// Codex's default, still names the retired model. The session already dropped it, so the
+    /// turn is no model change: it is sent on that session, not on a restart.
+    #[tokio::test]
+    async fn a_turn_naming_the_retired_codex_model_is_sent_without_a_restart() {
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            retired_model: Some("gpt-5.4"),
+            ..SupervisorDriverState::default()
+        }));
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        launch.model = Some("gpt-5.4".to_owned());
+        supervisor.launch(launch).await.expect("launch runtime");
+
+        let turn: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"retired-turn", "threadId":"t1",
+            "message":{"messageId":"user-retired","role":"user","text":"hello","attachments":[]},
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.4"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:01Z"
+        }))
+        .unwrap();
+        supervisor.handle_orchestration(turn).await.unwrap();
+        let (launches, shutdowns, models, sends) = {
+            let state = state.lock().unwrap();
+            (
+                state.launches,
+                state.shutdowns,
+                state.models.clone(),
+                state.sends.len(),
+            )
+        };
+        assert_eq!(
+            launches, 1,
+            "the session already runs without the retired model"
+        );
+        assert_eq!(shutdowns, 0);
+        assert_eq!(sends, 1, "the turn is sent on the running session");
+        assert!(
+            models.is_empty(),
+            "no live switch back to the retired model: {models:?}"
+        );
+        engine.shutdown().await;
+    }
+
+    /// #380 R4: the durable turn that launched the session was admitted naming the retired
+    /// model, and the session runs without it. That is the route the turn was admitted for, so
+    /// the turn is not blocked as a changed route.
+    #[tokio::test]
+    async fn a_turn_admitted_for_a_retired_codex_model_keeps_its_route_on_the_session() {
+        // The route fingerprints the spelling the turn was admitted with, an alias included, and
+        // the session may have launched from another spelling of the same model.
+        let spellings = ["gpt-5.4", "5.4", "gpt-5-codex"];
+        for launched in spellings {
+            for admitted in spellings {
+                assert_retired_codex_route_kept(launched, admitted).await;
+            }
+        }
+    }
+
+    async fn assert_retired_codex_route_kept(launched: &str, admitted: &str) {
+        let engine = supervisor_engine().await;
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            retired_model: Some("gpt-5.4"),
+            ..SupervisorDriverState::default()
+        }));
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state,
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            super::ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        launch.model = Some(admitted.to_owned());
+        let mut payload = json!({"modelSelection":{"instanceId":"codex","model":admitted}});
+        payload[super::DELIVERY_ROUTE_FINGERPRINT_FIELD] =
+            Value::String(super::delivery_route_fingerprint(&launch).unwrap());
+        launch.model = Some(launched.to_owned());
+        supervisor.launch(launch).await.expect("launch runtime");
+
+        let reconciled = supervisor
+            .reconcile_turn(crate::orchestration::ProviderTurnDelivery {
+                mode: crate::orchestration::TurnDeliveryMode::Start,
+                held: false,
+                command_id: "retired-turn".to_owned(),
+                thread_id: "t1".to_owned(),
+                message_id: "user-retired".to_owned(),
+                provider_instance_id: "codex".to_owned(),
+                provider_kind: "codex".to_owned(),
+                provider_session_id: None,
+                delivery_key: "retired-delivery".to_owned(),
+                payload,
+                state: crate::orchestration::TurnDeliveryState::Sending,
+                attempts: 1,
+                last_error: None,
+                created_at: "2026-07-16T00:00:00Z".to_owned(),
+                updated_at: "2026-07-16T00:00:00Z".to_owned(),
+            })
+            .await;
+        assert!(
+            reconciled.is_ok(),
+            "{launched} then {admitted}: {reconciled:?}"
+        );
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    /// #380 R4: a selection another client commits after the cleanup was decided is kept: the
+    /// cleanup must not write back the selection it read with the model replaced. The same model
+    /// chosen on another Codex instance, where it may still run, is another selection.
+    #[tokio::test]
+    async fn the_retired_codex_model_cleanup_keeps_a_selection_committed_meanwhile() {
+        for chosen in [
+            json!({
+                "instanceId":"codex","model":"gpt-6.2-sol",
+                "options":[{"id":"reasoningEffort","value":"high"}]
+            }),
+            json!({
+                "instanceId":"codex-api-key","model":"gpt-5.4",
+                "options":[{"id":"reasoningEffort","value":"high"}]
+            }),
+        ] {
+            let engine = supervisor_engine().await;
+            let select = |command_id: &str, model_selection: Value| {
+                serde_json::from_value::<OrchestrationCommand>(json!({
+                    "type":"thread.meta.update","commandId":command_id,"threadId":"t1",
+                    "modelSelection":model_selection
+                }))
+                .unwrap()
+            };
+            engine
+                .dispatch(select(
+                    "retired",
+                    json!({"instanceId":"codex","model":"5.4"}),
+                ))
+                .await
+                .unwrap();
+            // As a session on the "codex" instance that dropped `5.4` builds it.
+            let cleanup = serde_json::from_value::<OrchestrationCommand>(json!({
+                "type":"thread.retired-model.clear","commandId":"cleanup","threadId":"t1",
+                "instanceId":"codex","retired":"gpt-5.4"
+            }))
+            .unwrap();
+            engine
+                .dispatch(select("chosen", chosen.clone()))
+                .await
+                .unwrap();
+            let refused = engine.dispatch(cleanup).await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(crate::orchestration::OrchestrationError::Invariant { detail, .. })
+                        if detail == crate::orchestration::RETIRED_MODEL_ALREADY_REPLACED
+                ),
+                "{chosen}: {refused:?}"
+            );
+            let stored = engine
+                .repositories()
+                .get_thread("t1".to_owned())
+                .await
+                .unwrap()
+                .unwrap()
+                .model_selection;
+            assert_eq!(stored, chosen);
+            engine.shutdown().await;
+        }
+    }
+
     /// The session stays registered after its stream ends, and a shutdown writes its runtime row
     /// again: the refusal must survive that, so History keeps offering a copy.
     #[tokio::test]
@@ -24722,6 +25314,9 @@ while IFS= read -r line; do
     *'"fixtureAction":"unrelated"'*)
       printf '%s\n' '{"type":"user","message":{"role":"user","content":"another input"}}'
       ;;
+    *'"fixtureAction":"notification"'*)
+      printf '%s\n' '{"type":"user","message":{"role":"user","content":"follow up"},"origin":{"kind":"task-notification"}}'
+      ;;
     *'"fixtureAction":"multiple-text-blocks"'*)
       printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"other"},{"type":"text","text":"follow up"}]}}'
       ;;
@@ -24769,6 +25364,8 @@ done
             let echo = json!({"type":"user","message":{"role":"user","content":content}});
             assert_eq!(super::claude_replayed_user_text(&echo), expected, "{echo}");
         }
+        let notification = json!({"type":"user","message":{"role":"user","content":"prompt"},"origin":{"kind":"task-notification"}});
+        assert_eq!(super::claude_replayed_user_text(&notification), None);
     }
 
     #[cfg(unix)]
@@ -25364,6 +25961,8 @@ done
             "mixed-result",
             "unrelated",
             "multiple-text-blocks",
+            // A notification replay with the steer's text is Claude's own turn, not the echo.
+            "notification",
         ] {
             let (_temp, driver, active, mut steer) = claude_pending_steer_fixture().await;
             claude_fixture_action(&driver, noise).await;
@@ -32579,6 +33178,48 @@ while IFS= read -r line; do
 done
 "#;
 
+    /// The same agent as Claude Code 2.1.326 answers it while idle (recorded, see
+    /// docs/providers/claude.md): `task_notification`, then a turn Claude starts by itself with
+    /// `system` `init`, its main-thread answer and a `result` whose `origin.kind` is
+    /// `task-notification`, and no `user` record first. The older fixture keeps the documented
+    /// replay shape, which BiBCode still handles for a CLI that sends it.
+    #[cfg(unix)]
+    const CLAUDE_BACKGROUND_AGENT_2_1_326_FIXTURE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.1.326 (Claude Code)'; exit 0;;
+  --help) printf '%s\n' '__HELP__'; exit 0;;
+esac
+printf '%s\n' "$@" > "$BIBCODE_TEST_ARGS"
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      printf '%s\n' "$line"
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"task-bg","tool_use_id":"tool-agent-bg","description":"Background agent","task_type":"local_agent","is_backgrounded":true,"uuid":"task-started","session_id":"fixture-session"}'
+      printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"task-bg","task_type":"local_agent","description":"Background agent"}],"uuid":"tasks-changed-1","session_id":"fixture-session"}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"fixture-session","uuid":"result-1"}'
+      (
+        while [ ! -f "$BIBCODE_TEST_RELEASE" ]; do sleep 0.05; done
+        printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"task-bg","status":"completed","output_file":"/tmp/task-bg.output","summary":"Done.","uuid":"task-notified","session_id":"fixture-session"}'
+        printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"tasks-changed-2","session_id":"fixture-session"}'
+        sleep 0.6
+        printf '%s\n' '{"type":"system","subtype":"init","session_id":"fixture-session","uuid":"follow-up-init"}'
+        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"follow-up-delta","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The background agent finished."}}}'
+        printf '%s\n' '{"type":"assistant","session_id":"fixture-session","uuid":"follow-up-answer","parent_tool_use_id":null,"message":{"id":"follow-up-message","role":"assistant","content":[{"type":"text","text":"The background agent finished."}]}}'
+        sleep 0.6
+        : > "$BIBCODE_TEST_FOLLOW_UP"
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","origin":{"kind":"task-notification"},"session_id":"fixture-session","uuid":"follow-up-result"}'
+      ) &
+      ;;
+    *'"subtype":"get_context_usage"'*|*'"subtype":"mcp_status"'*)
+      # Claude answers the queries BiBCode sends after the answer ends. Without this case the
+      # fixture is the late-answer case, which the unanswered-query test below covers.
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":1000,"maxTokens":200000,"mcpServers":[]}}}\n' "$request_id"
+      ;;
+  esac
+done
+"#;
+
     /// Tests (b) and (c), end to end: a real Claude driver whose turn ended while a background
     /// agent runs is not suspended by the idle deadline, and is suspended once the agent ends.
     #[cfg(unix)]
@@ -32586,6 +33227,24 @@ done
         help: &str,
         launched_with_hook_events: bool,
         chat_activity: bool,
+    ) {
+        assert_claude_background_agent_fixture_outlives_the_idle_deadline(
+            CLAUDE_BACKGROUND_AGENT_FIXTURE,
+            help,
+            launched_with_hook_events,
+            chat_activity,
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_claude_background_agent_fixture_outlives_the_idle_deadline(
+        fixture: &str,
+        help: &str,
+        launched_with_hook_events: bool,
+        chat_activity: bool,
+        answer_has_its_own_turn: bool,
     ) {
         const IDLE_TIMEOUT: Duration = Duration::from_millis(300);
         let temp = TempDir::new().unwrap();
@@ -32595,7 +33254,7 @@ done
         let executable = executable_fixture(
             &temp,
             "claude-background-agent",
-            &CLAUDE_BACKGROUND_AGENT_FIXTURE.replace("__HELP__", help),
+            &fixture.replace("__HELP__", help),
         );
         let engine = supervisor_engine().await;
         let (deadline_tx, mut deadlines) = mpsc::unbounded_channel();
@@ -32716,14 +33375,29 @@ done
                 .unwrap()
                 .is_none()
         );
-        // Claude's answer is a turn of its own, after the delivered one.
+        // Claude's answer is stored complete. With a replay first it is a turn of its own,
+        // after the delivered one; without one BiBCode opens no turn for it.
         let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
         let answer = snapshot
             .messages
             .iter()
             .find(|message| message.text == "The background agent finished.")
             .expect("Claude's answer to its finished agent is in the thread");
-        assert!(!answer.is_streaming);
+        assert!(!answer.is_streaming, "Claude's answer was left streaming");
+        if !answer_has_its_own_turn {
+            // No turn of its own, and the delivered turn stays completed: the thread reads ready.
+            let session = engine
+                .repositories()
+                .get_thread_session("t1".into())
+                .await
+                .unwrap()
+                .expect("thread session");
+            assert_ne!(session.status, "running", "{session:?}");
+            assert_eq!(session.active_turn_id, None);
+            supervisor.shutdown().await.unwrap();
+            engine.shutdown().await;
+            return;
+        }
         assert!(answer.turn_id.is_some());
         let delivered_turn = snapshot
             .messages
@@ -32770,6 +33444,183 @@ done
             true,
         )
         .await;
+    }
+
+    /// Tests (b) and (c) with the sequence Claude Code 2.1.326 sends while idle: no `user`
+    /// replay before Claude's own answer. The idle deadline waits for that answer's `result`,
+    /// which ends the answer's text: it is stored complete, not left streaming. BiBCode opens no
+    /// turn for it (a known limit in docs/providers/claude.md), so the test claims none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_2_1_326_keeps_a_background_agent_past_the_idle_deadline() {
+        for (help, hook_events) in [
+            ("Usage: claude [options]", false),
+            ("--include-hook-events --forward-subagent-text", true),
+        ] {
+            assert_claude_background_agent_fixture_outlives_the_idle_deadline(
+                CLAUDE_BACKGROUND_AGENT_2_1_326_FIXTURE,
+                help,
+                hook_events,
+                true,
+                false,
+            )
+            .await;
+        }
+    }
+
+    /// The same, with a Claude that never answers the context query BiBCode sends after the
+    /// answer ends, while the idle deadline is about to fire: the answer is still stored
+    /// complete, and the session still suspends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_2_1_326_idle_answer_survives_an_unanswered_context_query() {
+        let query_case = CLAUDE_BACKGROUND_AGENT_2_1_326_FIXTURE
+            .find("    *'\"subtype\":\"get_context_usage\"'*")
+            .expect("the fixture answers queries");
+        let end = query_case
+            + CLAUDE_BACKGROUND_AGENT_2_1_326_FIXTURE[query_case..]
+                .find(";;\n")
+                .expect("the query case ends")
+            + 3;
+        let silent = format!(
+            "{}{}",
+            &CLAUDE_BACKGROUND_AGENT_2_1_326_FIXTURE[..query_case],
+            &CLAUDE_BACKGROUND_AGENT_2_1_326_FIXTURE[end..]
+        );
+        assert!(!silent.contains("get_context_usage"));
+        assert_claude_background_agent_fixture_outlives_the_idle_deadline(
+            &silent,
+            "--include-hook-events --forward-subagent-text",
+            true,
+            true,
+            false,
+        )
+        .await;
+    }
+
+    /// Claude Code 2.1.326 when the agent finishes while the turn writes its last answer
+    /// (recorded, see docs/providers/claude.md): `task_notification` inside the turn, no replay,
+    /// the turn's own `result`, then a turn Claude starts by itself. It answers BiBCode's queries
+    /// at once, so they cannot delay the idle deadline, and starts its answer only when the test
+    /// creates `$BIBCODE_TEST_RELEASE`, after the first deadline evaluation.
+    #[cfg(unix)]
+    const CLAUDE_AGENT_DONE_DURING_LAST_ANSWER_FIXTURE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.1.326 (Claude Code)'; exit 0;;
+  --help) printf '%s\n' 'Usage: claude [options]'; exit 0;;
+esac
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      printf '%s\n' "$line"
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"task-bg","tool_use_id":"tool-agent-bg","description":"Background agent","task_type":"local_agent","is_backgrounded":true,"uuid":"task-started","session_id":"fixture-session"}'
+      printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"task-bg","task_type":"local_agent","description":"Background agent"}],"uuid":"tasks-changed-1","session_id":"fixture-session"}'
+      (
+        sleep 0.2
+        printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"task-bg","status":"completed","output_file":"/tmp/task-bg.output","summary":"Done.","uuid":"task-notified","session_id":"fixture-session"}'
+        printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"tasks-changed-2","session_id":"fixture-session"}'
+        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"last-answer-delta","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Started the agent."}}}'
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"fixture-session","uuid":"result-1"}'
+        while [ ! -f "$BIBCODE_TEST_RELEASE" ]; do sleep 0.05; done
+        printf '%s\n' '{"type":"system","subtype":"init","session_id":"fixture-session","uuid":"follow-up-init"}'
+        printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"follow-up-delta","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The background agent finished."}}}'
+        : > "$BIBCODE_TEST_FOLLOW_UP"
+        printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","origin":{"kind":"task-notification"},"session_id":"fixture-session","uuid":"follow-up-result"}'
+      ) &
+      ;;
+    *'"subtype":"get_context_usage"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":31251,"maxTokens":200000,"isAutoCompactEnabled":true}}}\n' "$request_id"
+      ;;
+    *'"subtype":"mcp_status"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"mcpServers":[]}}}\n' "$request_id"
+      ;;
+  esac
+done
+"#;
+
+    /// Known limit, not a goal: an agent that finishes during the turn's last answer, with no
+    /// replay, leaves nothing BiBCode counts, so once the turn's context queries are answered the
+    /// idle deadline suspends Claude before the answer it starts by itself arrives. In the
+    /// recorded sequence that answer started 0.4 to 1.1 seconds after the turn's `result`, well
+    /// inside the 60-second production timeout; this fixture holds it past the first evaluation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_2_1_326_agent_done_during_the_last_answer_is_suspended_when_its_answer_is_late()
+    {
+        const IDLE_TIMEOUT: Duration = Duration::from_millis(300);
+        let temp = TempDir::new().unwrap();
+        let follow_up = temp.path().join("follow-up");
+        let release = temp.path().join("release");
+        let executable = executable_fixture(
+            &temp,
+            "claude-agent-done-during-last-answer",
+            CLAUDE_AGENT_DONE_DURING_LAST_ANSWER_FIXTURE,
+        );
+        let engine = supervisor_engine().await;
+        let (deadline_tx, mut deadlines) = mpsc::unbounded_channel();
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(super::NativeProviderDriverFactory::new(
+                temp.path().join("attachments"),
+            )),
+            activity,
+            super::SupervisorOptions {
+                session_idle_timeout: IDLE_TIMEOUT,
+                idle_deadline_test_observer: Some(deadline_tx),
+                ..super::SupervisorOptions::default()
+            },
+        );
+        let mut request = native_launch(&temp, "claudeAgent");
+        request.thread_id = "t1".to_owned();
+        request.binary_path = executable.to_string_lossy().into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_FOLLOW_UP".to_owned(),
+            follow_up.to_string_lossy().into_owned(),
+        );
+        request.environment.insert(
+            "BIBCODE_TEST_RELEASE".to_owned(),
+            release.to_string_lossy().into_owned(),
+        );
+        supervisor.launch(request).await.unwrap();
+        supervisor
+            .deliver_turn(
+                IdleDeadlineFixture::turn_command("first"),
+                "first".to_owned(),
+            )
+            .await
+            .expect("turn admitted");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match deadlines.recv().await.expect("deadline observer") {
+                    super::IdleDeadlineTestEvent::Evaluated {
+                        outcome: super::IdleDeadlineEvaluation::Suspended,
+                        ..
+                    } => {
+                        assert!(
+                            !follow_up.exists(),
+                            "the fixture holds Claude's answer until after the first evaluation"
+                        );
+                        return;
+                    }
+                    super::IdleDeadlineTestEvent::Evaluated {
+                        outcome: super::IdleDeadlineEvaluation::Failed,
+                        ..
+                    } => panic!("idle suspension failed"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the session is suspended before Claude's late answer");
+        // Lets the fixture's background writer finish.
+        std::fs::write(&release, b"").unwrap();
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
     }
 
     /// #165: a Claude whose background task finishes during a slow delivered turn (`/compact`).
@@ -32862,6 +33713,131 @@ done
             "/compact",
         )
         .await;
+    }
+
+    /// #389, as Claude Code 2.1.326 emits it: background tasks finish during a delivered turn,
+    /// Claude replays each notification into that turn and answers them there, under the turn's
+    /// one `result`, then stays silent.
+    #[cfg(unix)]
+    const CLAUDE_NOTIFICATION_ANSWERED_IN_ITS_TURN_FIXTURE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.1.326 (Claude Code)'; exit 0;;
+  --help) printf '%s\n' 'Usage: claude [options]'; exit 0;;
+esac
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      printf '%s\n' "$line"
+      for task in $BIBCODE_TEST_TASKS; do
+        printf '{"type":"system","subtype":"task_started","task_id":"%s","tool_use_id":"tool-%s","description":"Background command","task_type":"local_bash","is_backgrounded":true,"uuid":"started-%s","session_id":"fixture-session"}\n' "$task" "$task" "$task"
+      done
+      for task in $BIBCODE_TEST_TASKS; do
+        printf '{"type":"system","subtype":"task_notification","task_id":"%s","status":"completed","output_file":"/tmp/%s.output","summary":"Done.","uuid":"notified-%s","session_id":"fixture-session"}\n' "$task" "$task" "$task"
+      done
+      printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"tasks-changed","session_id":"fixture-session"}'
+      for task in $BIBCODE_TEST_TASKS; do
+        printf '{"type":"user","message":{"role":"user","content":"<task-notification><task-id>%s</task-id><status>completed</status></task-notification>"},"origin":{"kind":"task-notification"},"parent_tool_use_id":null,"isReplay":true,"session_id":"fixture-session","uuid":"replayed-%s"}\n' "$task" "$task"
+      done
+      printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"answer-delta","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The background commands finished."}}}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"fixture-session","uuid":"turn-result"}'
+      ;;
+  esac
+done
+"#;
+
+    /// #389 (a): one notification answered in its turn. The session suspends at the idle
+    /// deadline with that one turn completed and no other opened.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_notification_answered_in_its_turn_leaves_the_thread_ready() {
+        assert_claude_notification_answered_in_its_turn("task-bg").await;
+    }
+
+    /// #389 (b): two notifications answered by the turn's one `result`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_two_notifications_answered_by_one_result_leave_the_thread_ready() {
+        assert_claude_notification_answered_in_its_turn("task-a task-b").await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_claude_notification_answered_in_its_turn(tasks: &str) {
+        const IDLE_TIMEOUT: Duration = Duration::from_millis(300);
+        let temp = TempDir::new().unwrap();
+        let executable = executable_fixture(
+            &temp,
+            "claude-notification-answered-in-its-turn",
+            CLAUDE_NOTIFICATION_ANSWERED_IN_ITS_TURN_FIXTURE,
+        );
+        let engine = supervisor_engine().await;
+        let (deadline_tx, mut deadlines) = mpsc::unbounded_channel();
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(super::NativeProviderDriverFactory::new(
+                temp.path().join("attachments"),
+            )),
+            activity,
+            super::SupervisorOptions {
+                session_idle_timeout: IDLE_TIMEOUT,
+                idle_deadline_test_observer: Some(deadline_tx),
+                ..super::SupervisorOptions::default()
+            },
+        );
+        let mut request = native_launch(&temp, "claudeAgent");
+        request.thread_id = "t1".to_owned();
+        request.binary_path = executable.to_string_lossy().into_owned();
+        request
+            .environment
+            .insert("BIBCODE_TEST_TASKS".to_owned(), tasks.to_owned());
+        supervisor.launch(request).await.unwrap();
+        let command = serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"answered-turn", "threadId":"t1",
+            "message":{"messageId":"user-answered-turn","role":"user","text":"start background commands","attachments":[]},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:01Z"
+        }))
+        .unwrap();
+        let handle = supervisor
+            .deliver_turn(command, "answered-turn".to_owned())
+            .await
+            .expect("turn admitted");
+        let outcome = timeout(Duration::from_secs(10), handle.completion())
+            .await
+            .expect("Claude acknowledges the turn");
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match deadlines.recv().await.expect("deadline observer") {
+                    super::IdleDeadlineTestEvent::Evaluated {
+                        outcome: super::IdleDeadlineEvaluation::Suspended,
+                        ..
+                    } => return,
+                    super::IdleDeadlineTestEvent::Evaluated {
+                        outcome: super::IdleDeadlineEvaluation::Failed,
+                        ..
+                    } => panic!("idle suspension failed"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the session suspends: no turn stays open after the answered notification");
+        let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+        let turns = snapshot
+            .turns
+            .iter()
+            .filter(|turn| turn.thread_id == "t1")
+            .map(|turn| turn.state.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(turns, ["completed"], "{:?}", snapshot.turns);
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
     }
 
     #[cfg(unix)]
@@ -36772,6 +37748,66 @@ done
                 permission
             );
         }
+    }
+
+    #[test]
+    fn unknown_codex_runtime_mode_starts_supervised() {
+        for unknown in ["", "bypass", "FULL-ACCESS", "code-review"] {
+            assert_eq!(
+                super::runtime_mode(unknown),
+                crate::provider::codex::CodexRuntimeMode::ApprovalRequired,
+                "{unknown:?}"
+            );
+        }
+    }
+
+    /// A review panel switched to Claude launches Claude from the stored modes, as before #376;
+    /// only Codex reads the marker.
+    #[tokio::test]
+    async fn code_review_panel_switched_to_claude_launches_claude_from_its_stored_modes() {
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(serde_json::from_value(json!({
+                "type":"thread.create","commandId":"review","threadId":"review","projectId":"p1",
+                "title":"Code review","kind":"panel","hostThreadId":"t1","codeReview":true,
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"approval-required","interactionMode":"plan","branch":null,
+                "worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"
+            })).unwrap())
+            .await
+            .unwrap();
+        let settings = TempDir::new().expect("provider settings directory");
+        for (thread_id, code_review) in [("review", true), ("t1", false)] {
+            let command = serde_json::from_value(json!({
+                "type":"thread.turn.start","commandId":format!("turn-{thread_id}"),
+                "threadId":thread_id,
+                "message":{"messageId":format!("m-{thread_id}"),"role":"user","text":"review","attachments":[]},
+                "modelSelection":{"instanceId":"claudeAgent","model":"claude-sonnet-4-6"},
+                "runtimeMode":"approval-required","interactionMode":"plan",
+                "createdAt":"2026-07-16T00:00:00Z"
+            }))
+            .unwrap();
+            let request = super::launch_request_for_command(
+                &engine,
+                &settings.path().to_path_buf(),
+                &command,
+                None,
+            )
+            .await
+            .expect("launch request");
+            assert_eq!(request.provider, "claudeAgent");
+            assert_eq!(request.code_review, code_review);
+            assert_eq!(request.runtime_mode, "approval-required");
+            assert_eq!(request.interaction_mode, "plan");
+            assert_eq!(
+                super::claude_permission_arg(super::claude_mode(
+                    &request.runtime_mode,
+                    &request.interaction_mode
+                )),
+                "plan"
+            );
+        }
+        engine.shutdown().await;
     }
 
     #[cfg(target_os = "linux")]

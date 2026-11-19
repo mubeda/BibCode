@@ -164,7 +164,8 @@ describe("GitManagerTagDialog", () => {
     const reason = "This environment does not support Git Manager tag operations.";
     await renderDialog({ action: "delete", disabledReason: reason, tag: "release/v1" });
 
-    expect(button("Delete Tag")).toMatchObject({ disabled: true, title: reason });
+    expect(button("Delete Tag").disabled).toBe(true);
+    expect(button("Delete Tag").parentElement?.title).toBe(reason);
     expect(container.textContent).toContain(reason);
     expect(button("Cancel").disabled).toBe(false);
     await act(async () => button("Delete Tag").click());

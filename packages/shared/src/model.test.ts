@@ -12,6 +12,7 @@ import {
   buildProviderOptionSelectionsFromDescriptors,
   fallbackModelOption,
   replacedRetiredCodexModel,
+  retiredCodexSessionDefault,
   createModelCapabilities,
   createModelSelection,
   getModelSelectionBooleanOptionValue,
@@ -823,6 +824,35 @@ describe("applyClaudePromptEffortPrefix", () => {
     expect(applyClaudePromptEffortPrefix("Ultrathink: already", "ultrathink")).toBe(
       "Ultrathink: already",
     );
+  });
+});
+
+describe("retiredCodexSessionDefault (#380, R4)", () => {
+  const chatGptList = [{ slug: "auto" }, { slug: "gpt-6.2-sol" }];
+  it("names the retired model of a saved default that Codex no longer offers", () => {
+    expect(retiredCodexSessionDefault({ saved: { model: "gpt-5.4" }, offered: chatGptList })).toBe(
+      "gpt-5.4",
+    );
+    expect(
+      retiredCodexSessionDefault({ saved: { model: "gpt-5.4-mini" }, offered: chatGptList }),
+    ).toBe("gpt-5.4-mini");
+  });
+
+  it("keeps a default Codex still offers, any other model, and one read before the list", () => {
+    // API-key sign-in: the list still offers the model.
+    expect(
+      retiredCodexSessionDefault({
+        saved: { model: "gpt-5.4" },
+        offered: [...chatGptList, { slug: "gpt-5.4" }],
+      }),
+    ).toBeNull();
+    expect(
+      retiredCodexSessionDefault({ saved: { model: "gpt-6.2-sol" }, offered: chatGptList }),
+    ).toBeNull();
+    expect(
+      retiredCodexSessionDefault({ saved: { model: "gpt-5.4" }, offered: [{ slug: "auto" }] }),
+    ).toBeNull();
+    expect(retiredCodexSessionDefault({ saved: undefined, offered: chatGptList })).toBeNull();
   });
 });
 

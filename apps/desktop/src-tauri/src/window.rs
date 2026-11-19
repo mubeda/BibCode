@@ -1053,9 +1053,22 @@ mod tests {
             .build(context)
             .expect("mock Tauri app");
         let handle = app.handle();
+        // Tauri on Windows and Linux otherwise puts webview data in the identifier's local app-data
+        // folder, which outlives the test process.
+        // A folder an earlier run with this process id left behind is the test's own.
+        let local_app_data = handle
+            .path()
+            .app_local_data_dir()
+            .expect("local app-data folder");
+        let _ = std::fs::remove_dir_all(&local_app_data);
         let window = tauri::WebviewWindowBuilder::new(&app, MAIN_WINDOW_LABEL, Default::default())
+            .data_directory(temp.path().join("webview-data"))
             .build()
             .expect("mock webview");
+        assert!(
+            !local_app_data.exists(),
+            "the test leaves nothing in the local app-data folder"
+        );
         let state_path = window_state_path(handle).expect("window state path should resolve");
 
         persist_main_window_state(handle).expect("empty mock state should be ignored");

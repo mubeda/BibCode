@@ -400,6 +400,21 @@ describe("packaged send to agent", () => {
     await openFixtureCodexTerminal();
     terminalTabId = await selectedTabId();
 
+    // The terminal's control is easy to find: at least 28 px square and painted in the primary color.
+    const control = await browser.$(sendControlSelector);
+    const size = await control.getSize();
+    expect(size.width).toBeGreaterThanOrEqual(28);
+    expect(size.height).toBeGreaterThanOrEqual(28);
+    const colors = await browser.execute((element: HTMLElement) => {
+      const probe = document.createElement("span");
+      probe.style.backgroundColor = "var(--primary)";
+      document.body.append(probe);
+      const primary = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      return { control: getComputedStyle(element).backgroundColor, primary };
+    }, control);
+    expect(colors.control).toBe(colors.primary);
+
     await chooseSendTarget("Message", codexPanelTitle);
     await sendFromPreview(terminalNote);
     const requests = browser.$(`${visibleSurfaceSelector} button[aria-label^="Send requests"]`);

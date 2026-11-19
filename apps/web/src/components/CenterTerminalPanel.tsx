@@ -22,9 +22,13 @@ interface CenterTerminalPanelProps {
   focusRequestId: number;
   focusEligible: boolean;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
-  /** Invoked when the terminal is closed from within its own chrome. */
+  /** Invoked when the terminal is closed from within its own chrome, or its process exits. */
   onClose: () => void;
   workspaceUnavailable?: string | null;
+  /** False when no chat owns the terminal: no Add to chat, and links open without one. */
+  chatThread?: boolean;
+  /** The session exists already: attach to it and never start one. */
+  attachOnly?: boolean;
 }
 
 const noop = () => undefined;
@@ -49,6 +53,8 @@ export function CenterTerminalPanel({
   onAddTerminalContext,
   onClose,
   workspaceUnavailable = null,
+  chatThread = true,
+  attachOnly = false,
 }: CenterTerminalPanelProps) {
   const { terminalId, command, label } = surface;
   const knownTerminalSessions = useKnownTerminalSessions({
@@ -90,6 +96,8 @@ export function CenterTerminalPanel({
       onActiveTerminalChange={noop}
       onCloseTerminal={onClose}
       onAddTerminalContext={onAddTerminalContext}
+      chatThread={chatThread}
+      attachOnly={attachOnly}
       terminalLabelsById={terminalLabelsById}
       {...(terminalCommandsById ? { terminalCommandsById } : {})}
       keybindings={keybindings}

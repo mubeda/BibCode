@@ -18,6 +18,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { useGitManagerStore } from "../../gitManagerStore";
+import {
+  GIT_MANAGER_BRANCH_SYNC_DISABLED_REASON,
+  GIT_MANAGER_MERGE_INTO_DISABLED_REASON,
+  GIT_MANAGER_STASH_MERGE_DISABLED_REASON,
+} from "./gitManagerAvailability";
 
 const h = vi.hoisted(() => ({
   connectionState: null as SupervisorConnectionState | null,
@@ -62,9 +67,11 @@ const h = vi.hoisted(() => ({
 
   tagsViewProps: [] as Array<Record<string, unknown>>,
   refsSnapshot: null as GitManagerRefsSnapshot | null,
+  mergePreview: null as Record<string, unknown> | null,
   status: null as VcsStatusResult | null,
   /** A failed status read: its message, with `status` left at its last answer. */
   statusError: null as string | null,
+  refsError: null as string | null,
   stashes: null as ReadonlyArray<GitManagerStashEntry> | null,
   refreshed: [] as string[],
   signalGeneration: 1 as number | null,
@@ -123,12 +130,15 @@ vi.mock("../../state/query", () => ({
               ? { generation: h.signalGeneration }
               : atom?.kind === "stashes"
                 ? h.stashes
-                : null;
+                : atom?.kind === "preview"
+                  ? h.mergePreview
+                  : null;
     // Automatic re-reads record the same way as refreshes.
     const refresh = () => {
       if (atom !== null) h.refreshed.push(atom.kind);
     };
-    const error = atom?.kind === "status" ? h.statusError : null;
+    const error =
+      atom?.kind === "status" ? h.statusError : atom?.kind === "refs" ? h.refsError : null;
     return {
       data,
       error,
@@ -165,6 +175,7 @@ vi.mock("../../state/gitManager", () => ({
     getRefs: h.refsAtom,
     getStashes: h.stashesAtom,
     getCommits: () => ({ kind: "commits" }),
+    previewMerge: () => ({ kind: "preview" }),
     listPullRequests: h.listPullRequests,
     commit: { label: "test:commit" },
     undoCommit: { label: "test:undo-commit" },
@@ -231,6 +242,7 @@ vi.mock("./tags/GitManagerTagDialog", () => ({
 }));
 
 import { GitManagerPanel } from "./GitManagerPanel";
+import { expectLoadingModel } from "~/components/ui/loading-state.testing";
 
 const projectRef = {
   environmentId: "environment-1",
@@ -250,6 +262,7 @@ function config(
         gitManagerRewriteOperations: true,
         gitManagerTagOperations: true,
         gitManagerLiveSignal: true,
+        gitManagerMergeIntoOperations: true,
         gitManagerPullRequests: true,
         ...overrides,
       }),
@@ -350,8 +363,10 @@ beforeEach(() => {
   };
   h.activeSubscriptions = 0;
   h.refsSnapshot = refsSnapshot();
+  h.mergePreview = null;
   h.status = vcsStatus(false);
   h.statusError = null;
+  h.refsError = null;
   h.stashes = null;
   h.refreshed.length = 0;
   h.signalGeneration = 1;
@@ -408,6 +423,72 @@ describe("GitManagerPanel", () => {
     expect(h.catalogAtom).not.toHaveBeenCalled();
     expect(h.signalAtom).not.toHaveBeenCalled();
     expect(h.queryAtoms).toEqual([null, null, null]);
+  });
+
+  it("shows a loading status, not the unavailable card, while the environment is pending", () => {
+    h.connectionState = connection({ desired: true, phase: "connecting", stage: "synchronizing" });
+    const markup = renderPanel();
+
+    const host = document.createElement("div");
+    host.innerHTML = markup;
+    expectLoadingModel(host, ["This environment is synchronizing."]);
+    expect(markup).not.toContain("Git Manager Unavailable");
+  });
+
+  it("keeps the unavailable card for disconnected and unsupported environments", () => {
+    h.connectionState = connection({ desired: false, phase: "available", network: "online" });
+    const disconnected = renderPanel();
+    expect(disconnected).toContain("Git Manager Unavailable");
+    expect(disconnected).toContain("This environment is disconnected.");
+
+    h.connectionState = connection({ desired: true, phase: "connected", network: "online" });
+    h.serverConfig = config(false);
+    const unsupported = renderPanel();
+    expect(unsupported).toContain("Git Manager Unavailable");
+    expect(unsupported).toContain("Missing capability: gitManagerReads");
+  });
+
+  it("keeps Waiting for project data as the unavailable card", () => {
+    h.project = null;
+    expect(renderPanel()).toContain("Waiting for project data.");
+  });
+
+  it("tells the Tags view refs are pending only until they arrive or fail", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    useGitManagerStore.getState().setActiveTab(projectRef, "tags");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const pending = async () => {
+      h.tagsViewProps.length = 0;
+      await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+      return h.tagsViewProps.at(-1)?.refsPending;
+    };
+
+    try {
+      h.refsSnapshot = null;
+      expect(await pending()).toBe(true);
+      h.refsSnapshot = refsSnapshot();
+      await act(async () => root.unmount());
+      const next = createRoot(container);
+      h.tagsViewProps.length = 0;
+      await act(async () => next.render(<GitManagerPanel projectRef={projectRef} />));
+      expect(h.tagsViewProps.at(-1)?.refsPending).toBe(false);
+      await act(async () => next.unmount());
+      // A refs failure is not "still loading".
+      h.refsSnapshot = null;
+      h.refsError = "Could not read refs.";
+      const failed = createRoot(container);
+      h.tagsViewProps.length = 0;
+      await act(async () => failed.render(<GitManagerPanel projectRef={projectRef} />));
+      expect(h.tagsViewProps.at(-1)?.refsPending).toBe(false);
+      expect(h.tagsViewProps.at(-1)?.refsError).toBe("Could not read refs.");
+      expect(h.tagsViewProps.at(-1)?.refsLoaded).toBe(false);
+      await act(async () => failed.unmount());
+    } finally {
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
   });
 
   it("renders tabs and targets the selected checkout only while ready", () => {
@@ -1146,6 +1227,278 @@ describe("GitManagerPanel", () => {
       container.remove();
       (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
     }
+  });
+
+  describe("branch-scoped toolbar actions", () => {
+    async function withPanel(run: (container: HTMLElement) => Promise<void>) {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => root.render(<GitManagerPanel projectRef={projectRef} />));
+        await run(container);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+        (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+      }
+    }
+    const button = (container: ParentNode, text: string) =>
+      [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (candidate) => candidate.textContent === text,
+      );
+    const NEW_BRANCH = "New branch";
+    const MERGE_MAIN = "Merge main into…";
+
+    it("opens the create dialog from the checked-out branch", async () => {
+      await withPanel(async (container) => {
+        expect(button(container, MERGE_MAIN)).toBeDefined();
+        await act(async () => button(container, NEW_BRANCH)?.click());
+        expect(h.branchDialogProps.at(-1)?.dialog).toEqual({
+          kind: "create",
+          baseBranch: "main",
+          baseCommit: null,
+          unborn: false,
+        });
+      });
+    });
+
+    it("starts the new branch from HEAD when no branch is checked out", async () => {
+      h.refsSnapshot = refsSnapshot({
+        headRef: null,
+        detachedSha: "c".repeat(40),
+        localBranches: refsSnapshot().localBranches.map((branch) => ({
+          ...branch,
+          current: false,
+        })),
+      });
+      await withPanel(async (container) => {
+        await act(async () => button(container, NEW_BRANCH)?.click());
+        expect(h.branchDialogProps.at(-1)?.dialog).toEqual({
+          kind: "create",
+          baseBranch: null,
+          baseCommit: null,
+          unborn: false,
+        });
+        expect(button(container, "Merge branch into…")?.disabled).toBe(true);
+        expect(button(container, "Merge branch into…")?.parentElement?.title).toBe(
+          "Check out a branch before merging.",
+        );
+      });
+    });
+
+    it("opens the merge dialog with the selected branch as the fixed source", async () => {
+      await withPanel(async (container) => {
+        await act(async () => button(container, MERGE_MAIN)?.click());
+        expect(document.body.textContent).toContain("Source: main");
+        expect(document.body.textContent).toContain("Choose a branch to merge into.");
+        expect(
+          [...document.body.querySelectorAll("button")].find(
+            (candidate) => candidate.textContent === "Merge",
+          ),
+        ).toMatchObject({ disabled: true });
+      });
+    });
+
+    it("keeps Merge… choosing its own source after the branch-scoped merge", async () => {
+      await withPanel(async (container) => {
+        await act(async () => button(container, MERGE_MAIN)?.click());
+        await act(async () =>
+          [...document.body.querySelectorAll("button")]
+            .find((candidate) => candidate.textContent === "Cancel")
+            ?.click(),
+        );
+        await act(async () => button(container, "Merge…")?.click());
+        expect(document.body.textContent).not.toContain("Source: main");
+        expect(document.body.querySelector('[aria-label="Source branches"]')).not.toBeNull();
+      });
+    });
+
+    it("starts from no start point on an unborn branch, whose name is not a ref yet", async () => {
+      h.refsSnapshot = refsSnapshot({
+        headRef: "main",
+        localBranches: refsSnapshot().localBranches.map((branch) => ({
+          ...branch,
+          current: false,
+        })),
+      });
+      await withPanel(async (container) => {
+        await act(async () => button(container, NEW_BRANCH)?.click());
+        expect(h.branchDialogProps.at(-1)?.dialog).toEqual({
+          kind: "create",
+          baseBranch: null,
+          baseCommit: null,
+          unborn: true,
+        });
+      });
+    });
+
+    it("names the branch entry when HEAD's short name is shadowed by a tag", async () => {
+      h.refsSnapshot = refsSnapshot({ headRef: "heads/main" });
+      await withPanel(async (container) => {
+        await act(async () => button(container, NEW_BRANCH)?.click());
+        expect(h.branchDialogProps.at(-1)?.dialog).toMatchObject({ baseBranch: "main" });
+      });
+    });
+
+    it("reopens Merge <branch> into… without the earlier target", async () => {
+      const input = () =>
+        document.body.querySelector<HTMLInputElement>("#git-manager-merge-target");
+      await withPanel(async (container) => {
+        await act(async () => button(container, MERGE_MAIN)?.click());
+        await act(async () => {
+          input()
+            ?.closest('[data-slot="input-control"]')
+            ?.parentElement?.querySelector<HTMLButtonElement>('[data-slot="combobox-trigger"]')
+            ?.click();
+        });
+        const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
+          (item) => item.textContent?.trim() === "feature/base",
+        );
+        await act(async () => option?.click());
+        expect(input()?.value).toBe("feature/base");
+        await act(async () =>
+          [...document.body.querySelectorAll("button")]
+            .find((candidate) => candidate.textContent === "Cancel")
+            ?.click(),
+        );
+        await act(async () => button(container, MERGE_MAIN)?.click());
+        expect(input()?.value).toBe("");
+      });
+    });
+
+    it("keeps the choices made in Merge… when it is reopened", async () => {
+      const dialogButton = (text: string) =>
+        [...document.body.querySelectorAll("button")].find(
+          (candidate) => candidate.textContent === text,
+        );
+      await withPanel(async (container) => {
+        await act(async () => button(container, "Merge…")?.click());
+        await act(async () => dialogButton("Squash merge")?.click());
+        expect(dialogButton("Squash merge")?.getAttribute("aria-pressed")).toBe("true");
+        await act(async () => dialogButton("Cancel")?.click());
+        await act(async () => button(container, "Merge…")?.click());
+        expect(dialogButton("Squash merge")?.getAttribute("aria-pressed")).toBe("true");
+      });
+    });
+
+    it.each([
+      [
+        "New branch",
+        { gitManagerBranchSyncOperations: false },
+        NEW_BRANCH,
+        GIT_MANAGER_BRANCH_SYNC_DISABLED_REASON,
+      ],
+      [
+        "Merge main into…",
+        { gitManagerStashMergeOperations: false },
+        MERGE_MAIN,
+        GIT_MANAGER_STASH_MERGE_DISABLED_REASON,
+      ],
+      [
+        "Merge main into…",
+        { gitManagerMergeIntoOperations: false },
+        MERGE_MAIN,
+        GIT_MANAGER_MERGE_INTO_DISABLED_REASON,
+      ],
+    ])(
+      "%s is disabled with the reason when the server lacks the capability",
+      async (_n, caps, label, reason) => {
+        h.serverConfig = config(true, caps);
+        await withPanel(async (container) => {
+          const trigger = button(container, label);
+          expect(trigger?.disabled).toBe(true);
+          expect(trigger?.parentElement?.title).toBe(reason);
+          expect(trigger?.getAttribute("aria-describedby")).not.toBeNull();
+          expect(container.textContent).toContain(reason);
+        });
+      },
+    );
+
+    it("names the Git version in the toolbar reason when the server withdraws merge-into", async () => {
+      h.serverConfig = config(true, { gitManagerMergeIntoOperations: false });
+      await withPanel(async (container) => {
+        const trigger = button(container, MERGE_MAIN);
+        expect(trigger?.disabled).toBe(true);
+        expect(trigger?.parentElement?.title).toContain("Git 2.38");
+      });
+    });
+
+    it.each([
+      ["Merge…", "Merge one branch into another"],
+      ["Rebase…", "Rebase the current branch onto another branch"],
+      [NEW_BRANCH, "Create a branch from main"],
+      [MERGE_MAIN, "Merge main into another local branch"],
+    ])(
+      "%s explains itself on hover when disabled and keeps its tooltip when enabled",
+      async (label, tooltip) => {
+        await withPanel(async (container) => {
+          const enabled = button(container, label);
+          expect(enabled?.disabled).toBe(false);
+          expect(enabled?.title).toBe(tooltip);
+        });
+        h.serverConfig = config(true, {
+          gitManagerBranchSyncOperations: false,
+          gitManagerStashMergeOperations: false,
+          gitManagerRewriteOperations: false,
+        });
+        await withPanel(async (container) => {
+          const disabled = button(container, label);
+          expect(disabled?.disabled).toBe(true);
+          // The disabled Button has pointer-events-none, so the reason lives on its wrapper.
+          expect(disabled?.title).toBe("");
+          expect(disabled?.parentElement?.title).not.toBe("");
+          const describedBy = disabled?.getAttribute("aria-describedby") ?? "";
+          expect(container.querySelector(`#${describedBy}`)?.textContent).toBe(
+            disabled?.parentElement?.title,
+          );
+        });
+      },
+    );
+
+    it("disables New branch while the branches load", async () => {
+      h.refsSnapshot = null;
+      await withPanel(async (container) => {
+        expect(button(container, NEW_BRANCH)?.disabled).toBe(true);
+        expect(button(container, NEW_BRANCH)?.parentElement?.title).toBe("Loading branches.");
+      });
+    });
+
+    it("keeps a running merge when Merge… is reopened", async () => {
+      h.mergePreview = {
+        _tag: "clean",
+        source: "refs/heads/feature/base",
+        current: "main",
+        ahead: 1,
+        behind: 0,
+      };
+      await withPanel(async (container) => {
+        await act(async () => button(container, "Merge…")?.click());
+        const confirm = [...document.body.querySelectorAll("button")].find(
+          (candidate) => candidate.textContent === "Merge",
+        );
+        await act(async () => confirm?.click());
+        expect(h.runOperation).toHaveBeenCalledTimes(1);
+        await act(async () => button(container, "Merge…")?.click());
+        // A remount would drop the dialog's running state (and cancel its operation).
+        expect(
+          [...document.body.querySelectorAll("button")].find(
+            (candidate) => candidate.textContent === "Merge",
+          )?.parentElement?.title,
+        ).toBe("The selected Git operation is running.");
+      });
+    });
+
+    it("explains that no other local branch exists to merge into", async () => {
+      h.refsSnapshot = refsSnapshot({ localBranches: refsSnapshot().localBranches.slice(0, 1) });
+      await withPanel(async (container) => {
+        expect(button(container, MERGE_MAIN)?.disabled).toBe(true);
+        expect(button(container, MERGE_MAIN)?.parentElement?.title).toBe(
+          "No other local branch to merge into.",
+        );
+      });
+    });
   });
 
   it("opens the existing multi-commit chooser from the Rebase control", async () => {

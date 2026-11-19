@@ -29,6 +29,7 @@ import {
   isSummaryOverIdealLength,
 } from "./commitBox.logic";
 import { GitManagerUndoCommitStrip } from "./GitManagerUndoCommitStrip";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 
 export interface GitManagerCommitSubmission {
   readonly message: string;
@@ -111,7 +112,6 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
       isAmending,
       isBusy: busy,
     });
-  const disabledDescriptionId = disabledReason === null ? undefined : "git-manager-commit-disabled";
 
   const handleSummaryChange = useCallback(
     (event: ChangeEvent<HTMLInputElement>) => {
@@ -348,20 +348,18 @@ export const GitManagerCommitBox = memo(function GitManagerCommitBox({
               </div>
             </PopoverPopup>
           </Popover>
-          <Button
-            aria-describedby={disabledDescriptionId}
+          <GitManagerDisabledReasonButton
             className="min-w-0 flex-1"
             disabled={!enabled}
-            title={disabledReason ?? undefined}
+            disabledReason={disabledReason}
             type="submit"
+            wrapperClassName="flex min-w-0 flex-1"
           >
             {busy ? "Committing…" : `Commit ${includedPaths.length} files to ${branch}`}
-          </Button>
+          </GitManagerDisabledReasonButton>
         </div>
         {disabledReason === null ? null : (
-          <p className="text-xs text-muted-foreground" id={disabledDescriptionId}>
-            {disabledReason}
-          </p>
+          <p className="text-xs text-muted-foreground">{disabledReason}</p>
         )}
       </form>
       {latestCommit === null || onUndo === undefined ? null : (

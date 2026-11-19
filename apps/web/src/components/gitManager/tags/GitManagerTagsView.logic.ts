@@ -104,5 +104,5 @@ export function summarizeRemoteTagsQuery(input: {
   if (input.result.tags.length === 0) {
     return { kind: "empty", message: `No tags on ${input.remote}.` };
   }
-  return { kind: "ready", message: input.pending ? "Refreshing…" : null };
+  return { kind: "ready", message: null };
 }

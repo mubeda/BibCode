@@ -406,7 +406,8 @@ export default function FileBrowserPanel({
       try {
         const result = await refreshServerEntries({
           environmentId,
-          input: { cwd, refresh: true },
+          // The reply is not used: one entry keeps the rebuild from sending the whole list.
+          input: { cwd, refresh: true, limit: 1 },
         });
         if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
           showMutationError(squashAtomCommandFailure(result), "Failed to refresh workspace files");

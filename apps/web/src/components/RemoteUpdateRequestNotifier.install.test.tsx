@@ -2,7 +2,7 @@
 import type { DesktopBridge } from "@bibcode/contracts";
 import { act, Children, isValidElement, type ReactElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 vi.mock("../env", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../env")>()),
@@ -60,6 +60,12 @@ const manageDevices = () =>
   );
 const toastText = () => document.querySelector('[data-slot="toast-portal"]')?.textContent ?? "";
 const dialogText = () => document.querySelector('[data-slot="alert-dialog-popup"]')?.textContent;
+
+// The first import of the whole app graph is a cold transform that takes tens of seconds on a
+// loaded machine; it belongs in a hook with its own budget, not in the first test's 30 s.
+beforeAll(async () => {
+  await import("../AppRoot");
+}, 120_000);
 
 let container: HTMLDivElement;
 let root: Root;

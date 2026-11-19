@@ -193,13 +193,39 @@ pub async fn browse_directory(
 }
 
 fn expand_home(input: &str) -> PathBuf {
+    if !input.starts_with('~') {
+        return PathBuf::from(input);
+    }
+    let home =
+        environment_home(cfg!(windows), &|name| std::env::var_os(name)).or_else(dirs::home_dir);
+    expand_home_from(input, home)
+}
+
+/// The home the environment names, in the order Cursor capability discovery reads it:
+/// USERPROFILE then HOME on Windows, HOME elsewhere. `dirs::home_dir` ignores both on Windows.
+fn environment_home(
+    windows: bool,
+    variable: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let names: &[&str] = if windows {
+        &["USERPROFILE", "HOME"]
+    } else {
+        &["HOME"]
+    };
+    names
+        .iter()
+        .find_map(|name| variable(name).filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+}
+
+fn expand_home_from(input: &str, home: Option<PathBuf>) -> PathBuf {
     if input == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(input));
+        return home.unwrap_or_else(|| PathBuf::from(input));
     }
     if let Some(rest) = input
         .strip_prefix("~/")
         .or_else(|| input.strip_prefix("~\\"))
-        && let Some(home) = dirs::home_dir()
+        && let Some(home) = home
     {
         return home.join(rest);
     }
@@ -218,6 +244,56 @@ fn looks_like_windows_absolute(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `~` follows the home the environment names, as a shell does, before the platform's own
+    /// lookup: USERPROFILE then HOME on Windows, HOME elsewhere. An empty value is unset.
+    #[test]
+    fn home_follows_the_environment_before_the_platform_lookup() {
+        let environment = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            }
+        };
+        let both = environment(&[
+            ("USERPROFILE", "/fixture/profile"),
+            ("HOME", "/fixture/home"),
+        ]);
+        assert_eq!(
+            environment_home(true, &both),
+            Some(PathBuf::from("/fixture/profile"))
+        );
+        assert_eq!(
+            environment_home(false, &both),
+            Some(PathBuf::from("/fixture/home"))
+        );
+        let home_only = environment(&[("USERPROFILE", ""), ("HOME", "/fixture/home")]);
+        assert_eq!(
+            environment_home(true, &home_only),
+            Some(PathBuf::from("/fixture/home"))
+        );
+        let profile_only = environment(&[("USERPROFILE", "/fixture/profile")]);
+        assert_eq!(environment_home(false, &profile_only), None);
+        assert_eq!(environment_home(true, &environment(&[])), None);
+
+        let home = Some(PathBuf::from("/fixture/home"));
+        assert_eq!(
+            expand_home_from("~", home.clone()),
+            PathBuf::from("/fixture/home")
+        );
+        assert_eq!(
+            expand_home_from("~/code", home.clone()),
+            PathBuf::from("/fixture/home").join("code")
+        );
+        assert_eq!(
+            expand_home_from("~\\code", home.clone()),
+            PathBuf::from("/fixture/home").join("code")
+        );
+        assert_eq!(expand_home_from("~other", home), PathBuf::from("~other"));
+        assert_eq!(expand_home_from("~/code", None), PathBuf::from("~/code"));
+    }
 
     #[tokio::test]
     async fn browse_covers_relative_hidden_sorted_and_missing_directories() {

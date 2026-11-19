@@ -6577,6 +6577,7 @@ mod tests {
                     open_url: None,
                     host_thread_id: None,
                     side_chat_host_thread_id: None,
+                    code_review: false,
                 })
                 .await
                 .expect("provider launches");
@@ -6703,6 +6704,7 @@ mod tests {
                 open_url: None,
                 host_thread_id: None,
                 side_chat_host_thread_id: None,
+                code_review: false,
             })
             .await
             .expect("provider launches");

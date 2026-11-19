@@ -23,6 +23,37 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.providerInstanceId).toBe("ollama_local");
   });
 
+  it("decodes the text completion of a Claude answer given with no turn open", () => {
+    const event = {
+      eventId: "event-idle-answer",
+      provider: "claudeAgent",
+      createdAt: "2026-02-28T00:00:00.000Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "answer-message",
+    };
+    expect(
+      decodeRuntimeEvent({
+        ...event,
+        type: "content.delta",
+        payload: { streamKind: "assistant_text", delta: "Done." },
+      }).type,
+    ).toBe("content.delta");
+
+    const last = decodeRuntimeEvent({ ...event, type: "assistant.message.completed", payload: {} });
+    const earlier = decodeRuntimeEvent({
+      ...event,
+      type: "assistant.message.completed",
+      payload: { answerContinues: true },
+    });
+
+    expect(last.type).toBe("assistant.message.completed");
+    if (earlier.type !== "assistant.message.completed") {
+      throw new Error("expected assistant.message.completed");
+    }
+    expect(earlier.payload.answerContinues).toBe(true);
+  });
+
   it("decodes turn.plan.updated for plan rendering", () => {
     const parsed = decodeRuntimeEvent({
       type: "turn.plan.updated",

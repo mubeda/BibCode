@@ -87,6 +87,7 @@ import {
   applyTimelineDisclosureChange,
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
+  findWorkRowId,
   isNewestWorkEntry,
   deriveUnsettledTurnId,
   detailsDisclosureKey,
@@ -318,6 +319,9 @@ interface MessagesTimelineProps {
 
 const NO_FIND_FOCUS = () => {};
 
+/** The list method `patches/@legendapp__list@3.3.10.patch` adds for a row the reader toggles. */
+type ReaderToggleList = LegendListRef & { holdAnchorAboveRow?: (key: string) => void };
+
 // ---------------------------------------------------------------------------
 // MessagesTimeline — list owner
 // ---------------------------------------------------------------------------
@@ -386,11 +390,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   // A toggle flips what the row shows, which Verbose chat opens by default.
   const onToggleTurnFold = useCallback(
     (turnId: TurnId, expanded: boolean) => changeDisclosures({ turns: [[turnId, !expanded]] }),
-    [changeDisclosures],
-  );
-  const onSetEntryDisclosure = useCallback(
-    (entryId: string, key: string, open: boolean) =>
-      changeDisclosures({ entries: [[entryId, key, open]] }),
     [changeDisclosures],
   );
   const onToggleWorkGroup = useCallback(
@@ -496,6 +495,20 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   useLayoutEffect(() => {
     rowsRef.current = rows;
   }, [rows]);
+  const onSetEntryDisclosure = useCallback(
+    (entryId: string, key: string, open: boolean) => {
+      // A Thinking row or work step the reader toggles keeps its place: the list holds no row
+      // below it until its new size is measured (the patch's `holdAnchorAboveRow`).
+      if (key === TOOL_ROW_DISCLOSURE_KEY) {
+        const rowId = findWorkRowId(rowsRef.current, entryId);
+        if (rowId !== null) {
+          (listRef.current as ReaderToggleList | null)?.holdAnchorAboveRow?.(rowId);
+        }
+      }
+      changeDisclosures({ entries: [[entryId, key, open]] });
+    },
+    [changeDisclosures, listRef],
+  );
   const onReasoningEntryToggle = useCallback(
     (entryId: string) => onReasoningRowToggle(isNewestWorkEntry(rowsRef.current, entryId)),
     [onReasoningRowToggle],
@@ -1741,6 +1754,7 @@ function WorkingIndicatorIcon() {
 }
 
 function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "working" }> }) {
+  const { unsettledTurnId } = use(TimelineRowActivityCtx);
   return (
     <div className="py-0.5 pl-1.5">
       <div className="flex min-w-0 items-center gap-2 pt-1 text-xs text-muted-foreground tabular-nums">
@@ -1750,7 +1764,7 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
           {row.answerDelivered
             ? "Answer delivered, waiting for the provider to close the turn "
             : "Waiting for "}
-          <WorkingTimer createdAt={row.createdAt} />
+          <WorkingTimer createdAt={row.createdAt} turnId={unsettledTurnId} />
         </span>
         {row.latestThought !== null ? (
           <span className="min-w-0 truncate" data-working-latest-thought="">
@@ -1767,10 +1781,14 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
 // does not create a React commit every second while a response is streaming.
 // ---------------------------------------------------------------------------
 
-/** Live elapsed label for the active waiting row. */
-function WorkingTimer({ createdAt }: { createdAt: string | null }) {
+/**
+ * Live elapsed label for the active waiting row. It never moves backward within one wait (the
+ * server's turn start replacing the local send time), but a different turn starts its own count.
+ */
+function WorkingTimer({ createdAt, turnId }: { createdAt: string | null; turnId: TurnId | null }) {
   const textRef = useRef<HTMLSpanElement>(null);
   const elapsedFloorRef = useRef(0);
+  const floorTurnIdRef = useRef(turnId);
   // Rendered once: the frame loop below owns the text after mount.
   const [initialText] = useState(() =>
     formatWorkingElapsedMs(
@@ -1784,6 +1802,12 @@ function WorkingTimer({ createdAt }: { createdAt: string | null }) {
     if (sourceElapsedMs === null) {
       return;
     }
+    // Leaving a turn starts a new wait (the next turn, or a send pending after it); a send's own
+    // turn arriving (no turn yet, then its id) continues the same wait.
+    if (floorTurnIdRef.current !== null && turnId !== floorTurnIdRef.current) {
+      elapsedFloorRef.current = 0;
+    }
+    floorTurnIdRef.current = turnId;
 
     const elapsedAtAnchorMs = Math.max(elapsedFloorRef.current, sourceElapsedMs);
     const monotonicAnchorMs = performance.now();
@@ -1800,7 +1824,7 @@ function WorkingTimer({ createdAt }: { createdAt: string | null }) {
 
     updateText(monotonicAnchorMs);
     return () => cancelAnimationFrame(frameId);
-  }, [createdAt]);
+  }, [createdAt, turnId]);
 
   return (
     <span ref={textRef} className="tabular-nums">

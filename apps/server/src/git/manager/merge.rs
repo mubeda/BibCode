@@ -97,6 +97,19 @@ pub async fn ensure_merge_tree_supported(
     }
 }
 
+/// Whether merge-into can be offered: false only when Git is known to be older than 2.38.
+/// A failed or unparseable read keeps it on; the operation itself reports any real failure.
+pub async fn git_supports_merge_into(
+    repository: &GitRepository,
+    cwd: &Path,
+    cancellation: &CancellationToken,
+) -> bool {
+    !matches!(
+        ensure_merge_tree_supported(repository, cwd, cancellation).await,
+        Err(GitManagerMergeError::GitTooOld { .. })
+    )
+}
+
 fn valid_revision(value: &str) -> bool {
     !value.is_empty() && value.trim() == value && !value.starts_with('-')
 }
@@ -417,7 +430,7 @@ fn parse_ahead_behind(stdout: &str) -> Result<(u64, u64), GitManagerMergeError> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -427,10 +440,16 @@ mod tests {
     use crate::git::{BoxGitProcessFuture, GitProcessRunner, ProcessRequest};
 
     /// Answers every Git invocation with a fixed `git --version` line and counts the calls.
-    struct VersionRunner {
+    pub(crate) struct VersionRunner {
         stdout: &'static str,
-        calls: AtomicUsize,
+        pub(crate) calls: AtomicUsize,
     }
+
+    /// The Git every unit-test `NativeServerControl` reads its startup version from.
+    pub(crate) static UNIT_TEST_STARTUP_GIT: std::sync::LazyLock<(
+        Arc<VersionRunner>,
+        GitRepository,
+    )> = std::sync::LazyLock::new(|| version_runner("git version 2.38.0\n"));
 
     impl GitProcessRunner for VersionRunner {
         fn run<'a>(
@@ -452,7 +471,7 @@ mod tests {
         }
     }
 
-    fn version_runner(stdout: &'static str) -> (Arc<VersionRunner>, GitRepository) {
+    pub(crate) fn version_runner(stdout: &'static str) -> (Arc<VersionRunner>, GitRepository) {
         let runner = Arc::new(VersionRunner {
             stdout,
             calls: AtomicUsize::new(0),
@@ -473,6 +492,23 @@ mod tests {
             GitManagerMergeError::GitTooOld { found }
                 if found == (GitVersion { major: 2, minor: 34, patch: 1 })
         ));
+    }
+
+    #[tokio::test]
+    async fn merge_into_is_offered_only_on_git_2_38_or_later() {
+        let cancellation = CancellationToken::new();
+        for (version, supported) in [
+            ("git version 2.37.9\n", false),
+            ("git version 2.38.0\n", true),
+            ("not a git version\n", true),
+        ] {
+            let (_, repository) = version_runner(version);
+            assert_eq!(
+                git_supports_merge_into(&repository, Path::new("."), &cancellation).await,
+                supported,
+                "{version}"
+            );
+        }
     }
 
     #[tokio::test]

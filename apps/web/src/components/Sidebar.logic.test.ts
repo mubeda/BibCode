@@ -2028,3 +2028,16 @@ describe("keyboard context menu helpers", () => {
     expect(isKeyboardContextMenuEcho(Number.NEGATIVE_INFINITY, 5)).toBe(false);
   });
 });
+
+describe("resolveSidebarProjectAvailability when the connection runtime failed", () => {
+  it("reports the failure instead of loading forever", () => {
+    expect(
+      resolveSidebarProjectAvailability({
+        projectCount: 0,
+        catalogReady: false,
+        catalogFailed: true,
+        environments: [],
+      }),
+    ).toEqual({ kind: "runtime-failed", environmentId: null, error: null });
+  });
+});

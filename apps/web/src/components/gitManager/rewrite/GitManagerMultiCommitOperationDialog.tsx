@@ -3,6 +3,7 @@ import type { GitManagerRefEntry } from "@bibcode/contracts";
 import { memo, useCallback, useMemo } from "react";
 
 import { Button } from "~/components/ui/button";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 import {
   Dialog,
   DialogDescription,
@@ -40,32 +41,20 @@ const BranchChoice = memo(function BranchChoice({
   const choose = useCallback(() => onChoose(branch.name), [branch.name, onChoose]);
   const blocked = branch.blocked.find((reason) => reason.operation === operation) ?? null;
   const effectiveDisabledReason = disabledReason ?? blocked?.message ?? null;
-  const reasonId =
-    effectiveDisabledReason === null
-      ? undefined
-      : `git-manager-branch-choice-${branch.tipSha}-reason`;
   return (
-    <>
-      <Button
-        aria-describedby={reasonId}
-        aria-label={`Choose branch ${branch.name}`}
-        className="w-full min-w-0 justify-start font-mono"
-        disabled={effectiveDisabledReason !== null}
-        size="sm"
-        title={effectiveDisabledReason ?? undefined}
-        variant="ghost"
-        onClick={choose}
-      >
-        <span className="truncate" translate="no">
-          {branch.name}
-        </span>
-      </Button>
-      {effectiveDisabledReason === null ? null : (
-        <span className="sr-only" id={reasonId}>
-          {effectiveDisabledReason}
-        </span>
-      )}
-    </>
+    <GitManagerDisabledReasonButton
+      aria-label={`Choose branch ${branch.name}`}
+      className="w-full min-w-0 justify-start font-mono"
+      disabledReason={effectiveDisabledReason}
+      size="sm"
+      variant="ghost"
+      wrapperClassName="flex min-w-0"
+      onClick={choose}
+    >
+      <span className="truncate" translate="no">
+        {branch.name}
+      </span>
+    </GitManagerDisabledReasonButton>
   );
 });
 
@@ -200,8 +189,6 @@ export const GitManagerMultiCommitOperationDialog = memo(
       progress?.current === null || progress?.current === undefined || progress.total === null
         ? null
         : `Commit ${progress.current} of ${progress.total}`;
-    const disabledReasonId =
-      disabledReason === null ? undefined : "git-manager-multi-commit-disabled-reason";
 
     if (state.step === null) return null;
     if (state.step === "hide-conflicts") {
@@ -235,9 +222,7 @@ export const GitManagerMultiCommitOperationDialog = memo(
           </DialogHeader>
           <div className="min-h-0 space-y-3 px-6 pb-4">
             {disabledReason === null ? null : (
-              <p className="text-xs text-muted-foreground" id={disabledReasonId}>
-                {disabledReason}
-              </p>
+              <p className="text-xs text-muted-foreground">{disabledReason}</p>
             )}
             {state.step === "warn-force-push" ? (
               <div className="flex items-start gap-2 rounded-md border border-destructive/35 bg-destructive/5 p-3 text-sm">
@@ -311,25 +296,21 @@ export const GitManagerMultiCommitOperationDialog = memo(
                 <Button variant="outline" onClick={onCancel}>
                   Cancel
                 </Button>
-                <Button
-                  aria-describedby={disabledReasonId}
-                  disabled={disabledReason !== null}
-                  title={disabledReason ?? undefined}
+                <GitManagerDisabledReasonButton
+                  disabledReason={disabledReason}
                   variant="destructive"
                   onClick={confirmForcePush}
                 >
                   Rewrite History
-                </Button>
+                </GitManagerDisabledReasonButton>
               </>
             ) : state.step === "confirm-abort" ? (
               <>
                 <Button variant="outline" onClick={onCancel}>
                   Keep Working
                 </Button>
-                <Button
-                  aria-describedby={disabledReasonId}
-                  disabled={disabledReason !== null}
-                  title={disabledReason ?? undefined}
+                <GitManagerDisabledReasonButton
+                  disabledReason={disabledReason}
                   variant="destructive"
                   onClick={onConfirmAbort}
                 >
@@ -337,7 +318,7 @@ export const GitManagerMultiCommitOperationDialog = memo(
                   {state.kind === "cherry-pick"
                     ? "Cherry-Pick"
                     : operationTitle(state).slice(6, -1)}
-                </Button>
+                </GitManagerDisabledReasonButton>
               </>
             ) : state.step === "show-conflicts" ? (
               <Button variant="outline" onClick={dismissConflicts}>

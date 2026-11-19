@@ -90,6 +90,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "codeReviews": true,
             "hostMetrics": true,
             "sendRequests": true,
+            "readOnlyCodexReviews": true,
             "conversationOnlyRewind": true,
             "threadDeleteOnlyIfUnused": true,
         },
@@ -1416,6 +1417,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["codeReviews"], true);
         assert_eq!(descriptor["capabilities"]["hostMetrics"], true);
         assert_eq!(descriptor["capabilities"]["sendRequests"], true);
+        assert_eq!(descriptor["capabilities"]["readOnlyCodexReviews"], true);
         assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);

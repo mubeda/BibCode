@@ -134,6 +134,14 @@ afterEach(async () => {
 });
 
 describe("PipelinesPanel", () => {
+  it("shows a pending environment as loading, not unavailable", async () => {
+    h.connection = null;
+    await render();
+    const status = container.querySelector('[role="status"]');
+    expect(status?.textContent).toContain("Waiting for the environment connection state.");
+    expect(container.querySelector('[aria-label="Pipelines unavailable"]')).toBeNull();
+  });
+
   it("follows its own setting, not the Pull Requests one", async () => {
     h.settings = { pullRequestsEnabled: true, pipelinesEnabled: false };
     await render();

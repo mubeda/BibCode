@@ -22,6 +22,11 @@ interface DesktopActivityBridge {
   }>;
 }
 
+interface DesktopActivityDispatchResult extends DesktopActivitySessionMaterialization {
+  /** What each setup request answered, in order. */
+  readonly setupResults: ReadonlyArray<Record<string, unknown>>;
+}
+
 interface DesktopActivityRpcRequest {
   readonly payload: Record<string, unknown>;
   readonly tag: string;
@@ -31,7 +36,7 @@ async function dispatchDesktopActivityCommands(
   commands: ReadonlyArray<Record<string, unknown>>,
   requestedProjectId: string | null,
   setupRequests: ReadonlyArray<DesktopActivityRpcRequest> = [],
-): Promise<DesktopActivitySessionMaterialization> {
+): Promise<DesktopActivityDispatchResult> {
   return browser.execute(
     async (input: {
       readonly commands: ReadonlyArray<Record<string, unknown>>;
@@ -250,8 +255,9 @@ async function dispatchDesktopActivityCommands(
             );
           });
 
+        const setupResults: Record<string, unknown>[] = [];
         for (const setupRequest of input.setupRequests) {
-          await request(setupRequest.tag, setupRequest.payload);
+          setupResults.push(await request(setupRequest.tag, setupRequest.payload));
         }
 
         let resolvedProjectId = input.requestedProjectId;
@@ -266,7 +272,7 @@ async function dispatchDesktopActivityCommands(
           }
         }
         if (!input.commands.some((command) => command.type === "thread.create")) {
-          return { projectId: "", providerInstanceId: "", threadId: "" };
+          return { projectId: "", providerInstanceId: "", threadId: "", setupResults };
         }
         const envelope = await request(
           "orchestration.subscribeThread",
@@ -302,6 +308,7 @@ async function dispatchDesktopActivityCommands(
           projectId: snapshot.projectId,
           providerInstanceId: session.providerInstanceId,
           threadId: snapshot.id,
+          setupResults,
         };
       } finally {
         disposeSocketListeners();
@@ -324,10 +331,65 @@ async function dispatchDesktopActivityCommands(
 export async function materializeDesktopActivitySession(
   projectPath: string,
 ): Promise<DesktopActivitySessionMaterialization> {
-  return dispatchDesktopActivityCommands(
+  // The setup replies stay with the inventory helper; this returns the three identifiers.
+  const { projectId, providerInstanceId, threadId } = await dispatchDesktopActivityCommands(
     desktopActivitySessionCommands(projectPath),
     desktopActivityFixture.project.id,
   );
+  return { projectId, providerInstanceId, threadId };
+}
+
+/** The fixture Codex snapshot's sign-in type and models, from what the server published. */
+function codexInventory(config: Record<string, unknown>): {
+  readonly authType: string | null;
+  readonly models: ReadonlyArray<string>;
+} {
+  const providers = Array.isArray(config.providers) ? config.providers : [];
+  const codex = providers.find(
+    (provider): provider is Record<string, unknown> =>
+      provider !== null &&
+      typeof provider === "object" &&
+      (provider as Record<string, unknown>).instanceId === "codex",
+  );
+  const auth = codex?.auth as Record<string, unknown> | undefined;
+  const models = Array.isArray(codex?.models) ? codex.models : [];
+  return {
+    authType: typeof auth?.type === "string" ? auth.type : null,
+    models: models.flatMap((model) =>
+      model !== null && typeof model === "object" && typeof model.slug === "string"
+        ? [model.slug]
+        : [],
+    ),
+  };
+}
+
+/**
+ * Waits until the server has published the fixture Codex's ChatGPT sign-in and model list. A
+ * launch before that cannot know the stored model is retired under that sign-in, so it starts
+ * with the model, and the composer's later send of Codex's default restarts the session, ending
+ * the fixture's activity. Returns what the first read showed, for the run's evidence.
+ */
+export async function waitForDesktopActivityCodexInventory(): Promise<{
+  readonly firstAuthType: string | null;
+  readonly refreshes: number;
+}> {
+  const read = async (tag: string, payload: Record<string, unknown>) =>
+    codexInventory(
+      (await dispatchDesktopActivityCommands([], null, [{ tag, payload }])).setupResults[0] ?? {},
+    );
+  const first = await read("server.getConfig", {});
+  let current = first;
+  let refreshes = 0;
+  while (current.authType !== "chatgpt" || current.models.length === 0) {
+    if (refreshes >= 5) {
+      throw new Error(
+        `The fixture Codex inventory never published its sign-in: ${JSON.stringify(current)}`,
+      );
+    }
+    refreshes += 1;
+    current = await read("server.refreshProviders", { instanceId: "codex" });
+  }
+  return { firstAuthType: first.authType, refreshes };
 }
 
 export async function startDesktopActivityFollowupTurn(): Promise<void> {

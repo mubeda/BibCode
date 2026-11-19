@@ -44,7 +44,7 @@ import { classOf, levelTextTags, textColorUtilities } from "./sidebar/sidebarLev
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import * as React from "react";
-import { beforeEach, expect, it, vi } from "vite-plus/test";
+import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   DEFAULT_SERVER_SETTINGS,
   ProjectId,
@@ -202,11 +202,18 @@ staticDescribe("Sidebar global event helpers", () => {
     expect(padding(PROJECT_HEADER_ACTION_PADDING[count].badge)).toBeGreaterThanOrEqual(strip + 22);
   });
 
-  it("counts the always-shown actions plus Pull Requests and Pipelines", () => {
-    expect(projectHeaderActionCount({ showsPullRequests: false, showsPipelines: false })).toBe(3);
-    expect(projectHeaderActionCount({ showsPullRequests: true, showsPipelines: false })).toBe(4);
-    expect(projectHeaderActionCount({ showsPullRequests: false, showsPipelines: true })).toBe(4);
-    expect(projectHeaderActionCount({ showsPullRequests: true, showsPipelines: true })).toBe(5);
+  it("counts the always-shown actions plus Pull Requests, Pipelines and the server commands", () => {
+    const count = (
+      showsPullRequests: boolean,
+      showsPipelines: boolean,
+      showsServerCommands = false,
+    ) => projectHeaderActionCount({ showsPullRequests, showsPipelines, showsServerCommands });
+    expect(count(false, false)).toBe(3);
+    expect(count(true, false)).toBe(4);
+    expect(count(false, true)).toBe(4);
+    expect(count(true, true)).toBe(5);
+    // A Repositories server card: the three icons plus Open terminal and Dashboard.
+    expect(count(false, false, true)).toBe(5);
   });
 
   // #382: a collapsed card hides the open chat, so that chat is not in the ordered list.
@@ -590,6 +597,13 @@ staticDescribe("Sidebar full render", () => {
     const markup = render(<Sidebar />);
     expect(markup).toContain("Project data is still loading");
     expect(markup).not.toContain("No projects yet");
+  });
+
+  it("renders the failed connection runtime instead of loading forever", () => {
+    h.state.shellSummary = { ...h.state.shellSummary, catalogFailed: true };
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Connections could not start");
+    expect(markup).not.toContain("Project data is still loading");
   });
 
   it("keeps a saved remote project row while hiding desktop remote recovery controls", () => {
@@ -3927,6 +3941,95 @@ staticDescribe("grouped and remote projects", () => {
     const strip = /<div[^>]*data-testid="repository-group-actions-strip"[^>]*>/.exec(markup)?.[0];
     expect(strip).toBeDefined();
     expect(strip).not.toContain("opacity-0");
+  });
+
+  describe("server card commands (#378)", () => {
+    it("puts Open terminal and Dashboard on each server card, named for its server", () => {
+      groupedScenario();
+      h.uiStore.setState({ sidebarView: "repositories" });
+      const markup = render(<Sidebar />);
+      for (const label of ["Main", "Remote Box"]) {
+        const terminal = mustFindProps(byAriaLabel(`Open terminal on ${label}`), label);
+        const dashboard = mustFindProps(byAriaLabel(`Dashboard for ${label}`), label);
+        expect(terminal["data-testid"]).toBe("server-command-terminal");
+        expect(dashboard["data-testid"]).toBe("server-command-dashboard");
+        expect(terminal["aria-disabled"]).toBeUndefined();
+      }
+      // The strip keeps its three icons, then the two server commands.
+      const strip = markup.slice(markup.indexOf('data-testid="project-actions-strip"'));
+      const order = [
+        "project-actions-button",
+        "new-worktree-button",
+        "git-manager-button",
+        "server-command-terminal",
+        "server-command-dashboard",
+      ].map((id) => strip.indexOf(`data-testid="${id}"`));
+      expect(order.every((index) => index >= 0)).toBe(true);
+      expect(order).toEqual([...order].toSorted((left, right) => left - right));
+      // Five icons: the card title stops short of them.
+      const header = captured("SidebarMenuButton").find(
+        (entry) => typeof entry.props["onPointerDownCapture"] === "function",
+      )!;
+      expect(header.props["className"]).toContain(PROJECT_HEADER_ACTION_PADDING[5].plain);
+    });
+
+    it("opens that server's center panel from each icon", () => {
+      groupedScenario();
+      h.uiStore.setState({ sidebarView: "repositories" });
+      render(<Sidebar />);
+      const click = mouseEvent();
+      invoke(mustFindProps(byAriaLabel("Dashboard for Remote Box"), "Dashboard"), "onClick", click);
+      expect(click.stopPropagation, "the card must not toggle").toHaveBeenCalled();
+      expect(h.spies.navigate).toHaveBeenLastCalledWith({
+        to: "/environment/$environmentId/dashboard",
+        params: { environmentId: ENV_REMOTE },
+      });
+      invoke(
+        mustFindProps(byAriaLabel("Open terminal on Main"), "Terminal"),
+        "onClick",
+        mouseEvent(),
+      );
+      expect(h.spies.navigate).toHaveBeenLastCalledWith({
+        to: "/environment/$environmentId/terminal",
+        params: { environmentId: ENV_MAIN },
+        search: { open: expect.any(Number) },
+      });
+      expect(h.spies.navigate).toHaveBeenCalledTimes(2);
+    });
+
+    it("explains and refuses the commands on a server that is not connected", () => {
+      groupedScenario();
+      h.state.environments = [
+        environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
+        environmentFixture({
+          environmentId: ENV_REMOTE,
+          label: "Remote Box",
+          connectionId: "remote",
+          phase: "error",
+          error: "Remote host is offline.",
+        }),
+      ];
+      h.uiStore.setState({ sidebarView: "repositories" });
+      render(<Sidebar />);
+      for (const name of ["Open terminal on Remote Box", "Dashboard for Remote Box"]) {
+        const button = mustFindProps(byAriaLabel(name), name);
+        expect(button["aria-disabled"]).toBe(true);
+        expect(button["aria-description"]).toBe("Remote Box is not connected.");
+        invoke(button, "onClick", mouseEvent());
+      }
+      expect(h.spies.navigate).not.toHaveBeenCalled();
+    });
+
+    it("shows no server commands on a project row outside a server card", () => {
+      groupedScenario();
+      h.uiStore.setState({ sidebarView: "environments" });
+      render(<Sidebar />);
+      expect(findProps(byTestId("server-command-terminal"))).toBeNull();
+      expect(findProps(byTestId("server-command-dashboard"))).toBeNull();
+      expect(findProps(byTestId("git-manager-button"))).not.toBeNull();
+      expect(findProps(byTestId("new-worktree-button"))).not.toBeNull();
+      expect(findProps(byTestId("project-actions-button"))).not.toBeNull();
+    });
   });
 
   it("puts Pipelines after Pull Requests on the repository row, not its environment rows", () => {

@@ -24,6 +24,7 @@ import {
   type OrchestrationReasoning,
   OrchestrationThreadActivity,
   ProviderInteractionMode,
+  CODEX_AUTO_MODEL,
   ProviderDriverKind,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   RuntimeMode,
@@ -74,6 +75,7 @@ import {
 import {
   applyClaudePromptEffortPrefix,
   replacedRetiredCodexModel,
+  retiredCodexSessionDefault,
   resolvePromptInjectedEffort,
 } from "@bibcode/shared/model";
 import { canonicalizeLegacyComposerFileReferences } from "@bibcode/shared/composerReferences";
@@ -282,7 +284,11 @@ import {
 } from "~/projectScripts";
 import { newCommandId, newDraftId, newMessageId, newThreadId } from "~/lib/utils";
 import { getProviderModelCapabilities, resolveSelectableProvider } from "../providerModels";
-import { useEnvironmentSettings } from "../hooks/useSettings";
+import {
+  readEnvironmentServerSettings,
+  useEnvironmentSettings,
+  useUpdateEnvironmentSettings,
+} from "../hooks/useSettings";
 import { readTerminalFittedSize } from "./terminalSizing";
 import { worktreeEnvironment } from "../state/worktrees";
 import { resolveAppModelSelectionForInstance } from "../modelSelection";
@@ -1271,6 +1277,7 @@ function ChatViewContent(props: ChatViewProps) {
     routeKind === "server" ? store.threadLastVisitedAtById[routeThreadKey] : undefined,
   );
   const settings = useEnvironmentSettings(environmentId);
+  const updateEnvironmentSettings = useUpdateEnvironmentSettings(environmentId);
   const enableChatAgentActivity = settings.enableChatAgentActivity;
   const enableTerminalAgentActivity = settings.enableTerminalAgentActivity;
   const setStickyComposerModelSelection = useComposerDraftStore(
@@ -5020,6 +5027,8 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const codeReviewPlatformOs = serverConfig?.environment.platform.os ?? null;
   const codeReviewsSupported = serverConfig?.environment.capabilities?.codeReviews === true;
+  const readOnlyCodexReviews =
+    serverConfig?.environment.capabilities?.readOnlyCodexReviews === true;
   const hasCodeReviewLaunchContext = isServerThread && centerPanelLaunchContext !== null;
   // Reasons that hold for every reviewer on this thread and environment.
   const codeReviewEnvironmentReason = !codeReviewsSupported
@@ -5057,13 +5066,15 @@ function ChatViewContent(props: ChatViewProps) {
           (action.disabled
             ? (action.disabledReason ?? `${action.label} is not available.`)
             : codeReviewerReason({ action, reason: null })),
+        readOnlyCodexReviews,
       ),
-    [codeReviewAgentActions, codeReviewEnvironmentReason, codeReviewerReason],
+    [codeReviewAgentActions, codeReviewEnvironmentReason, codeReviewerReason, readOnlyCodexReviews],
   );
   const codeReviewGuard = savedCodeReviewer.action
     ? codeReviewGuardLine({
         kind: savedCodeReviewer.action.kind,
         driver: savedCodeReviewer.action.entry.driverKind,
+        readOnlyCodexReviews,
       })
     : null;
   // `selection` is a one-off reviewer from the menu; the saved reviewer stays as saved (R103).
@@ -6815,6 +6826,7 @@ function ChatViewContent(props: ChatViewProps) {
         }
       }
 
+      let retiredThreadModel: string | null = null;
       if (failure === null && isServerThread) {
         const settingsResult = await persistThreadSettingsForNextTurn({
           threadId: threadIdForSend,
@@ -6828,7 +6840,7 @@ function ChatViewContent(props: ChatViewProps) {
         } else {
           // #380: the thread stored a model Codex retired, and this send replaced it with
           // Codex's default. The thread now stores that choice, so this shows once.
-          const retiredModel = ctxSelectedModel
+          retiredThreadModel = ctxSelectedModel
             ? replacedRetiredCodexModel({
                 driver: ctxSelectedProvider,
                 stored: activeThread?.modelSelection,
@@ -6836,15 +6848,58 @@ function ChatViewContent(props: ChatViewProps) {
                 offered: ctxSelectedProviderModels,
               })
             : null;
-          if (retiredModel !== null) {
-            toastManager.add(
-              stackedThreadToast({
-                type: "warning",
-                title: `Codex retired ${retiredModel}`,
-                description: "This thread now uses Codex's default model.",
-              }),
+        }
+      }
+
+      // #380 R4: a saved default that names the retired model is cleared when it is used,
+      // a new chat's first send included.
+      if (failure === null) {
+        const announceRetired = (models: ReadonlyArray<string | null>, description: string) =>
+          toastManager.add(
+            stackedThreadToast({
+              type: "warning",
+              title: `Codex retired ${[...new Set(models.filter(Boolean))].join(" and ")}`,
+              description,
+            }),
+          );
+        const threadNotice = "This thread now uses Codex's default model.";
+        // Read now, not from the render: another window may have saved a default meanwhile.
+        const savedDefaults = readEnvironmentServerSettings(environmentId).providerSessionDefaults;
+        const savedCodexDefault = savedDefaults[ctxSelectedProvider];
+        const retiredDefault =
+          ctxSelectedProvider === ProviderDriverKind.make("codex")
+            ? retiredCodexSessionDefault({
+                saved: savedCodexDefault,
+                offered: ctxSelectedProviderModels,
+              })
+            : null;
+        if (retiredDefault !== null && savedCodexDefault) {
+          // The notice says the default was saved, so it waits for the save; one notice
+          // covers the thread too.
+          // Owning only this provider's default keeps one another window saved meanwhile; an
+          // older server ignores the option and replaces the map, as before.
+          void updateEnvironmentSettings(
+            {
+              providerSessionDefaults: {
+                ...savedDefaults,
+                [ctxSelectedProvider]: { ...savedCodexDefault, model: CODEX_AUTO_MODEL },
+              },
+            },
+            { ownedProviderSessionDefaults: [ctxSelectedProvider] },
+          ).then((result) => {
+            if (result._tag !== "Success") {
+              if (retiredThreadModel !== null) announceRetired([retiredThreadModel], threadNotice);
+              return;
+            }
+            announceRetired(
+              [retiredThreadModel, retiredDefault],
+              retiredThreadModel !== null
+                ? "This thread and your saved Codex default now use Codex's default model."
+                : "Your saved Codex default now uses Codex's default model.",
             );
-          }
+          });
+        } else if (retiredThreadModel !== null) {
+          announceRetired([retiredThreadModel], threadNotice);
         }
       }
 
@@ -8276,6 +8331,7 @@ function ChatViewContent(props: ChatViewProps) {
                             planSidebarOpen={planSidebarOpen}
                             runtimeMode={runtimeMode}
                             interactionMode={interactionMode}
+                            readOnlyCodexReviews={readOnlyCodexReviews}
                             lockedProvider={lockedProvider}
                             providerBindingInstanceId={providerBinding.instanceId}
                             lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}

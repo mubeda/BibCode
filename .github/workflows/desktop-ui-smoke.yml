@@ -203,7 +203,7 @@ jobs:
           BIBCODE_E2E_ARTIFACT_DIR: ${{ runner.temp }}/bibcode-desktop-ui-artifacts
         run: |
           if [[ "$BIBCODE_E2E_PLATFORM" == "linux" ]]; then
-            xvfb-run --auto-servernum vp run test:ui:desktop
+            xvfb-run --auto-servernum -s '-screen 0 1920x1080x24' vp run test:ui:desktop
           else
             vp run test:ui:desktop
           fi

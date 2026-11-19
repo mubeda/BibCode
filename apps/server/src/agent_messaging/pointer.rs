@@ -117,9 +117,9 @@ impl PointerTerminals for TerminalManager {
 }
 
 /// The only text the server ever types into a terminal (R17): it names no message, title or
-/// sender.
-pub const POINTER_LINE: &str =
-    "BiBCode: you have new messages. Run `bibcode agent inbox` to read them.";
+/// sender. It asks for the answer too: an agent told only to read its inbox reads it and stops,
+/// because it treats what a message asks as data, not as its user's request.
+pub const POINTER_LINE: &str = "BiBCode: you have new messages. Run `bibcode agent inbox` to read them, and answer each one that asks for a reply.";
 pub const POINTER_PASTE_OPEN: &str = "\u{1b}[200~";
 pub const POINTER_PASTE_CLOSE: &str = "\u{1b}[201~";
 pub const POINTER_SUBMIT: &str = "\r";
@@ -1547,7 +1547,7 @@ pub(crate) mod tests {
         assert_eq!(fixture.terminals.writes("t", "term-1"), [pointer_bytes()]);
         assert_eq!(
             pointer_bytes(),
-            "\u{1b}[200~BiBCode: you have new messages. Run `bibcode agent inbox` to read them.\u{1b}[201~\r"
+            "\u{1b}[200~BiBCode: you have new messages. Run `bibcode agent inbox` to read them, and answer each one that asks for a reply.\u{1b}[201~\r"
         );
         fixture.shutdown().await;
     }

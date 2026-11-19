@@ -357,7 +357,11 @@ flowchart TB
 
 - **Git Manager (`apps/server/src/git/manager/`)** owns repository generations,
   refs and worktree occupancy snapshots, tip-pinned history pages (at most 100
-  commits and about 1 MiB each), diff and
+  commits and 1 MiB of commit JSON each; for a request with `fitFirstCommit`,
+  the page's commit JSON stays within 960 KiB and its first commit is cut to
+  fit, changed files first, and
+  `changedFilesOmitted` counts the files it leaves out; only SHAs and parents
+  are never cut), diff and
   patch parsing, server-authored guards, in-progress/conflict inspection, and
   the branch, sync, stash, merge, rewrite, conflict, and tag operation
   primitives. `apps/server/src/production/git_manager_rpc.rs` adapts those
@@ -3950,6 +3954,14 @@ view), or free scrolling.
   and no later scroll applies it; it also releases the anchor a recent data
   change locked, which was recorded before that adjustment and would apply it
   a second time. A held request therefore never moves a reader who took over.
+- **Toggled rows.** A press on a Thinking row or a work step is no takeover, so
+  the anchor a data change locked for 300 ms can still hold a row below the
+  toggled one, and the toggled row would move by its own growth. Before the
+  toggle's update, `MessagesTimeline` calls `holdAnchorAboveRow(rowKey)`, which
+  the patch adds: until that row's new size is measured (at most 1 s), the
+  list drops a lock below the row and holds no row below it, also for a
+  delivery that lands in between. An anchor above the toggled row stays
+  (`legendListReaderToggle.dom.test.tsx`).
 - **Hidden lists.** A list under a hidden or detached ancestor measures every
   row 0 by 0. LegendList's resize path already ignores that rectangle; the
   patch adds the same skip to its layout-effect measurement
@@ -4016,7 +4028,13 @@ view), or free scrolling.
   in place, so it holds none and the answer's end can drop out of view.
   `MessagesTimeline` reports the settled turn (`onTurnSettled`) from a layout
   effect, after LegendList has taken the new rows, and `ChatView` runs the
-  same follow pass two frames later, unless the reader has taken over.
+  same follow pass two frames later, unless the reader has taken over. An end
+  scroll can still be completing when those rows go, so its target index points
+  past the data. LegendList 3.3.10 then sizes a missing row, and a null row key
+  sets its total size to the row estimate, so it clamps the next scroll to the
+  top. `patches/@legendapp__list@3.3.10.patch` corrects a scroll target's size
+  only while that row exists. 3.7.3 still has the same path, so the hunk stays
+  until an upgrade drops it (`legendListStaleScrollTarget.dom.test.tsx`).
 - **Scroll keys.** The browser scrolls for a key after the keydown, and WebKit
   can start that scroll several hundred milliseconds later on a busy webview.
   Any scroll the list makes in between cancels it, such as LegendList holding

@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeRemovalError",
-          "reason": "internal",
-          "message": "ay"
+          "reason": "git-failed",
+          "message": "yj+:>m{P\\y"
         }
       }
     ]

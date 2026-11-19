@@ -5,6 +5,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import { DESKTOP_UI_BUNDLE_IDENTIFIER } from "../../support/app-lifecycle.ts";
+import { captureStuckConnectionState } from "../../support/connection-state.ts";
 import { ensureMainSidebarOpen, mockDesktopUiFolderPicker } from "../../support/ui-state.ts";
 
 /**
@@ -90,7 +91,14 @@ async function importProject(): Promise<void> {
   const loading = browser.$("//*[normalize-space()='Project data is still loading']");
   await browser.pause(1_000);
   if (await loading.isExisting()) {
-    await loading.waitForDisplayed({ reverse: true, timeout: 60_000 });
+    try {
+      await loading.waitForDisplayed({ reverse: true, timeout: 60_000 });
+    } catch (error) {
+      // #381: keep what the client held, for the next diagnosis.
+      const state = await captureStuckConnectionState().catch((reason: unknown) => String(reason));
+      note(`project data never loaded; client state: ${JSON.stringify(state)}`);
+      throw error;
+    }
   }
   const addProject = browser.$('[data-testid="sidebar-add-project-trigger"]');
   await addProject.waitForDisplayed();

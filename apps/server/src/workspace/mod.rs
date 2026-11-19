@@ -15,7 +15,10 @@ pub use rpc::{
     WorkspaceMutationObserver, WorkspaceRpc, WorkspaceRpcDependencies,
 };
 #[allow(unused_imports)]
-pub use search::{EntryKind, SearchLimits, SearchResult, WorkspaceEntry, WorkspaceSearchIndex};
+pub use search::{
+    EntryKind, ListPage, SearchLimits, SearchResult, StaleCursor, WorkspaceEntry,
+    WorkspaceSearchIndex,
+};
 #[allow(unused_imports)]
 pub(crate) use service::PathLocks;
 pub use service::{ReadFileResult, WorkspaceService};

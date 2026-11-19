@@ -395,7 +395,8 @@ prevents transient metadata failure, migration failure, or version skew from
 downgrading a Windows DPAPI catalog into renderer storage.
 
 Once a compare-only or CAS call is issued it is uninterruptible through
-transaction/command completion. There is no in-memory catalog publication
+transaction/command completion, or until an IndexedDB call misses its deadline
+(see [Local store deadlines](#local-store-deadlines)). There is no in-memory catalog publication
 afterward, so a caller interrupted around commit cannot leave stale renderer
 state that overwrites the durable winner on a later update. On protected hosts,
 the native mutex coordinates every WebView in one desktop host. Separate
@@ -459,6 +460,47 @@ publishes an identity and the client accepts it, subsequent switches are
 blocked before synchronization. See
 [Project data safety and recovery](../guides/project-data-recovery.md) for the
 observable platform scenarios and supported recovery actions.
+
+## Local store deadlines
+
+WebKit can leave an IndexedDB request pending without any event (#381). Every
+request the web connection storage makes therefore has a 10-second deadline
+(`CONNECTION_DATABASE_DEADLINE_MS` in `apps/web/src/connection/databaseHealth.ts`):
+the open, whether or not `blocked` fired, each read, each write transaction,
+and the recovery deletion (15 seconds). A host timer enforces it, because the
+catalog compare-and-set runs inside uninterruptible regions. A missed deadline
+aborts the transaction when it can, and fails the request with the existing
+`ConnectionTransientError`. A write that misses its deadline says that its
+outcome is unknown. It is never reported as saved and the storage layer does
+not retry it. A write whose transaction IndexedDB aborts fails at once as not
+saved and leaves the store available. An event that arrives after the deadline
+is ignored, and a late open is closed. A recovery deletion that misses its
+deadline, blocked or silent, enters the same timed-out state, and its later
+events change nothing.
+
+The miss is published as `unavailable` connection-database health with
+`timedOut: true`. Publishing it mutes open monitors that started earlier, so a
+late success cannot report the store as ready. `ConnectionDatabaseRecoveryDialog`
+shows a timed-out store as not responding and tells the user to quit BiBCode
+and open it again. It offers only Copy diagnostics: no reset, because a reset
+of an unprotected store deletes saved servers for a condition a restart
+clears, and no Reload, because nothing shows that a reload in the same process
+recovers. There is no in-memory or fallback store.
+
+The dialog, which is mounted on every route, also sets
+`data-connection-store` on `<html>` (`connection/connectionStoreReadiness.ts`):
+`pending` until the catalog is ready, `ready` once it is, and `failed` when the
+runtime failed or the store timed out. The E2E harness waits on it.
+
+A failed open fails the connection runtime layer. The catalog atom then holds a
+failure, which `createEnvironmentCatalogAtoms` publishes as `failed: true` and
+the shell summary as `catalogFailed`. The sidebar project list and the Inbox
+show "Connections could not start" with a Reload
+(`ConnectionRuntimeFailedNotice`) instead of their loading lines.
+
+The browser DPoP key storage (`apps/web/src/cloud/dpop.ts`) bounds its open,
+read and write the same way. A timeout fails the relay request with a clear
+`BrowserDpopError` and never substitutes weaker key storage.
 
 ## State and retry policy
 
@@ -637,7 +679,23 @@ connection status appends "Reconnecting…", and Git Manager shows "Reconnecting
 Each session opens exactly one `subscribeServerConfig` stream. Readiness waits
 for its first snapshot, and every later config subscription on that session
 replays the same stream (a snapshot of the current config, then live events),
-so the roughly 250 KB config crosses the wire once per connection. The stream
+so the roughly 250 KB config crosses the wire once per connection. A server
+capability that changes after startup (`gitManagerMergeIntoOperations` once the
+Git version probe answers) arrives as a later snapshot on the same stream. That snapshot
+changes only the environment: every other part is what the stream already sent,
+so it cannot undo or jump ahead of a `settingsUpdated` still queued on the
+stream. A stream that falls behind the server's event buffer resynchronises
+with a snapshot of the current config. Settings, keybindings, the provider list
+and the tools each have a version inside the server, bumped where their writer
+changes them and carried by each event until the stream removes it. Every full
+snapshot, the first included, records the version of each part it read, and
+the stream skips any later event whose part it already holds at that version
+or a newer one, so a snapshot is sent at once however busy the server is and
+no part moves backward after it. A `providerStatuses` that carries the tools
+takes its provider list from what the stream already sent. When settings were committed
+since the stream's last settings, a resync also sends `settingsUpdated`, even
+if the redacted settings look the same, because the client refreshes provider
+capabilities on that event and a rotated secret is redacted. The stream
 starts once the socket is connected (for E2EE, authenticated), so a session
 that ends earlier never sends it. Its first snapshot is bounded by inbound
 progress (liveness) and the 120-second configuring ceiling, not the 15-second

@@ -256,7 +256,8 @@ describe("retained Git Manager history pages", () => {
         yield* Effect.promise(() =>
           vi.waitFor(() => expect(AsyncResult.isSuccess(h.registry.get(first))).toBe(true)),
         );
-        expect(requests).toEqual([{ cwd: "/repo", limit: 100 }]);
+        // The history asks for a fitted first commit; it shows changedFilesOmitted (#390).
+        expect(requests).toEqual([{ cwd: "/repo", limit: 100, fitFirstCommit: true }]);
         const next = h.atoms.getHistoryFirstPage({
           ...target,
           input: { ...target.input, refreshCacheKey: "_r_1_1" },
@@ -266,8 +267,8 @@ describe("retained Git Manager history pages", () => {
           vi.waitFor(() => expect(AsyncResult.isSuccess(h.registry.get(next))).toBe(true)),
         );
         expect(requests).toEqual([
-          { cwd: "/repo", limit: 100 },
-          { cwd: "/repo", limit: 100 },
+          { cwd: "/repo", limit: 100, fitFirstCommit: true },
+          { cwd: "/repo", limit: 100, fitFirstCommit: true },
         ]);
         const result = h.registry.get(next);
         if (AsyncResult.isSuccess(result)) expect(result.value.generation).toBe(2);
@@ -328,6 +329,7 @@ describe("retained Git Manager history pages", () => {
             pinnedTips: ["original-tip"],
             offset,
             limit: 50,
+            fitFirstCommit: true,
           })),
         );
         expect(maximumActive).toBe(2);

@@ -172,6 +172,25 @@ describe("ordered terminal input binding", () => {
         registry.reset("env", target);
       }),
   );
+  it.effect("prepares a fresh binding after a preparation failed on the same session", () =>
+    Effect.gen(function* () {
+      const h = harness();
+      const client = h.session.client as unknown as Record<string, (input: never) => unknown>;
+      const begin = client[WS_METHODS.terminalBeginInput]!;
+      client[WS_METHODS.terminalBeginInput] = () =>
+        Effect.fail(new TerminalInputError({ code: "closed", message: "Begin timed out." }));
+      const registry = createTerminalInputBindingRegistry();
+      const context = yield* Effect.context();
+      yield* registry.prepare(h.session, "env", target, context).pipe(Effect.flip);
+      client[WS_METHODS.terminalBeginInput] = begin;
+      // The next attachment on this connection prepares again instead of replaying the failure.
+      yield* registry.prepare(h.session, "env", target, context);
+      yield* registry.write(h.session, "env", target, "a", context);
+      expect(h.begins()).toBe(1);
+      expect(h.frames.map((f) => f.data)).toEqual(["a"]);
+      registry.reset("env", target);
+    }),
+  );
   it("splits programmatic Unicode input into bounded frames", () => {
     const input = "😀é".repeat(10000);
     const frames = splitTerminalInputFrames(input);

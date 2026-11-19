@@ -36,6 +36,9 @@ use crate::{
 };
 
 const MAX_KEYBINDINGS: usize = 256;
+/// Internal to the config event channel: each `subscribeServerConfig` stream replaces it
+/// with a snapshot built in its own order, so no client ever receives it.
+const CONFIG_SNAPSHOT_REFRESH_EVENT: &str = "internal.configSnapshotRefresh";
 const PROVIDER_REFRESH_TTL: Duration = Duration::from_secs(5 * 60);
 const PROVIDER_PROBE_TIMESTAMP_PATHS: &[&[&str]] =
     &[&["checkedAt"], &["versionAdvisory", "checkedAt"]];
@@ -324,6 +327,10 @@ pub struct NativeServerControl {
     mcp_server: watch::Sender<crate::mcp::control::McpServerSettings>,
     settings_update_lock: Arc<Mutex<()>>,
     settings_generation: Arc<AtomicU64>,
+    /// Bumped under the provider list's write lock whenever the list changes.
+    providers_version: Arc<AtomicU64>,
+    /// Bumped under the keybinding rules' write lock at each keybindings write.
+    keybindings_version: Arc<AtomicU64>,
     agent_activity_handler: AgentActivityHandlerSlot,
     next_provider_probe_sequence: Arc<AtomicU64>,
     latest_committed_provider_probe_sequence: Arc<AtomicU64>,
@@ -362,6 +369,8 @@ pub struct NativeServerControl {
     full_provider_refresh_running: Arc<AtomicBool>,
     provider_refresh_state: Arc<std::sync::Mutex<ProviderRefreshState>>,
     activity_protocol_registered: Arc<AtomicBool>,
+    /// Cleared by the startup Git version read when Git is older than 2.38.
+    merge_into_git_supported: Arc<AtomicBool>,
     config_events: broadcast::Sender<Value>,
     trace_diagnostics: TraceDiagnosticsStore,
 }
@@ -391,6 +400,22 @@ impl NativeServerControl {
         config: ServerConfig,
         auth_descriptor: Value,
         trace_diagnostics: TraceDiagnosticsStore,
+    ) -> Self {
+        // Unit tests never read the host's Git version: it decides a capability they assert.
+        #[cfg(test)]
+        let git = crate::git::manager::merge::tests::UNIT_TEST_STARTUP_GIT
+            .1
+            .clone();
+        #[cfg(not(test))]
+        let git = crate::git::GitRepository::default();
+        Self::with_merge_into_git_probe(config, auth_descriptor, trace_diagnostics, git).await
+    }
+
+    async fn with_merge_into_git_probe(
+        config: ServerConfig,
+        auth_descriptor: Value,
+        trace_diagnostics: TraceDiagnosticsStore,
+        git: crate::git::GitRepository,
     ) -> Self {
         let state_directory = config.state_dir();
         let settings_path = state_directory.join("settings.json");
@@ -437,7 +462,7 @@ impl NativeServerControl {
         // Nothing subscribes yet, so the tools' publish during startup reaches no one.
         *providers.write().await =
             probe_startup_inventory(&settings, &cwd, &provider_maintenance, &tools).await;
-        Self {
+        let control = Self {
             config,
             auth_descriptor,
             state_directory,
@@ -452,6 +477,8 @@ impl NativeServerControl {
             mcp_server,
             settings_update_lock: Arc::new(Mutex::new(())),
             settings_generation: Arc::new(AtomicU64::new(0)),
+            providers_version: Arc::new(AtomicU64::new(0)),
+            keybindings_version: Arc::new(AtomicU64::new(0)),
             agent_activity_handler: AgentActivityHandlerSlot::default(),
             next_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
             latest_committed_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
@@ -492,9 +519,36 @@ impl NativeServerControl {
                 std::sync::Mutex::new(ProviderRefreshState::default()),
             ),
             activity_protocol_registered: Arc::new(AtomicBool::new(false)),
+            merge_into_git_supported: Arc::new(AtomicBool::new(true)),
             config_events,
             trace_diagnostics,
-        }
+        };
+        control.spawn_merge_into_git_probe(git);
+        control
+    }
+
+    /// Reads the Git version once, off the startup path, so the descriptor can stop
+    /// advertising merge-into on a Git too old for it. Until it answers, merge-into stays on.
+    fn spawn_merge_into_git_probe(&self, repository: crate::git::GitRepository) {
+        let control = self.clone();
+        let cwd = PathBuf::from(current_directory(&self.config));
+        self.capability_tasks.spawn(async move {
+            let result = crate::git::manager::merge::git_supports_merge_into(
+                &repository,
+                &cwd,
+                &control.capability_shutdown,
+            )
+            .await;
+            let previous = control
+                .merge_into_git_supported
+                .swap(result, Ordering::AcqRel);
+            // A client that subscribed before the probe answered holds the old descriptor.
+            // A snapshot built here could carry settings older than a `settingsUpdated`
+            // published while it was built, so each subscriber builds it in stream order.
+            if previous != result {
+                control.publish(json!({ "type": CONFIG_SNAPSHOT_REFRESH_EVENT }));
+            }
+        });
     }
 
     /// Marks the structured activity protocol ready after the production registry
@@ -504,29 +558,71 @@ impl NativeServerControl {
             .store(true, Ordering::Release);
     }
 
+    fn environment(&self) -> Value {
+        environment_descriptor(
+            &self.config,
+            self.activity_protocol_registered.load(Ordering::Acquire),
+            self.merge_into_git_supported.load(Ordering::Acquire),
+        )
+    }
+
     pub async fn config_snapshot(&self) -> Value {
         let settings = self.settings.read().await.clone();
-        let rules = self.keybinding_rules.read().await.clone();
-        let issues = self.keybinding_issues.read().await.clone();
-        let providers = self.providers.read().await.clone();
+        self.config_snapshot_with(settings, 0).await.0
+    }
+
+    /// A snapshot with the version of each part it holds, for a config stream to skip every
+    /// later event that the snapshot already holds or that is older than it.
+    async fn versioned_config_snapshot(&self) -> (Value, ConfigVersions) {
+        let (generation, settings) = self.settings_snapshot().await;
+        self.config_snapshot_with(settings, generation).await
+    }
+
+    /// Each part is read with its version under the lock its writers bump that version in.
+    async fn config_snapshot_with(
+        &self,
+        settings: Value,
+        generation: u64,
+    ) -> (Value, ConfigVersions) {
+        let (rules, issues, keybindings) = {
+            let rules = self.keybinding_rules.read().await;
+            let issues = self.keybinding_issues.read().await.clone();
+            (
+                rules.clone(),
+                issues,
+                self.keybindings_version.load(Ordering::Acquire),
+            )
+        };
+        let (providers, provider_version) = {
+            let providers = self.providers.read().await;
+            (
+                providers.clone(),
+                self.providers_version.load(Ordering::Acquire),
+            )
+        };
+        let (tools, tool_version) = self.tools.snapshots_with_version();
         let cwd = current_directory(&self.config);
-        json!({
-            "environment": environment_descriptor(
-                &self.config,
-                self.activity_protocol_registered.load(Ordering::Acquire),
-            ),
+        let snapshot = json!({
+            "environment": self.environment(),
             "auth": self.auth_descriptor,
             "cwd": cwd,
             "keybindingsConfigPath": self.keybindings_path.to_string_lossy(),
             "keybindings": keybindings::resolve(&rules),
             "issues": issues,
             "providers": providers,
-            "tools": self.tools.snapshots(),
+            "tools": tools,
             "availableEditors": available_editors(),
             "observability": observability_snapshot(&self.state_directory),
             "settings": settings,
             "mcpLaunch": mcp_launch(&self.config),
-        })
+        });
+        let versions = ConfigVersions {
+            settings: generation,
+            keybindings,
+            providers: provider_version,
+            tools: tool_version,
+        };
+        (snapshot, versions)
     }
 
     pub(crate) fn automatic_git_fetch_interval_signal(&self) -> watch::Sender<Duration> {
@@ -634,6 +730,33 @@ impl NativeServerControl {
                 agent_activity_enabled(&current, AgentActivitySource::Terminal),
             ),
         ];
+        // A write that owns some providers' session defaults sets or removes only those, so a
+        // default another window committed meanwhile survives a map built from an older copy.
+        if let (Some(owned), Some(written)) = (
+            payload
+                .get("ownedProviderSessionDefaults")
+                .and_then(Value::as_array),
+            patch
+                .get("providerSessionDefaults")
+                .and_then(Value::as_object),
+        ) {
+            let mut merged = current
+                .get("providerSessionDefaults")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            for provider in owned.iter().filter_map(Value::as_str) {
+                match written.get(provider) {
+                    Some(default) => {
+                        merged.insert(provider.to_owned(), default.clone());
+                    }
+                    None => {
+                        merged.remove(provider);
+                    }
+                }
+            }
+            patch["providerSessionDefaults"] = Value::Object(merged);
+        }
         let mut next = current;
         apply_settings_patch(&mut next, patch);
         validate_settings_document(&next)
@@ -776,6 +899,8 @@ impl NativeServerControl {
                 "version": 1,
                 "type": "settingsUpdated",
                 "payload": { "settings": next.clone() },
+                // Read and removed by each config stream before it sends the event.
+                "sectionVersion": generation,
             }));
             drop(update_guard);
             // Once settings are committed, their inventory refresh must also survive
@@ -1033,6 +1158,9 @@ impl NativeServerControl {
             let previous = provider.get("updateState").cloned();
             self.provider_maintenance.overlay_update_state(provider);
             changed |= provider.get("updateState") != previous.as_ref();
+        }
+        if changed {
+            self.providers_version.fetch_add(1, Ordering::AcqRel);
         }
         let snapshot = providers.clone();
         drop(providers);
@@ -1657,15 +1785,21 @@ impl NativeServerControl {
                 .iter()
                 .zip(&merged)
                 .any(|(current, next)| !provider_snapshot_content_eq(current, next));
+        // Every write is a new version, timestamps included: a manual refresh publishes them.
+        self.providers_version.fetch_add(1, Ordering::AcqRel);
         *current = merged;
         (current.clone(), changed)
     }
 
+    /// Callers hold `settings_update_lock` across the write and this publication, so the
+    /// version read here is the one that write made.
     fn publish_provider_snapshots(&self, providers: &[Value]) {
         self.publish(json!({
             "version": 1,
             "type": "providerStatuses",
             "payload": { "providers": providers },
+            // Read and removed by each config stream before it sends the event.
+            "sectionVersion": self.providers_version.load(Ordering::Acquire),
         }));
     }
 
@@ -1791,10 +1925,13 @@ impl NativeServerControl {
             .map_err(|error| keybindings_error(&self.keybindings_path, &error.to_string()))?;
         self.keybinding_issues.write().await.clear();
         let result = json!({ "keybindings": keybindings::resolve(&rules), "issues": [] });
+        let version = self.keybindings_version.fetch_add(1, Ordering::AcqRel) + 1;
         self.publish(json!({
             "version": 1,
             "type": "keybindingsUpdated",
             "payload": result.clone(),
+            // Read and removed by each config stream before it sends the event.
+            "sectionVersion": version,
         }));
         Ok(result)
     }
@@ -1969,10 +2106,11 @@ impl NativeServerControl {
                             .discover_provider_capabilities(payload, CancellationToken::new())
                             .await
                         {
-                            let reason = error.get("reason").and_then(Value::as_str);
+                            // The reason can carry provider error text that names skills.
+                            let tag = error.get("_tag").and_then(Value::as_str);
                             tracing::warn!(
                                 instance_id = %key.0,
-                                reason = reason.unwrap_or_default(),
+                                tag = tag.unwrap_or_default(),
                                 "background provider capability refresh failed"
                             );
                         }
@@ -2099,12 +2237,16 @@ impl ProductionServerControl for NativeServerControl {
                         FullProviderRefreshTrigger::Subscription,
                     );
                     let mut updates = control.config_events.subscribe();
+                    // The config as this stream's client holds it, so a capability change
+                    // can be sent without moving any other part of it, and the version of
+                    // each part it holds, so no event older than it is sent after it.
+                    let (mut sent, mut held) = control.versioned_config_snapshot().await;
                     if send_event(
                         &sender,
                         json!({
                             "version": 1,
                             "type": "snapshot",
-                            "config": control.config_snapshot().await,
+                            "config": sent.clone(),
                         }),
                     )
                     .await
@@ -2116,12 +2258,82 @@ impl ProductionServerControl for NativeServerControl {
                         tokio::select! {
                             () = cancellation.cancelled() => return,
                             event = updates.recv() => match event {
-                                Ok(event) => {
+                                Ok(mut event) => {
+                                    if !held.advance(&mut event) {
+                                        continue;
+                                    }
+                                    // The tools publisher copies the provider list outside the
+                                    // lock provider writers publish under, so that copy can be
+                                    // older than the list already sent.
+                                    if event["type"] == "providerStatuses"
+                                        && event["payload"].get("tools").is_some()
+                                    {
+                                        event["payload"]["providers"] = sent["providers"].clone();
+                                    }
+                                    // Only the environment changed: everything else is what
+                                    // this stream already sent, so a settingsUpdated still
+                                    // queued behind the marker never lands on newer settings.
+                                    let event = if event["type"] == CONFIG_SNAPSHOT_REFRESH_EVENT {
+                                        let environment = control.environment();
+                                        // Already sent, as when the probe answered before this
+                                        // stream's first snapshot was built.
+                                        if sent["environment"] == environment {
+                                            continue;
+                                        }
+                                        sent["environment"] = environment;
+                                        json!({
+                                            "version": 1,
+                                            "type": "snapshot",
+                                            "config": sent.clone(),
+                                        })
+                                    } else {
+                                        // A manual provider refresh republishes the whole provider
+                                        // list even when nothing in it changed.
+                                        if !config_stream_event_changes(&sent, &event) {
+                                            continue;
+                                        }
+                                        apply_config_stream_event(&mut sent, &event);
+                                        event
+                                    };
                                     if send_event(&sender, event).await.is_err() {
                                         return;
                                     }
                                 }
-                                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    // Dropped events can include a capability marker: send the
+                                    // whole config again. Resubscribing first skips the retained
+                                    // events older than it, and anything after it is newer.
+                                    updates = updates.resubscribe();
+                                    let (current, versions) =
+                                        control.versioned_config_snapshot().await;
+                                    // A dropped settingsUpdated can hold a rotated secret, which
+                                    // redacts to the same settings. The client refreshes provider
+                                    // capabilities on that event, never on equal settings.
+                                    let settings_hidden = versions.settings != held.settings
+                                        && sent["settings"] == current["settings"];
+                                    held = versions;
+                                    if !config_content_eq(&sent, &current) {
+                                        sent = current;
+                                        let snapshot = json!({
+                                            "version": 1,
+                                            "type": "snapshot",
+                                            "config": sent.clone(),
+                                        });
+                                        if send_event(&sender, snapshot).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    if settings_hidden {
+                                        let event = json!({
+                                            "version": 1,
+                                            "type": "settingsUpdated",
+                                            "payload": { "settings": sent["settings"].clone() },
+                                        });
+                                        if send_event(&sender, event).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
                                 Err(broadcast::error::RecvError::Closed) => return,
                             }
                         }
@@ -2136,8 +2348,13 @@ impl ProductionServerControl for NativeServerControl {
                         .unwrap_or("BiBCode");
                     let activity_protocol_registered =
                         control.activity_protocol_registered.load(Ordering::Acquire);
-                    let environment =
-                        environment_descriptor(&control.config, activity_protocol_registered);
+                    let merge_into_git_supported =
+                        control.merge_into_git_supported.load(Ordering::Acquire);
+                    let environment = environment_descriptor(
+                        &control.config,
+                        activity_protocol_registered,
+                        merge_into_git_supported,
+                    );
                     if send_event(
                         &sender,
                         json!({
@@ -2167,6 +2384,7 @@ impl ProductionServerControl for NativeServerControl {
                                 "environment": environment_descriptor(
                                     &control.config,
                                     activity_protocol_registered,
+                                    merge_into_git_supported,
                                 ),
                             },
                         }),
@@ -2183,6 +2401,95 @@ impl ProductionServerControl for NativeServerControl {
         });
         receiver
     }
+}
+
+/// The version of each config part a stream's client holds. Every versioned event carries its
+/// part's version in `sectionVersion`, taken where its writer bumped it.
+#[derive(Clone, Copy, Debug)]
+struct ConfigVersions {
+    settings: u64,
+    keybindings: u64,
+    providers: u64,
+    tools: u64,
+}
+
+impl ConfigVersions {
+    /// Removes the event's version and records it; false when the client already holds that
+    /// part at this version or a newer one, so the event must not be sent.
+    fn advance(&mut self, event: &mut Value) -> bool {
+        let Some(version) = event
+            .as_object_mut()
+            .and_then(|event| event.remove("sectionVersion"))
+            .and_then(|version| version.as_u64())
+        else {
+            return true;
+        };
+        let held = match event["type"].as_str() {
+            Some("settingsUpdated") => &mut self.settings,
+            Some("keybindingsUpdated") => &mut self.keybindings,
+            Some("providerStatuses") if event["payload"].get("tools").is_some() => &mut self.tools,
+            Some("providerStatuses") => &mut self.providers,
+            _ => return true,
+        };
+        if version <= *held {
+            return false;
+        }
+        *held = version;
+        true
+    }
+}
+
+/// Applies a config stream event the way a client does: a snapshot replaces the config, and
+/// each update replaces the part it names.
+fn apply_config_stream_event(config: &mut Value, event: &Value) {
+    let payload = &event["payload"];
+    match event["type"].as_str() {
+        Some("snapshot") => *config = event["config"].clone(),
+        Some("settingsUpdated") => config["settings"] = payload["settings"].clone(),
+        Some("keybindingsUpdated") => {
+            config["keybindings"] = payload["keybindings"].clone();
+            config["issues"] = payload["issues"].clone();
+        }
+        Some("providerStatuses") => {
+            config["providers"] = payload["providers"].clone();
+            if let Some(tools) = payload.get("tools") {
+                config["tools"] = tools.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether two configs differ only in provider probe timestamps, which are never published on
+/// their own either.
+fn config_content_eq(sent: &Value, current: &Value) -> bool {
+    let (Value::Object(sent), Value::Object(current)) = (sent, current) else {
+        return sent == current;
+    };
+    sent.len() == current.len()
+        && sent
+            .iter()
+            .all(|(key, value)| match (key.as_str(), current.get(key)) {
+                ("providers", Some(Value::Array(next))) => value.as_array().is_some_and(|held| {
+                    held.len() == next.len()
+                        && held
+                            .iter()
+                            .zip(next)
+                            .all(|(held, next)| provider_snapshot_content_eq(held, next))
+                }),
+                (_, next) => next == Some(value),
+            })
+}
+
+/// Whether a provider list event would change the config a client holds. Every other event is
+/// sent as published.
+fn config_stream_event_changes(config: &Value, event: &Value) -> bool {
+    let payload = &event["payload"];
+    event["type"] != "providerStatuses"
+        || config["providers"] != payload["providers"]
+        || payload
+            .get("tools")
+            .is_some_and(|tools| config["tools"] != *tools)
 }
 
 async fn send_event(
@@ -2890,7 +3197,11 @@ fn current_directory(config: &ServerConfig) -> String {
         .into_owned()
 }
 
-fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: bool) -> Value {
+fn environment_descriptor(
+    config: &ServerConfig,
+    activity_protocol_registered: bool,
+    merge_into_git_supported: bool,
+) -> Value {
     // Built apart from the descriptor: one literal holding both exceeds `json!`'s recursion limit.
     let mut capabilities = json!({
         "repositoryIdentity": true,
@@ -2901,7 +3212,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "gitManagerCommitOperations": true,
         "gitManagerBranchSyncOperations": true,
         "gitManagerStashMergeOperations": true,
-        "gitManagerMergeIntoOperations": true,
+        "gitManagerMergeIntoOperations": merge_into_git_supported,
         "gitManagerPartialStaging": true,
         "gitManagerRewriteOperations": true,
         "gitManagerTagOperations": true,
@@ -2939,6 +3250,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
     capabilities["terminalUserInputClaim"] = json!(true);
     capabilities["agentMessaging"] = json!(true);
     capabilities["sendRequests"] = json!(true);
+    capabilities["readOnlyCodexReviews"] = json!(true);
     capabilities["terminalSizeHandOver"] = json!(true);
     // A flag is advertised only when every method it promises is registered.
     capabilities["pipelinesReads"] =
@@ -3376,6 +3688,15 @@ mod tests {
     }
 
     async fn scheduler_control(temp: &tempfile::TempDir) -> NativeServerControl {
+        let (_, git) = crate::git::manager::merge::tests::version_runner("git version 2.38.0\n");
+        scheduler_control_with_git(temp, git).await
+    }
+
+    /// `scheduler_control` with the Git the startup version probe reads.
+    async fn scheduler_control_with_git(
+        temp: &tempfile::TempDir,
+        git: crate::git::GitRepository,
+    ) -> NativeServerControl {
         let config = running_test_config(temp.path());
         let settings_path = config.state_dir().join("settings.json");
         let missing_binary = missing_provider_executable(temp);
@@ -3411,7 +3732,15 @@ mod tests {
         )
         .await
         .expect("write settings");
-        NativeServerControl::new(config, json!({"policy":"test"})).await
+        let trace_diagnostics =
+            TraceDiagnosticsStore::new(config.state_dir().join("logs/server.trace.ndjson"));
+        NativeServerControl::with_merge_into_git_probe(
+            config,
+            json!({"policy":"test"}),
+            trace_diagnostics,
+            git,
+        )
+        .await
     }
 
     async fn control_with_stub_tool(
@@ -3869,6 +4198,111 @@ mod tests {
             .unwrap_err();
         assert_eq!(error["_tag"], "ServerProviderCapabilitiesError");
         assert!(error["reason"].as_str().unwrap().contains("shutting down"));
+    }
+
+    /// In a process of its own, so no sibling test can turn a callsite off for this capture.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_background_capability_refresh_keeps_catalog_content_out_of_the_log() {
+        let Some(child) = crate::test_support::in_own_process(
+            "production::control::tests::a_failed_background_capability_refresh_keeps_catalog_content_out_of_the_log",
+        ) else {
+            return;
+        };
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        const SENTINEL: &str = "sentinel-skill-name";
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let control = scheduler_control(&temp).await;
+        let sandbox = crate::test_support::TestSandbox::new("capability-refresh-log");
+        let binary = sandbox.executable_script(
+            "codex",
+            &format!(
+                r#"
+while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialized"'*) ;;
+    *'"method":"skills/list"'*) printf '{{"id":%s,"error":{{"code":-32000,"message":"cannot load {SENTINEL}"}}}}\n' "$id" ;;
+    *) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done
+"#
+            ),
+            "",
+        );
+        let mut settings = control.settings.read().await.clone();
+        settings["providerInstances"]["codex"]["config"]["binaryPath"] = json!(binary);
+        settings["providerInstances"]["codex"]["environment"] =
+            json!([{"name":"HOME","value":sandbox.root()}]);
+        tokio::fs::write(
+            &control.settings_path,
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .await
+        .unwrap();
+        let payload = json!({"instanceId":"codex","cwd":sandbox.root()});
+        let key = CapabilityCache::key(&payload).unwrap();
+        // A stale cached catalog answers at once and starts the refresh that fails.
+        control.capability_cache.lock().unwrap().store(
+            key,
+            control.settings_generation.load(Ordering::Acquire),
+            json!({"slashCommands":[],"skills":[],"agents":[],"issues":[]}),
+        );
+        for entry in control
+            .capability_cache
+            .lock()
+            .unwrap()
+            .entries
+            .values_mut()
+        {
+            entry.stored_at = std::time::Instant::now()
+                .checked_sub(CAPABILITY_CACHE_FRESH * 2)
+                .unwrap();
+        }
+        control
+            .call(
+                "server.getProviderCapabilities",
+                payload,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the cached catalog answers");
+        let text = || String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !text().contains("background provider capability refresh failed") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the refresh failure was logged:\n{}", text()));
+        control.shutdown_capability_discovery().await;
+        assert!(
+            !text().contains(SENTINEL),
+            "catalog content reached the log:\n{}",
+            text()
+        );
+        child.complete();
     }
 
     async fn mutable_provider_registry(
@@ -7543,6 +7977,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_that_owns_one_session_default_keeps_another_windows_save() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        let codex = json!({ "model": "gpt-5.4", "options": [] });
+        let claude = json!({ "model": "claude-sonnet-4-6", "options": [] });
+        let auto = json!({ "model": "auto", "options": [] });
+        let update = async |request: Value| {
+            control
+                .call("server.updateSettings", request, CancellationToken::new())
+                .await
+                .expect("settings update")["providerSessionDefaults"]
+                .clone()
+        };
+        update(json!({ "patch": { "providerSessionDefaults": { "codex": codex } } })).await;
+        // Window B saves a Claude default.
+        update(json!({
+            "patch": { "providerSessionDefaults": { "codex": codex, "claudeAgent": claude } },
+        }))
+        .await;
+
+        // Window A has not seen B's save yet and rewrites only its Codex default.
+        let saved = update(json!({
+            "patch": { "providerSessionDefaults": { "codex": auto } },
+            "ownedProviderSessionDefaults": ["codex"],
+        }))
+        .await;
+        assert_eq!(saved, json!({ "codex": auto, "claudeAgent": claude }));
+
+        // An owned provider the map leaves out is removed; the rest stays.
+        let saved = update(json!({
+            "patch": { "providerSessionDefaults": {} },
+            "ownedProviderSessionDefaults": ["codex"],
+        }))
+        .await;
+        assert_eq!(saved, json!({ "claudeAgent": claude }));
+
+        // Without the field the map still replaces the whole saved map, as older clients expect.
+        let saved =
+            update(json!({ "patch": { "providerSessionDefaults": { "codex": auto } } })).await;
+        assert_eq!(saved, json!({ "codex": auto }));
+    }
+
+    #[tokio::test]
     async fn settings_validation_preserves_open_unknown_keys_and_legacy_options() {
         #[cfg(feature = "hermetic-test-guard")]
         if crate::test_support::reexec_without_provider_path(
@@ -7598,11 +8077,601 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_git_probe_corrects_merge_into_without_rolling_back_a_newer_setting() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let (_, startup_git) =
+            crate::git::manager::merge::tests::version_runner("git version 2.38.0\n");
+        let control = scheduler_control_with_git(&temp, startup_git).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        let cancellation = CancellationToken::new();
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        let mut client = stream
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot")[0]["config"]
+            .clone();
+        let merge_into = |config: &Value| {
+            config["environment"]["capabilities"]["gitManagerMergeIntoOperations"].clone()
+        };
+        assert_eq!(merge_into(&client), true);
+
+        for (version, expected, setting) in [
+            ("git version 2.37.9\n", false, false),
+            ("git version 2.38.0\n", true, true),
+        ] {
+            // Any snapshot built now waits on the keybindings after reading the settings.
+            let keybindings = control.keybinding_rules.write().await;
+            let (_, repository) = crate::git::manager::merge::tests::version_runner(version);
+            control.spawn_merge_into_git_probe(repository);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while control.merge_into_git_supported.load(Ordering::Acquire) != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the probe answers");
+            control
+                .update_settings(json!({"patch": {"enableChatAgentActivity": setting}}))
+                .await
+                .expect("settings update");
+            drop(keybindings);
+            control.capability_tasks.wait().await;
+
+            let server = control.config_snapshot().await;
+            assert_eq!(merge_into(&server), expected, "{version}");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while client["settings"] != server["settings"] || merge_into(&client) != expected {
+                    for event in stream.recv().await.expect("config stream").expect("events") {
+                        apply_config_stream_event(&mut client, &event);
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{version}: the client settled on enableChatAgentActivity {} and merge-into {}",
+                    client["settings"]["enableChatAgentActivity"],
+                    merge_into(&client)
+                )
+            });
+        }
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_delayed_config_stream_never_moves_settings_backward_on_a_capability_change() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        let cancellation = CancellationToken::new();
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        let mut client = stream
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot")[0]["config"]
+            .clone();
+        // Fill the stream's output so it stops reading: everything after queues behind.
+        for _ in 0..12 {
+            control.publish(json!({ "type": "unit" }));
+        }
+        let (_, repository) =
+            crate::git::manager::merge::tests::version_runner("git version 2.37.9\n");
+        control.spawn_merge_into_git_probe(repository);
+        control.capability_tasks.wait().await;
+        for prompt in ["first", "second"] {
+            control
+                .update_settings(json!({"patch": {"codeReviewPrompt": prompt}}))
+                .await
+                .expect("settings update");
+        }
+
+        let server = control.config_snapshot().await;
+        // Read everything the stream sends, until it has been quiet for a while.
+        let mut prompts = Vec::new();
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_millis(500), stream.recv()).await
+        {
+            for event in chunk.expect("events") {
+                apply_config_stream_event(&mut client, &event);
+                prompts.push(client["settings"]["codeReviewPrompt"].clone());
+            }
+        }
+        assert_eq!(client["settings"], server["settings"]);
+        assert_eq!(client["environment"], server["environment"]);
+        let second = prompts
+            .iter()
+            .position(|prompt| prompt == "second")
+            .expect("the second prompt arrives");
+        assert!(
+            !prompts[second..].contains(&json!("first")),
+            "the prompt moved back: {prompts:?}"
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_config_stream_that_lags_past_its_buffer_resynchronises_its_client() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        let cancellation = CancellationToken::new();
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        let mut client = stream
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot")[0]["config"]
+            .clone();
+        // Fill the stream's output so it stops reading: everything after queues behind.
+        for _ in 0..12 {
+            control.publish(json!({ "type": "unit" }));
+        }
+        let (_, repository) =
+            crate::git::manager::merge::tests::version_runner("git version 2.37.9\n");
+        control.spawn_merge_into_git_probe(repository);
+        control.capability_tasks.wait().await;
+        control
+            .update_settings(json!({"patch": {"codeReviewPrompt": "lagged"}}))
+            .await
+            .expect("settings update");
+        // More than the broadcast holds: the marker and the settings update are dropped.
+        for _ in 0..64 {
+            control.publish(json!({ "type": "unit" }));
+        }
+        // Retained behind the lag, and older than any snapshot built after it.
+        for prompt in ["first", "second"] {
+            control
+                .update_settings(json!({"patch": {"codeReviewPrompt": prompt}}))
+                .await
+                .expect("settings update");
+        }
+
+        let server = control.config_snapshot().await;
+        let mut prompts = Vec::new();
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_millis(500), stream.recv()).await
+        {
+            for event in chunk.expect("events") {
+                apply_config_stream_event(&mut client, &event);
+                prompts.push(client["settings"]["codeReviewPrompt"].clone());
+            }
+        }
+        let second = prompts
+            .iter()
+            .position(|prompt| prompt == "second")
+            .expect("the second prompt arrives");
+        assert!(
+            !prompts[second..].contains(&json!("first")),
+            "the prompt moved back: {prompts:?}"
+        );
+        assert_eq!(
+            client["environment"]["capabilities"]["gitManagerMergeIntoOperations"],
+            false
+        );
+        assert_eq!(client["environment"], server["environment"]);
+        assert_eq!(client["settings"], server["settings"]);
+        cancellation.cancel();
+    }
+
+    /// Reads everything a config stream sends until it has been quiet for a while, applying each
+    /// event to `client`, and returns the events.
+    async fn drain_config_stream(stream: &mut JsonStream, client: &mut Value) -> Vec<Value> {
+        let mut events = Vec::new();
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_millis(500), stream.recv()).await
+        {
+            for event in chunk.expect("events") {
+                apply_config_stream_event(client, &event);
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// A subscribed stream past its first snapshot and its own provider refresh.
+    async fn settled_config_stream(
+        control: &NativeServerControl,
+        cancellation: &CancellationToken,
+    ) -> (JsonStream, Value) {
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        let mut client = stream
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot")[0]["config"]
+            .clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while control
+                .full_provider_refresh_running
+                .load(Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the subscription's provider refresh settles");
+        drain_config_stream(&mut stream, &mut client).await;
+        (stream, client)
+    }
+
+    #[tokio::test]
+    async fn a_config_resync_never_replays_an_inventory_older_than_its_snapshot() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        let cancellation = CancellationToken::new();
+        let (mut stream, mut client) = settled_config_stream(&control, &cancellation).await;
+        let publish_inventory = async |mark: &str| {
+            let (providers, _) = control
+                .merge_provider_snapshots(
+                    vec![provider_inventory::ProviderProbeResult {
+                        snapshot: json!({
+                            "instanceId": "resync-probe",
+                            "driver": "codex",
+                            "message": mark,
+                        }),
+                        rich_metadata: provider_inventory::RichMetadataOutcome::NotRequested,
+                        models_authoritative: false,
+                    }],
+                    true,
+                )
+                .await;
+            control.publish_provider_snapshots(&providers);
+        };
+        let mark = |config: &Value| {
+            config["providers"]
+                .as_array()
+                .and_then(|providers| {
+                    providers
+                        .iter()
+                        .find(|provider| provider["instanceId"] == "resync-probe")
+                })
+                .map(|provider| provider["message"].clone())
+                .unwrap_or(Value::Null)
+        };
+
+        // Fill the stream's output so it stops reading, then lag it past the broadcast.
+        for _ in 0..12 {
+            control.publish(json!({ "type": "unit" }));
+        }
+        // The resync's snapshot reads the settings, then waits here before the providers.
+        let keybindings = control.keybinding_rules.write().await;
+        for _ in 0..64 {
+            control.publish(json!({ "type": "unit" }));
+        }
+        drain_config_stream(&mut stream, &mut client).await;
+        publish_inventory("A").await;
+        publish_inventory("B").await;
+        drop(keybindings);
+
+        let mut marks = Vec::new();
+        for event in drain_config_stream(&mut stream, &mut Value::Null).await {
+            apply_config_stream_event(&mut client, &event);
+            marks.push(mark(&client));
+        }
+        let latest = marks
+            .iter()
+            .position(|mark| mark == "B")
+            .expect("the newer inventory arrives");
+        assert!(
+            !marks[latest..].contains(&json!("A")),
+            "the inventory moved back: {marks:?}"
+        );
+        assert_eq!(mark(&client), "B");
+        cancellation.cancel();
+    }
+
+    /// Publishes an inventory whose `ordered-probe` row carries `mark`, as a provider writer does.
+    async fn publish_marked_inventory(control: &NativeServerControl, mark: u64) {
+        let (providers, _) = control
+            .merge_provider_snapshots(
+                vec![provider_inventory::ProviderProbeResult {
+                    snapshot: json!({
+                        "instanceId": "ordered-probe",
+                        "driver": "codex",
+                        "message": mark,
+                    }),
+                    rich_metadata: provider_inventory::RichMetadataOutcome::NotRequested,
+                    models_authoritative: false,
+                }],
+                true,
+            )
+            .await;
+        control.publish_provider_snapshots(&providers);
+    }
+
+    fn inventory_mark(config: &Value) -> Option<u64> {
+        config["providers"]
+            .as_array()?
+            .iter()
+            .find(|provider| provider["instanceId"] == "ordered-probe")?["message"]
+            .as_u64()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_config_stream_gets_its_snapshot_while_publications_never_stop() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        let publishing = CancellationToken::new();
+        let publisher = tokio::spawn({
+            let control = control.clone();
+            let publishing = publishing.clone();
+            async move {
+                let mut mark = 0;
+                while !publishing.is_cancelled() {
+                    mark += 1;
+                    publish_marked_inventory(&control, mark).await;
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        // Other events never pause either, so no snapshot build ever sees a quiet moment.
+        let spamming = Arc::new(AtomicBool::new(true));
+        let spammer = std::thread::spawn({
+            let events = control.config_events.clone();
+            let spamming = spamming.clone();
+            move || {
+                while spamming.load(Ordering::Acquire) {
+                    let _ = events.send(json!({ "type": "unit" }));
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+        });
+        // Publications are under way before the subscription and never pause.
+        loop {
+            let providers = control.providers.read().await.clone();
+            if inventory_mark(&json!({ "providers": providers })).is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let cancellation = CancellationToken::new();
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        let mut client = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+            .await
+            .expect("the snapshot arrives while publications go on")
+            .expect("config stream")
+            .expect("snapshot")[0]["config"]
+            .clone();
+        let mut marks = Vec::from_iter(inventory_mark(&client));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.recv()).await {
+            for event in chunk.expect("events") {
+                apply_config_stream_event(&mut client, &event);
+                marks.extend(inventory_mark(&client));
+            }
+        }
+        publishing.cancel();
+        publisher.await.expect("publisher joins");
+        spamming.store(false, Ordering::Release);
+        spammer.join().expect("spammer joins");
+        assert!(
+            marks.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the inventory moved back: {marks:?}"
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_config_resync_never_replays_tools_older_than_its_snapshot() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        let cancellation = CancellationToken::new();
+        let (mut stream, mut client) = settled_config_stream(&control, &cancellation).await;
+        let publish_tools = async |mark: &str| {
+            control
+                .tools
+                .publish_snapshots_for_tests(vec![
+                    json!({ "toolId": "ordered-tool", "message": mark }),
+                ])
+                .await;
+        };
+        let mark = |config: &Value| config["tools"][0]["message"].clone();
+
+        // Fill the stream's output so it stops reading, then lag it past the broadcast.
+        for _ in 0..12 {
+            control.publish(json!({ "type": "unit" }));
+        }
+        // The resync's snapshot reads the settings, then waits here before the tools.
+        let keybindings = control.keybinding_rules.write().await;
+        for _ in 0..64 {
+            control.publish(json!({ "type": "unit" }));
+        }
+        drain_config_stream(&mut stream, &mut client).await;
+        publish_tools("A").await;
+        publish_tools("B").await;
+        drop(keybindings);
+
+        let mut marks = Vec::new();
+        for event in drain_config_stream(&mut stream, &mut Value::Null).await {
+            apply_config_stream_event(&mut client, &event);
+            marks.push(mark(&client));
+        }
+        let latest = marks
+            .iter()
+            .position(|mark| mark == "B")
+            .expect("the newer tools arrive");
+        assert!(
+            !marks[latest..].contains(&json!("A")),
+            "the tools moved back: {marks:?}"
+        );
+        assert_eq!(mark(&client), "B");
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_config_resync_keeps_a_rotated_secret_as_a_capability_change() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        let rotate = async |value: &str| {
+            let mut instances = control.settings.read().await["providerInstances"].clone();
+            instances["codex"]["environment"] =
+                json!([{ "name": "TOKEN", "value": value, "sensitive": true }]);
+            control
+                .update_settings(json!({ "patch": { "providerInstances": instances } }))
+                .await
+                .expect("settings update");
+        };
+        rotate("first").await;
+        let cancellation = CancellationToken::new();
+        let (mut stream, mut client) = settled_config_stream(&control, &cancellation).await;
+
+        // Fill the stream's output so it stops reading; the rotation is then dropped by a lag.
+        for _ in 0..12 {
+            control.publish(json!({ "type": "unit" }));
+        }
+        rotate("second").await;
+        for _ in 0..64 {
+            control.publish(json!({ "type": "unit" }));
+        }
+
+        // The client refreshes provider capabilities when one of these reaches it
+        // (`capabilitiesMayHaveChanged` in packages/client-runtime/src/state/server.ts).
+        let mut capabilities_may_have_changed = false;
+        for event in drain_config_stream(&mut stream, &mut Value::Null).await {
+            capabilities_may_have_changed |= match event["type"].as_str() {
+                Some("settingsUpdated" | "providerStatuses") => true,
+                Some("snapshot") => {
+                    event["config"]["providers"] != client["providers"]
+                        || event["config"]["settings"] != client["settings"]
+                }
+                _ => false,
+            };
+            apply_config_stream_event(&mut client, &event);
+        }
+        assert!(
+            capabilities_may_have_changed,
+            "the rotated secret never reached the client as a capability change"
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_config_stream_sends_nothing_for_a_refresh_its_client_already_holds() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        let cancellation = CancellationToken::new();
+        let mut stream = control.subscribe("subscribeServerConfig", cancellation.clone());
+        let mut client = stream
+            .recv()
+            .await
+            .expect("config stream")
+            .expect("snapshot")[0]["config"]
+            .clone();
+        let mut sent = Vec::new();
+        let mut drain = async |client: &mut Value, sent: &mut Vec<Value>| {
+            while let Ok(Some(chunk)) =
+                tokio::time::timeout(Duration::from_millis(500), stream.recv()).await
+            {
+                for event in chunk.expect("events") {
+                    if event["type"] == "unit" {
+                        continue;
+                    }
+                    let before = client.clone();
+                    apply_config_stream_event(client, &event);
+                    assert_ne!(
+                        *client, before,
+                        "an event changed nothing: {}",
+                        event["type"]
+                    );
+                    sent.push(event["type"].clone());
+                }
+            }
+        };
+        // A capability marker and a provider list that change nothing, then a real change.
+        control.publish(json!({ "type": CONFIG_SNAPSHOT_REFRESH_EVENT }));
+        control.publish_provider_snapshots(&control.providers.read().await.clone());
+        control
+            .update_settings(json!({"patch": {"codeReviewPrompt": "visible"}}))
+            .await
+            .expect("settings update");
+        drain(&mut client, &mut sent).await;
+        assert!(
+            sent.contains(&json!("settingsUpdated")),
+            "the real change arrives: {sent:?}"
+        );
+        // The subscription's own provider refresh is a real change: let it land first.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while control
+                .full_provider_refresh_running
+                .load(Ordering::Acquire)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the subscription's provider refresh settles");
+        drain(&mut client, &mut sent).await;
+        // A lag past the buffer that dropped nothing the client lacks resynchronises silently.
+        sent.clear();
+        for _ in 0..76 {
+            control.publish(json!({ "type": "unit" }));
+        }
+        drain(&mut client, &mut sent).await;
+        assert!(sent.is_empty(), "an unchanged resync was sent: {sent:?}");
+        assert_eq!(
+            client["settings"],
+            control.config_snapshot().await["settings"]
+        );
+        cancellation.cancel();
+    }
+
+    #[tokio::test]
+    async fn unit_tests_never_read_the_host_git_version_for_merge_into() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let calls = || {
+            crate::git::manager::merge::tests::UNIT_TEST_STARTUP_GIT
+                .0
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let config = running_test_config(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({})).await;
+        control.capability_tasks.close();
+        control.capability_tasks.wait().await;
+        // The constructor every unit test uses reads the unit-test Git, never the host's.
+        // The version is read once per repository, so earlier tests may have made the call.
+        assert!(calls() > 0, "the startup probe read another Git");
+        assert_eq!(
+            control.config_snapshot().await["environment"]["capabilities"]["gitManagerMergeIntoOperations"],
+            true
+        );
+    }
+
+    #[test]
+    fn environment_descriptor_withdraws_merge_into_on_old_git() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let config = running_test_config(temp.path());
+        for supported in [true, false] {
+            let descriptor = environment_descriptor(&config, false, supported);
+            assert_eq!(
+                descriptor["capabilities"]["gitManagerMergeIntoOperations"],
+                supported
+            );
+        }
+    }
+
     #[test]
     fn environment_descriptor_advertises_complete_worktree_catalog_surface() {
         let temp = tempfile::tempdir().expect("state directory");
         let config = running_test_config(temp.path());
-        let descriptor = environment_descriptor(&config, false);
+        let descriptor = environment_descriptor(&config, false, true);
         assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
         assert_eq!(descriptor["capabilities"]["worktreeCatalog"], true);
         assert_eq!(
@@ -7648,7 +8717,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = running_test_config(temp.path());
         config.boot_id = Some(uuid::Uuid::nil());
-        let descriptor = environment_descriptor(&config, false);
+        let descriptor = environment_descriptor(&config, false, true);
         assert_eq!(descriptor["bootId"], "00000000-0000-0000-0000-000000000000");
         assert_eq!(descriptor["capabilities"]["remoteUpdateControl"], true);
         assert_eq!(descriptor["capabilities"]["remoteUpdateProgress"], true);
@@ -7668,6 +8737,8 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["sendRequests"], true);
         assert_eq!(descriptor["capabilities"]["sideChats"], true);
         assert_eq!(descriptor["capabilities"]["codeReviews"], true);
+        // The web client words the Codex review guard line by this flag (#376).
+        assert_eq!(descriptor["capabilities"]["readOnlyCodexReviews"], true);
         assert_eq!(descriptor["capabilities"]["hostMetrics"], true);
         assert_eq!(descriptor["capabilities"]["threadDeleteOnlyIfUnused"], true);
         // `server.getConfig` carries this descriptor; a client downloads a remote
@@ -7688,7 +8759,7 @@ mod tests {
     fn environment_descriptor_advertises_the_protocol_compatibility_window() {
         let temp = tempfile::tempdir().expect("state directory");
         let config = running_test_config(temp.path());
-        let descriptor = environment_descriptor(&config, false);
+        let descriptor = environment_descriptor(&config, false, true);
         assert_eq!(descriptor["remoteProtocolVersion"], 1);
         assert_eq!(descriptor["minCompatibleRemoteProtocol"], 1);
     }
@@ -7711,7 +8782,7 @@ mod tests {
         let expected = prepared.storage_instance_id.to_string();
         config.storage_instance_id = Some(prepared.storage_instance_id);
 
-        let descriptor = environment_descriptor(&config, true);
+        let descriptor = environment_descriptor(&config, true, true);
 
         assert_eq!(descriptor["storageInstanceId"], expected);
         let encoded = descriptor.to_string();
@@ -7752,14 +8823,15 @@ mod tests {
         assert!(!platform_os().is_empty());
         assert!(!platform_arch().is_empty());
         assert!(
-            environment_descriptor(&config, false)["capabilities"]["repositoryIdentity"] == true
+            environment_descriptor(&config, false, true)["capabilities"]["repositoryIdentity"]
+                == true
         );
         assert_eq!(
-            environment_descriptor(&config, false)["capabilities"]["worktreeCatalog"],
+            environment_descriptor(&config, false, true)["capabilities"]["worktreeCatalog"],
             true
         );
         assert_eq!(
-            environment_descriptor(&config, false)["capabilities"]["worktreeCatalogRefreshReason"],
+            environment_descriptor(&config, false, true)["capabilities"]["worktreeCatalogRefreshReason"],
             true
         );
         let editors = available_editors();

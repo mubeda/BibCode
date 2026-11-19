@@ -126,7 +126,7 @@ describe("GitManagerBranchDropdown", () => {
       const merge = rowButton("Choose a branch to merge into " + current);
       const create = rowButton("New branch");
       expect(merge.disabled).toBe(true);
-      expect(merge.title).toBe(reason);
+      expect(merge.parentElement?.title).toBe(reason);
       expect(merge.textContent).toContain(current);
       const text = Array.from(merge.children).find((child) => child.tagName === "SPAN");
       expect(text).toBeDefined();
@@ -263,7 +263,8 @@ describe("GitManagerBranchDropdown", () => {
     });
 
     const merge = rowButton("Choose a branch to merge into main");
-    expect(merge).toMatchObject({ disabled: true, title: reason });
+    expect(merge.disabled).toBe(true);
+    expect(merge.parentElement?.title).toBe(reason);
     expect(document.body.textContent).toContain(reason);
     expect(rowButton("feature").disabled).toBe(false);
     await act(async () => rowButton("feature").click());

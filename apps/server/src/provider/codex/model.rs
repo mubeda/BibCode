@@ -169,6 +169,9 @@ pub enum CodexRuntimeMode {
     ApprovalRequired,
     AutoAcceptEdits,
     FullAccess,
+    /// A code review panel's session (#376): never asks, in the read-only sandbox, whatever mode
+    /// the thread stores. Internal to the server; never a thread's runtime mode on the wire.
+    CodeReview,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -737,6 +740,7 @@ pub fn build_turn_start_params(input: &BuildTurnStartInput) -> Value {
         CodexRuntimeMode::ApprovalRequired => ("untrusted", json!({ "type": "readOnly" })),
         CodexRuntimeMode::AutoAcceptEdits => ("on-request", json!({ "type": "workspaceWrite" })),
         CodexRuntimeMode::FullAccess => ("never", json!({ "type": "dangerFullAccess" })),
+        CodexRuntimeMode::CodeReview => ("never", json!({ "type": "readOnly" })),
     };
 
     let mut payload = json!({
@@ -1267,6 +1271,14 @@ pub fn retired_model(model: &str) -> Option<&'static str> {
         "gpt-5.4-mini" => Some("gpt-5.4-mini"),
         _ => None,
     }
+}
+
+/// Whether two model strings name the same Codex model: the same string, or one retired model
+/// under any of its spellings. The one equality a dropped retired model is compared with.
+#[must_use]
+pub fn same_model(left: &str, right: &str) -> bool {
+    left == right
+        || retired_model(left).is_some_and(|retired| retired_model(right) == Some(retired))
 }
 
 fn chosen_turn_model(model: &str) -> Option<String> {
