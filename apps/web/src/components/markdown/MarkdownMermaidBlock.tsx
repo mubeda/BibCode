@@ -83,11 +83,10 @@ function loadMermaidRenderer(): Promise<MermaidRenderer> {
 }
 
 /**
- * Test seam: replaces the renderer import, or restores it when given nothing. Inert outside unit
- * tests, so no script in another build can swap what draws diagrams.
+ * Test seam: replaces the renderer import, or restores it when given nothing. The typography
+ * gallery build calls it for its "renderer unavailable" state, so it works in every build.
  */
 export function __setMermaidRendererLoaderForTests(loader?: () => Promise<MermaidRenderer>): void {
-  if (import.meta.env.MODE !== "test") return;
   rendererLoader = loader ?? importMermaidRenderer;
   rendererModule = null;
 }
