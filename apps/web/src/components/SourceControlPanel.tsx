@@ -23,6 +23,7 @@ import { useAtomValue } from "@effect/atom-react";
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import {
+  BotIcon,
   ChevronDownIcon,
   CloudUploadIcon,
   DownloadIcon,
@@ -30,7 +31,6 @@ import {
   GitCommitIcon,
   ListChecksIcon,
   ListIcon,
-  ScanSearchIcon,
   SparklesIcon,
   SquareIcon,
   Undo2Icon,
@@ -1142,7 +1142,8 @@ export default function SourceControlPanel({
     <div className="flex min-w-0 flex-1 items-center gap-2">
       <span className="truncate text-sm font-medium">{status?.refName ?? "Source Control"}</span>
       {vsBaseLabel ? (
-        <span className="shrink-0 text-xs text-muted-foreground">{vsBaseLabel}</span>
+        // Truncates before it can push Review out of a narrow panel.
+        <span className="min-w-0 truncate text-xs text-muted-foreground">{vsBaseLabel}</span>
       ) : null}
       {status?.pr?.state === "open" ? (
         <button
@@ -1168,8 +1169,7 @@ export default function SourceControlPanel({
                 aria-disabled={codeReviewButton.disabled}
                 aria-label="Review changes"
                 className={cn("ml-auto shrink-0", codeReviewButton.disabled && "opacity-64")}
-                size="icon-xs"
-                variant="ghost"
+                size="sm"
                 onClick={() => {
                   if (!codeReviewButton.disabled && codeReviewScope) {
                     codeReview.onStart(codeReviewScope);
@@ -1178,7 +1178,8 @@ export default function SourceControlPanel({
               />
             }
           >
-            <ScanSearchIcon aria-hidden="true" className="size-3.5" />
+            <BotIcon aria-hidden="true" />
+            Review
           </TooltipTrigger>
           <TooltipPopup side="bottom">
             {codeReviewButton.reason ?? (

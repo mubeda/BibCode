@@ -451,7 +451,10 @@ covers every client and environment, and the evidence names the latest
 - **Raised when:** main-thread stalls add up to more than 1 s within one batch
   window (about 10 s). With the `heartbeat` capability (WebKit), stalls are
   measured only while the window has focus, and not in the first 20 s after a
-  sleep.
+  sleep. A run of beats that each arrive about 500 ms late is WebKit delivering
+  timers 1 s apart, not a stall, and is not counted. A finding from a build
+  through v0.16.0 with 11 stalls of about 500 ms in an 11 s window is that
+  case.
 - **Evidence:** `stalls: { count, totalMs, maxMs }`.
 
 ### client.interaction

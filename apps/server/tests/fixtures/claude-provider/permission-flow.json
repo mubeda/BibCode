@@ -53,6 +53,7 @@
         "providerItemId": "tool-use-1"
       },
       "payload": {
+        "detail": "pwd",
         "requestType": "command_execution_approval",
         "toolName": "Bash",
         "input": {

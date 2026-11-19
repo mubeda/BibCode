@@ -9,6 +9,7 @@ import { refreshDesktopUiDocument } from "./support/document-navigation.ts";
 
 import { resolveDesktopAppPath, type DesktopUiPlatform } from "./support/app-path.ts";
 import {
+  acceptEndedApplicationSessionDelete,
   DESKTOP_UI_TEST_TIMEOUT_MS,
   ensureLiveDesktopUiWebview,
   isDesktopUiApplicationRunning,
@@ -71,6 +72,7 @@ const desktopUiSpecFiles =
         "./specs/appearance-themes.e2e.ts",
         "./specs/source-control-review.e2e.ts",
         "./specs/host-dashboard.e2e.ts",
+        "./specs/server-commands.e2e.ts",
         closingSpec,
       ];
 // The default specs share one app session. The closing spec ends the app, so it runs last in a
@@ -94,7 +96,31 @@ const screenshotPath = (title: string): string =>
       .toLowerCase()}.png`,
   );
 
+/**
+ * Waits for the app's readiness signal, `data-connection-store` on `<html>`, to say the
+ * connection store finished opening. Destroying the document while its IndexedDB requests
+ * are in flight is what left a later open pending in WebKit (#381). A new document has no
+ * attribute until the app sets it, which reads as pending.
+ */
+async function waitForDesktopUiConnectionStoreIdle(stage: string): Promise<void> {
+  // A plain loop: this file keeps to plain driver commands (tauri-service-compat.test.ts).
+  let lastState: string | null = null;
+  // 120 polls of 250 ms: 30 s.
+  for (let poll = 0; poll < 120; poll += 1) {
+    lastState = await browser.execute(() =>
+      document.documentElement.getAttribute("data-connection-store"),
+    );
+    if (lastState === "failed") {
+      throw new Error(`The app's connection store failed ${stage}.`);
+    }
+    if (lastState === "ready") return;
+    await browser.pause(250);
+  }
+  throw new Error(`The app's connection store was not ready ${stage} (${lastState ?? "pending"}).`);
+}
+
 async function resetDesktopUiConnectionCache(): Promise<void> {
+  await waitForDesktopUiConnectionStoreIdle("before the connection reset");
   const resetResult = await browser.executeAsync(
     (done: (result: { readonly error: string | null }) => void) => {
       window.localStorage.clear();
@@ -106,11 +132,23 @@ async function resetDesktopUiConnectionCache(): Promise<void> {
         done({ error });
       };
       const openRequest = indexedDB.open("bibcode:connection-runtime", 2);
+      // Set by an upgrade: null for a new database, which has nothing to clear.
+      let upgradeOutcome: string | null | undefined;
       openRequest.addEventListener("error", () => {
-        finish(String(openRequest.error ?? "Could not open the E2E connection catalog."));
+        finish(
+          upgradeOutcome !== undefined
+            ? upgradeOutcome
+            : String(openRequest.error ?? "Could not open the E2E connection catalog."),
+        );
       });
-      openRequest.addEventListener("upgradeneeded", () => {
-        finish("The E2E connection catalog schema was unexpectedly missing.");
+      openRequest.addEventListener("upgradeneeded", (event) => {
+        // Abort, so the app's own open creates the stores. The abort ends this request with
+        // an error event, and that event ends the reset.
+        openRequest.transaction?.abort();
+        upgradeOutcome =
+          event.oldVersion === 0
+            ? null
+            : "The E2E connection catalog schema was unexpectedly missing.";
       });
       openRequest.addEventListener("success", () => {
         const database = openRequest.result;
@@ -134,6 +172,7 @@ async function resetDesktopUiConnectionCache(): Promise<void> {
     throw new Error(resetResult.error);
   }
   await refreshDesktopUiDocument();
+  await waitForDesktopUiConnectionStoreIdle("after the connection reset");
 }
 
 export const config = {
@@ -236,6 +275,7 @@ export const config = {
     await requestDesktopUiApplicationExit();
     // The service stops only the app it started; an app a closing case relaunched is stopped here.
     await stopRelaunchedDesktopUiApplication();
+    acceptEndedApplicationSessionDelete();
   },
   onComplete: () => {
     // Keep the app's own logs (native page loads, webview process failures, server errors)

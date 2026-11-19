@@ -5110,6 +5110,27 @@ filesystem fallback. Non-Git workspaces use the same fallback. Both paths are
 bounded by entry count, total memory, and path length; exceeding a bound returns
 the entries accepted so far with `truncated: true`.
 
+`projects.listEntries` with `limit` answers at most that many entries (200 at
+most). With `paged: true` it answers the first page of the index, and with the
+previous page's `cursor` the next one. Each page encodes to at most 960 KiB,
+leaving room for the RPC envelope under a remote client's 1 MiB message limit,
+and holds at least one entry. `nextCursor` is absent on the last page. The cursor
+names a random per-index value, the index snapshot's generation and an offset.
+When the index was rebuilt since the first page, or the server restarted, the
+server refuses the cursor with the
+`search_index_cursor_stale` failure, so pages of two snapshots are never joined.
+A later page never rebuilds the index, even with `refresh`. `limit` takes
+precedence over paging. The Files panel's query reads every page and shows the
+joined list only when it is complete, so a re-read keeps the previous list on
+screen. It restarts from the first page at most three times on a stale cursor,
+then shows the list error. The panel's rescan sends `refresh: true` with
+`limit: 1`, because it only rebuilds the index.
+
+Compatibility path: a request with neither `paged`, `cursor` nor `limit`, as
+older clients send it, still answers the whole index in one reply. A server
+that predates paging ignores both fields and answers the whole list without
+`nextCursor`, which the client reads as one complete page.
+
 Lazy ignored-directory loading remains a separately reviewed follow-up. It is
 required only if a representative native measurement finds ignored walking
 above 500 ms at p95 or above 50% of p95 cache-build time; until then the eager
@@ -5364,6 +5385,13 @@ optional attachment owner; renderers mirror that applied state.
 | Attach snapshot                         | `oscColorResponderActive`, default false when absent, reports whether the actual spawned PTY color responder is active.                                                                                                                                                                                                                                              |
 | Attach snapshot                         | `firstAttachmentGrant`, default false when absent, grants one startup-history reply pass only before any claim, or a claimed stream surviving a restart, has consumed it.                                                                                                                                                                                            |
 | Attach event                            | `resized { threadId, terminalId, size }`, only on streams opened with `sizeClaim`; never on `subscribeTerminalEvents` or operational-log records.                                                                                                                                                                                                                    |
+
+The thread id `server-terminal` names the terminal each server owns in its
+user's home folder (#378), not a thread. The engine refuses `thread.create` and
+a bootstrapped `thread.turn.start` with that id. Terminal requests on it skip
+workspace admission, and thread-wide terminal cleanup skips it. Only
+`terminal.open` starts or replaces that shell; clients attach to it without a
+working directory and never close it.
 
 `terminalSizeHandOver` is a separate environment capability, decoded as false
 when absent. A server advertising it leaves a released size un-owned until a
@@ -5837,7 +5865,9 @@ least one connected environment has `capabilities.profiler` and its
   second animation frame after it;
 - main-thread stalls, from Long Animation Frames where the engine supports them
   (WebView2, Chromium), and elsewhere from a 500 ms heartbeat that counts more
-  than 50 ms of lateness as a stall and pauses while the page is hidden;
+  than 50 ms of lateness as a stall, pauses while the page is hidden, and counts
+  no stalls for a run of beats that each arrive about 500 ms late (WebKit
+  delivering the page's timers 1 s apart);
 - slow interactions from Event Timing, over 104 ms, where supported; and
 - the JavaScript heap where `performance.memory` exists (Chromium).
 

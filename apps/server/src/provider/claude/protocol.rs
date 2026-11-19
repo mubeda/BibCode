@@ -156,8 +156,17 @@ pub struct ResultMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_command: Option<String>,
     pub stop_reason: Option<String>,
+    /// `task-notification` on the result of a turn Claude started by itself to answer a
+    /// background task that finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ResultOrigin>,
     pub session_id: String,
     pub uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResultOrigin {
+    pub kind: String,
 }
 
 #[derive(Clone, PartialEq, Deserialize)]

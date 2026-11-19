@@ -4,6 +4,7 @@ import {
   findDefaultThread,
   getSidebarThreadIdsToPrewarm,
   getVisibleSidebarThreadIds,
+  resolveVisibleProjectThreads,
   orderRowsWithPins,
   resolveAdjacentThreadId,
   getFallbackThreadIdAfterDelete,
@@ -607,6 +608,85 @@ describe("resolveAdjacentThreadId", () => {
         direction: "previous",
       }),
     ).toBeNull();
+  });
+});
+
+describe("resolveVisibleProjectThreads", () => {
+  const thread = (id: string, kind: "default" | "worktree" | "panel" = "worktree") => ({
+    id,
+    kind,
+  });
+  const resolve = (
+    threads: ReturnType<typeof thread>[],
+    overrides: {
+      pinnedKeys?: string[];
+      isListExpanded?: boolean;
+      previewCount?: number;
+      sort?: (ids: string[]) => string[];
+    } = {},
+  ) => {
+    const result = resolveVisibleProjectThreads({
+      threads: threads as never,
+      sort: (items) => {
+        const order = overrides.sort?.(items.map((item) => (item as { id: string }).id));
+        return order
+          ? order.map((id) => items.find((item) => (item as { id: string }).id === id)!)
+          : items;
+      },
+      pinnedKeys: overrides.pinnedKeys ?? [],
+      keyOf: (item) => (item as unknown as { id: string }).id,
+      isListExpanded: overrides.isListExpanded ?? false,
+      previewCount: overrides.previewCount ?? 6,
+    });
+    return {
+      primary: (result.primaryThread as { id: string } | null)?.id ?? null,
+      rows: (result.rows as { id: string }[]).map((row) => row.id),
+    };
+  };
+
+  it("gives a panel chat no row, even when it is the most recent thread", () => {
+    // A center-panel chat is not a sidebar row, so a jump shortcut must not reach it.
+    expect(resolve([thread("panel-chat", "panel"), thread("a"), thread("b")]).rows).toEqual([
+      "a",
+      "b",
+    ]);
+  });
+
+  it("keeps a grouped card's first default thread as the primary, whatever the sort order", () => {
+    // Two member projects, one default thread each: the card shows the first as its primary
+    // and the second as a row, so the second takes a jump number even when it sorts first.
+    const threads = [thread("main-a", "default"), thread("main-b", "default"), thread("w")];
+    expect(resolve(threads, { sort: (ids) => ids.toReversed() })).toEqual({
+      primary: "main-a",
+      rows: ["w", "main-b"],
+    });
+  });
+
+  it("keeps the primary thread out of the rows", () => {
+    expect(resolve([thread("a"), thread("main", "default"), thread("b")])).toEqual({
+      primary: "main",
+      rows: ["a", "b"],
+    });
+  });
+
+  it("puts pinned rows first, as the card renders them", () => {
+    expect(resolve([thread("a"), thread("b"), thread("c")], { pinnedKeys: ["c"] }).rows).toEqual([
+      "c",
+      "a",
+      "b",
+    ]);
+  });
+
+  it("shows only the preview while the list is folded", () => {
+    const threads = [thread("a"), thread("b"), thread("c")];
+    expect(resolve(threads, { previewCount: 2 }).rows).toEqual(["a", "b"]);
+    expect(resolve(threads, { previewCount: 2, isListExpanded: true }).rows).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
+    // A pinned row past the fold is shown before an unpinned one inside it.
+    expect(resolve(threads, { previewCount: 2, pinnedKeys: ["c"] }).rows).toEqual(["c", "a"]);
   });
 });
 
@@ -1946,5 +2026,18 @@ describe("keyboard context menu helpers", () => {
     expect(isKeyboardContextMenuEcho(1_000, 1_000 + KEYBOARD_CONTEXT_MENU_ECHO_MS - 1)).toBe(true);
     expect(isKeyboardContextMenuEcho(1_000, 1_000 + KEYBOARD_CONTEXT_MENU_ECHO_MS)).toBe(false);
     expect(isKeyboardContextMenuEcho(Number.NEGATIVE_INFINITY, 5)).toBe(false);
+  });
+});
+
+describe("resolveSidebarProjectAvailability when the connection runtime failed", () => {
+  it("reports the failure instead of loading forever", () => {
+    expect(
+      resolveSidebarProjectAvailability({
+        projectCount: 0,
+        catalogReady: false,
+        catalogFailed: true,
+        environments: [],
+      }),
+    ).toEqual({ kind: "runtime-failed", environmentId: null, error: null });
   });
 });

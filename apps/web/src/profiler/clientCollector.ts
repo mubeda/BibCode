@@ -19,6 +19,16 @@ const RECORD_OVER_MS = 250;
 const STALL_OVER_MS = 50;
 const HEARTBEAT_MS = 500;
 /**
+ * WebKit delivers a page's timers 1 s apart when the page is visible but visually idle: nothing
+ * on screen has changed for about a minute (measured in a packaged macOS run; a visible
+ * animation stops it at once). Frames keep rendering, so the main thread is free, and every
+ * heartbeat arrives this late (499 to 519 ms). Two such beats in a row are an aligned run, not
+ * stalls.
+ */
+const ALIGNED_PERIOD_MS = 1_000;
+const ALIGNED_LATENESS_MS = ALIGNED_PERIOD_MS - HEARTBEAT_MS;
+const ALIGNED_TOLERANCE_MS = 25;
+/**
  * The wall clock ran this much further than the monotonic one, so the machine slept: the
  * monotonic clock (`performance.now()`) stops during a suspend on every platform but Windows.
  */
@@ -245,6 +255,10 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
   let quietUntil = 0;
   let pausedAt = 0;
   let pausedAtWall = 0;
+  /** Late beats not counted yet: the next beat tells a stall from the start of an aligned run. */
+  let heldStalls: number[] = [];
+  /** Consecutive beats that arrived one aligned period late; 2 or more is an aligned run. */
+  let alignedBeats = 0;
   let lastInteractionId = 0;
   /**
    * Per environment, the caught render errors its server has not accepted yet: an entry leaves
@@ -281,6 +295,34 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
     }
   };
 
+  const countHeldStalls = () => {
+    for (const ms of heldStalls) addStall(ms);
+    heldStalls = [];
+  };
+  /** A lone held beat is a stall; one that may open an aligned run waits for the next beat. */
+  const settleHeldStalls = () => {
+    if (alignedBeats === 0) countHeldStalls();
+  };
+  const onLateness = (lateness: number) => {
+    if (lateness <= STALL_OVER_MS) {
+      countHeldStalls();
+      alignedBeats = 0;
+    } else if (Math.abs(lateness - ALIGNED_LATENESS_MS) <= ALIGNED_TOLERANCE_MS) {
+      alignedBeats += 1;
+      // The second aligned beat proves the run: the beats held since were its start.
+      if (alignedBeats >= 2) heldStalls = [];
+      else heldStalls.push(lateness);
+    } else {
+      // Neither on time nor aligned: what was held before it was a stall, and a run must prove
+      // itself again. A timer moved to the next 1 s boundary is under 1 s late, so only such
+      // a beat can open a run; a later one is a stall now.
+      countHeldStalls();
+      alignedBeats = 0;
+      if (lateness >= ALIGNED_PERIOD_MS) addStall(lateness);
+      else heldStalls.push(lateness);
+    }
+  };
+
   /**
    * Hidden, or, where the heartbeat is the stall signal (WebKit), without focus: WebKit keeps a
    * covered window, or one on another Space, "visible" while macOS App Nap aligns its timers to
@@ -313,8 +355,11 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
     if (slept(beatScheduledAt, beatScheduledAtWall) || overdue()) {
       epoch += 1;
       quietUntil = now() + RESUME_GRACE_MS;
-    } else if (!longFrames && lateness > STALL_OVER_MS && now() >= quietUntil) {
-      addStall(lateness);
+      // The beats held before the sleep ended before it.
+      countHeldStalls();
+      alignedBeats = 0;
+    } else if (!longFrames && now() >= quietUntil) {
+      onLateness(lateness);
     }
     scheduleBeat();
   };
@@ -322,6 +367,9 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
     if (heartbeat === undefined) return;
     clearTimeout(heartbeat);
     heartbeat = undefined;
+    // Nothing can follow a held beat now, so it counts as the stall it looked like.
+    countHeldStalls();
+    alignedBeats = 0;
     pausedAt = now();
     pausedAtWall = wallNow();
   };
@@ -509,6 +557,7 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
   };
 
   const flush = async () => {
+    settleHeldStalls();
     if (windows.size === 0) return;
     const at = now();
     const heap = jsHeapBytes();
@@ -620,6 +669,8 @@ export function createClientCollector(deps: ClientCollectorDeps): ClientCollecto
       };
     },
     setEnabledEnvironments(ids) {
+      // A held beat belongs to the environments recording when it happened.
+      countHeldStalls();
       for (const environmentId of windows.keys()) {
         if (!ids.has(environmentId)) windows.delete(environmentId);
       }

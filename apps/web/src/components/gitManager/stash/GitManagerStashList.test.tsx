@@ -178,11 +178,13 @@ describe("GitManagerStashList", () => {
 
     for (const label of ["Apply stash@{0}", "Pop stash@{0}", "Drop stash@{0}"]) {
       const action = h.buttons.find((props) => props["aria-label"] === label);
-      expect(action).toMatchObject({
-        disabled: true,
-        title: blocked.message,
-      });
-      expect(action?.["aria-describedby"]).toBe("git-manager-stash-stash-sha-blocked");
+      expect(action?.disabled).toBe(true);
+      // The reason sits on the wrapper: the disabled Button itself receives no pointer events.
+      expect(markup).toContain(`title="${blocked.message}"`);
+      const host = document.createElement("div");
+      host.innerHTML = markup;
+      const described = host.querySelector(`[id="${String(action?.["aria-describedby"])}"]`);
+      expect(described?.textContent).toBe(blocked.message);
     }
     expect(markup).toContain(blocked.message);
   });
@@ -196,12 +198,9 @@ describe("GitManagerStashList", () => {
     });
 
     for (const label of ["Apply stash@{0}", "Pop stash@{0}", "Drop stash@{0}"]) {
-      expect(h.buttons.find((props) => props["aria-label"] === label)).toMatchObject({
-        disabled: true,
-        title: reason,
-      });
+      expect(h.buttons.find((props) => props["aria-label"] === label)?.disabled).toBe(true);
     }
-    expect(markup).toContain(reason);
+    expect(markup).toContain(`title="${reason}"`);
     const select = h.buttons.find((props) => props["aria-label"] === "Select stash stash@{0}");
     expect(select?.disabled).not.toBe(true);
     (select?.onClick as (() => void) | undefined)?.();

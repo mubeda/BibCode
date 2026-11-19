@@ -10,6 +10,7 @@ import {
   WsServerConsumeCodexRateLimitResetRpc,
   WsServerRefreshProvidersRpc,
   WsServerRefreshProviderUsageRpc,
+  WsServerUpdateSettingsRpc,
   WsVcsCancelCloneRpc,
   WsVcsPullRpc,
   WsVcsInitRpc,
@@ -565,5 +566,23 @@ describe("vcs.cancelClone wire shapes", () => {
         message: "x",
       }),
     ).toThrow();
+  });
+});
+
+const encodeUpdateSettings = Schema.encodeUnknownSync(WsServerUpdateSettingsRpc.payloadSchema);
+const decodeUpdateSettings = Schema.decodeUnknownSync(WsServerUpdateSettingsRpc.payloadSchema);
+
+describe("server.updateSettings", () => {
+  it("carries the providers whose session defaults a write owns", () => {
+    const payload = {
+      patch: { providerSessionDefaults: { codex: { model: "auto", options: [] } } },
+      ownedProviderSessionDefaults: ["codex"],
+    };
+    expect(encodeUpdateSettings(decodeUpdateSettings(payload))).toEqual(payload);
+  });
+
+  it("keeps a write without owned defaults as it was", () => {
+    const payload = { patch: { providerSessionDefaults: {} } };
+    expect(encodeUpdateSettings(decodeUpdateSettings(payload))).toEqual(payload);
   });
 });

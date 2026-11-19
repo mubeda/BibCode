@@ -119,6 +119,26 @@ behavior when applicable.
 
 ## Native tests and static gates
 
+A stock Ubuntu 22.04 host or container lacks some of what the Rust tests
+need. Before a native run, check these prerequisites:
+
+- Run the tests as a normal user, not root. Some server tests remove a file's
+  permissions and expect the read or write to be refused, such as the MCP
+  `files_read` check on a mode `000` file. Root bypasses file permissions, so
+  those tests fail in a container that runs as root.
+- Install Git 2.38 or newer. Git Manager merges need `git merge-tree --write-tree`
+  (2.38, refused with `git-too-old`) and agent clones need
+  `http.curloptResolve` (2.37, refused with `clone_git_too_old`). Ubuntu 22.04
+  ships Git 2.34, on which dozens of server tests fail with those reasons.
+- Install `openssh-client`. The desktop tests in
+  `apps/desktop/src-tauri/tests/ssh_public_contract.rs` start the system `ssh`
+  against a closed local port and expect its connection failure.
+- Install `unzip`. `apps/server/tests/diagnostic_bundle.rs` unpacks the
+  diagnostic bundle with it.
+- Give the build enough memory. Compiling the `bibcode-server` library and
+  its library test target in one Cargo command needs about 14 GB. Building
+  them one after the other fits in less.
+
 Run the shared focused tests and sequential broad/static gate set. Confirm
 Linux-only tests are not filtered unexpectedly and record any AppImage,
 WebKitGTK, X11, or Wayland diagnostic.
@@ -340,8 +360,21 @@ export BIBCODE_E2E_PLATFORM=linux
 vp run test:ui:desktop:build
 export BIBCODE_E2E_APP_PATH="$(find "$PWD/target/$(rustc -vV | sed -n 's/^host: //p')/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)"
 test -n "$BIBCODE_E2E_APP_PATH"
-WAYLAND_DISPLAY=bibcode-no-wayland xvfb-run --auto-servernum vp run test:ui:desktop
+WAYLAND_DISPLAY=bibcode-no-wayland xvfb-run --auto-servernum -s '-screen 0 1920x1080x24' vp run test:ui:desktop
 ```
+
+The specs resize the window to exact viewport sizes, so the display must let
+the window be resized and be large enough for every size a spec asks for:
+
+- Give Xvfb a screen of at least 1920x1080, as above. The `xvfb-run` default
+  on Arch is 640x480, which is too small. A screen smaller than a requested
+  size makes the harness accept whatever size the screen allows.
+- Do not run the suite on a tiling Wayland compositor's own display, such as
+  Hyprland. It refuses the resize, also with a floating window rule. The
+  embedded `tauri-plugin-wdio-webdriver` already carries out a WebDriver
+  resize with the app's own Tauri `set_size`, so the compositor refuses an
+  ordinary client request and no other sizing route exists. On such a host,
+  run under Xvfb as above.
 
 When the run ends, the artifact directory (`BIBCODE_E2E_ARTIFACT_DIR`) also holds
 `app-*.log`: the last 4 MiB of each of the packaged app's own logs, with the native

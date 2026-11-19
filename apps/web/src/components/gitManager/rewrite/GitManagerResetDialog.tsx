@@ -9,6 +9,7 @@ import {
   DialogPopup,
   DialogTitle,
 } from "~/components/ui/dialog";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 
 export type GitManagerResetMode = "hard" | "mixed" | "soft";
 
@@ -43,9 +44,7 @@ export const GitManagerResetDialog = memo(function GitManagerResetDialog({
             <strong className="text-foreground">Keep all changes</strong> leaves later changes
             staged.
           </p>
-          {disabledReason === null ? null : (
-            <p id="git-manager-reset-disabled-reason">{disabledReason}</p>
-          )}
+          {disabledReason === null ? null : <p>{disabledReason}</p>}
           <p>
             <strong className="text-foreground">Keep changes unstaged</strong> preserves the files
             but clears their staging state.
@@ -59,39 +58,27 @@ export const GitManagerResetDialog = memo(function GitManagerResetDialog({
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button
-            aria-describedby={
-              disabledReason === null ? undefined : "git-manager-reset-disabled-reason"
-            }
-            disabled={disabledReason !== null}
-            title={disabledReason ?? undefined}
+          <GitManagerDisabledReasonButton
+            disabledReason={disabledReason}
             variant="outline"
             onClick={resetSoft}
           >
             Keep All Changes
-          </Button>
-          <Button
-            aria-describedby={
-              disabledReason === null ? undefined : "git-manager-reset-disabled-reason"
-            }
-            disabled={disabledReason !== null}
-            title={disabledReason ?? undefined}
+          </GitManagerDisabledReasonButton>
+          <GitManagerDisabledReasonButton
+            disabledReason={disabledReason}
             variant="outline"
             onClick={resetMixed}
           >
             Keep Changes Unstaged
-          </Button>
-          <Button
-            aria-describedby={
-              disabledReason === null ? undefined : "git-manager-reset-disabled-reason"
-            }
-            disabled={disabledReason !== null}
-            title={disabledReason ?? undefined}
+          </GitManagerDisabledReasonButton>
+          <GitManagerDisabledReasonButton
+            disabledReason={disabledReason}
             variant="destructive"
             onClick={resetHard}
           >
             Discard Changes and Reset
-          </Button>
+          </GitManagerDisabledReasonButton>
         </DialogFooter>
       </DialogPopup>
     </Dialog>

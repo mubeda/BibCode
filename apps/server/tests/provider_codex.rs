@@ -91,7 +91,7 @@ fn missing_codex_rollout_is_a_recoverable_resume_failure() {
 }
 
 #[test]
-fn automatic_codex_model_resolves_to_the_supported_default() {
+fn automatic_codex_model_names_no_model() {
     let payload = build_turn_start_params(&BuildTurnStartInput {
         thread_id: "provider-thread-1".to_owned(),
         runtime_mode: CodexRuntimeMode::FullAccess,
@@ -99,12 +99,18 @@ fn automatic_codex_model_resolves_to_the_supported_default() {
         prompt: Some("hello".to_owned()),
         attachments: vec![],
         model: Some("auto".to_owned()),
+        reported_model: Some("gpt-6.2-sol".to_owned()),
         service_tier: None,
         effort: None,
         interaction_mode: Some("default".to_owned()),
     });
-    assert_eq!(payload["model"], "gpt-5.4");
-    assert_eq!(payload["collaborationMode"]["settings"]["model"], "gpt-5.4");
+    // "auto" is no chosen model: the turn names none, and the collaboration mode, which requires
+    // a name, takes the one Codex reported for the thread.
+    assert!(payload.get("model").is_none());
+    assert_eq!(
+        payload["collaborationMode"]["settings"]["model"],
+        "gpt-6.2-sol"
+    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -2572,6 +2578,7 @@ async fn helper_outputs_match_canonical_codex_fixtures() {
                 "url": "data:image/png;base64,abc",
             })],
             model: Some("gpt-5.3-codex".to_owned()),
+            reported_model: None,
             service_tier: None,
             effort: None,
             interaction_mode: Some("default".to_owned()),
@@ -2588,6 +2595,7 @@ async fn helper_outputs_match_canonical_codex_fixtures() {
             prompt: Some("Make a plan".to_owned()),
             attachments: vec![],
             model: Some("gpt-5.3-codex".to_owned()),
+            reported_model: None,
             service_tier: None,
             effort: Some("medium".to_owned()),
             interaction_mode: Some("plan".to_owned()),
@@ -2631,6 +2639,9 @@ async fn probe_matches_fixture_corpus() {
         .respond(scenario["modelListFirst"].clone());
     peer.expect_request("model/list", json!({ "cursor": "cursor-2" }))
         .respond(scenario["modelListSecond"].clone());
+    // No configured model: the "Codex default" entry is named after the listed default.
+    peer.expect_request("config/read", json!({}))
+        .respond(json!({ "config": { "model": null } }));
     peer.expect_request(
         "skills/list",
         json!({ "cwds": [scenario["cwd"].as_str().expect("cwd")] }),
@@ -10178,6 +10189,10 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
     peer.expect_request("initialize", build_initialize_params("0.1.1"))
         .respond(json!({}));
     peer.expect_notification("initialized");
+    // A resume names the model Codex's configuration names, because a thread resumed without a
+    // model keeps its old one.
+    peer.expect_request("config/read", json!({}))
+        .respond(json!({ "config": { "model": "gpt-default" } }));
     peer.expect_request(
         "thread/resume",
         json!({
@@ -10185,7 +10200,7 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
             "cwd": "/tmp/codex-edge",
             "approvalPolicy": "on-request",
             "sandbox": "workspace-write",
-            "model": null,
+            "model": "gpt-default",
             "serviceTier": "fast",
         }),
     )
@@ -10577,6 +10592,11 @@ async fn codex_runtime_and_probe_reject_invalid_provider_payloads() {
         .expect_request("initialize", build_initialize_params("0.1.1"))
         .respond(json!({}));
     resume_peer.expect_notification("initialized");
+    // A resume names the model Codex's configuration names, because a thread resumed without a
+    // model keeps its old one.
+    resume_peer
+        .expect_request("config/read", json!({}))
+        .respond(json!({ "config": { "model": "gpt-default" } }));
     resume_peer
         .expect_request(
             "thread/resume",
@@ -10585,7 +10605,7 @@ async fn codex_runtime_and_probe_reject_invalid_provider_payloads() {
                 "cwd": "/tmp/codex-invalid",
                 "approvalPolicy": "untrusted",
                 "sandbox": "read-only",
-                "model": null,
+                "model": "gpt-default",
                 "serviceTier": null,
             }),
         )
@@ -10892,6 +10912,7 @@ fn codex_edge_turn_params(provider_thread_id: &str, prompt: &str) -> Value {
         prompt: Some(prompt.to_owned()),
         attachments: Vec::new(),
         model: None,
+        reported_model: None,
         service_tier: Some("fast".to_owned()),
         effort: Some("high".to_owned()),
         interaction_mode: None,

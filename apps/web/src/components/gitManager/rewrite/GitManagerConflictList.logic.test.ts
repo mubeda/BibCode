@@ -104,10 +104,11 @@ describe("GitManagerConflictList", () => {
     const continueButton = container.querySelector<HTMLButtonElement>(
       '[aria-label="Continue operation"]',
     );
-    expect(continueButton).toMatchObject({ disabled: true, title: blocked.message });
-    expect(continueButton?.getAttribute("aria-describedby")).toBe(
-      "git-manager-conflicts-continue-reason",
-    );
+    expect(continueButton?.disabled).toBe(true);
+    expect(continueButton?.parentElement?.title).toBe(blocked.message);
+    expect(
+      document.getElementById(continueButton?.getAttribute("aria-describedby") ?? "")?.textContent,
+    ).toBe(blocked.message);
     expect(container.textContent).toContain(blocked.message);
 
     await act(async () =>

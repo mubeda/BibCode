@@ -309,7 +309,12 @@ vi.mock("../state/terminalSessions", () => ({
   useThreadRunningTerminalIds: () => h.runningTerminalIds,
 }));
 
+const updateEnvironmentSettingsMock = vi.hoisted(() =>
+  vi.fn(async (_patch: unknown) => ({ _tag: "Success" as const })),
+);
 vi.mock("../hooks/useSettings", () => ({
+  useUpdateEnvironmentSettings: () => updateEnvironmentSettingsMock,
+  readEnvironmentServerSettings: () => h.settings,
   useEnvironmentSettings: (_environmentId: string, selector?: (settings: unknown) => unknown) =>
     selector ? selector(h.settings) : h.settings,
 }));

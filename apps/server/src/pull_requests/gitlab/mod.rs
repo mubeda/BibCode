@@ -1052,7 +1052,9 @@ mod tests {
         let s = TestSandbox::new("pr-gitlab-pipeline-cancel");
         let script = s.executable_script(
             "glab",
-            "printf '%s\\n' \"$*\" >> calls\nsleep 20\necho '{}'",
+            // Opens the record before writing it, so the race with cancellation is the same
+            // every run, not only under load.
+            "exec 3>>calls\nsleep 0.2\nprintf '%s\\n' \"$*\" >&3\nsleep 20\necho '{}'",
             "",
         );
         let host = GitLabHost::new(Arc::new(
@@ -1065,9 +1067,11 @@ mod tests {
         let c = CancellationToken::new();
         let started = std::time::Instant::now();
         let read = host.pipeline_graph(&scope, 42, &c);
-        // Cancel once the read is out on the host, as a leaving subscriber would.
+        // Cancel once the read is out on the host, as a leaving subscriber would. `>>` creates
+        // the file before `printf` writes, so wait for the whole recorded line, not the file.
         let cancel = async {
-            while !s.path("calls").exists() {
+            while !std::fs::read_to_string(s.path("calls")).is_ok_and(|calls| calls.ends_with('\n'))
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             c.cancel();

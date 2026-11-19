@@ -27,6 +27,8 @@ const h = vi.hoisted(() => ({
   statusError: null as string | null,
   statusEmission: null as AsyncResult.AsyncResult<unknown, unknown> | null,
   refsError: null as string | null,
+  // A refs read runs while the last snapshot stays.
+  refsRefreshing: false,
   refsEmission: null as AsyncResult.AsyncResult<unknown, unknown> | null,
   refreshStatusQuery: vi.fn(),
   revalidateStatusQuery: vi.fn(),
@@ -91,6 +93,7 @@ function readActionsFor(kind: string | undefined) {
 function pendingFor(kind: string | undefined, data: unknown): boolean {
   if (kind === "status" && h.statusEmission !== null) return h.statusEmission.waiting;
   if (kind === "refs" && h.refsError !== null) return false;
+  if (kind === "refs" && h.refsRefreshing) return true;
   if (kind === "commits" && h.commitsEmission !== null) return h.commitsEmission.waiting;
   return data === null;
 }
@@ -192,6 +195,7 @@ vi.mock("./GitManagerChangesList", () => ({
 }));
 
 import { GitManagerChangesView } from "./GitManagerChangesView";
+import { expectLoadingModel } from "~/components/ui/loading-state.testing";
 import { GitManagerChangeRow } from "./GitManagerChangeRow";
 
 const projectRef = { environmentId: "environment-1", projectId: "project-1" } as never;
@@ -307,6 +311,7 @@ beforeEach(() => {
   h.statusError = null;
   h.statusEmission = null;
   h.refsError = null;
+  h.refsRefreshing = false;
   h.refsEmission = null;
   h.refreshStatusQuery.mockClear();
   h.revalidateStatusQuery.mockClear();
@@ -462,9 +467,21 @@ describe("GitManagerChangesView", () => {
     expect(container.textContent).toContain("src/manual-refresh.ts");
   });
 
+  it("keeps the changes beside a refresh label while the refs reread", async () => {
+    h.status = statusWith("src/kept.ts");
+    await renderView();
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    h.refsRefreshing = true;
+    await renderView();
+    expect(container.textContent).toContain("src/kept.ts");
+    expectLoadingModel(container, ["Refreshing changes…"]);
+  });
+
   it("repopulates from the status subscription after a reconnect", async () => {
     await renderView();
     expect(container.textContent).toContain("Connecting to changes");
+    expectLoadingModel(container, ["Connecting to changes…"]);
+    expect(container.querySelector('[role="status"] svg.animate-spin')).not.toBeNull();
 
     h.status = statusWith("src/before.ts");
     await renderView();

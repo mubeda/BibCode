@@ -238,7 +238,10 @@ The Claude session applies three model options:
   aliases such as `opus`, or, for a model Claude did not report, one BiBCode's
   built-in catalog offers it for. Turning it off is always accepted;
 - **Agent** (`agent`), passed as `--agent` and listed from the agents Claude
-  reports.
+  reports. The default, `claude`, is passed as no flag, so Claude runs its own
+  default agent, which its settings can name. A chat's first message can leave
+  the agent out and later ones name the default: both are the same launch, so
+  the change does not restart a running session or block a queued message.
 
 Models and their options normally come from Claude's session initialization.
 Model labels use Claude's `displayName`; descriptions appear as secondary text.
@@ -252,6 +255,42 @@ example one saved while an older catalog offered another option, is not retried:
 its delivery fails once and the thread shows **Delivery failed** with the
 reason, such as "Fast Mode is not supported by the selected model." Choose
 another model or option, then send the message again.
+
+## Approvals and questions
+
+A Claude chat thread asks before it runs a tool that its permission mode does
+not allow. BiBCode starts Claude Code with `--permission-prompt-tool stdio`, so
+Claude sends such a tool to BiBCode as a `can_use_tool` request and waits for
+the answer. The flag is passed only when Claude's `--help` lists
+`--permission-prompts`. An older Claude Code denies such a tool by itself, and
+no card opens.
+
+| Claude asks about          | What happens                                                                                                                   |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| A tool that needs approval | An approval card opens. It names the command, or the tool and its file or target.                                              |
+| `AskUserQuestion`          | The question card opens. Your answers go back to Claude as the tool's input.                                                   |
+| `ExitPlanMode`             | BiBCode denies it at once and tells Claude to end its turn. You review the plan in BiBCode, which reads it from the tool call. |
+
+The card's buttons answer Claude like this:
+
+- **Approve once** allows this tool use.
+- **Always allow this session** also gives Claude the rules it suggested for the
+  request, limited to the session. BiBCode keeps only allow rules and readable
+  folders, sends each to the session and never to a settings file, and drops a
+  suggested permission-mode change, so the thread keeps the mode it shows. When
+  Claude suggested no such rule, the tool is approved once and the thread says
+  so.
+- **Decline** refuses this tool use, and Claude goes on.
+- **Cancel turn** interrupts the turn.
+
+A request belongs to the Claude process and the turn that asked. Its card
+closes when Claude withdraws the request, when the turn is interrupted, and
+when the session stops or restarts. An answer to a card that is no longer
+waiting is refused and nothing is written to Claude. Session rules end with
+the Claude process: a new session asks again.
+
+Full access runs Claude with `bypassPermissions`, which asks for nothing except
+tools that need you, such as `AskUserQuestion`.
 
 ## Steering a running turn
 
@@ -367,18 +406,87 @@ BiBCode counts tasks that are neither foreground nor `ambient` and keeps the
 session while the count is non-zero and Claude has written something in the
 last 30 minutes.
 
-When a background task finishes, Claude answers it in a turn it starts itself:
-a `user` message and a `result` whose `origin.kind` is `task-notification`.
-BiBCode gives that answer a turn of its own, so the thread reads running and
-idle suspension waits for its result. Between the finished task and that turn
-the session stays busy. When the task finishes during another turn, Claude can
-replay its notification just before that turn's `result`; BiBCode then starts
-the answer's turn as that `result` ends the first one, so the idle deadline the
-`result` arms cannot stop Claude while it answers. This holds for `/compact`
-too, which Claude never replays: a notification that arrives while a delivered
-message awaits its replay starts its answer's turn once the message is replayed
+When a background task finishes, Claude answers it in one of these ways
+(recorded from Claude Code 2.1.326 in stream-JSON mode with
+`--replay-user-messages`, for `run_in_background` Bash commands and background
+Agent subagents):
+
+- **No turn running.** Claude starts a turn by itself: `system` `init`, its
+  main-thread output, and a `result` whose `origin.kind` is
+  `task-notification`. Two tasks get two such turns. No `user` message comes
+  first. A background subagent's own records carry its `parent_tool_use_id`.
+- **A turn running, Claude still working.** Claude replays the notification into
+  that turn as a `user` message with `origin.kind` `task-notification` (one per
+  task), answers it there, and ends with that turn's one `result`, which has no
+  origin. No other turn follows.
+- **A turn running, Claude already writing its last answer.** No replay: the
+  turn ends with its own `result`, then Claude answers in a turn of its own as
+  above (seen with a background subagent).
+- **Claude stops the task itself** (the TaskStop tool, in the turn that
+  started it or a later one). `task_updated` with status `killed`, a
+  `task_notification` with status `stopped`, and an empty
+  `background_tasks_changed`, then the turn goes on and ends with its own
+  `result`. No replay and no answer follow, also 30 seconds later.
+
+BiBCode gives an answer Claude starts with a task-notification `user` message
+a turn of its own, so the thread reads running and idle suspension waits for
+its result. Between the finished task and that turn the session stays busy.
+When such a replay arrives while another turn is open (#165, for example during
+`/compact`, which Claude never replays), BiBCode counts it and starts the
+answer's turn as that turn's `result` ends it, so the idle deadline the
+`result` arms cannot stop Claude while it answers. A notification that arrives
+while a delivered message awaits its replay counts once the message is replayed
 or, for a local command, acknowledged by its `result`. An interrupted turn
 starts no answer.
+
+A replay followed by main-thread model output in the same turn is not counted:
+that turn answered it, and the one `result` that follows ends it with no other
+turn opened (#389). Several replays answered in one turn count none.
+
+A task that finishes during a turn is not counted after that turn, whether it
+completed or Claude stopped it (`killed` or `stopped`): the turn's `result`
+arms the idle deadline, and only a replay in the turn opens an answer's turn.
+A task that finishes while no turn runs counts until a `result` with origin
+`task-notification` arrives or Claude has written nothing for the 30-minute
+quiet cap; this also refuses a revert, which a running task refuses too.
+
+Known limits:
+
+- An answer Claude gives in a turn of its own with no replay before it (what
+  Claude Code 2.1.326 sends when a background task finishes while no turn
+  runs) opens no BiBCode turn. Its text and tool calls are stored under the
+  last turn's id. A tool call completes from its own result. The answer's
+  `result` completes its text, any tool call, thinking block or compaction
+  still open, closes subagent rows Claude no longer lists, and withdraws an
+  approval or question it left pending, but completes no turn. It completes
+  every text the answer streamed, each under the message it was stored with
+  (text, a tool call, then more text are two messages). When it streamed
+  text, BiBCode then asks Claude for the context reading once, as after a
+  completed turn, once the last text is stored complete, and drops the answer if another turn
+  started first or the session was suspended. An idle answer with
+  no text keeps the reading from its own usage until the next turn ends.
+- Background output that arrives before a user message's replay is stored under
+  that message's turn.
+- A task that finishes while Claude writes a turn's last answer, with no
+  replay (the third case above), leaves nothing counted once that turn's
+  `result` arrives. Claude's own answer started about 0.4 to 1.1 seconds
+  later in the recorded sequences, so only the idle timeout's length (60
+  seconds by default) keeps the deadline from suspending Claude before it
+  starts. Starting an answer does not cancel the deadline either, so a long
+  answer can be suspended while it runs, and a revert is not refused while
+  that uncounted answer runs a tool.
+- A tagged `result` settles one counted answer whichever task it answers, so
+  with two tasks one answer's `result` can settle the other's count.
+- A task stopped while no turn runs still counts until a tagged `result` or the
+  30-minute quiet cap; no capture covers that stop.
+- A task that finishes while no turn runs and that Claude answers inside the
+  user's next turn (a replay followed by model output there, so no tagged
+  `result`) stays counted until the 30-minute quiet cap. The recorded
+  sequences show a tagged `result` for that case.
+
+A notification replay never confirms a delivered message, even one with the same
+text: only a `user` record without a `task-notification` origin is a message's
+echo.
 
 If a session was stopped while background work ran (for example by an earlier
 version of BiBCode), resuming it makes Claude deliver the stopped tasks'

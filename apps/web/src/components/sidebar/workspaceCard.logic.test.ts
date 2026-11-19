@@ -120,6 +120,37 @@ describe("workspace model labels", () => {
     ).toBe("gpt-5-codex");
   });
 
+  it("names Codex's default instead of showing the slug auto (#380)", () => {
+    const codexLabels = buildWorkspaceModelLabels(
+      new Map([
+        [
+          environmentId,
+          {
+            providers: [
+              {
+                instanceId,
+                models: [
+                  {
+                    slug: "auto",
+                    name: "Codex default (GPT-6.2-Sol)",
+                    isCustom: false,
+                    capabilities: null,
+                  },
+                ],
+              },
+            ],
+          } as unknown as ServerConfig,
+        ],
+      ]),
+    );
+    expect(
+      resolveWorkspaceModelLabel(codexLabels, {
+        environmentId,
+        modelSelection: { instanceId, model: "auto" },
+      }),
+    ).toBe("Codex default (GPT-6.2-Sol)");
+  });
+
   it("shows the slug for a model with no short name and a descriptive name", () => {
     // Some catalogs report aliases this way: name "Most efficient for everyday tasks".
     expect(

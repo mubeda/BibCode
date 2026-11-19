@@ -630,6 +630,7 @@ vi.mock("../state/terminalSessions", () => ({
     const session = testState.sessionsByEnvironment.get(input.environmentId) ?? testState.session;
     return { ...(session as object), reattach: testState.reattachCommand };
   },
+  useKnownTerminalSessions: () => [],
 }));
 vi.mock("../hooks/useSettings", () => ({
   useEnvironmentSettings: (
@@ -711,6 +712,7 @@ vi.mock("~/components/ui/popover", () => ({
   PopoverPopup: ({ children }: { children?: React.ReactNode }) => <span>{children}</span>,
 }));
 
+import { CenterTerminalPanel } from "./CenterTerminalPanel";
 import ThreadTerminalPanel, {
   enqueueTerminalInput,
   releaseTerminalUiResources,
@@ -6808,6 +6810,38 @@ describe("TerminalViewport mounted lifecycle", () => {
     terminal.selectionHandler?.();
   });
 
+  it("offers only Copy when no chat owns the terminal (#378)", async () => {
+    testState.localApiAvailable = true;
+    testState.contextMenuShow.mockResolvedValue(null);
+    const onAddTerminalContext = vi.fn();
+    const mounted = await mount(
+      <TerminalViewport {...viewportProps({ onAddTerminalContext, chatThread: false })} />,
+    );
+    const terminal = xtermState.terminals[0]!;
+    terminal.hasActiveSelection = true;
+    terminal.selectionText = "first";
+    terminal.selectionPosition = { start: { y: 4 } };
+    const mountElement = mounted.container.querySelector<HTMLElement>(
+      '[data-terminal-xterm-mount="term-1"]',
+    )!;
+    await act(async () => {
+      mountElement.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          button: 2,
+          clientX: 30,
+          clientY: 40,
+        }),
+      );
+    });
+    expect(testState.contextMenuShow).toHaveBeenCalledWith(
+      [{ id: "copy", label: "Copy" }],
+      expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }),
+    );
+    expect(onAddTerminalContext).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["the clipboard API", "resolve", true, null],
     ["execCommand after a rejected clipboard write", "reject", true, null],
@@ -7819,6 +7853,73 @@ describe("TerminalViewport mounted lifecycle", () => {
       expect.objectContaining({ url: "http://localhost:5173", invert: true }),
     );
     expect(testState.contextMenuShow).not.toHaveBeenCalled();
+  });
+
+  it("opens links without a chat thread when no chat owns the terminal (#378)", async () => {
+    vi.stubGlobal("navigator", { platform: "Linux" });
+    testState.localApiAvailable = true;
+    await mount(<TerminalViewport {...viewportProps({ chatThread: false })} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("http://localhost:5173"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+
+    link!.activate(new MouseEvent("click", { ctrlKey: true }));
+    expect(openLink).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        url: "http://localhost:5173",
+        threadRef: null,
+        environmentId: THREAD_REF.environmentId,
+      }),
+    );
+  });
+
+  it("attaches a server terminal through the center panel without a working directory (#378)", async () => {
+    // The center panel, the terminal panel and the viewport are the real ones; only the
+    // attach hook below them records its input.
+    await mount(
+      <CenterTerminalPanel
+        threadRef={THREAD_REF}
+        surface={{
+          id: "terminal:term-1",
+          kind: "terminal",
+          terminalId: "term-1",
+          label: "Terminal",
+        }}
+        launchContext={{ cwd: "/home/test-user", worktreePath: null, runtimeEnv: { A: "1" } }}
+        keybindings={EMPTY_KEYBINDINGS}
+        focusRequestId={1}
+        focusEligible
+        chatThread={false}
+        attachOnly
+        onAddTerminalContext={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    const attached = testState.attachedSessionInputs.at(-1) as {
+      readonly terminal: Record<string, unknown>;
+    };
+    expect(attached.terminal).toMatchObject({ terminalId: "term-1" });
+    for (const key of ["cwd", "worktreePath", "env", "command"]) {
+      expect(attached.terminal, `${key} would let the attach start a shell`).not.toHaveProperty(
+        key,
+      );
+    }
+  });
+
+  it("attaches without a working directory when the session exists already (#378)", async () => {
+    await mount(<TerminalViewport {...viewportProps({ attachOnly: true })} />);
+    const attached = testState.attachedSessionInputs.at(-1) as {
+      readonly terminal: Record<string, unknown>;
+    };
+    expect(attached.terminal).toMatchObject({
+      threadId: THREAD_REF.threadId,
+      terminalId: "term-1",
+    });
+    for (const key of ["cwd", "worktreePath", "env", "command"]) {
+      expect(attached.terminal, `${key} would let the attach start a shell`).not.toHaveProperty(
+        key,
+      );
+    }
   });
 
   it("reports link router failures in the terminal", async () => {

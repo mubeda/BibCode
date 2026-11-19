@@ -209,8 +209,10 @@ describe("GitManagerPullRequestPanel", () => {
 
     expect(container.textContent).toContain("Pull requests and checks");
     expect(container.textContent).toContain(reason);
-    expect(button("Create pull request")).toMatchObject({ disabled: true, title: reason });
-    expect(button("Refresh")).toMatchObject({ disabled: true, title: reason });
+    expect(button("Create pull request").disabled).toBe(true);
+    expect(button("Create pull request").parentElement?.title).toBe(reason);
+    expect(button("Refresh").disabled).toBe(true);
+    expect(button("Refresh").parentElement?.title).toBe(reason);
     expect(h.listRequests).not.toHaveBeenCalled();
     expect(h.createPr).not.toHaveBeenCalled();
     expect(onRefresh).not.toHaveBeenCalled();

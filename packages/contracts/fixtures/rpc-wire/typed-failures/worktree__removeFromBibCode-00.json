@@ -8,9 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeRemovalError",
-          "reason": "replacement-conflict",
-          "message": "[",
-          "currentGeneration": 2
+          "reason": "locked",
+          "message": "toString"
         }
       }
     ]

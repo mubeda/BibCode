@@ -11,6 +11,7 @@ import {
   type ServerSettings,
   type ServerProviderModel,
 } from "@bibcode/contracts";
+import { resolveSelectableModel } from "@bibcode/shared/model";
 import { describe, expect, it } from "vite-plus/test";
 
 import type { ProviderInstanceEntry } from "~/providerInstances";
@@ -262,11 +263,45 @@ describe("resolveProviderTerminalAction", () => {
       resolveProviderTerminalAction(entry("codex", "codex", "Codex", []), settings)?.command?.args,
     ).toEqual([
       "--dangerously-bypass-approvals-and-sandbox",
-      "--model",
-      DEFAULT_MODEL_BY_PROVIDER[CODEX_DRIVER],
       "--config",
       'model_reasoning_effort="xhigh"',
     ]);
+  });
+
+  // #380: a built-in model name stops Codex at its "no longer available" question once the
+  // model is retired, so a terminal nobody chose a model for names none.
+  it("shows Codex's default first in the list and names no model for it (R6)", () => {
+    // The server lists "no model chosen" first, named after the default Codex reports.
+    const models = [model("auto", [effortDescriptor]), model("gpt-6.2-sol", [effortDescriptor])];
+    const codex = entry("codex", "codex", "Codex", models);
+    // The picker's default for a thread with no chosen model...
+    expect(
+      resolveSelectableModel(CODEX_DRIVER, DEFAULT_MODEL_BY_PROVIDER[CODEX_DRIVER], models),
+    ).toBe("auto");
+    // ...and the request made for it agree: neither names a model.
+    expect(
+      resolveProviderTerminalAction(codex, DEFAULT_SERVER_SETTINGS)?.command?.args,
+    ).not.toContain("--model");
+
+    // A chosen model is kept.
+    const chosen = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerSessionDefaults: { [CODEX_DRIVER]: { model: "gpt-6.2-sol", options: [] } },
+    } satisfies ServerSettings;
+    const args = resolveProviderTerminalAction(codex, chosen)?.command?.args ?? [];
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+      "--model",
+      "gpt-6.2-sol",
+    ]);
+  });
+
+  it("starts a Codex terminal without a model when none was chosen", () => {
+    const args = resolveProviderTerminalAction(
+      entry("codex", "codex", "Codex", []),
+      DEFAULT_SERVER_SETTINGS,
+    )?.command?.args;
+    expect(args).not.toContain("--model");
+    expect(args?.join(" ")).not.toMatch(/gpt-5\.4/);
   });
 
   it("omits Codex Fast arguments through a partial live serviceTier descriptor", () => {

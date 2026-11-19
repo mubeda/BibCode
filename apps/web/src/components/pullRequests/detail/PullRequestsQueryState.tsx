@@ -3,6 +3,7 @@ import { PullRequestsOperationError } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
 import { useContext, useEffect, type ReactNode } from "react";
 import type { EnvironmentQueryView } from "../../../state/query";
+import { LoadingState, RefreshRegion } from "../../ui/loading-state";
 import { Skeleton } from "../../ui/skeleton";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { PermissionButton } from "../../ui/permission-button";
@@ -11,10 +12,16 @@ const isOperationError = Schema.is(PullRequestsOperationError);
 export function PullRequestsQueryState({
   query,
   label,
+  busy,
   children,
 }: {
   query: EnvironmentQueryView<unknown>;
   label: string;
+  /**
+   * Marks the shown content busy while an outer status names its reread. Its own first
+   * load stays outside that region, as the loading model in `loading-state.tsx` asks.
+   */
+  busy?: boolean | undefined;
   children: ReactNode;
 }) {
   const failure =
@@ -40,19 +47,26 @@ export function PullRequestsQueryState({
     </div>
   );
   if (message !== null && query.data === null) return alert;
-  if (message !== null && query.data !== null)
-    return (
-      <>
-        {alert}
-        {children}
-      </>
-    );
   if (query.data === null)
     return (
-      <div role="status" className="space-y-3 p-4">
-        <span className="text-sm text-muted-foreground">Loading {label}…</span>
+      <LoadingState label={`Loading ${label}…`}>
         <Skeleton className="h-16 w-full" />
-      </div>
+      </LoadingState>
     );
-  return children;
+  const content =
+    busy === undefined ? (
+      children
+    ) : (
+      <RefreshRegion className="flex min-h-0 min-w-0 flex-1 flex-col" refreshing={busy}>
+        {children}
+      </RefreshRegion>
+    );
+  return message === null ? (
+    content
+  ) : (
+    <>
+      {alert}
+      {content}
+    </>
+  );
 }

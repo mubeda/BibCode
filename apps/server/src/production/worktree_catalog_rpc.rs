@@ -1922,6 +1922,10 @@ struct WorktreeRemovalError {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     current_generation: Option<u64>,
+    /// Set on `thread-not-found` when the thread's removal already finished. An optional field,
+    /// not a reason, so a client that predates it still decodes the failure (#391).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    already_removed: Option<bool>,
 }
 
 async fn get_removal_plan(
@@ -1943,7 +1947,14 @@ async fn get_removal_plan(
         // The plan is advisory: execution plans again under the lock and compares the token.
         let epoch = catalog.mutation_epoch(project_id);
         let plan =
-            build_removal_plan(services, project_id, thread_id, None, true, &cancellation).await;
+            match build_removal_plan(services, project_id, thread_id, None, true, &cancellation)
+                .await
+            {
+                Err(error) if error["reason"] == "thread-not-found" => {
+                    Err(distinguish_removed(services, project_id, thread_id, error).await)
+                }
+                other => other,
+            };
         // The lock waits out a mutation in flight, then confirms that nothing moved.
         let (unchanged, generation) = catalog
             .with_project_mutation_lock_cancellation(project_id, &cancellation, || async {
@@ -1967,11 +1978,44 @@ async fn get_removal_plan(
         }
         current_generation = generation;
     }
-    Err(encode(removal_error(
+    let stale = encode(removal_error(
         WorktreeRemovalErrorReason::StaleGeneration,
         "The worktree changed while its removal details loaded. Load them again.",
         current_generation,
-    )))
+    ));
+    // A detach during the last read moves the catalog too; the target is gone, not stale.
+    Err(distinguish_removed(services, project_id, thread_id, stale).await)
+}
+
+/// Answers `thread-not-found` with `alreadyRemoved` when the thread's row survives with a
+/// deletion mark (a removal finished while the plan loaded, #391), so a client can tell that
+/// from a thread that never existed. Otherwise `error` stands.
+async fn distinguish_removed(
+    services: &WorktreeCatalogRpcServices,
+    project_id: &str,
+    thread_id: &str,
+    error: Value,
+) -> Value {
+    let removed = services
+        .orchestration
+        .repositories()
+        .get_thread(thread_id.to_owned())
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|thread| {
+            thread.project_id == project_id
+                && thread.kind == "workspace"
+                && thread.deleted_at.is_some()
+        });
+    if removed {
+        encode(WorktreeRemovalError {
+            already_removed: Some(true),
+            ..removal_not_found()
+        })
+    } else {
+        error
+    }
 }
 
 async fn remove_from_bibcode(
@@ -2604,7 +2648,22 @@ async fn resolve_removal_thread(
     })
 }
 
+/// Answers `thread-not-found` with `alreadyRemoved` when another removal or detach finished
+/// first, as the plan does (#391).
 async fn resolve_removal_thread_with_ownership(
+    services: &WorktreeCatalogRpcServices,
+    project_id: &str,
+    thread_id: &str,
+) -> Result<(WorkspaceOwnershipLease, ResolvedRemovalThread), Value> {
+    match resolve_removal_thread_owned(services, project_id, thread_id).await {
+        Err(error) if error["reason"] == "thread-not-found" => {
+            Err(distinguish_removed(services, project_id, thread_id, error).await)
+        }
+        other => other,
+    }
+}
+
+async fn resolve_removal_thread_owned(
     services: &WorktreeCatalogRpcServices,
     project_id: &str,
     thread_id: &str,
@@ -3214,6 +3273,7 @@ fn removal_error(
         reason,
         message: crate::worktree_catalog::bounded_message(message.into()),
         current_generation,
+        already_removed: None,
     }
 }
 
@@ -4989,6 +5049,78 @@ mod mutation_invalidation_tests {
     }
 
     #[tokio::test]
+    async fn plan_for_a_removed_thread_reports_already_removed_not_missing() {
+        let fixture = RemovalFixture::new().await;
+        fixture
+            .remove(fixture.payload().await)
+            .await
+            .expect("removal succeeds");
+        let plan = |thread_id: &'static str| {
+            get_removal_plan(
+                &fixture.handler.services,
+                request(
+                    "worktree.getRemovalPlan",
+                    json!({"projectId":"project-1", "threadId":thread_id}),
+                ),
+                CancellationToken::new(),
+            )
+        };
+        let removed = plan("removed-thread")
+            .await
+            .expect_err("a removed thread has no plan");
+        assert_eq!(removed["reason"], "thread-not-found");
+        assert_eq!(removed["alreadyRemoved"], true);
+        let unknown = plan("never-existed")
+            .await
+            .expect_err("an unknown thread has no plan");
+        assert_eq!(unknown["reason"], "thread-not-found");
+        assert!(unknown.get("alreadyRemoved").is_none());
+        fixture.handler.shutdown().await;
+    }
+
+    /// A detach or a removal that reaches a thread another client already removed reports that
+    /// outcome, as the plan does, and an unknown thread stays plainly missing.
+    #[tokio::test]
+    async fn detach_or_remove_of_a_removed_thread_reports_already_removed_not_missing() {
+        let fixture = RemovalFixture::new().await;
+        let payload = fixture.payload().await;
+        fixture
+            .remove(payload.clone())
+            .await
+            .expect("removal succeeds");
+        let detach = |command_id: &'static str, thread_id: &'static str| {
+            remove_from_bibcode(
+                &fixture.handler.services,
+                request(
+                    "worktree.removeFromBibCode",
+                    json!({"commandId":command_id, "projectId":"project-1", "threadId":thread_id}),
+                ),
+                CancellationToken::new(),
+            )
+        };
+        let removed = detach("late-detach", "removed-thread")
+            .await
+            .expect_err("a removed thread cannot be detached again");
+        assert_eq!(removed["reason"], "thread-not-found");
+        assert_eq!(removed["alreadyRemoved"], true);
+        let unknown = detach("unknown-detach", "never-existed")
+            .await
+            .expect_err("an unknown thread cannot be detached");
+        assert_eq!(unknown["reason"], "thread-not-found");
+        assert!(unknown.get("alreadyRemoved").is_none());
+        // A second client's removal with the plan it loaded before the first finished.
+        let mut late_remove = payload;
+        late_remove["commandId"] = json!("late-remove");
+        let removed = fixture
+            .remove(late_remove)
+            .await
+            .expect_err("a removed thread cannot be removed again");
+        assert_eq!(removed["reason"], "thread-not-found");
+        assert_eq!(removed["alreadyRemoved"], true);
+        fixture.handler.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn removal_waits_for_admitted_work_before_checking_the_session() {
         let mut fixture = RemovalFixture::new().await;
         fixture.set_live_sessions(&["removed-thread"]);
@@ -5286,6 +5418,7 @@ mod mutation_invalidation_tests {
                 .expect("plan joins")
                 .expect_err("a plan that raced a detach reads the result again");
             assert_eq!(error["reason"], "thread-not-found");
+            assert_eq!(error["alreadyRemoved"], true);
             fixture.handler.shutdown().await;
         }
 
@@ -5384,6 +5517,47 @@ mod mutation_invalidation_tests {
             assert_eq!(error["reason"], "stale-generation");
             assert_eq!(error["currentGeneration"], moved);
             assert_eq!(gate.inventories.load(Ordering::SeqCst), 2);
+            fixture.handler.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn plan_answers_already_removed_when_a_detach_lands_during_its_second_read() {
+            let (fixture, gate) = gated_fixture().await;
+            let plan = plan_in_flight(&fixture, &gate).await;
+            fixture
+                .handler
+                .catalog
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+                .expect("refresh during the first read");
+            gate.armed.store(true, Ordering::SeqCst);
+            gate.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(30), gate.entered.acquire())
+                .await
+                .expect("the plan reads again")
+                .expect("gate open")
+                .forget();
+            remove_from_bibcode(
+                &fixture.handler.services,
+                request(
+                    "worktree.removeFromBibCode",
+                    json!({
+                        "commandId":"detach-command",
+                        "projectId":"project-1",
+                        "threadId":"removed-thread"
+                    }),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("detach succeeds");
+            gate.release.add_permits(1);
+            let error = plan
+                .await
+                .expect("plan joins")
+                .expect_err("the target is gone");
+            assert_eq!(error["reason"], "thread-not-found");
+            assert_eq!(error["alreadyRemoved"], true);
             fixture.handler.shutdown().await;
         }
     }

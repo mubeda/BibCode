@@ -716,7 +716,10 @@ Profiler on, as every packaged run should be, and read its findings afterwards.
 It modifies the fixture's `README.md`, clicks **Review changes** in Source
 Control and checks that a **Code review · Codex** tab opens, that Codex's first
 provider input starts with the review lead-in and names the uncommitted scope,
-and that the panel's runtime picker reads **Supervised**. It then picks
+and that the panel's runtime picker reads **Supervised** (the stored mode; the
+server still runs a Codex review read-only without approvals, which
+`production_provider_runtime.rs` proves against the fake Codex, not this
+spec). It then picks
 **Claude** under **Review once with** in the review menu: the Claude fixture
 answers a prompt that starts with "Code review requested from BiBCode." with an
 `ExitPlanMode` plan, and the spec checks that the card reads **Review findings**
@@ -2129,6 +2132,35 @@ from `apps/web`.
 Record the agent versions, the protocol version each negotiated and every
 message shown in the execution report.
 
+## Claude approvals
+
+Run this on every native desktop after a change to the Claude driver's launch
+arguments, its handling of Claude's `can_use_tool` requests, the approval or
+question card, or the session approval reply. The focused gates are:
+
+```sh
+cargo test -p bibcode-server --test provider_claude
+cargo test -p bibcode-server --lib claude_tool_approval_round_trips_through_the_driver
+cargo test -p bibcode-server --test production_provider_runtime claude_launch_arguments
+```
+
+Those run against a scripted Claude. The check against the installed Claude
+Code is the manual spec `specs/manual/claude-approval-real-provider.e2e.ts`. It
+runs the machine's own `claude` and its sign-in, so it spends a little of that
+account. Set `BIBCODE_E2E_REAL_PROVIDERS=1`, `BIBCODE_E2E_REAL_PROJECT` to a
+disposable Git folder and `BIBCODE_E2E_SPEC` to the spec, then run the packaged
+UI suite. It writes `real-claude-approval-evidence.txt` and four screenshots to
+the artifact directory, and it passes when:
+
+1. A Supervised Claude chat opens an approval card for a shell command, and the
+   command has not run yet.
+2. **Always allow this session** runs the command and closes the card.
+3. The same command sent again runs with no card.
+4. No `.claude/settings.local.json` appears in the project.
+
+A Claude Code whose `--help` does not list `--permission-prompts` opens no
+card: record that version as not covered.
+
 ## Send to agent and agent messaging
 
 Run this on every native desktop after a change to `send_requests`,
@@ -2228,7 +2260,8 @@ CLI stay manual.
     project, `bibcode agent list` exits with the "no agent identity" error. Send a
     message to the AI Terminal from a chat's agent or from another terminal: after
     the terminal's agent finishes its turn, the pointer line "BiBCode: you have new
-    messages. Run `bibcode agent inbox` to read them." appears once and is
+    messages. Run `bibcode agent inbox` to read them, and answer each one that asks
+    for a reply." appears once and is
     submitted, `bibcode agent inbox` prints the message inside its envelope and a
     person's request as from the user, and `bibcode agent status <id>` reads
     `consumed`, then `completed` once the agent ran `bibcode agent reply`. No
@@ -3958,6 +3991,16 @@ sizes. Cover relevant:
   `BIBCODE_E2E_SPEC=./specs/host-dashboard.e2e.ts`. By hand, open the dashboard
   from the environment menu and from Settings > Remote Servers too, and against
   an older remote server check it asks to update the server;
+- Server commands: the packaged `server-commands` spec chooses **Dashboard** and
+  **Open terminal** from the Local rail icon's menu (the native menu is mocked,
+  and on Windows it picks the in-page menu item), then the same two buttons on
+  the Repositories card. It checks the menu order, that the center dashboard
+  shows a CPU percentage, that the terminal has focus and starts in the server
+  user's home folder, that the card's Open terminal and a reload reuse the
+  running shell, and that `exit` after a refocus brings back the Local
+  dashboard it was opened from, without reopening the terminal. The suite has no remote environment, so the
+  Environments view's server card is covered by unit tests only. Rerun it alone
+  with `BIBCODE_E2E_SPEC=./specs/server-commands.e2e.ts`;
 - Desktop export and close: the packaged `desktop-save-and-close` spec proves that
   **Export** on a custom theme writes the theme JSON through the real Save
   command (an end-to-end build writes to the path in

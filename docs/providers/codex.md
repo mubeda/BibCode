@@ -94,6 +94,57 @@ provider status. Existing-thread model pickers are locked to the Codex driver,
 but must not be treated as proof that every displayed Codex instance can safely
 resume the same provider session. Prefer the instance that created the thread.
 
+## Default model
+
+BiBCode has no built-in Codex model. A thread, an AI Terminal or a setting that
+nobody chose a model for stores `auto`, and BiBCode then starts Codex without
+naming a model, so Codex runs its own default. That default is the `model` in
+Codex's configuration (`config.toml`, read with `config/read`), and otherwise
+the model that `model/list` marks with `isDefault`.
+
+The model picker lists this choice first as **Codex default**, followed by the
+name of that model, for example **Codex default (GPT-6-Sol)**. When Codex
+reports neither, or its list cannot be read, the entry reads **Codex default**.
+A model you choose is sent as chosen.
+
+Codex's collaboration mode (Plan) requires a model name. For a thread with no
+chosen model BiBCode sends the model Codex reported when it opened the thread,
+and `gpt-6.1-sol` only when Codex reported none.
+
+Codex retired `gpt-5.4` and `gpt-5.4-mini` for ChatGPT sign-in, and its model
+list no longer offers them there. A thread or a saved default that still names
+one, or the aliases `5.4` and `gpt-5-codex`, is handled when it is used:
+
+- In the app, the model picker shows **Codex default** for it. The next message
+  starts without a model, stores that choice on the thread, and shows one notice
+  that names the retired model.
+- A message that does not come from the app (an agent message, an MCP client)
+  starts the session without a model when BiBCode knows Codex is signed in with
+  ChatGPT, and the thread shows one warning line. The server then stores
+  **Codex default** on the thread, so the warning does not come back and the
+  next message does not restart the session. It does so with the server-only
+  `thread.retired-model.clear` command. It names the instance that dropped
+  the model and replaces only the model, and it changes nothing when the
+  thread meanwhile names another model, or the same model on another instance.
+  A message
+  admitted naming the retired model or an alias, before or while the session
+  started, is sent on that session as admitted.
+- A saved default is skipped while the list does not offer it. The next Codex
+  message sent from the app saves Codex's default in its place and shows one
+  notice that names the retired model.
+
+With API-key sign-in the list still offers the model and the stored choice is
+sent unchanged, with no notice. Before BiBCode has read the sign-in type, and
+for any other model name that Codex refuses, the name is passed through and
+Codex's own error is shown.
+
+Switching a thread from a named model to **Codex default** restarts its Codex
+session when the next message starts, because a running session cannot be told
+to drop its model. Codex keeps a thread's previous model when the thread is
+resumed without one, so a resume with no chosen model names Codex's default as
+described above. The lookup has 5 seconds. If Codex does not answer, the resume
+names no model and the thread keeps its previous one. A fresh thread names none.
+
 ## Custom endpoints and secrets
 
 Add account-specific variables in the provider instance's **Environment
@@ -198,6 +249,19 @@ revert it cannot do fails without changing anything:
 - `legacy` means a thread that cannot be rewound: one an older Codex started,
   or any thread on a Codex before 0.151.0. The work log asks you to start a new
   thread on Codex 0.151.0 or later.
+
+## Code reviews
+
+A Codex chat review (Source Control → **Review changes**) runs with
+`approvalPolicy: never` and Codex's read-only sandbox on `thread/start`,
+`thread/resume` and every `turn/start`, whatever runtime mode the review thread
+stores. This is the policy of the Codex terminal review. Codex may read the
+checkout and run commands the sandbox allows without asking; a command that
+needs to write fails back to the model. If Codex still sends a command
+approval, a file-change approval or a question, BiBCode declines it at once and
+no card opens. The sandbox is Codex's own: the user's Codex configuration, MCP
+servers and hooks still load, and BiBCode adds no limit on readable paths or
+network beyond it. See [Runtime modes](../architecture/runtime-modes.md#codex-code-reviews).
 
 ## Activity observation
 

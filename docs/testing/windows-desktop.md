@@ -555,10 +555,27 @@ Build and run packaged E2E with the supported platform value
 
 ```powershell
 $env:BIBCODE_E2E_PLATFORM = 'win'
+$env:BIBCODE_E2E_ARCH = node -p process.arch
+$rustTarget = @{ arm64 = 'aarch64-pc-windows-msvc'; x64 = 'x86_64-pc-windows-msvc' }[$env:BIBCODE_E2E_ARCH]
+if ($null -eq $rustTarget) { throw 'Unsupported Windows architecture' }
 vp run test:ui:desktop:build
-$env:BIBCODE_E2E_APP_PATH = (Resolve-Path 'target/release/bibcode-desktop.exe').Path
+$env:BIBCODE_E2E_APP_PATH = (Resolve-Path "target/$rustTarget/release/bibcode-desktop.exe").Path
 vp run test:ui:desktop
 ```
+
+The E2E build passes Tauri the release target for `BIBCODE_E2E_ARCH`, or for
+Node's architecture when it is unset, so the executable lands under
+`target/<target triple>/release/`, not `target/release/`. On an arm64 guest
+whose Node is x64, that target is the x64 one.
+
+The packaged UI suite is not part of pull request or main-branch CI. Its
+workflow, `.github/workflows/desktop-ui-smoke.yml`, runs only on
+`workflow_dispatch` or `workflow_call`, and no other workflow calls it. A spec
+that no longer matches the app is therefore caught only by a lab run or a
+manual dispatch. The workflow installs the NSIS build silently on its
+disposable runner and tests the installed executable. A local or lab run tests
+the built executable instead, so it never touches an installed copy or the
+user's profile.
 
 When the run ends, the artifact directory (`BIBCODE_E2E_ARTIFACT_DIR`) also holds
 `app-*.log`: the last 4 MiB of each of the packaged app's own logs, with the native

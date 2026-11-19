@@ -19,6 +19,7 @@ import {
   GitCompareArrowsIcon,
   GitMergeIcon,
   GitPullRequestIcon,
+  PlusIcon,
 } from "lucide-react";
 import {
   memo,
@@ -47,7 +48,6 @@ import {
 import { useEnvironmentQuery } from "../../state/query";
 import { vcsEnvironment } from "../../state/vcs";
 import { worktreeEnvironment } from "../../state/worktrees";
-import { Button } from "../ui/button";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../ui/tabs";
 import {
   resolveGitManagerTabTransition,
@@ -61,7 +61,10 @@ import {
   type GitManagerBranchDialog,
   type GitManagerBranchDialogSubmission,
 } from "./dialogs/GitManagerBranchDialogs";
+import { LoadingState } from "~/components/ui/loading-state";
+import { GitManagerDisabledReasonButton } from "./GitManagerDisabledReasonButton";
 import { GitManagerMergeDialog } from "./merge/GitManagerMergeDialog";
+import { newBranchDialog } from "./toolbar/branchCreateBase";
 import { hasMergeSource } from "./merge/GitManagerMergeDialog.logic";
 import { GitManagerStashDiff } from "./stash/GitManagerStashDiff";
 import { GitManagerStashList } from "./stash/GitManagerStashList";
@@ -211,7 +214,7 @@ interface GitManagerRepositorySurfacesProps {
   readonly branchSyncDisabledReason: string | null;
   readonly stashMergeDisabledReason: string | null;
   /** The environment can merge into a branch that is not checked out. */
-  readonly mergeIntoAvailable: boolean;
+  readonly mergeIntoDisabledReason: string | null;
   readonly rewriteDisabledReason: string | null;
   readonly tagDisabledReason: string | null;
   readonly pullRequestsDisabledReason: string | null;
@@ -229,7 +232,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   signalPending,
   branchSyncDisabledReason,
   stashMergeDisabledReason,
-  mergeIntoAvailable,
+  mergeIntoDisabledReason,
   rewriteDisabledReason,
   tagDisabledReason,
   pullRequestsDisabledReason,
@@ -462,6 +465,10 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   const recentNames = useMemo(() => (recentRef === null ? [] : [recentRef]), [recentRef]);
 
   const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
+  // The branch the dialog merges from when opened by "Merge <branch> into…"; null for Merge….
+  const [mergeFromBranch, setMergeFromBranch] = useState<string | null>(null);
+  const [mergeDialogKey, setMergeDialogKey] = useState(0);
+  const [mergeRunning, setMergeRunning] = useState(false);
   const [multiCommitState, setMultiCommitState] = useState<GitManagerMultiCommitState | null>(null);
   const [historyBranchDialog, setHistoryBranchDialog] = useState<GitManagerBranchDialog | null>(
     null,
@@ -893,8 +900,26 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       setHistoryActionMessage(stashMergeDisabledReason);
       return;
     }
+    // Remount only when the entry mode changes, so an ordinary reopen keeps the user's
+    // choices; never while a merge runs, because a remount would cancel it.
+    if (!mergeRunning && mergeFromBranch !== null) {
+      setMergeFromBranch(null);
+      setMergeDialogKey((key) => key + 1);
+    }
     setMergeDialogOpen(true);
-  }, [stashMergeDisabledReason]);
+  }, [mergeFromBranch, mergeRunning, stashMergeDisabledReason]);
+  const openMergeFromSelected = useCallback(() => {
+    // Every idle open starts without a target, so Merge cannot enable on an earlier choice.
+    if (!mergeRunning) {
+      setMergeFromBranch(currentBranchName);
+      setMergeDialogKey((key) => key + 1);
+    }
+    setMergeDialogOpen(true);
+  }, [currentBranchName, mergeRunning]);
+  const openNewBranchDialog = useCallback(() => {
+    setHistoryActionMessage(null);
+    setHistoryBranchDialog(newBranchDialog(snapshot));
+  }, [snapshot]);
   const handleMergeFinished = useCallback(() => revalidateRefs(), [revalidateRefs]);
   const closeHistoryBranchDialog = useCallback(() => {
     if (!operationRunning) setHistoryBranchDialog(null);
@@ -981,6 +1006,19 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       : !hasMergeSource(localBranches, snapshot?.remoteBranches ?? EMPTY_REFS)
         ? "No source branch is available."
         : null);
+  const newBranchDisabledReason =
+    branchSyncDisabledReason ??
+    (refsQuery.isPending || snapshot === null ? "Loading branches." : null);
+  const mergeFromSelectedDisabledReason =
+    stashMergeDisabledReason ??
+    (refsQuery.isPending || snapshot === null
+      ? "Loading branches."
+      : currentBranch === null
+        ? "Check out a branch before merging."
+        : (mergeIntoDisabledReason ??
+          (localBranches.every((branch) => branch.current)
+            ? "No other local branch to merge into."
+            : null)));
   const rebaseBlockedReason =
     currentBranch?.blocked.find((reason) => reason.operation === "rebase") ?? null;
   const rebaseDisabledReason =
@@ -1027,39 +1065,24 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           onContinue={continueInProgress}
         />
       )}
-      <div className="flex items-center justify-end gap-2 border-b border-panel-separator px-4 py-1.5">
-        <Button
-          aria-describedby={
-            pullRequestsDisabledReason === null
-              ? undefined
-              : "git-manager-pull-requests-disabled-reason"
-          }
+      <div className="flex flex-wrap items-center justify-end gap-2 border-b border-panel-separator px-4 py-1.5">
+        <GitManagerDisabledReasonButton
+          size="xs"
+          variant="ghost"
           aria-expanded={providerPaneOpen}
           aria-label={`${providerPaneOpen ? "Hide" : "Show"} ${changeRequest.pluralLongName} and checks`}
-          disabled={pullRequestsDisabledReason !== null}
-          size="xs"
-          title={pullRequestsDisabledReason ?? undefined}
-          variant="ghost"
+          disabledReason={pullRequestsDisabledReason}
           onClick={toggleProviderPane}
         >
           <GitPullRequestIcon aria-hidden="true" />
           {`${providerPaneOpen ? "Hide" : "Show"} ${changeRequest.pluralLongName}`}
-        </Button>
-        {pullRequestsDisabledReason === null ? null : (
-          <span className="sr-only" id="git-manager-pull-requests-disabled-reason">
-            {pullRequestsDisabledReason}
-          </span>
-        )}
-        <Button
-          aria-describedby={
-            stashMergeDisabledReason === null ? undefined : "git-manager-stash-disabled-reason"
-          }
+        </GitManagerDisabledReasonButton>
+        <GitManagerDisabledReasonButton
+          size="xs"
+          variant="ghost"
           aria-expanded={stashPaneOpen}
           aria-label="Toggle repository stashes"
-          disabled={stashMergeDisabledReason !== null}
-          size="xs"
-          title={stashMergeDisabledReason ?? undefined}
-          variant="ghost"
+          disabledReason={stashMergeDisabledReason}
           onClick={toggleStashPane}
         >
           <ArchiveIcon aria-hidden="true" />
@@ -1067,48 +1090,48 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           {repositoryUnavailable !== null || stashesQuery.data === null
             ? ""
             : ` (${stashes.length})`}
-        </Button>
-        {stashMergeDisabledReason === null ? null : (
-          <span className="sr-only" id="git-manager-stash-disabled-reason">
-            {stashMergeDisabledReason}
-          </span>
-        )}
-        <Button
-          aria-describedby={
-            mergeDisabledReason === null ? undefined : "git-manager-merge-trigger-reason"
-          }
-          disabled={mergeDisabledReason !== null}
+        </GitManagerDisabledReasonButton>
+        <GitManagerDisabledReasonButton
           size="xs"
-          title={mergeDisabledReason ?? "Merge one branch into another"}
           variant="ghost"
+          disabledReason={newBranchDisabledReason}
+          enabledTitle={`Create a branch from ${currentBranchName ?? "the current HEAD"}`}
+          onClick={openNewBranchDialog}
+        >
+          <PlusIcon aria-hidden="true" />
+          New branch
+        </GitManagerDisabledReasonButton>
+        <GitManagerDisabledReasonButton
+          size="xs"
+          variant="ghost"
+          aria-label={`Merge ${currentBranchName ?? "selected branch"} into another branch`}
+          disabledReason={mergeFromSelectedDisabledReason}
+          enabledTitle={`Merge ${currentBranchName} into another local branch`}
+          onClick={openMergeFromSelected}
+        >
+          <GitMergeIcon aria-hidden="true" />
+          <span className="max-w-40 truncate">{`Merge ${currentBranchName ?? "branch"} into…`}</span>
+        </GitManagerDisabledReasonButton>
+        <GitManagerDisabledReasonButton
+          size="xs"
+          variant="ghost"
+          disabledReason={mergeDisabledReason}
+          enabledTitle="Merge one branch into another"
           onClick={openMergeDialog}
         >
           <GitMergeIcon aria-hidden="true" />
           Merge…
-        </Button>
-        {mergeDisabledReason === null ? null : (
-          <span className="sr-only" id="git-manager-merge-trigger-reason">
-            {mergeDisabledReason}
-          </span>
-        )}
-        <Button
-          aria-describedby={
-            rebaseDisabledReason === null ? undefined : "git-manager-rebase-trigger-reason"
-          }
-          disabled={rebaseDisabledReason !== null}
+        </GitManagerDisabledReasonButton>
+        <GitManagerDisabledReasonButton
           size="xs"
-          title={rebaseDisabledReason ?? "Rebase the current branch onto another branch"}
           variant="ghost"
+          disabledReason={rebaseDisabledReason}
+          enabledTitle="Rebase the current branch onto another branch"
           onClick={openRebaseDialog}
         >
           <GitCompareArrowsIcon aria-hidden="true" />
           Rebase…
-        </Button>
-        {rebaseDisabledReason === null ? null : (
-          <span className="sr-only" id="git-manager-rebase-trigger-reason">
-            {rebaseDisabledReason}
-          </span>
-        )}
+        </GitManagerDisabledReasonButton>
       </div>
       {historyActionMessage === null ? null : (
         <p
@@ -1244,6 +1267,11 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
           ) : activeTab === "tags" ? (
             <GitManagerTagsView
               collapsedSections={collapsedTagSections}
+              refsPending={snapshot === null && refsQuery.error === null}
+              refsError={refsQuery.error}
+              refsLoaded={snapshot !== null}
+              refsRefreshing={refsQuery.isPending}
+              onRetryRefs={refreshRefs}
               remotes={snapshot?.remotes ?? EMPTY_REMOTES}
               scope={historyTagScope}
               tagDisabledReason={tagDisabledReason}
@@ -1294,7 +1322,9 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
       />
       <GitManagerMergeDialog
         disabledReason={stashMergeDisabledReason}
-        mergeIntoAvailable={mergeIntoAvailable}
+        mergeIntoAvailable={mergeIntoDisabledReason === null}
+        sourceBranch={mergeFromBranch}
+        key={mergeDialogKey}
         open={mergeDialogOpen}
         projectRef={projectRef}
         recentNames={recentNames}
@@ -1303,6 +1333,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
         scope={scope}
         onFinished={handleMergeFinished}
         onOpenChange={setMergeDialogOpen}
+        onRunningChange={setMergeRunning}
       />
     </>
   );
@@ -1424,7 +1455,12 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
   );
 
   if (availability.kind !== "ready") {
-    return <GitManagerUnavailableState reason={unavailableReason(availability)} />;
+    // Pending is a transient wait, not a failure: say what is awaited without the error card.
+    return availability.kind === "pending" ? (
+      <LoadingState label={unavailableReason(availability)} />
+    ) : (
+      <GitManagerUnavailableState reason={unavailableReason(availability)} />
+    );
   }
   if (project === null || mainCheckoutCwd === null || activeCwd === null) {
     return <GitManagerUnavailableState reason="Waiting for project data." />;
@@ -1462,7 +1498,7 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           signalGeneration={signalGeneration}
           signalPending={signalPending}
           stashMergeDisabledReason={effectiveDisabledReasons.stashMerge}
-          mergeIntoAvailable={capabilityDisabledReasons.mergeInto === null}
+          mergeIntoDisabledReason={capabilityDisabledReasons.mergeInto}
           tagDisabledReason={effectiveDisabledReasons.tag}
           tabTransitionBaselineRef={tabTransitionBaselineRef}
           onTabChange={handleTabChange}

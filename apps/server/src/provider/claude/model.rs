@@ -5,6 +5,10 @@ use serde_json::{Value, json};
 /// How the Fast Mode option is named everywhere a user sees it, including a refusal.
 pub(crate) const FAST_MODE_LABEL: &str = "Fast Mode";
 
+/// The agent Claude Code runs when none is named. Starting with `--agent claude` is the same
+/// session as starting with no `--agent`.
+pub const DEFAULT_AGENT: &str = "claude";
+
 const MINIMUM_FABLE_5_VERSION: [u64; 3] = [2, 1, 169];
 const MINIMUM_OPUS_4_8_VERSION: [u64; 3] = [2, 1, 154];
 const MINIMUM_OPUS_4_7_VERSION: [u64; 3] = [2, 1, 111];

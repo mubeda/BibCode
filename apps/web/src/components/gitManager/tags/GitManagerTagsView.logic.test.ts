@@ -81,6 +81,6 @@ describe("summarizeRemoteTagsQuery", () => {
           tags: [{ name: "v1", targetSha: "a" }],
         },
       }),
-    ).toEqual({ kind: "ready", message: "Refreshing…" });
+    ).toEqual({ kind: "ready", message: null });
   });
 });

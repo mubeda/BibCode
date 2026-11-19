@@ -20,6 +20,7 @@ import { GitHubIcon, GitLabIcon } from "../Icons";
 import { PullRequestsContextRefresh } from "../pullRequests/pullRequestsContextRefresh";
 import { usePullRequestsContextQuery } from "../pullRequests/usePullRequestsContextQuery";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
+import { LoadingState } from "../ui/loading-state";
 import { Skeleton } from "../ui/skeleton";
 import type {
   AvailableRepositoryContext,
@@ -334,6 +335,7 @@ function Gate({ children }: { children: ReactNode }) {
     isPending?: boolean;
     children?: ReactNode;
   }) => <RepositoryModuleUnavailableState label={module.label} Icon={module.Icon} {...props} />;
+  if (availability.kind === "pending") return <LoadingState label={availability.reason} />;
   if (availability.kind !== "ready")
     return unavailable({
       reason: availabilityReason(module, availability),
@@ -359,12 +361,11 @@ function Gate({ children }: { children: ReactNode }) {
   }
   if (context === null)
     return (
-      <div role="status" className="space-y-3 p-4">
-        <span className="sr-only">Loading {module.label}…</span>
+      <LoadingState label={`Loading ${module.label}…`}>
         <Skeleton className="h-8 w-60" />
         <Skeleton className="h-14 w-full" />
         <Skeleton className="h-14 w-full" />
-      </div>
+      </LoadingState>
     );
   const gap = module.providerGap(context);
   if (gap !== null)

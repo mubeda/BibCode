@@ -65,6 +65,35 @@ const output = (data: string): TerminalAttachStreamEvent => ({
 });
 
 describe("createTerminalTranscriptRuntime", () => {
+  it("applies an exit only to the process it names (#378)", () => {
+    const runtime = createTerminalTranscriptRuntime();
+    const first = { boot: "boot-1", process: 4 };
+    const second = { boot: "boot-1", process: 5 };
+    const exited = (generation: typeof first, sequence: number) =>
+      ({
+        type: "exited",
+        threadId: "thread-1",
+        terminalId: "terminal-1",
+        sequence,
+        exitCode: 0,
+        exitSignal: null,
+        generation,
+      }) as const;
+    runtime.ingest({ type: "snapshot", snapshot: { ...snapshotData("$ "), generation: first } });
+    runtime.ingest({
+      type: "restarted",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      sequence: 1,
+      snapshot: { ...snapshotData("$ "), generation: second },
+    });
+    // Process 4's exit arrives late, from a stream that had not caught up.
+    runtime.ingest(exited(first, 9));
+    expect(runtime.metadata().status).toBe("running");
+    runtime.ingest(exited(second, 2));
+    expect(runtime.metadata().status).toBe("exited");
+  });
+
   it("delivers applied size and claim in stream order and hydrates the latest size", () => {
     const runtime = createTerminalTranscriptRuntime();
     runtime.ingest({

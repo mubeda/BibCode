@@ -4559,9 +4559,22 @@ mod tests {
             .expect("mock Tauri app");
         #[cfg(target_os = "linux")]
         app.manage(crate::linux_theme::LinuxThemeState::default());
+        // Tauri on Windows and Linux otherwise puts webview data in the identifier's local app-data
+        // folder, which outlives the test process.
+        // A folder an earlier run with this process id left behind is the test's own.
+        let local_app_data = app
+            .path()
+            .app_local_data_dir()
+            .expect("local app-data folder");
+        let _ = std::fs::remove_dir_all(&local_app_data);
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .data_directory(temp.path().join("webview-data"))
             .build()
             .expect("mock webview");
+        assert!(
+            !local_app_data.exists(),
+            "the test leaves nothing in the local app-data folder"
+        );
         let invoke = |cmd: &str, body: Value| {
             get_ipc_response(
                 &webview,

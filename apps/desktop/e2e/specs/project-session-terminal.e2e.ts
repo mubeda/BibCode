@@ -63,7 +63,7 @@ describe("packaged project session and terminal", () => {
 
     const providerModelPicker = browser.$('[data-chat-provider-model-picker="true"]');
     await expect(providerModelPicker).toBeEnabled();
-    await expect(providerModelPicker).toHaveText(expect.stringContaining("GPT-5.4"));
+    await expect(providerModelPicker).toHaveText(expect.stringContaining("Codex default"));
 
     const composer = browser.$('[data-testid="composer-editor"]');
     await expect(composer).toBeDisplayed();

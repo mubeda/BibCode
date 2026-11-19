@@ -154,6 +154,27 @@ describe("codeReviewGuardLine", () => {
     expect(line("terminal", "codex")).toBe("Runs in Codex's read-only sandbox.");
   });
 
+  it("says a Codex chat review runs on its own only on a server with read-only Codex reviews", () => {
+    const codex = ProviderDriverKind.make("codex");
+    expect(codeReviewGuardLine({ kind: "chat", driver: codex, readOnlyCodexReviews: true })).toBe(
+      "Runs on its own in Codex's read-only sandbox, like the Codex terminal review.",
+    );
+    // An older server still asks before commands, so the line keeps today's wording.
+    expect(codeReviewGuardLine({ kind: "chat", driver: codex, readOnlyCodexReviews: false })).toBe(
+      "Runs in Codex's read-only sandbox. Writes ask for your approval.",
+    );
+    expect(
+      codeReviewGuardLine({ kind: "terminal", driver: codex, readOnlyCodexReviews: true }),
+    ).toBe("Runs in Codex's read-only sandbox.");
+    expect(
+      codeReviewGuardLine({
+        kind: "chat",
+        driver: ProviderDriverKind.make("claudeAgent"),
+        readOnlyCodexReviews: true,
+      }),
+    ).toBe("Starts in Claude's plan mode.");
+  });
+
   it("never promises that a review cannot edit", () => {
     for (const kind of ["chat", "terminal"] as const) {
       for (const driver of ["claudeAgent", "codex", "opencode", "cursor", "grok", "other"]) {

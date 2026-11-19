@@ -521,6 +521,108 @@ describe("clientCollector", () => {
     c.dispose();
   });
 
+  /** Advances the clock by each gap and lets the 500 ms heartbeat fire once per gap. */
+  function beats(gapsMs: readonly number[], clock: { t: number }): void {
+    for (const gap of gapsMs) {
+      clock.t += gap;
+      vi.advanceTimersByTime(500);
+    }
+  }
+
+  function focusedCollector() {
+    vi.useFakeTimers();
+    const clock = { t: 0 };
+    const send = vi.fn(async (_environmentId: string, _batch: any) => ({ accepted: true }));
+    const c = createClientCollector({
+      now: () => clock.t,
+      send,
+      supportedEntryTypes: [],
+      clientId: "c1",
+      raf: nextFrame,
+    });
+    c.setEnabledEnvironments(new Set(["e"]));
+    return { c, clock, send };
+  }
+
+  it("counts no stalls while WebKit delivers a focused page's timers 1 s apart", async () => {
+    // Recorded in a packaged macOS run: visible, focused, frames rendering, every beat 499 to
+    // 519 ms late for minutes, after one irregular beat (925 ms and 361 ms in two runs).
+    for (const onset of [925, 361]) {
+      const { c, clock, send } = focusedCollector();
+      beats([500, 500, 500 + onset], clock);
+      await c.flush();
+      // The irregular beat alone stays under the server's 1 s finding threshold.
+      expect(send.mock.calls[0]![1].stalls.totalMs).toBe(onset);
+      send.mockClear();
+      beats(
+        Array.from({ length: 22 }, (_, i) => 999 + (i % 3)),
+        clock,
+      );
+      await c.flush();
+      expect(send).not.toHaveBeenCalled();
+      // A flush between the first two aligned beats decides nothing yet.
+      beats([500, 1_000], clock);
+      await c.flush();
+      beats([1_019, 1_000], clock);
+      await c.flush();
+      expect(send).not.toHaveBeenCalled();
+      c.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("still counts one beat that is as late as an aligned one", async () => {
+    const { c, clock, send } = focusedCollector();
+    beats([500, 1_000, 500], clock);
+    await c.flush();
+    expect(send.mock.calls[0]![1].stalls).toEqual({ count: 1, totalMs: 500, maxMs: 500 });
+    c.dispose();
+  });
+
+  it("keeps a stall that came before an aligned run", async () => {
+    const { c, clock, send } = focusedCollector();
+    beats([500, 3_000, 1_000, 1_000], clock);
+    await c.flush();
+    expect(send.mock.calls[0]![1].stalls).toEqual({ count: 1, totalMs: 2_500, maxMs: 2_500 });
+    c.dispose();
+  });
+
+  it("counts a held beat when the window loses focus or the recording changes", async () => {
+    const blurred = focusedCollector();
+    beats([500, 1_000], blurred.clock);
+    setFocus(false);
+    await blurred.c.flush();
+    expect(blurred.send.mock.calls[0]![1].stalls.count).toBe(1);
+    blurred.c.dispose();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+
+    const switched = focusedCollector();
+    beats([500, 1_400], switched.clock);
+    switched.c.setEnabledEnvironments(new Set(["other"]));
+    beats([500], switched.clock);
+    await switched.c.flush();
+    // The stall happened while only "e" was recording, which is gone: "other" gets none.
+    expect(switched.send).not.toHaveBeenCalled();
+    switched.c.dispose();
+  });
+
+  it("makes an interrupted run prove itself again", async () => {
+    const { c, clock, send } = focusedCollector();
+    beats([500, 1_000, 1_000, 2_400, 1_900, 1_000, 500], clock);
+    await c.flush();
+    expect(send.mock.calls[0]![1].stalls).toEqual({ count: 3, totalMs: 3_800, maxMs: 1_900 });
+    c.dispose();
+  });
+
+  it("counts a stall on top of an aligned run", async () => {
+    const { c, clock, send } = focusedCollector();
+    beats([500, 1_000, 1_000, 1_000, 3_000, 1_000, 1_000], clock);
+    await c.flush();
+    expect(send.mock.calls[0]![1].stalls).toEqual({ count: 1, totalMs: 2_500, maxMs: 2_500 });
+    c.dispose();
+  });
+
   it("ignores the heartbeat while the system catches up after waking", async () => {
     vi.useFakeTimers();
     let t = 0;

@@ -32,12 +32,21 @@ export const ProjectListEntriesInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(PROJECT_ENTRIES_MAX_LIMIT))),
   refresh: Schema.optional(Schema.Boolean),
+  /**
+   * Asks for the first page of the list instead of the whole list in one reply. A server that
+   * predates paging ignores it and answers the whole list without `nextCursor`.
+   */
+  paged: Schema.optional(Schema.Boolean),
+  /** The previous page's `nextCursor`. */
+  cursor: Schema.optional(TrimmedNonEmptyString),
 });
 export type ProjectListEntriesInput = typeof ProjectListEntriesInput.Type;
 
 export const ProjectListEntriesResult = Schema.Struct({
   entries: Schema.Array(ProjectEntry),
   truncated: Schema.Boolean,
+  /** Present when a paged list has another page of the same index snapshot. */
+  nextCursor: Schema.optional(TrimmedNonEmptyString),
 });
 export type ProjectListEntriesResult = typeof ProjectListEntriesResult.Type;
 
@@ -67,6 +76,7 @@ export const ProjectEntriesFailure = Schema.Literals([
   "search_index_create_failed",
   "search_index_scan_timed_out",
   "search_index_search_failed",
+  "search_index_cursor_stale",
 ]);
 export type ProjectEntriesFailure = typeof ProjectEntriesFailure.Type;
 

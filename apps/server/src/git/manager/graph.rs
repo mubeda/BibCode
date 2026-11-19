@@ -22,9 +22,15 @@ pub const MAX_REASONABLE_DIFF_SIZE: usize = MAX_DIFF_BUFFER_SIZE / 16;
 pub const MAX_DIFF_LINE_CHARACTERS: usize = 5_000;
 const COMMIT_TEXT_LIMIT: usize = 100 * 1024;
 const RECORD_SEPARATOR: char = '\u{1e}';
-/// History pages target 1 MiB of serialized commit JSON. Always retain one
-/// commit so an unusually large entry cannot stop pagination.
+/// History pages hold at most 1 MiB of serialized commit JSON. A page always
+/// keeps one commit so pagination never stalls, and that commit is cut down to
+/// fit the target on its own (see `fit_first_commit`).
 pub const COMMIT_PAGE_TARGET_BYTES: usize = 1024 * 1024;
+/// Room left for `,"changedFilesOmitted":<count>` when changed files are cut.
+const OMITTED_MARKER_BYTES: usize = 48;
+/// A first commit cut to fit leaves this much of the target for the page around it (pinned
+/// tips, offsets) and the RPC envelope, under the 1 MiB logical message a remote client accepts.
+const FIRST_COMMIT_HEADROOM_BYTES: usize = 64 * 1024;
 
 /// The entry's exact JSON size, escaping, field names and numbers included.
 /// It is counted, not built, so the response encoding is the only place the
@@ -33,6 +39,20 @@ pub const COMMIT_PAGE_TARGET_BYTES: usize = 1024 * 1024;
 /// it can only appear as a page's first commit.
 fn encoded_entry_bytes(entry: &GitManagerCommitEntry) -> usize {
     encoded_json_len(entry).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes the first-commit fitter measured on this thread, for its cost test.
+    static FIT_BYTES_MEASURED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `encoded_json_len` for the first-commit fitter, counted in tests.
+fn fit_measure<T: Serialize + ?Sized>(value: &T) -> usize {
+    let bytes = encoded_json_len(value).unwrap_or(usize::MAX);
+    #[cfg(test)]
+    FIT_BYTES_MEASURED.with(|measured| measured.set(measured.get().saturating_add(bytes)));
+    bytes
 }
 
 /// How many leading commits fit the page target; always at least one.
@@ -47,6 +67,87 @@ fn commits_within_target(commits: &[GitManagerCommitEntry], target: usize) -> us
         }
     }
     commits.len()
+}
+
+/// How many leading commits the page keeps. With `fit_first` (a client that shows
+/// `changedFilesOmitted`) its first commit is cut to fit, and the whole page, cut or not, keeps
+/// the headroom free for the page wrapper. Without it the first commit is sent whole and the page
+/// uses the full target, as older clients expect.
+fn fit_page(commits: &mut [GitManagerCommitEntry], fit_first: bool) -> usize {
+    if !fit_first {
+        return commits_within_target(commits, COMMIT_PAGE_TARGET_BYTES);
+    }
+    if let Some(first) = commits.first_mut() {
+        fit_first_commit(first, COMMIT_PAGE_TARGET_BYTES);
+    }
+    commits_within_target(
+        commits,
+        COMMIT_PAGE_TARGET_BYTES - FIRST_COMMIT_HEADROOM_BYTES,
+    )
+}
+
+/// Cuts `entry` until it fits `target` less `FIRST_COMMIT_HEADROOM_BYTES` (#390), and says
+/// whether it cut anything. Changed files go first, from the end, and are counted in
+/// `changed_files_omitted`; then text fields, longest first; then decorations, from the end. The
+/// cut is computed from the sizes of the parts it removes, so the entry is measured whole once.
+/// Only the SHAs and parents, which the graph needs, are never cut.
+fn fit_first_commit(entry: &mut GitManagerCommitEntry, target: usize) -> bool {
+    let budget = target.saturating_sub(FIRST_COMMIT_HEADROOM_BYTES);
+    let size = fit_measure(entry);
+    if size <= budget {
+        return false;
+    }
+    // Each removed array item also frees its comma; the marker room covers the one fewer comma
+    // than items an emptied array frees.
+    let mut excess = size
+        .saturating_sub(budget)
+        .saturating_add(OMITTED_MARKER_BYTES);
+    while excess > 0 {
+        let Some(path) = entry.changed_files.pop() else {
+            break;
+        };
+        excess = excess.saturating_sub(fit_measure(&path).saturating_add(1));
+        entry.changed_files_omitted += 1;
+    }
+    let mut texts = [
+        &mut entry.body,
+        &mut entry.subject,
+        &mut entry.author_name,
+        &mut entry.author_email,
+        &mut entry.committer_name,
+        &mut entry.committer_email,
+    ];
+    texts.sort_by_key(|text| std::cmp::Reverse(text.len()));
+    for text in texts {
+        if excess == 0 {
+            break;
+        }
+        // The text's encoded size without its quotes.
+        let bytes = fit_measure(text.as_str()).saturating_sub(2);
+        if bytes <= excess {
+            excess -= bytes;
+            text.clear();
+            continue;
+        }
+        let keep = bytes - excess;
+        let boundaries = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([text.len()])
+            .collect::<Vec<_>>();
+        let fitting =
+            boundaries.partition_point(|&end| fit_measure(&text[..end]).saturating_sub(2) <= keep);
+        let end = boundaries[fitting.saturating_sub(1)];
+        text.truncate(end);
+        excess = 0;
+    }
+    while excess > 0 {
+        let Some(decoration) = entry.decorations.pop() else {
+            break;
+        };
+        excess = excess.saturating_sub(fit_measure(&decoration).saturating_add(1));
+    }
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -65,6 +166,13 @@ pub struct GitManagerCommitEntry {
     pub committer_email: String,
     pub committed_at_ms: u64,
     pub changed_files: Vec<String>,
+    /// How many changed files `changed_files` leaves out to keep the entry within a page.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub changed_files_omitted: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -120,6 +228,7 @@ pub fn parse_commit_record(record: &str) -> Option<GitManagerCommitEntry> {
             .map(str::to_owned)
             .collect(),
         changed_files: Vec::new(),
+        changed_files_omitted: 0,
     };
     fields.next().is_none().then_some(entry)
 }
@@ -169,6 +278,7 @@ pub async fn page(
     pinned_tips: Option<&[String]>,
     offset: usize,
     limit: usize,
+    fit_first: bool,
     cancellation: &CancellationToken,
 ) -> Result<GitManagerCommitPage, GitManagerGraphError> {
     let (selection, generation) = match pinned_tips {
@@ -245,7 +355,7 @@ pub async fn page(
     }
     let has_more = commits.len() > limit;
     commits.truncate(limit);
-    let kept = commits_within_target(&commits, COMMIT_PAGE_TARGET_BYTES);
+    let kept = fit_page(&mut commits, fit_first);
     let trimmed = kept < commits.len();
     commits.truncate(kept);
     let returned = commits.len();
@@ -376,6 +486,7 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
             None,
             1,
             100,
+            true,
             &CancellationToken::new(),
         )
         .await
@@ -396,6 +507,7 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
             Some(&[missing]),
             0,
             100,
+            true,
             &CancellationToken::new(),
         )
         .await
@@ -439,6 +551,7 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
             None,
             0,
             1,
+            true,
             &CancellationToken::new(),
         )
         .await
@@ -453,6 +566,7 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
             Some(&first.pinned_tips),
             1,
             1,
+            true,
             &CancellationToken::new(),
         )
         .await
@@ -476,6 +590,7 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
             committer_email: "cara@example.test".to_owned(),
             committed_at_ms: 0,
             changed_files: Vec::new(),
+            changed_files_omitted: 0,
         }
     }
 
@@ -487,6 +602,106 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
         assert_eq!(commits_within_target(&huge, COMMIT_PAGE_TARGET_BYTES), 1);
         let small: Vec<_> = (0..100).map(|_| entry_with_body(100)).collect();
         assert_eq!(commits_within_target(&small, COMMIT_PAGE_TARGET_BYTES), 100);
+    }
+
+    /// After a cut first commit, the rest of the page shares its budget, so the whole page with
+    /// its wrapper stays within the target (#390 review).
+    #[test]
+    fn a_page_after_a_cut_first_commit_stays_within_the_target() {
+        let mut first = entry_with_body(0);
+        first.changed_files = (0..27_000)
+            .map(|index| format!("generated/path/{index:05}/file-name.txt"))
+            .collect();
+        // Whole, it fits 1 MiB alone but not the 960 KiB a cut leaves, as in the review.
+        let whole = encoded_entry_bytes(&first);
+        assert!(whole > COMMIT_PAGE_TARGET_BYTES - FIRST_COMMIT_HEADROOM_BYTES);
+        assert!(whole < COMMIT_PAGE_TARGET_BYTES);
+        let mut alone = first.clone();
+        assert!(fit_first_commit(&mut alone, COMMIT_PAGE_TARGET_BYTES));
+        let first_bytes = encoded_entry_bytes(&alone);
+        // A second commit that would just fit the full target after the cut first one.
+        let base = encoded_entry_bytes(&entry_with_body(0));
+        let room = COMMIT_PAGE_TARGET_BYTES - 2 - first_bytes - 1 - 20;
+        let second = entry_with_body(room - base);
+        assert_eq!(encoded_entry_bytes(&second), room);
+        let mut commits = vec![first, second];
+        let kept = fit_page(&mut commits, true);
+        let page = GitManagerCommitPage {
+            generation: 1,
+            pinned_tips: vec!["c".repeat(40)],
+            commits: commits[..kept].to_vec(),
+            next_offset: Some(kept),
+            exhausted: false,
+            degraded_to_all_paging: false,
+        };
+        let bytes = serde_json::to_vec(&page).expect("page JSON").len();
+        assert!(bytes <= COMMIT_PAGE_TARGET_BYTES, "{bytes} bytes");
+    }
+
+    /// With the flag the page keeps the headroom for its wrapper even when no commit needs a
+    /// cut: two commits that each fit leave the serialized page within the target.
+    #[test]
+    fn an_opted_in_page_without_a_cut_stays_within_the_target() {
+        let base = encoded_entry_bytes(&entry_with_body(0));
+        let half = entry_with_body(524_284 - base);
+        assert_eq!(encoded_entry_bytes(&half), 524_284);
+        let mut commits = vec![half.clone(), half];
+        let kept = fit_page(&mut commits, true);
+        let page = GitManagerCommitPage {
+            generation: 1,
+            pinned_tips: vec!["c".repeat(40)],
+            commits: commits[..kept].to_vec(),
+            next_offset: Some(kept),
+            exhausted: false,
+            degraded_to_all_paging: false,
+        };
+        let bytes = serde_json::to_vec(&page).expect("page JSON").len();
+        assert!(bytes <= COMMIT_PAGE_TARGET_BYTES, "{bytes} bytes");
+        // A client without the flag keeps the base behaviour: both commits, the full target.
+        let mut base_commits = vec![entry_with_body(524_284 - base); 2];
+        assert_eq!(fit_page(&mut base_commits, false), 2);
+    }
+
+    /// Fitting a commit with 20,000 decorations measures a bounded number of bytes instead of
+    /// re-encoding the entry once per dropped decoration (#390 review).
+    #[test]
+    fn fitting_a_heavily_decorated_commit_measures_a_bounded_number_of_bytes() {
+        let mut entry = entry_with_body(0);
+        entry.decorations = (0..20_000)
+            .map(|index| format!("tag: refs/tags/release-{index:05}-{}", "x".repeat(50)))
+            .collect();
+        assert!(encoded_entry_bytes(&entry) > COMMIT_PAGE_TARGET_BYTES);
+        FIT_BYTES_MEASURED.with(|measured| measured.set(0));
+        fit_first_commit(&mut entry, COMMIT_PAGE_TARGET_BYTES);
+        let measured = FIT_BYTES_MEASURED.with(std::cell::Cell::get);
+        assert!(measured < 64 * 1024 * 1024, "measured {measured} bytes");
+        assert!(
+            encoded_entry_bytes(&entry) <= COMMIT_PAGE_TARGET_BYTES - FIRST_COMMIT_HEADROOM_BYTES
+        );
+    }
+
+    /// Text that only fits after escaping is cut too, and the SHA and parents stay (#390).
+    #[test]
+    fn a_first_commit_over_the_target_without_files_cuts_its_text() {
+        let mut entry = entry_with_body(0);
+        entry.body = "\u{0001}".repeat(COMMIT_TEXT_LIMIT);
+        entry.subject = "\u{0001}".repeat(COMMIT_TEXT_LIMIT);
+        entry.parents = vec!["b".repeat(40)];
+        assert!(encoded_entry_bytes(&entry) > COMMIT_PAGE_TARGET_BYTES);
+        let sha = entry.sha.clone();
+        fit_first_commit(&mut entry, COMMIT_PAGE_TARGET_BYTES);
+        let bytes = serde_json::to_vec(std::slice::from_ref(&entry))
+            .expect("page JSON")
+            .len();
+        assert!(bytes <= COMMIT_PAGE_TARGET_BYTES, "{bytes} bytes");
+        assert_eq!(entry.sha, sha);
+        assert_eq!(entry.parents, vec!["b".repeat(40)]);
+        assert_eq!(entry.changed_files_omitted, 0);
+        // A commit within the target is left as it was.
+        let small = entry_with_body(100);
+        let mut fitted = small.clone();
+        fit_first_commit(&mut fitted, COMMIT_PAGE_TARGET_BYTES);
+        assert_eq!(fitted, small);
     }
 
     #[test]
@@ -569,6 +784,79 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
         assert_eq!(pages, vec![5, 3, 4, 3, 4, 3, 1, 1, 3, 4, 3, 4, 2]);
     }
 
+    /// A first commit whose changed files alone pass the page target still fits it, and says how
+    /// many files it leaves out (#390).
+    #[tokio::test]
+    async fn a_first_commit_with_a_huge_file_list_stays_within_the_page_target() {
+        let repository = repository_with_one_commit();
+        const FILES: usize = 8_000;
+        // The paths go straight into the index, so no file on disk meets a path length limit.
+        let blob = git_stdout(repository.path(), &["hash-object", "-w", "README.md"]);
+        let index_info = (0..FILES)
+            .map(|index| {
+                format!(
+                    "100644 {} 0\tgenerated/module-{:03}/{}file-{index:05}.txt\n",
+                    blob.trim(),
+                    index / 100,
+                    "nested-directory-name/".repeat(24)
+                )
+            })
+            .collect::<String>();
+        let mut update = Command::new("git")
+            .args(["update-index", "--index-info"])
+            .current_dir(repository.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("git update-index starts");
+        std::io::Write::write_all(
+            update.stdin.as_mut().expect("update-index stdin"),
+            index_info.as_bytes(),
+        )
+        .expect("index info written");
+        assert!(update.wait().expect("update-index ends").success());
+        git(repository.path(), &["commit", "-q", "-m", "many files"]);
+        // A client that does not ask for a fitted first commit gets it whole, as before.
+        let whole = page(
+            &GitRepository::default(),
+            repository.path(),
+            None,
+            0,
+            COMMIT_PAGE_SIZE,
+            false,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("whole history page");
+        assert_eq!(whole.commits[0].changed_files.len(), FILES);
+        assert_eq!(whole.commits[0].changed_files_omitted, 0);
+        let first = page(
+            &GitRepository::default(),
+            repository.path(),
+            None,
+            0,
+            COMMIT_PAGE_SIZE,
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("first history page");
+        let commits_bytes = serde_json::to_vec(&first.commits).expect("page JSON").len();
+        let page_bytes = serde_json::to_vec(&first).expect("page JSON").len();
+        let listed = first.commits[0].changed_files.len();
+        eprintln!(
+            "getCommits first page: {} commits, commits {commits_bytes} bytes, page {page_bytes} bytes, {listed} of {FILES} files listed",
+            first.commits.len()
+        );
+        assert!(
+            commits_bytes <= COMMIT_PAGE_TARGET_BYTES,
+            "{commits_bytes} bytes"
+        );
+        assert!(page_bytes <= COMMIT_PAGE_TARGET_BYTES, "{page_bytes} bytes");
+        assert_eq!(listed + first.commits[0].changed_files_omitted, FILES);
+        assert!(first.commits[0].changed_files_omitted > 0);
+        assert!(listed > 0, "the files that fit stay listed");
+    }
+
     #[tokio::test]
     async fn a_page_of_large_commits_stops_near_one_mebibyte_and_pages_on() {
         let repository = repository_with_one_commit();
@@ -593,27 +881,30 @@ parent1\u{1f}HEAD -> main\0\nfirst.txt\0nested/second.txt\0";
             None,
             0,
             COMMIT_PAGE_SIZE,
+            true,
             &CancellationToken::new(),
         )
         .await
         .expect("first history page");
-        assert_eq!(first.commits.len(), 11, "eleven 90 KiB commits fit 1 MiB");
-        assert_eq!(first.next_offset, Some(11));
+        // The client opted in, so the page keeps the wrapper's headroom: 960 KiB.
+        assert_eq!(first.commits.len(), 10, "ten 90 KiB commits fit 960 KiB");
+        assert_eq!(first.next_offset, Some(10));
         assert!(!first.exhausted);
         let second = page(
             &GitRepository::default(),
             repository.path(),
             Some(first.pinned_tips.as_slice()),
-            11,
+            10,
             COMMIT_PAGE_SIZE,
+            true,
             &CancellationToken::new(),
         )
         .await
         .expect("second history page");
         assert_eq!(
             second.commits.len(),
-            4,
-            "three large commits and the first one"
+            5,
+            "four large commits and the first one"
         );
         assert!(second.exhausted);
     }

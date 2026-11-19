@@ -41,6 +41,7 @@ const h = vi.hoisted(() => ({
   retainedInputs: [] as unknown[],
   firstPageInputs: [] as Array<{ input: { refreshCacheKey: string } }>,
   firstPageWaiting: false,
+  firstPagePending: false,
   firstPageError: null as string | null,
   retainedError: null as string | null,
   retainedWaiting: false,
@@ -51,6 +52,7 @@ const h = vi.hoisted(() => ({
   revalidateFirstPage: vi.fn(),
   scrollNode: null as HTMLElement | null,
   nextPageRequests: [] as number[],
+  nextPageFitFlags: [] as Array<boolean | undefined>,
   nextPageResult: (_request: NextPageRequest): NextPageResult => PENDING_NEXT_PAGE,
   retryNextPage: vi.fn(),
 }));
@@ -86,9 +88,10 @@ vi.mock("../../../localApi", () => ({
 
 vi.mock("../../../state/gitManager", () => ({
   gitManagerEnvironment: {
-    getCommits: vi.fn((request: { input: { offset: number } }) => {
+    getCommits: vi.fn((request: { input: { offset: number; fitFirstCommit?: boolean } }) => {
       const offset = request.input.offset;
       h.nextPageRequests.push(offset);
+      h.nextPageFitFlags.push(request.input.fitFirstCommit);
       const attempt = h.nextPageRequests.filter((requested) => requested === offset).length;
       return { kind: "next", offset, attempt };
     }),
@@ -134,7 +137,12 @@ vi.mock("../../../state/query", () => ({
           : atom?.kind === "commits"
             ? h.firstPageError
             : (next?.error ?? null),
-      isPending: false,
+      isPending:
+        atom?.kind === "commits"
+          ? h.firstPagePending
+          : atom?.kind === "retained"
+            ? h.retainedWaiting
+            : false,
       refresh:
         atom?.kind === "commits"
           ? h.refreshCommits
@@ -164,6 +172,7 @@ vi.mock("../rewrite/gitManagerCommitDrag", () => ({
 
 import { GitManagerCommitList } from "./GitManagerCommitList";
 import { GitManagerHistoryView } from "./GitManagerHistoryView";
+import { expectLoadingModel } from "../../ui/loading-state.testing";
 
 let container: HTMLDivElement;
 let root: Root | null;
@@ -196,6 +205,7 @@ beforeEach(() => {
   h.retainedInputs.length = 0;
   h.firstPageInputs.length = 0;
   h.firstPageWaiting = false;
+  h.firstPagePending = false;
   h.firstPageError = null;
   h.retainedError = null;
   h.retainedWaiting = false;
@@ -205,6 +215,7 @@ beforeEach(() => {
   h.refreshCommits.mockReset();
   h.revalidateFirstPage.mockReset();
   h.nextPageRequests.length = 0;
+  h.nextPageFitFlags.length = 0;
   h.nextPageResult = () => PENDING_NEXT_PAGE;
   h.retryNextPage.mockReset();
   container = document.createElement("div");
@@ -801,6 +812,39 @@ describe("GitManagerHistoryView repository generation tracking", () => {
     expect(firstPageReads()).toHaveLength(2);
   });
 
+  it("labels the first load, then keeps the commits beside a refresh label", async () => {
+    h.firstPagePending = true;
+    await renderHistory(null, null, true);
+    expectLoadingModel(container, ["Loading commit history…"]);
+    h.commitPage = page(4, [commit(50)]);
+    h.firstPagePending = false;
+    await renderHistory(4, 1);
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    h.firstPagePending = true;
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[aria-label="Refresh history"]')?.click(),
+    );
+    expect(h.refreshCommits).toHaveBeenCalledOnce();
+    await renderHistory(4, 1);
+    expect(renderedShas()).toEqual([commit(50).sha]);
+    expectLoadingModel(container, ["Refreshing history…"]);
+  });
+
+  it("keeps a settled empty history on screen while Refresh rereads it", async () => {
+    h.commitPage = page(4, []);
+    await renderHistory(4, 1);
+    expect(container.textContent).toContain("This repository has no commits yet.");
+    h.firstPagePending = true;
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[aria-label="Refresh history"]')?.click(),
+    );
+    await renderHistory(4, 1);
+    expect(container.textContent).toContain("This repository has no commits yet.");
+    expect(container.querySelector('[aria-label="Refresh history"]')).not.toBeNull();
+    expect(container.textContent).not.toContain("Loading commit history…");
+    expectLoadingModel(container, ["Refreshing history…"]);
+  });
+
   it("waits for an in-flight first-page read instead of starting another", async () => {
     h.commitPage = page(4, [commit(50)]);
     await renderHistory(4, 1);
@@ -1122,6 +1166,16 @@ describe("GitManagerHistoryView repository generation tracking", () => {
     expect(retryButton()).toBeUndefined();
   });
 
+  it("keeps the refresh line while the retained pages reread after the first page settled", async () => {
+    await loadWithRetainedBatch();
+    h.retainedWaiting = true;
+    await renderHistory(2, 2);
+    expectLoadingModel(container, ["Refreshing history…"]);
+    h.retainedWaiting = false;
+    await renderHistory(2, 2);
+    expect(container.querySelector('[role="status"]')).toBeNull();
+  });
+
   it("ends a cause without final punctuation before the banner's next sentence", async () => {
     h.commitPage = page(1, [commit(80)]);
     await renderHistory(1, 1);
@@ -1301,6 +1355,14 @@ describe("GitManagerHistoryView paging", () => {
     );
 
     expect(h.refreshCommits).toHaveBeenCalledOnce();
+    // The read is still out: the loaded pages and their cursors stay until it succeeds.
+    h.firstPagePending = true;
+    await renderPagedHistory();
+    expect(container.textContent).toContain("The next page could not load.");
+    expect(loadedCursors()).toEqual([0, 3]);
+    h.firstPagePending = false;
+    h.commitPage = historyPage([commit(1), commit(2), commit(3)], 3);
+    await renderPagedHistory();
     expect(container.textContent).not.toContain("The next page could not load.");
     expect(container.textContent).toContain("3 commits loaded");
     expect(h.nextPageRequests).toEqual([3]);
@@ -1320,6 +1382,8 @@ describe("GitManagerHistoryView paging", () => {
     await renderPagedHistory();
 
     expect(h.nextPageRequests).toEqual([3, 6]);
+    // The commit detail shows changedFilesOmitted, so every page asks for a fitted first commit.
+    expect(h.nextPageFitFlags).toEqual([true, true]);
     expect(container.textContent).toContain("7 commits loaded");
     expect(container.textContent).not.toContain("Loading more commits…");
     expect(loadedCursors()).toEqual([0, 3, 6]);

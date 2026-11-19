@@ -8,6 +8,7 @@ import {
   type ServerProvider,
 } from "@bibcode/contracts";
 import {
+  codexAutoModelOption,
   createModelSelection,
   normalizeModelSlug,
   resolveSelectableModel,
@@ -253,6 +254,7 @@ export function resolveAppModelSelectionForInstance(
   const options = getAppModelOptionsForInstance(settings, entry);
   return (
     resolveSelectableModel(entry.driverKind, selectedModel, options) ??
+    codexAutoModelOption(entry.driverKind, options)?.slug ??
     options[0]?.slug ??
     entry.models[0]?.slug ??
     null

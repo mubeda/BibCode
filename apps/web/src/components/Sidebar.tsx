@@ -187,6 +187,7 @@ import {
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
 import { AgentsUnreadTracker } from "./sidebar/AgentsUnreadTracker";
 import { SendRequestsUnreadTracker } from "./sendToAgent/SendRequestsUnreadTracker";
+import { ServerCommandButtons } from "./serverCommands/ServerCommandButtons";
 import { EnvironmentCardHeader } from "./sidebar/EnvironmentCardHeader";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
 import {
@@ -268,6 +269,7 @@ import {
   getSidebarThreadIdsToPrewarm,
   orderRowsWithPins,
   resolveAdjacentThreadId,
+  resolveVisibleProjectThreads,
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   resolveSidebarProjectAvailability,
@@ -485,6 +487,7 @@ const SIDEBAR_LIST_ANIMATION_OPTIONS = {
   easing: "ease-out",
 } as const;
 const EMPTY_THREAD_JUMP_LABELS = new Map<string, string>();
+const EMPTY_RENDERED_THREADS: readonly SidebarThreadSummary[] = [];
 const EMPTY_EDITOR_IDS: ReadonlyArray<EditorId> = [];
 const PROJECT_GROUPING_MODE_LABELS: Record<SidebarProjectGroupingMode, string> = {
   repository: "Group by repository",
@@ -516,7 +519,12 @@ export function handleSidebarNavigationKeyDown(input: {
     traversalDirection !== null
       ? resolveAdjacentThreadId({
           threadIds: input.orderedThreadKeys,
-          currentThreadId: input.currentThreadKey,
+          // The open chat is not listed while its card is collapsed: traverse from the edge.
+          currentThreadId:
+            input.currentThreadKey !== null &&
+            input.orderedThreadKeys.includes(input.currentThreadKey)
+              ? input.currentThreadKey
+              : null,
           direction: traversalDirection,
         })
       : (() => {
@@ -668,14 +676,19 @@ export const PROJECT_HEADER_ACTION_PADDING = {
 
 export type ProjectHeaderActionCount = keyof typeof PROJECT_HEADER_ACTION_PADDING;
 
-/** Project actions, New worktree and Git Manager always show; Pull Requests and Pipelines may. */
+/**
+ * Project actions, New worktree and Git Manager always show; Pull Requests and Pipelines may.
+ * A server card adds Open terminal and Dashboard (two icons) and never shows the other two.
+ */
 export function projectHeaderActionCount(input: {
   readonly showsPullRequests: boolean;
   readonly showsPipelines: boolean;
+  readonly showsServerCommands: boolean;
 }): ProjectHeaderActionCount {
   return (3 +
     Number(input.showsPullRequests) +
-    Number(input.showsPipelines)) as ProjectHeaderActionCount;
+    Number(input.showsPipelines) +
+    2 * Number(input.showsServerCommands)) as ProjectHeaderActionCount;
 }
 
 export function projectHeaderButtonClassName(input: {
@@ -1335,7 +1348,6 @@ interface SidebarProjectThreadListProps {
   hiddenThreadStatus: WorkspaceCardStatus | null;
   orderedProjectThreadKeys: readonly string[];
   renderedThreads: readonly SidebarThreadSummary[];
-  shouldShowThreadPanel: boolean;
   isThreadListExpanded: boolean;
   activeRouteThreadKey: string | null;
   threadJumpLabelByKey: ReadonlyMap<string, string>;
@@ -1638,7 +1650,6 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
     hiddenThreadStatus,
     orderedProjectThreadKeys,
     renderedThreads,
-    shouldShowThreadPanel,
     isThreadListExpanded,
     activeRouteThreadKey,
     threadJumpLabelByKey,
@@ -1684,7 +1695,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
   const cardLookups = useWorkspaceCardLookups({
     project,
     serverConfigs,
-    active: shouldShowThreadPanel,
+    active: projectExpanded,
     threads: lookupThreads,
     pinnedKeys,
     unreadKeys,
@@ -1721,7 +1732,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
           onHiddenCountChange={onDiscoveryHiddenCountChange}
         />
       ) : null}
-      {projectExpanded || primaryThreadActive ? (
+      {projectExpanded ? (
         <SidebarPrimaryCard
           project={project}
           primaryThread={primaryThread}
@@ -1748,7 +1759,7 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
           navigateToThread={navigateToThread}
         />
       ) : null}
-      {shouldShowThreadPanel &&
+      {projectExpanded &&
         renderedThreads.map((thread) => {
           const keyInfo = cardLookups.keys.get(thread)!;
           const threadKey = keyInfo.key;
@@ -2158,89 +2169,31 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     threadSortOrder,
     workspaceStatuses,
   ]);
-  const pinnedCollapsedThread = useMemo(() => {
-    const activeThreadKey = activeRouteThreadKey ?? undefined;
-    if (!activeThreadKey || projectExpanded) {
-      return null;
-    }
-    return (
-      visibleProjectThreads.find(
-        (thread) =>
-          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === activeThreadKey,
-      ) ?? null
-    );
-  }, [activeRouteThreadKey, projectExpanded, visibleProjectThreads]);
-  // The primary row's thread was
-  // split out of `visibleProjectThreads`, so `pinnedCollapsedThread` (which
-  // only searches that array) never matched it — collapsing a project while
-  // routed to its own default thread hid the primary row entirely, unlike
-  // regular threads which peek through when collapsed+active. Tracked
-  // separately (not folded into `pinnedCollapsedThread` itself) because that
-  // value also drives which threads `SidebarProjectThreadList` renders, and
-  // the primary thread must stay rendered via `SidebarPrimaryRow`, not
-  // `SidebarThreadRow`.
-  const isPrimaryThreadActiveWhileCollapsed = useMemo(() => {
-    if (!primaryThread || projectExpanded || !activeRouteThreadKey) {
-      return false;
-    }
-    return (
-      scopedThreadKey(scopeThreadRef(primaryThread.environmentId, primaryThread.id)) ===
-      activeRouteThreadKey
-    );
-  }, [activeRouteThreadKey, primaryThread, projectExpanded]);
-
-  const { hasOverflowingThreads, hiddenThreadStatus, renderedThreads, shouldShowThreadPanel } =
-    useMemo(() => {
-      const hasOverflowingThreads = visibleProjectThreads.length > sidebarThreadPreviewCount;
-      const previewThreads =
-        isThreadListExpanded || !hasOverflowingThreads
-          ? visibleProjectThreads
-          : visibleProjectThreads.slice(0, sidebarThreadPreviewCount);
-      const visibleThreadKeys = new Set(
-        [...previewThreads, ...(pinnedCollapsedThread ? [pinnedCollapsedThread] : [])].map(
-          (thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
-        ),
-      );
-      // Collapsed + routed to the primary (default) thread: `pinnedCollapsedThread`
-      // stays null (it only searches workspace threads, see
-      // `isPrimaryThreadActiveWhileCollapsed` above) and `shouldShowThreadPanel`
-      // is true so the primary row can peek through -- but that must NOT fall
-      // into the `previewThreads` branch below, or every workspace row's
-      // preview slice would render alongside it. Only render workspace rows
-      // here when actually expanded or peeking a specific pinned/active one.
-      const renderedThreads = pinnedCollapsedThread
-        ? [pinnedCollapsedThread]
-        : projectExpanded
-          ? visibleProjectThreads.filter((thread) =>
-              visibleThreadKeys.has(
-                scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
-              ),
-            )
-          : [];
-      const hiddenThreads = visibleProjectThreads.filter(
-        (thread) =>
-          !visibleThreadKeys.has(scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))),
-      );
-      return {
-        hasOverflowingThreads,
-        hiddenThreadStatus: resolveHighestWorkspaceCardStatus(
-          hiddenThreads.map(workspaceStatuses.statusOf),
-        ),
-        renderedThreads,
-        shouldShowThreadPanel:
-          projectExpanded || pinnedCollapsedThread !== null || isPrimaryThreadActiveWhileCollapsed,
-      };
-    }, [
-      isPrimaryThreadActiveWhileCollapsed,
-      isThreadListExpanded,
-      pinnedCollapsedThread,
-      projectExpanded,
-      sidebarThreadPreviewCount,
-      visibleProjectThreads,
-      workspaceStatuses,
-    ]);
+  // A collapsed card hides every descendant, the open chat's card included (#382).
+  const { hasOverflowingThreads, hiddenThreadStatus, renderedThreads } = useMemo(() => {
+    const hasOverflowingThreads = visibleProjectThreads.length > sidebarThreadPreviewCount;
+    const previewThreads =
+      isThreadListExpanded || !hasOverflowingThreads
+        ? visibleProjectThreads
+        : visibleProjectThreads.slice(0, sidebarThreadPreviewCount);
+    return {
+      hasOverflowingThreads,
+      hiddenThreadStatus: resolveHighestWorkspaceCardStatus(
+        visibleProjectThreads.slice(previewThreads.length).map(workspaceStatuses.statusOf),
+      ),
+      renderedThreads: projectExpanded ? previewThreads : EMPTY_RENDERED_THREADS,
+    };
+  }, [
+    isThreadListExpanded,
+    projectExpanded,
+    sidebarThreadPreviewCount,
+    visibleProjectThreads,
+    workspaceStatuses,
+  ]);
 
   const projectSelected = selectedProjectKey === project.projectKey;
+  // The open chat's card is hidden while collapsed, so the header marks where it is.
+  const holdsOpenChatWhileCollapsed = !projectExpanded && activeRouteThreadKey !== null;
 
   const handleProjectButtonClick = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -3414,9 +3367,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         <SidebarMenuButton
           ref={isManualProjectSorting ? dragHandleProps?.setActivatorNodeRef : undefined}
           aria-expanded={projectExpanded}
-          aria-current={moduleRouteActive ? "page" : undefined}
+          aria-current={
+            moduleRouteActive ? "page" : holdsOpenChatWhileCollapsed ? "true" : undefined
+          }
           data-selected={projectSelected}
-          isActive={moduleRouteActive || projectSelected}
+          isActive={moduleRouteActive || projectSelected || holdsOpenChatWhileCollapsed}
           size="sm"
           className={projectHeaderButtonClassName({
             showsSandboxBadge,
@@ -3425,6 +3380,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             actionCount: projectHeaderActionCount({
               showsPullRequests: showsPullRequestsAction,
               showsPipelines: showsPipelinesAction,
+              showsServerCommands: environmentCard !== null,
             }),
           })}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.attributes : {})}
@@ -3544,6 +3500,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             </TooltipTrigger>
             <TooltipPopup side="top">Git Manager</TooltipPopup>
           </Tooltip>
+          {environmentCard ? (
+            <ServerCommandButtons
+              environmentId={environmentCard.environmentId}
+              target={{ label: environmentCard.label, connected: environmentCard.available }}
+              className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+            />
+          ) : null}
           {showsPullRequestsAction ? (
             <Tooltip>
               <TooltipTrigger
@@ -3589,7 +3552,6 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         hiddenThreadStatus={hiddenThreadStatus}
         orderedProjectThreadKeys={orderedProjectThreadKeys}
         renderedThreads={renderedThreads}
-        shouldShowThreadPanel={shouldShowThreadPanel}
         isThreadListExpanded={isThreadListExpanded}
         activeRouteThreadKey={activeRouteThreadKey}
         threadJumpLabelByKey={threadJumpLabelByKey}
@@ -4874,10 +4836,17 @@ export default function Sidebar() {
       resolveSidebarProjectAvailability({
         projectCount: projects.length,
         catalogReady: shellSummary.catalogReady,
+        catalogFailed: shellSummary.catalogFailed,
         catalogHealth: shellSummary.catalogHealth,
         environments: shellSummary.statuses,
       }),
-    [projects.length, shellSummary.catalogHealth, shellSummary.catalogReady, shellSummary.statuses],
+    [
+      projects.length,
+      shellSummary.catalogFailed,
+      shellSummary.catalogHealth,
+      shellSummary.catalogReady,
+      shellSummary.statuses,
+    ],
   );
   const projectAvailabilityEnvironment = useMemo(() => {
     if (projectAvailability.environmentId === null) {
@@ -5298,56 +5267,59 @@ export default function Sidebar() {
     [repositoryGroupExpandedById, repositoryGroups, sortedProjects],
   );
   const isManualProjectSorting = sidebarProjectSortOrder === "manual";
-  const visibleSidebarThreadKeys = useMemo(
+  const pinnedSidebarThreadKeys = useSidebarWorkspaceMetaStore((state) => state.pinnedThreadKeys);
+  // What each expanded project card shows, in card order: the same rows the card renders, so a
+  // jump shortcut or thread traversal never reaches a thread that has no row.
+  const visibleSidebarThreads = useMemo(
     () =>
       visibleProjectsInOrder.flatMap((project) => {
-        const projectThreads = sortThreads(
-          (threadsByProjectKey.get(project.projectKey) ?? []).filter(
-            (thread) => thread.archivedAt === null,
-          ),
-          sidebarThreadSortOrder,
-        );
         const projectExpanded = resolveProjectExpanded(
           projectExpandedById,
           projectExpansionPreferenceKeys(project),
         );
-        const activeThreadKey = routeThreadKey ?? undefined;
-        const pinnedCollapsedThread =
-          !projectExpanded && activeThreadKey
-            ? (projectThreads.find(
-                (thread) =>
-                  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) ===
-                  activeThreadKey,
-              ) ?? null)
-            : null;
-        const shouldShowThreadPanel = projectExpanded || pinnedCollapsedThread !== null;
-        if (!shouldShowThreadPanel) {
+        if (!projectExpanded) {
           return [];
         }
-        const isThreadListExpanded = expandedThreadListsByProject.has(project.projectKey);
-        const hasOverflowingThreads = projectThreads.length > sidebarThreadPreviewCount;
-        const previewThreads =
-          isThreadListExpanded || !hasOverflowingThreads
-            ? projectThreads
-            : projectThreads.slice(0, sidebarThreadPreviewCount);
-        const renderedThreads = pinnedCollapsedThread ? [pinnedCollapsedThread] : previewThreads;
-        return renderedThreads.map((thread) =>
-          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
-        );
+        const keyOf = (thread: SidebarThreadSummary) =>
+          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+        const { primaryThread, rows } = resolveVisibleProjectThreads({
+          threads: (threadsByProjectKey.get(project.projectKey) ?? []).filter(
+            (thread) => thread.archivedAt === null,
+          ),
+          sort: (threads) => sortThreads(threads, sidebarThreadSortOrder),
+          pinnedKeys: pinnedSidebarThreadKeys,
+          keyOf,
+          isListExpanded: expandedThreadListsByProject.has(project.projectKey),
+          previewCount: sidebarThreadPreviewCount,
+        });
+        return [
+          ...(primaryThread ? [{ key: keyOf(primaryThread), row: false }] : []),
+          ...rows.map((thread) => ({ key: keyOf(thread), row: true })),
+        ];
       }),
     [
       sidebarThreadSortOrder,
       sidebarThreadPreviewCount,
       expandedThreadListsByProject,
+      pinnedSidebarThreadKeys,
       projectExpandedById,
-      routeThreadKey,
       threadsByProjectKey,
       visibleProjectsInOrder,
     ],
   );
+  // Traversal and prewarming cover every thread a card shows, the primary card's included.
+  const visibleSidebarThreadKeys = useMemo(
+    () => visibleSidebarThreads.map((thread) => thread.key),
+    [visibleSidebarThreads],
+  );
+  // Jump labels are drawn on rows only, so only rows take a jump number.
+  const jumpableSidebarThreadKeys = useMemo(
+    () => visibleSidebarThreads.filter((thread) => thread.row).map((thread) => thread.key),
+    [visibleSidebarThreads],
+  );
   const threadJumpCommandByKey = useMemo(() => {
     const mapping = new Map<string, NonNullable<ReturnType<typeof threadJumpCommandForIndex>>>();
-    for (const [visibleThreadIndex, threadKey] of visibleSidebarThreadKeys.entries()) {
+    for (const [visibleThreadIndex, threadKey] of jumpableSidebarThreadKeys.entries()) {
       const jumpCommand = threadJumpCommandForIndex(visibleThreadIndex);
       if (!jumpCommand) {
         return mapping;
@@ -5356,7 +5328,7 @@ export default function Sidebar() {
     }
 
     return mapping;
-  }, [visibleSidebarThreadKeys]);
+  }, [jumpableSidebarThreadKeys]);
   const threadJumpThreadKeys = useMemo(
     () => [...threadJumpCommandByKey.keys()],
     [threadJumpCommandByKey],

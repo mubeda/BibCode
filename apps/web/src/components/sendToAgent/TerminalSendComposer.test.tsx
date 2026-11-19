@@ -454,6 +454,7 @@ describe("TerminalSendComposer", () => {
     ];
     render();
     expect(h.buttonProps.at(-1)!["waitingAnswers"]).toBe(1);
+    expect(h.buttonProps.at(-1)!["prominent"]).toBe(true);
   });
 
   describe("answers and requests of this terminal", () => {

@@ -1,4 +1,5 @@
 import {
+  CODEX_AUTO_MODEL,
   DEFAULT_MODEL,
   DEFAULT_MODEL_BY_PROVIDER,
   MODEL_SLUG_ALIASES_BY_PROVIDER,
@@ -357,6 +358,89 @@ export function getModelSelectionOptionDescriptors(
 
 export function isClaudeUltrathinkPrompt(text: string | null | undefined): boolean {
   return typeof text === "string" && /\bultrathink\b/i.test(text);
+}
+
+/** Codex retired these for ChatGPT sign-in on 31 August 2026. An API-key session still runs them. */
+const RETIRED_CODEX_MODELS: ReadonlySet<string> = new Set(["gpt-5.4", "gpt-5.4-mini"]);
+
+/**
+ * The retired Codex model that a thread stored, when the selection about to be sent replaced it
+ * with Codex's default because Codex no longer offers it. Under ChatGPT sign-in Codex's live
+ * model list leaves a retired model out, so the picker falls back to "auto". Under API-key
+ * sign-in the list still offers it: the stored model is sent unchanged, and a person who then
+ * picks Codex's default did so on purpose. Both return null.
+ */
+export function replacedRetiredCodexModel(input: {
+  readonly driver: ProviderDriverKind;
+  readonly stored: { readonly instanceId: string; readonly model: string } | null | undefined;
+  readonly sent: { readonly instanceId: string; readonly model: string };
+  readonly offered: ReadonlyArray<{ readonly slug: string }>;
+}): string | null {
+  const { driver, offered, sent, stored } = input;
+  if (
+    driver !== CODEX_PROVIDER_DRIVER_KIND ||
+    !stored ||
+    stored.instanceId !== sent.instanceId ||
+    sent.model !== CODEX_AUTO_MODEL
+  ) {
+    return null;
+  }
+  return retiredCodexModelNotOffered(stored.model, offered);
+}
+
+/** The retired model `stored` names, when Codex's live list is known and leaves it out. */
+function retiredCodexModelNotOffered(
+  stored: string,
+  offered: ReadonlyArray<{ readonly slug: string }>,
+): string | null {
+  const model = normalizeModelSlug(stored, CODEX_PROVIDER_DRIVER_KIND);
+  if (model === null || !RETIRED_CODEX_MODELS.has(model)) {
+    return null;
+  }
+  // A list with nothing but "auto" is the placeholder shown before Codex's own list is read,
+  // which says nothing about what Codex offers.
+  if (!offered.some((option) => option.slug !== CODEX_AUTO_MODEL)) {
+    return null;
+  }
+  return offered.some((option) => option.slug === model || option.slug === stored) ? null : model;
+}
+
+/**
+ * The retired model a saved Codex default names, when Codex no longer offers it (ChatGPT
+ * sign-in). The caller then saves Codex's default in its place (#380, R4). Null under API-key
+ * sign-in, where the list still offers the model, and before Codex's list is read.
+ */
+export function retiredCodexSessionDefault(input: {
+  readonly saved: { readonly model: string } | null | undefined;
+  readonly offered: ReadonlyArray<{ readonly slug: string }>;
+}): string | null {
+  return input.saved ? retiredCodexModelNotOffered(input.saved.model, input.offered) : null;
+}
+
+/**
+ * The model to fall back to when nothing selectable was chosen. For Codex it is the "auto"
+ * entry, wherever a saved picker order put it. Other providers keep their own order: the first
+ * built-in model, else the first model.
+ */
+export function fallbackModelOption<
+  T extends { readonly slug: string; readonly isCustom?: boolean },
+>(driver: ProviderDriverKind, models: ReadonlyArray<T>): T | null {
+  return (
+    codexAutoModelOption(driver, models) ??
+    models.find((model) => !model.isCustom) ??
+    models[0] ??
+    null
+  );
+}
+
+/** Codex's "no model chosen" entry in `models`, or null for another provider or a list without it. */
+export function codexAutoModelOption<
+  T extends { readonly slug: string; readonly isCustom?: boolean },
+>(driver: ProviderDriverKind, models: ReadonlyArray<T>): T | null {
+  if (driver !== CODEX_PROVIDER_DRIVER_KIND) {
+    return null;
+  }
+  return models.find((model) => model.slug === CODEX_AUTO_MODEL && !model.isCustom) ?? null;
 }
 
 export function normalizeModelSlug(

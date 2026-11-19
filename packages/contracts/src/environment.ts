@@ -111,6 +111,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   sideChats: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `worktree.createPanel` takes `codeReview`: a review panel that offers no Implement (#293). */
   codeReviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** A Codex code review panel never asks and runs in Codex's read-only sandbox (#376). */
+  readOnlyCodexReviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `thread.delete` takes `onlyIfUnused` and refuses a used thread (#265). */
   threadDeleteOnlyIfUnused: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** The `agentMessaging.enabled` setting and the agent messaging tools exist. */

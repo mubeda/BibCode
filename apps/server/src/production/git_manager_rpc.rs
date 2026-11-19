@@ -606,6 +606,7 @@ impl ConfiguredGitManagerRpcServices {
                         input.pinned_tips.as_deref(),
                         input.offset.unwrap_or(0),
                         input.limit.unwrap_or(100),
+                        input.fit_first_commit == Some(true),
                         &cancellation,
                     )
                     .await
@@ -1372,6 +1373,8 @@ struct GitManagerGetCommitsInput {
     pinned_tips: Option<Vec<String>>,
     offset: Option<usize>,
     limit: Option<usize>,
+    /// The client shows `changedFilesOmitted`, so a huge first commit may be cut (#390).
+    fit_first_commit: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

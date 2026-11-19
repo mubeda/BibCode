@@ -66,6 +66,8 @@ export interface OrderedTerminalInputBinding {
   ) => Effect.Effect<void, TerminalInputError>;
   /** Synchronously fences all work; cancellation of the captured lease runs independently. */
   readonly dispose: () => void;
+  /** Disposed, by its owner or by a failure: it accepts no more work. */
+  readonly stopped: () => boolean;
 }
 
 export function createOrderedTerminalInputBinding(
@@ -223,6 +225,7 @@ export function createOrderedTerminalInputBinding(
         catch: mapError,
       }),
     dispose,
+    stopped: () => stopped,
   };
 }
 
@@ -240,7 +243,8 @@ export function createTerminalInputBindingRegistry() {
     ) {
       const id = key(environmentId, target);
       let binding = bindings.get(id);
-      if (binding == null || binding.session !== session) {
+      // A binding a failure stopped would replay that failure to every later attachment.
+      if (binding == null || binding.session !== session || binding.stopped()) {
         binding?.dispose();
         binding = createOrderedTerminalInputBinding(session, environmentId, target, context);
         bindings.set(id, binding);

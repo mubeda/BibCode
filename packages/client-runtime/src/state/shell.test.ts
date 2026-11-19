@@ -11,6 +11,7 @@ import {
   PrimaryConnectionTarget,
   type SupervisorConnectionState,
 } from "../connection/model.ts";
+import type { EnvironmentCatalogState } from "./connections.ts";
 import type { EnvironmentShellState } from "./shell.ts";
 import type { ConnectionCatalogHealth } from "../platform/persistence.ts";
 import {
@@ -121,6 +122,25 @@ describe("environment shell projections", () => {
     });
   });
 
+  it("carries a failed connection runtime into the summary", () => {
+    const catalogValueAtom = Atom.make<EnvironmentCatalogState>({
+      isReady: false,
+      entries: new Map(),
+    });
+    const summaryAtom = createEnvironmentShellSummaryAtom({
+      catalogValueAtom,
+      shellStateValueAtom: Atom.family((_environmentId: EnvironmentId) =>
+        Atom.make(shellState({ status: "live", updatedAt: "2026-07-01T00:00:00.000Z" })),
+      ),
+    });
+    const registry = AtomRegistry.make();
+
+    expect(registry.get(summaryAtom).catalogFailed).toBe(false);
+    // The summary keeps its previous value when nothing it compares changed, so the flag must count.
+    registry.set(catalogValueAtom, { isReady: false, entries: new Map(), failed: true });
+    expect(registry.get(summaryAtom).catalogFailed).toBe(true);
+  });
+
   it("maps structured supervisor failures without inspecting error text", () => {
     const blocked = (lastFailure: SupervisorConnectionState["lastFailure"]) => ({
       ...AVAILABLE_CONNECTION_STATE,
@@ -226,6 +246,7 @@ describe("environment shell projections", () => {
 
     expect(summary).toEqual({
       catalogReady: true,
+      catalogFailed: false,
       catalogHealth: { status: "ready" },
       desiredEnvironmentCount: 2,
       statuses: [

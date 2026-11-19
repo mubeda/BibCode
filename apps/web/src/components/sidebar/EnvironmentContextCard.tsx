@@ -9,8 +9,13 @@ import { environmentCatalog } from "../../connection/catalog";
 import { cn } from "../../lib/utils";
 import { useActiveEnvironmentId } from "../../state/entities";
 import { useEnvironment } from "../../state/environments";
-import { useOpenHostDashboard } from "../../state/hostDashboard";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { ServerCommandButtons } from "../serverCommands/ServerCommandButtons";
+import {
+  serverCommandTarget,
+  serverCommandUnavailableReason,
+  useRunServerCommand,
+} from "../serverCommands/serverCommands";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { buildEnvironmentContextCardView } from "./environmentContextCard.logic";
@@ -35,7 +40,7 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
   const activeEnvironmentId = useActiveEnvironmentId();
   const environment = useEnvironment(activeEnvironmentId);
   const navigate = useNavigate();
-  const openHostDashboard = useOpenHostDashboard();
+  const runServerCommand = useRunServerCommand();
   const disconnectEnvironment = useAtomCommand(environmentCatalog.disconnect, {
     reportFailure: false,
   });
@@ -53,9 +58,11 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
     [environment],
   );
 
-  if (view === null || activeEnvironmentId === null) {
+  if (view === null || environment === null || activeEnvironmentId === null) {
     return null;
   }
+  const commandTarget = serverCommandTarget(environment);
+  const commandUnavailableReason = serverCommandUnavailableReason(commandTarget);
 
   // A failure reason ("No data from … for 30 seconds. …") runs to several
   // lines, so it takes its own line, clamped to three, and the version moves
@@ -134,6 +141,12 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
           {props.updateBadge ?? null}
         </div>
       </div>
+      <ServerCommandButtons
+        environmentId={activeEnvironmentId}
+        target={commandTarget}
+        className="inline-flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+        iconClassName="size-4"
+      />
       <Menu>
         <MenuTrigger
           render={
@@ -148,7 +161,14 @@ export function EnvironmentContextCard(props: EnvironmentContextCardProps) {
           <EllipsisIcon className="size-4" />
         </MenuTrigger>
         <MenuPopup align="end">
-          <MenuItem onClick={() => openHostDashboard(activeEnvironmentId)}>Host dashboard</MenuItem>
+          {/* The same center panel as the Dashboard button, so there is one dashboard here. */}
+          <MenuItem
+            disabled={commandUnavailableReason !== null}
+            title={commandUnavailableReason ?? undefined}
+            onClick={() => runServerCommand("dashboard", activeEnvironmentId)}
+          >
+            Host dashboard
+          </MenuItem>
           <MenuItem onClick={() => void disconnectEnvironment(activeEnvironmentId)}>
             Disconnect
           </MenuItem>

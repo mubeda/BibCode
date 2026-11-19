@@ -348,10 +348,10 @@ it("returns from real History PNG selection to exactly one visible working-tree 
     expect(retainedImage).not.toBeNull();
     // The list and the diff share one split under the filters; the commit form sits in its own
     // pane below it. Both panes resize, so the list is not a direct child of the section.
-    const split = list.parentElement!.parentElement!;
     const diffSlot = retainedImage.parentElement!;
+    const split = diffSlot.parentElement!;
     expect(split.parentElement).toBe(changes);
-    expect(diffSlot.parentElement).toBe(split);
+    expect(split.contains(list)).toBe(true);
     expect(retainedCommit.parentElement!.parentElement).toBe(changes);
     expect(
       retainedCommit.querySelector<HTMLInputElement>('input[name="git-manager-summary"]')?.value,

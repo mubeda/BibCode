@@ -192,7 +192,9 @@ describe("GitManagerMergeDialog", () => {
 
     const confirm = buttonWithText("Merge");
     expect(confirm.disabled).toBe(true);
-    expect(confirm.title).toBe("Nothing to merge: `feature` has no commits that `main` lacks.");
+    expect(confirm.parentElement?.title).toBe(
+      "Nothing to merge: `feature` has no commits that `main` lacks.",
+    );
     expect(container.textContent).toContain("Nothing to merge");
   });
 
@@ -206,8 +208,9 @@ describe("GitManagerMergeDialog", () => {
 
     const confirm = buttonWithText("Merge");
     expect(confirm.disabled).toBe(true);
-    expect(confirm.title).toBe(message);
-    expect(confirm.getAttribute("aria-describedby")).toBe("git-manager-merge-disabled-reason");
+    expect(confirm.parentElement?.title).toBe(message);
+    const describedBy = confirm.getAttribute("aria-describedby");
+    expect(document.getElementById(describedBy ?? "")?.textContent).toBe(message);
     expect(container.textContent).toContain(message);
   });
 
@@ -216,7 +219,8 @@ describe("GitManagerMergeDialog", () => {
     await renderDialog([branch("main", true), branch("feature")], vi.fn(), reason);
 
     expect(h.previewMerge).not.toHaveBeenCalled();
-    expect(buttonWithText("Merge")).toMatchObject({ disabled: true, title: reason });
+    expect(buttonWithText("Merge").disabled).toBe(true);
+    expect(buttonWithText("Merge").parentElement?.title).toBe(reason);
     expect(container.textContent).toContain(reason);
     expect(buttonWithText("Cancel").disabled).toBe(false);
     expect(container.textContent).toContain("feature");
@@ -235,7 +239,8 @@ describe("GitManagerMergeDialog", () => {
     expect(h.previewMerge).toHaveBeenLastCalledWith(
       expect.objectContaining({ input: { cwd: "/repo", source: "refs/remotes/origin/topic" } }),
     );
-    expect(buttonWithText("Merge")).toMatchObject({ disabled: true, title: message });
+    expect(buttonWithText("Merge").disabled).toBe(true);
+    expect(buttonWithText("Merge").parentElement?.title).toBe(message);
   });
 
   it("merges the checked-out branch into another branch with merge-into", async () => {
@@ -262,6 +267,77 @@ describe("GitManagerMergeDialog", () => {
       },
       expect.any(Function),
     );
+  });
+
+  it("fixes the source to the selected branch and waits for an Into choice", async () => {
+    await renderDialog([branch("main", true), branch("release")], vi.fn(), null, [], {
+      mergeIntoAvailable: true,
+      sourceBranch: "main",
+    });
+    expect(container.textContent).toContain("Source: main");
+    expect(container.querySelector('[aria-label="Source branches"]')).toBeNull();
+    expect(buttonWithText("Merge").disabled).toBe(true);
+    expect(buttonWithText("Merge").parentElement?.title).toBe("Choose a branch to merge into.");
+    expect(h.previewMerge).not.toHaveBeenCalled();
+  });
+
+  it("offers every other branch as Into and merges the fixed source into the choice", async () => {
+    h.preview = { ...cleanPreview, source: "refs/heads/main", current: "release" };
+    await renderDialog([branch("main", true), branch("release")], vi.fn(), null, [], {
+      mergeIntoAvailable: true,
+      sourceBranch: "main",
+    });
+    await act(async () => {
+      targetInput().focus();
+      targetInput()
+        .closest('[data-slot="input-control"]')
+        ?.parentElement?.querySelector<HTMLButtonElement>('[data-slot="combobox-trigger"]')
+        ?.click();
+    });
+    const options = [...document.querySelectorAll('[role="option"]')].map((o) => o.textContent);
+    expect(options).toEqual(["release"]);
+    await chooseTarget("release");
+    await act(async () => buttonWithText("Merge").click());
+    expect(h.runOperation).toHaveBeenLastCalledWith(
+      expect.anything(),
+      {
+        environmentId: "env-a",
+        input: {
+          _tag: "merge-into",
+          cwd: "/repo",
+          projectId: "project-a",
+          source: "refs/heads/main",
+          target: "release",
+        },
+      },
+      expect.any(Function),
+    );
+  });
+
+  it("shows a target-neutral title and no Squash until a target is chosen from a fixed source", async () => {
+    await renderDialog([branch("main", true), branch("release")], vi.fn(), null, [], {
+      mergeIntoAvailable: true,
+      sourceBranch: "main",
+    });
+    expect(container.querySelector("h2")?.textContent).toBe("Merge main into another branch");
+    expect(buttonWithText("Squash merge", { optional: true })).toBeNull();
+  });
+
+  it("never falls back to an ordinary merge when the chosen target becomes checked out", async () => {
+    h.preview = { ...cleanPreview, source: "refs/heads/main", current: "release" };
+    const extra = { mergeIntoAvailable: true, sourceBranch: "main" };
+    await renderDialog([branch("main", true), branch("release")], vi.fn(), null, [], extra);
+    await chooseTarget("release");
+    await renderDialog([branch("main"), branch("release", true)], vi.fn(), null, [], extra);
+    const merge = buttonWithText("Merge");
+    expect(merge.disabled).toBe(true);
+    // The reason sits on a wrapper that still receives hover; the disabled button ignores the pointer.
+    expect(merge.title).toBe("");
+    expect(merge.parentElement?.title).toBe(
+      "release is now checked out. Use Merge… to merge into the checked-out branch.",
+    );
+    await act(async () => merge.click());
+    expect(h.runOperation).not.toHaveBeenCalled();
   });
 
   it("keeps Merge disabled until the preview matches the chosen target", async () => {
@@ -457,10 +533,10 @@ describe("GitManagerMergeDialog", () => {
     h.preview = null;
     h.error = "The current HEAD could not be resolved for merge preview.";
     await renderDialog([branch("main", true), branch("feature")]);
-    expect(buttonWithText("Merge")).toMatchObject({
-      disabled: true,
-      title: "The current HEAD could not be resolved for merge preview.",
-    });
+    expect(buttonWithText("Merge").disabled).toBe(true);
+    expect(buttonWithText("Merge").parentElement?.title).toBe(
+      "The current HEAD could not be resolved for merge preview.",
+    );
   });
 
   it("closes on a conflicted current-branch merge so the panel strip shows", async () => {

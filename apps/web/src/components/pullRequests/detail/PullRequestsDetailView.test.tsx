@@ -13,6 +13,7 @@ import { recordPrefetch, resetPrefetchGates } from "../hoverPrefetch.logic";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { context, detail, fakeNavigation, gitlabContext } from "./testFixtures";
 import { click, allowed } from "../review/testHelpers";
+import { clearResourceRefusals } from "../../repositoryModule/resourceRefusal";
 const h = vi.hoisted(() => ({
   command: vi.fn(),
   data: {} as Record<string, unknown>,
@@ -92,6 +93,7 @@ vi.mock("@tanstack/react-router", () => ({
   Link: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,
 }));
 import { PullRequestsDetailView } from "./PullRequestsDetailView";
+import { expectLoadingModel } from "../../ui/loading-state.testing";
 import {
   PullRequestsFileAnchorContext,
   PullRequestsNavigationContext,
@@ -182,12 +184,50 @@ beforeEach(() => {
   vi.clearAllMocks();
   h.command.mockResolvedValue({ _tag: "Success", value: { kind: "done" } });
   usePullRequestsStore.setState({ byProjectKey: {} });
+  clearResourceRefusals();
 });
 afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
 });
 describe("PullRequestsDetailView", () => {
+  it("hides the detail beside a refusal until a later read of it succeeds", async () => {
+    await render();
+    expect(container.textContent).toContain(detail.title);
+    h.errors.get = new PullRequestsOperationError({
+      operation: "pullRequests.get",
+      code: "forbidden",
+      message: "You can't view this request.",
+      hostDetail: null,
+      retryable: false,
+    });
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "You can't view this request.",
+    );
+    expect(container.textContent).not.toContain(detail.title);
+    // A failure of another kind while the refusal is held never shows the old detail.
+    h.errors.get = new PullRequestsOperationError({
+      operation: "pullRequests.get",
+      code: "host_unreachable",
+      message: "Could not refresh request details. Try again.",
+      hostDetail: null,
+      retryable: true,
+    });
+    await render();
+    expect(container.textContent).not.toContain(detail.title);
+    // Held with no live failure and the same value: it still says why nothing is shown.
+    delete h.errors.get;
+    await render();
+    expect(container.textContent).not.toContain(detail.title);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "You can't view this pull request.",
+    );
+    h.data.get = { ...detail };
+    await render();
+    expect(container.textContent).toContain(detail.title);
+  });
+
   it("uses the loaded GitLab vocabulary in the action owner's stale-head toast", async () => {
     h.data.get = { ...detail, permissions: { ...detail.permissions, comment: allowed } };
     usePullRequestsStore.getState().setCommentDraft(projectRef, 14, "Keep this draft");
@@ -314,6 +354,51 @@ describe("PullRequestsDetailView", () => {
       environmentId: "env",
       input: { cwd: scope.cwd, number: 14, action: "setLabels", add: ["bug"], remove: [] },
     });
+  });
+
+  it("shows refresh feedback while a change event's stored read is pending", async () => {
+    await render("conversation");
+    expect(document.querySelector('[role="status"][aria-label^="Refreshing"]')).toBeNull();
+    h.pendingQueries.add("readSnapshot");
+    await render("conversation");
+    expect(document.querySelector('[role="status"][aria-label^="Refreshing"]')).not.toBeNull();
+  });
+
+  it("leaves a cold tab's first-load feedback to the tab, not the outer refresh line", async () => {
+    delete h.data.getTimeline;
+    h.pendingQueries.add("getTimeline");
+    await render("conversation");
+    expectLoadingModel(document, ["Loading Conversation…"]);
+  });
+
+  it("names a cold tab's first load once when opening it also rereads the stored copy", async () => {
+    await render("conversation");
+    // Opening Commits starts its own read and a stored-copy read keyed by the tab.
+    delete h.data.getCommits;
+    h.pendingQueries.add("getCommits");
+    h.pendingQueries.add("readSnapshot");
+    await render("commits");
+    expectLoadingModel(document, ["Loading Commits…"]);
+  });
+
+  it("names a detail reread once, outside every busy region, while the tab stays exposed", async () => {
+    await render("conversation");
+    h.pendingQueries.add("get");
+    await render("conversation");
+    expectLoadingModel(document, ["Refreshing pull request #14…"]);
+    // The shown tab is one of the regions being refreshed.
+    expect(document.querySelector('[role="tabpanel"] [aria-busy="true"]')).not.toBeNull();
+  });
+
+  it("keeps refresh feedback while the Files tab's review threads are the last read running", async () => {
+    await render("files");
+    expect(document.querySelector('[role="status"][aria-label^="Refreshing"]')).toBeNull();
+    h.pendingQueries.add("getTimeline");
+    await render("files");
+    expectLoadingModel(document, ["Refreshing pull request #14…"], ["Preparing diffs…"]);
+    h.pendingQueries.delete("getTimeline");
+    await render("files");
+    expect(document.querySelector('[role="status"][aria-label^="Refreshing"]')).toBeNull();
   });
 
   it("invalidates commits, checks and files after an update without subscribing inactive tabs", async () => {

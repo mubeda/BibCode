@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 import { desktopUiFixture } from "../support/test-project.ts";
 import {
   ensureMainSidebarOpen,
+  expectRightPanelBesideChat,
   mockDesktopUiFolderPicker,
   setDesktopUiWindowSize,
 } from "../support/ui-state.ts";
@@ -194,7 +195,9 @@ async function loadedImage(): Promise<{ width: number; height: number } | null> 
 describe("packaged Files binary previews", () => {
   it("shows a PNG, an SVG without running its script, and a PDF from the Files tree", async () => {
     writeFixtureFiles();
-    await setDesktopUiWindowSize(1_600, 1_000);
+    // The case needs only the Files panel beside the chat, and this size fits a laptop screen.
+    await setDesktopUiWindowSize(1_200, 720);
+    await expectRightPanelBesideChat();
     await openFixtureWorkspace();
     await openFilesSurface();
     await watchSecurityPolicyViolations();

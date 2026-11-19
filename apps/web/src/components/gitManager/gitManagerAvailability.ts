@@ -18,7 +18,7 @@ export const GIT_MANAGER_TAG_DISABLED_REASON =
 export const GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON =
   "This environment does not support Git Manager pull request operations.";
 export const GIT_MANAGER_MERGE_INTO_DISABLED_REASON =
-  "This environment does not support merging into a branch that is not checked out.";
+  "Merging into a branch that is not checked out needs Git 2.38 or later and a current server on this environment.";
 export const GIT_MANAGER_LIVE_SIGNAL_DISABLED_REASON =
   "This environment does not support Git Manager live updates. Use Refresh to load new repository data.";
 

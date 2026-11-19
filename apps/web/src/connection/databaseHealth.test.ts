@@ -171,15 +171,40 @@ describe("connection database health", () => {
 
       // Attach the rejection expectation before the timer fires so the
       // settle rejection is never momentarily unhandled.
-      const settleFailure = expect(pending).rejects.toThrow("Close them and try again");
+      const settleFailure = expect(pending).rejects.toThrow("quit BiBCode and open it again");
       await vi.advanceTimersByTimeAsync(15_000);
       await settleFailure;
-      expect(getConnectionDatabaseHealth()).toMatchObject({ status: "blocked" });
+      // The timed-out recovery, which offers no Reload, replaces the blocked view.
+      expect(getConnectionDatabaseHealth()).toMatchObject({
+        status: "unavailable",
+        timedOut: true,
+      });
+
+      // An event after the deadline changes nothing: the reset already failed.
+      deletion.fire("success");
+      expect(getConnectionDatabaseHealth()).toMatchObject({ timedOut: true });
 
       // Health reporting keeps flowing afterwards.
       const laterOpen = new FakeRequest();
       monitorConnectionDatabaseOpenRequest(laterOpen);
       laterOpen.fire("success");
+      expect(getConnectionDatabaseHealth().status).toBe("ready");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears its deadline when the deletion request throws", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("indexedDB", {
+        deleteDatabase: () => {
+          throw new DOMException("not allowed", "SecurityError");
+        },
+      });
+      await expect(deleteIncompatibleConnectionDatabase()).rejects.toThrow("not allowed");
+      await vi.advanceTimersByTimeAsync(15_000);
+
       expect(getConnectionDatabaseHealth().status).toBe("ready");
     } finally {
       vi.useRealTimers();

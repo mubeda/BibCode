@@ -923,6 +923,10 @@ interface TerminalViewportProps {
   visible: boolean;
   onSessionExited: () => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
+  /** False when no chat owns the terminal: no Add to chat, and links open without one. */
+  chatThread?: boolean;
+  /** The session exists already: attach to it and never start one (no working directory). */
+  attachOnly?: boolean;
   focusRequestId: number;
   autoFocus: boolean;
   keybindings: ResolvedKeybindingsConfig;
@@ -970,6 +974,8 @@ export function TerminalViewport({
   visible,
   onSessionExited,
   onAddTerminalContext,
+  chatThread = true,
+  attachOnly = false,
   focusRequestId,
   autoFocus,
   keybindings,
@@ -1082,7 +1088,8 @@ export function TerminalViewport({
   );
   const openTerminalPath = useEffectEvent((target: string) => openInPreferredEditor(target));
   const readWorkspaceUnavailable = useEffectEvent(() => workspaceUnavailable);
-  const readHasThread = useEffectEvent(() => threadRef.threadId.length > 0);
+  const readHasThread = useEffectEvent(() => chatThread && threadRef.threadId.length > 0);
+  const readChatThread = useEffectEvent(() => chatThread);
   const openPreview = useAtomCommand(previewEnvironment.open, {
     reportFailure: false,
   });
@@ -1106,7 +1113,7 @@ export function TerminalViewport({
   const routeTerminalUrl = useEffectEvent((url: string, invert: boolean) => {
     const outcome = openLink({
       url,
-      threadRef: threadRef.threadId.length > 0 ? threadRef : null,
+      threadRef: readHasThread() ? threadRef : null,
       environmentId,
       invert,
       openPreview,
@@ -1210,9 +1217,6 @@ export function TerminalViewport({
       error: error instanceof Error ? error.name : error === undefined ? undefined : typeof error,
     });
   }, []);
-  const handleSessionExited = useEffectEvent(() => {
-    onSessionExited();
-  });
   const handleAddTerminalContext = useEffectEvent((selection: TerminalContextSelection) => {
     onAddTerminalContext(selection);
   });
@@ -1270,12 +1274,17 @@ export function TerminalViewport({
     terminal: {
       threadId,
       terminalId,
-      cwd,
       ...readyRenderer?.dimensions,
       ...(sizeOwnership && readyRenderer ? { sizeClaim: readyRenderer.sizeClaim } : {}),
-      ...(worktreePath !== undefined ? { worktreePath } : {}),
-      ...(spawnEnv ? { env: spawnEnv } : {}),
-      ...(command ? { command } : {}),
+      // Without a working directory the server attaches only: a missing session stays missing.
+      ...(attachOnly
+        ? {}
+        : {
+            cwd,
+            ...(worktreePath !== undefined ? { worktreePath } : {}),
+            ...(spawnEnv ? { env: spawnEnv } : {}),
+            ...(command ? { command } : {}),
+          }),
       ...(centerPanel ? { centerPanel } : {}),
     },
     attach: shouldRender && canAttachTerminal && readyRenderer !== null,
@@ -1286,6 +1295,9 @@ export function TerminalViewport({
   const readTerminalGeneration = useEffectEvent(() => terminalGeneration);
   const readServerOs = useEffectEvent(() => serverConfig?.environment.platform.os);
   const transcriptRuntime = terminalSession.transcriptRuntime;
+  const handleSessionExited = useEffectEvent(() => {
+    onSessionExited();
+  });
   const [observedTerminalError, setObservedTerminalError] = useState(terminalError);
   if (terminalError !== observedTerminalError) {
     setObservedTerminalError(terminalError);
@@ -2216,7 +2228,7 @@ export function TerminalViewport({
         const clicked = await localApi.contextMenu.show(
           [
             { id: "copy", label: "Copy" },
-            { id: "add-to-chat", label: "Add to chat" },
+            ...(readChatThread() ? [{ id: "add-to-chat", label: "Add to chat" }] : []),
           ],
           nextAction.position,
         );
@@ -3232,6 +3244,10 @@ interface ThreadTerminalPanelProps {
   onActiveTerminalChange: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
+  /** False when no chat owns the terminal; see `TerminalViewport`. */
+  chatThread?: boolean;
+  /** See `TerminalViewport`. */
+  attachOnly?: boolean;
   keybindings: ResolvedKeybindingsConfig;
   /** Prefer server-provided tab titles when present (e.g. active subprocess name). */
   terminalLabelsById?: ReadonlyMap<string, string>;
@@ -3244,9 +3260,8 @@ interface ThreadTerminalPanelProps {
   aiTerminalIds?: ReadonlySet<string>;
 }
 
-// The control's icon button is sized for the composer; the toolbars are about 22px tall.
-const TOOLBAR_SEND_CLASS =
-  "inline-flex items-center [&_button]:size-5 [&_button]:rounded-none [&_svg]:size-3.25";
+// The control keeps its composer size (28px target, 16px icon), so the toolbars grow to hold it.
+const TOOLBAR_SEND_CLASS = "inline-flex items-center gap-0.5 p-0.5";
 
 interface TerminalActionButtonProps {
   label: string;
@@ -3316,6 +3331,8 @@ export default function ThreadTerminalPanel({
   onActiveTerminalChange,
   onCloseTerminal,
   onAddTerminalContext,
+  chatThread = true,
+  attachOnly = false,
   keybindings,
   terminalLabelsById,
   terminalCommandsById,
@@ -3683,6 +3700,8 @@ export default function ThreadTerminalPanel({
                           visible
                           onSessionExited={() => onCloseTerminal(terminalId)}
                           onAddTerminalContext={onAddTerminalContext}
+                          chatThread={chatThread}
+                          attachOnly={attachOnly}
                           focusRequestId={focusRequestId}
                           autoFocus={focusEligible && terminalId === resolvedActiveTerminalId}
                           keybindings={keybindings}
@@ -3718,6 +3737,8 @@ export default function ThreadTerminalPanel({
                   visible
                   onSessionExited={() => onCloseTerminal(resolvedActiveTerminalId)}
                   onAddTerminalContext={onAddTerminalContext}
+                  chatThread={chatThread}
+                  attachOnly={attachOnly}
                   focusRequestId={focusRequestId}
                   autoFocus={focusEligible}
                   keybindings={keybindings}
@@ -3735,11 +3756,13 @@ export default function ThreadTerminalPanel({
               {hasToolbar ? (
                 <div
                   data-terminal-toolbar="sidebar"
-                  className="flex h-[22px] items-stretch justify-end border-b border-panel-separator"
+                  className={`flex items-stretch justify-end border-b border-panel-separator ${
+                    sendToAgentControl ? "min-h-8" : "h-[22px]"
+                  }`}
                 >
                   <div className="inline-flex h-full items-stretch">
                     {sendToAgentControl ? (
-                      <div className={`${TOOLBAR_SEND_CLASS} h-full`}>{sendToAgentControl}</div>
+                      <div className={TOOLBAR_SEND_CLASS}>{sendToAgentControl}</div>
                     ) : null}
                     {onSplitTerminal ? (
                       <TerminalActionButton

@@ -35,11 +35,11 @@ use super::{
         CodexProviderSnapshot, CodexRuntimeMode, ReconciliationThread,
         ThreadBackgroundTerminalsListParams, ThreadListParams, ThreadReadParams,
         ThreadReadResponse, TurnsPager, build_initialize_params, build_turn_start_params,
-        build_turn_steer_params, decode_background_terminals_list_response,
+        build_turn_steer_params, configured_model, decode_background_terminals_list_response,
         decode_thread_list_response, decode_thread_read_response, decode_turns_page,
         delivery_key_in_turns, is_recoverable_thread_resume_error, parse_model_list_response,
-        parse_skills_list_response, parse_thread_snapshot, reasoning_effort_label,
-        turn_option_label,
+        parse_model_list_with_default, parse_skills_list_response, parse_thread_snapshot,
+        reasoning_effort_label, reported_default_model, turn_option_label,
     },
     protocol::{IncomingEvent, JsonRpcConnection, ProtocolError},
 };
@@ -642,6 +642,35 @@ struct PendingRequest {
     turn_id: Option<String>,
 }
 
+/// The model Codex runs for a request that names none: the one its configuration names, else
+/// the one `model/list` marks as default. `None` when Codex reports neither.
+async fn effective_default_model(connection: &JsonRpcConnection) -> Option<String> {
+    if let Some(model) = bounded_lookup(connection, "config/read")
+        .await
+        .as_ref()
+        .and_then(configured_model)
+    {
+        return Some(model);
+    }
+    let list = bounded_lookup(connection, "model/list").await?;
+    reported_default_model(list.get("data")?.as_array()?)
+}
+
+/// How long a lookup made while a session opens may take. The provider supervisor awaits the
+/// open for every session, so a Codex that does not answer must not hold it.
+const DEFAULT_MODEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One request whose failure or silence means "unknown", never a failed launch.
+async fn bounded_lookup(connection: &JsonRpcConnection, method: &str) -> Option<Value> {
+    tokio::time::timeout(
+        DEFAULT_MODEL_LOOKUP_TIMEOUT,
+        connection.request(method, json!({})),
+    )
+    .await
+    .ok()?
+    .ok()
+}
+
 pub async fn probe_provider(
     connection: &JsonRpcConnection,
     version: &str,
@@ -678,8 +707,18 @@ pub async fn probe_provider(
             break;
         }
     }
-    let models = parse_model_list_response(&json!({ "data": raw_models }), custom_models)
-        .map_err(|message| RuntimeError::InvalidPayload { message })?;
+    // What the "Codex default" entry is named after. A Codex without `config/read` names the
+    // listed default.
+    let configured = bounded_lookup(connection, "config/read")
+        .await
+        .as_ref()
+        .and_then(configured_model);
+    let models = parse_model_list_with_default(
+        &json!({ "data": raw_models }),
+        custom_models,
+        configured.as_deref(),
+    )
+    .map_err(|message| RuntimeError::InvalidPayload { message })?;
 
     let skills_response = connection
         .request("skills/list", json!({ "cwds": [cwd] }))
@@ -1114,11 +1153,13 @@ impl CodexSessionRuntime {
                 CodexRuntimeMode::ApprovalRequired => "untrusted",
                 CodexRuntimeMode::AutoAcceptEdits => "on-request",
                 CodexRuntimeMode::FullAccess => "never",
+                CodexRuntimeMode::CodeReview => "never",
             },
             "sandbox": match self.inner.options.runtime_mode {
                 CodexRuntimeMode::ApprovalRequired => "read-only",
                 CodexRuntimeMode::AutoAcceptEdits => "workspace-write",
                 CodexRuntimeMode::FullAccess => "danger-full-access",
+                CodexRuntimeMode::CodeReview => "read-only",
             },
             "model": self.inner.options.model,
             "serviceTier": self.inner.options.service_tier,
@@ -1144,6 +1185,13 @@ impl CodexSessionRuntime {
             self.publish_initialize_response_ready();
             connection.notify_without_params("initialized").await?;
             let opened = if let Some(resume_thread_id) = resume_thread_id {
+                // A thread resumed without a model keeps the one it ran before (measured on
+                // codex-cli 0.169.0). "No model chosen" means Codex's default, so a resume
+                // names the model a new thread would run. When Codex reports none, it names none.
+                let resume_model = match self.inner.options.model.clone() {
+                    Some(model) => Some(model),
+                    None => effective_default_model(&connection).await,
+                };
                 match connection
                     .request(
                         "thread/resume",
@@ -1154,13 +1202,15 @@ impl CodexSessionRuntime {
                                 CodexRuntimeMode::ApprovalRequired => "untrusted",
                                 CodexRuntimeMode::AutoAcceptEdits => "on-request",
                                 CodexRuntimeMode::FullAccess => "never",
+                                CodexRuntimeMode::CodeReview => "never",
                             },
                             "sandbox": match self.inner.options.runtime_mode {
                                 CodexRuntimeMode::ApprovalRequired => "read-only",
                                 CodexRuntimeMode::AutoAcceptEdits => "workspace-write",
                                 CodexRuntimeMode::FullAccess => "danger-full-access",
+                                CodexRuntimeMode::CodeReview => "read-only",
                             },
-                            "model": self.inner.options.model,
+                            "model": resume_model,
                             "serviceTier": self.inner.options.service_tier,
                         }),
                     )
@@ -1229,6 +1279,12 @@ impl CodexSessionRuntime {
         Ok(self.inner.session.lock().await.clone())
     }
 
+    /// Shows the person one warning line in the thread.
+    pub async fn warn(&self, message: &str) {
+        self.emit("runtime.warning", None, None, json!({ "message": message }))
+            .await;
+    }
+
     pub async fn refresh_mcp_status(&self) {
         let completion = match self.inner.mcp_status.refresh().await {
             Ok(completion) => completion,
@@ -1292,7 +1348,8 @@ impl CodexSessionRuntime {
             client_user_message_id,
             prompt: input,
             attachments,
-            model: session.model.clone(),
+            model: self.inner.options.model.clone(),
+            reported_model: session.model.clone(),
             service_tier: turn_options.service_tier,
             effort: turn_options.effort,
             interaction_mode,
@@ -2955,6 +3012,26 @@ impl CodexSessionRuntime {
         params: Value,
     ) -> Result<(), RuntimeError> {
         match method.as_str() {
+            // A code review runs on its own (#376): nobody answers a card, so it is declined at
+            // once and never recorded as pending, and the turn goes on.
+            "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/tool/requestUserInput"
+                if self.inner.options.runtime_mode == CodexRuntimeMode::CodeReview =>
+            {
+                let reply = if method == "item/tool/requestUserInput" {
+                    json!({ "answers": {} })
+                } else {
+                    json!({ "decision": "decline" })
+                };
+                tracing::info!(
+                    provider = PROVIDER,
+                    method = method.as_str(),
+                    "declined a Codex request in a code review"
+                );
+                connection.respond(wire_id, reply).await?;
+                Ok(())
+            }
             "item/commandExecution/requestApproval" => {
                 let request_id = request_scope.approval_id(&correlation_id);
                 let turn_id = params
@@ -5335,6 +5412,69 @@ mod tests {
         let second = runtime.next_event().await.expect("second event");
         assert_eq!(second.event_type, "request.opened");
         assert_ne!(first.request_id, second.request_id);
+    }
+
+    #[tokio::test]
+    async fn code_review_session_declines_codex_requests_without_a_pending_card() {
+        let requests = [
+            ("1", "item/commandExecution/requestApproval"),
+            ("2", "item/fileChange/requestApproval"),
+            ("3", "item/tool/requestUserInput"),
+        ];
+        for code_review in [true, false] {
+            let (connection, _protocol, _peer_stdout, peer_stdin, _peer_stderr) =
+                runtime_test_connection();
+            let (sender, incoming) = mpsc::unbounded_channel();
+            let mut options = reconciliation_test_options();
+            if code_review {
+                options.runtime_mode = CodexRuntimeMode::CodeReview;
+            }
+            let runtime = CodexSessionRuntime::new(options, connection, incoming);
+            for (id, method) in requests {
+                sender
+                    .send(IncomingEvent::Request {
+                        correlation_id: id.to_owned(),
+                        wire_id: json!(id.parse::<u64>().unwrap()),
+                        method: method.to_owned(),
+                        params: json!({"turnId":"turn-1","reason":"Approve","questions":[]}),
+                    })
+                    .expect("request");
+            }
+            if code_review {
+                let mut reader = BufReader::new(peer_stdin);
+                let mut replies = Vec::new();
+                for _ in requests {
+                    let reply = read_runtime_test_json(&mut reader).await;
+                    replies.push((reply["id"].as_u64().unwrap(), reply["result"].clone()));
+                }
+                replies.sort_by_key(|(id, _)| *id);
+                assert_eq!(
+                    replies,
+                    [
+                        (1, json!({"decision":"decline"})),
+                        (2, json!({"decision":"decline"})),
+                        (3, json!({"answers":{}})),
+                    ]
+                );
+                assert!(runtime.inner.pending_requests.lock().await.is_empty());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), runtime.next_event())
+                        .await
+                        .is_err(),
+                    "a declined request publishes no request.opened"
+                );
+            } else {
+                let mut kinds = Vec::new();
+                for _ in requests {
+                    kinds.push(runtime.next_event().await.expect("event").event_type);
+                }
+                assert_eq!(
+                    kinds,
+                    ["request.opened", "request.opened", "user-input.requested"]
+                );
+                assert_eq!(runtime.inner.pending_requests.lock().await.len(), 3);
+            }
+        }
     }
 
     #[tokio::test]

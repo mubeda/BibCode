@@ -134,8 +134,13 @@ const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
 
-export const DEFAULT_MODEL = "gpt-5.4";
-export const DEFAULT_GIT_TEXT_GENERATION_MODEL = "gpt-5.4-mini";
+/**
+ * Codex's "no model chosen": the request names no model and Codex runs its own recommended one.
+ * A built-in model name stops working when Codex retires it, so the default names none.
+ */
+export const CODEX_AUTO_MODEL = "auto";
+export const DEFAULT_MODEL = CODEX_AUTO_MODEL;
+export const DEFAULT_GIT_TEXT_GENERATION_MODEL = CODEX_AUTO_MODEL;
 
 export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, string>> = {
   [CODEX_DRIVER_KIND]: DEFAULT_MODEL,

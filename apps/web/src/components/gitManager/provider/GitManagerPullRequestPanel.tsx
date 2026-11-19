@@ -16,12 +16,12 @@ import { memo, useCallback, useMemo, useState } from "react";
 import { usePullRequestsStore } from "../../../pullRequestsStore";
 import { gitManagerEnvironment } from "../../../state/gitManager";
 import { useEnvironmentQuery } from "../../../state/query";
-import { Button } from "../../ui/button";
 import { GitManagerCreatePullRequestDialog } from "./GitManagerCreatePullRequestDialog";
 import {
   resolveProviderPanePresentation,
   resolveStatusChangeRequestPresentation,
 } from "./GitManagerPullRequestPanel.logic";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 
 const EMPTY_PULL_REQUESTS: ReadonlyArray<GitManagerPullRequestEntry> = Object.freeze([]);
 const EMPTY_CHECKS: ReadonlyArray<GitManagerCheckEntry> = Object.freeze([]);
@@ -185,8 +185,6 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
     if (disabledReason !== null) return;
     setCreateDialogOpen(true);
   }, [disabledReason]);
-  const disabledReasonId =
-    disabledReason === null ? undefined : "git-manager-pull-request-panel-disabled-reason";
 
   return (
     <section aria-label={heading} className="flex min-h-0 flex-col gap-3 p-3">
@@ -196,29 +194,26 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
           <p className="text-xs text-muted-foreground">Provider data refreshes only on demand.</p>
         </div>
         <div className="flex gap-2">
-          <Button
-            aria-describedby={disabledReasonId}
+          <GitManagerDisabledReasonButton
             aria-haspopup="dialog"
-            disabled={disabledReason !== null}
+            disabledReason={disabledReason}
             size="xs"
-            title={disabledReason ?? undefined}
             variant="outline"
             onClick={create}
           >
             <GitPullRequestIcon aria-hidden="true" />
             Create {changeRequest.longName}
-          </Button>
-          <Button
-            aria-describedby={disabledReasonId}
-            disabled={disabledReason !== null || query.isPending}
+          </GitManagerDisabledReasonButton>
+          <GitManagerDisabledReasonButton
+            disabled={query.isPending}
+            disabledReason={disabledReason}
             size="xs"
-            title={disabledReason ?? undefined}
             variant="outline"
             onClick={refresh}
           >
             <RefreshCwIcon aria-hidden="true" />
             Refresh
-          </Button>
+          </GitManagerDisabledReasonButton>
         </div>
       </header>
       <p
@@ -228,7 +223,6 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
             ? "text-xs text-destructive"
             : "text-xs text-muted-foreground"
         }
-        id={disabledReasonId}
         role={presentation.kind === "loading" ? "status" : undefined}
       >
         {disabledReason ?? presentation.message}

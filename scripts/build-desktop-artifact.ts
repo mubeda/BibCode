@@ -136,7 +136,7 @@ export interface TauriBuildPlan {
   readonly verbose: boolean;
   /** `tauri build --no-bundle`: compiles the app. */
   readonly buildCommand: SpawnPlan;
-  /** `tauri bundle`: packages the binary the build left in `target/<triple>/release`. */
+  /** `tauri bundle`: packages the binary the build left in `<target dir>/<triple>/release`. */
   readonly bundleCommand: SpawnPlan;
   readonly symbols: TauriSymbolsPlan | undefined;
 }
@@ -489,20 +489,27 @@ export const resolveTauriBuildPlan = Effect.fn("resolveTauriBuildPlan")(function
       path.join("release", "desktop", `${platform}-${arch}`),
   );
   const bundleDirectoryName = target === "app" ? "macos" : target;
-  const bundleDir = path.join(
-    repoRoot,
-    "target",
+  // Cargo writes to CARGO_TARGET_DIR when it is set, so the bundle is there and not in `target`.
+  const cargoTargetDir = env.CARGO_TARGET_DIR || undefined;
+  if (cargoTargetDir !== undefined && !path.isAbsolute(cargoTargetDir)) {
+    return yield* Effect.fail(
+      new TauriDesktopBuildConfigurationError(
+        `CARGO_TARGET_DIR must be an absolute path, because Cargo resolves a relative one against its own working folder: ${cargoTargetDir}.`,
+      ),
+    );
+  }
+  const releaseDir = path.join(
+    cargoTargetDir ?? path.join(repoRoot, "target"),
     rustTarget,
     "release",
-    "bundle",
-    bundleDirectoryName,
   );
+  const bundleDir = path.join(releaseDir, "bundle", bundleDirectoryName);
   const updaterManifestTarget = updater
     ? yield* tryBuildConfiguration(() => resolveTauriUpdaterManifestTarget(platform, arch))
     : undefined;
   const updaterBundleDir =
     updater && platform === "mac" && target === "dmg"
-      ? path.join(repoRoot, "target", rustTarget, "release", "bundle", "macos")
+      ? path.join(releaseDir, "bundle", "macos")
       : undefined;
   // The DMG bundler deletes the app it builds unless `app` is requested too. Updater builds
   // publish that app's archive, and symbol builds check the binary inside it.
@@ -560,7 +567,7 @@ export const resolveTauriBuildPlan = Effect.fn("resolveTauriBuildPlan")(function
     buildCommand: tauriCommand("build"),
     bundleCommand: tauriCommand("bundle"),
     symbols:
-      input.symbols === true ? yield* planSymbols(platform, arch, rustTarget, repoRoot) : undefined,
+      input.symbols === true ? yield* planSymbols(platform, arch, releaseDir, repoRoot) : undefined,
   };
 });
 
@@ -571,7 +578,7 @@ const decodeDesktopPackageVersion = Schema.decodeEffect(
 const planSymbols = Effect.fn("planTauriSymbols")(function* (
   platform: TauriBuildPlatform,
   arch: TauriBuildArch,
-  rustTarget: string,
+  release: string,
   repoRoot: string,
 ) {
   const fs = yield* FileSystem.FileSystem;
@@ -580,7 +587,6 @@ const planSymbols = Effect.fn("planTauriSymbols")(function* (
   const { version } = yield* fs
     .readFileString(path.join(repoRoot, "apps", "desktop", "package.json"))
     .pipe(Effect.flatMap(decodeDesktopPackageVersion));
-  const release = path.join(repoRoot, "target", rustTarget, "release");
   // Tauri ships the binary under Cargo's name (no mainBinaryName override).
   const binary = path.join(release, platform === "win" ? "bibcode-desktop.exe" : "bibcode-desktop");
   const archive = path.join(

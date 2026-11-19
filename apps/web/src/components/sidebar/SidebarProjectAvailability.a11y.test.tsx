@@ -71,3 +71,36 @@ describe("SidebarProjectAvailability accessibility", () => {
     expect(accessibleDescription(notice!)).toContain(REASON);
   });
 });
+
+describe("SidebarProjectAvailability when the connection runtime failed", () => {
+  it("shows an alert with a Reload that calls its handler instead of loading forever", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const onReload = vi.fn();
+    await act(async () => {
+      root!.render(
+        <SidebarProjectAvailability
+          view={{ kind: "runtime-failed", environmentId: null, error: null }}
+          showRetry
+          showConnectionSettings={false}
+          onRetry={vi.fn()}
+          onOpenSettings={vi.fn()}
+          onViewDiagnostics={vi.fn()}
+          onAdoptStorage={vi.fn()}
+          onReload={onReload}
+        />,
+      );
+    });
+
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain("Connections could not start");
+    expect(container.textContent).not.toContain("still loading");
+    const reload = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Reload",
+    );
+    expect(reload, "the Reload button").toBeDefined();
+    await act(async () => reload!.click());
+    expect(onReload).toHaveBeenCalledOnce();
+  });
+});

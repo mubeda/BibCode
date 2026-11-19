@@ -17,7 +17,7 @@ import {
 
 import { useClientSettings } from "~/hooks/useSettings";
 import { cn } from "~/lib/utils";
-import { useEnvironment } from "~/state/environments";
+import { type EnvironmentPresentation, useEnvironment } from "~/state/environments";
 import { hostDashboardRequest } from "~/state/hostDashboard";
 import { useEnvironmentQuery } from "~/state/query";
 import { serverEnvironment } from "~/state/server";
@@ -110,6 +110,37 @@ export function HostDashboardSheet({
   readonly onOpenRemoteServers: () => void;
 }) {
   const environment = useEnvironment(environmentId);
+  const dashboard = useHostDashboard(environmentId, environment);
+  return (
+    <Sheet
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <SheetPopup side="right" className="max-w-lg" data-testid="host-dashboard">
+        <SheetHeader>
+          <SheetTitle>{environment?.label ?? "Host dashboard"}</SheetTitle>
+          <SheetDescription>Host dashboard</SheetDescription>
+        </SheetHeader>
+        <SheetPanel>
+          <div data-text-surface="popover" className="grid gap-5 text-sm">
+            <HostDashboardBody dashboard={dashboard} onOpenRemoteServers={onOpenRemoteServers} />
+          </div>
+        </SheetPanel>
+      </SheetPopup>
+    </Sheet>
+  );
+}
+
+/**
+ * The dashboard's subscription, notices and values, shared by the sheet and the center panel.
+ * The caller keys it by `environmentId`, so one server's baseline never shows under another.
+ */
+export function useHostDashboard(
+  environmentId: EnvironmentId,
+  environment: EnvironmentPresentation | null,
+) {
   const visible = useDocumentVisible();
   const timestampFormat = useClientSettings(selectTimestampFormat);
   const nowMs = useVisibleSecondTick(visible);
@@ -144,59 +175,50 @@ export function HostDashboardSheet({
     timestampFormat,
   });
   const chartView = view ?? shown.baseline;
+  return { presentation, chartView, timestampFormat, query };
+}
 
+/** The notices and values of `useHostDashboard`, for the sheet and the center panel. */
+export function HostDashboardBody({
+  dashboard: { presentation, chartView, timestampFormat, query },
+  onOpenRemoteServers,
+}: {
+  readonly dashboard: ReturnType<typeof useHostDashboard>;
+  readonly onOpenRemoteServers: () => void;
+}) {
   return (
-    <Sheet
-      open
-      onOpenChange={(open) => {
-        if (!open) onClose();
-      }}
-    >
-      <SheetPopup side="right" className="max-w-lg" data-testid="host-dashboard">
-        <SheetHeader>
-          <SheetTitle>{environment?.label ?? "Host dashboard"}</SheetTitle>
-          <SheetDescription>Host dashboard</SheetDescription>
-        </SheetHeader>
-        <SheetPanel>
-          <div data-text-surface="popover" className="grid gap-5 text-sm">
-            {presentation.notice === null ? null : (
-              <div className="flex flex-wrap items-center gap-2 text-muted-foreground text-xs">
-                <span
-                  className={cn(presentation.state === "error" && "text-destructive-foreground")}
-                >
-                  {presentation.notice}
-                </span>
-                {presentation.state === "error" ? (
-                  <RetryButton retrying={query.isPending} onRetry={query.refresh} />
-                ) : null}
-                {presentation.state === "unsupported" ? (
-                  <Button size="xs" variant="outline" onClick={onOpenRemoteServers}>
-                    Open Remote Servers
-                  </Button>
-                ) : null}
-              </div>
-            )}
-            {presentation.values === null ? (
-              presentation.state === "loading" ? (
-                <HostDashboardSkeleton />
-              ) : null
-            ) : (
-              <div
-                className={cn("grid gap-6 transition-opacity", presentation.dimmed && "opacity-64")}
-              >
-                <HostDashboardSinceContext value={presentation.values.since}>
-                  <HostDashboardValuesView
-                    values={presentation.values}
-                    view={chartView}
-                    timestampFormat={timestampFormat}
-                  />
-                </HostDashboardSinceContext>
-              </div>
-            )}
-          </div>
-        </SheetPanel>
-      </SheetPopup>
-    </Sheet>
+    <>
+      {presentation.notice === null ? null : (
+        <div className="flex flex-wrap items-center gap-2 text-muted-foreground text-xs">
+          <span className={cn(presentation.state === "error" && "text-destructive-foreground")}>
+            {presentation.notice}
+          </span>
+          {presentation.state === "error" ? (
+            <RetryButton retrying={query.isPending} onRetry={query.refresh} />
+          ) : null}
+          {presentation.state === "unsupported" ? (
+            <Button size="xs" variant="outline" onClick={onOpenRemoteServers}>
+              Open Remote Servers
+            </Button>
+          ) : null}
+        </div>
+      )}
+      {presentation.values === null ? (
+        presentation.state === "loading" ? (
+          <HostDashboardSkeleton />
+        ) : null
+      ) : (
+        <div className={cn("grid gap-6 transition-opacity", presentation.dimmed && "opacity-64")}>
+          <HostDashboardSinceContext value={presentation.values.since}>
+            <HostDashboardValuesView
+              values={presentation.values}
+              view={chartView}
+              timestampFormat={timestampFormat}
+            />
+          </HostDashboardSinceContext>
+        </div>
+      )}
+    </>
   );
 }
 

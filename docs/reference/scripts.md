@@ -165,7 +165,8 @@ PowerShell; on other platforms it exits 0 without doing anything.
 The wrapper, `scripts/build-desktop-artifact.ts`, rejects cross-platform builds
 by default, invokes the canonical `@bibcode/desktop` Tauri package, and copies
 bundle output under `release/desktop/<platform>-<arch>` unless an output
-directory is supplied. It compiles with `tauri build --no-bundle` and then
+directory is supplied. It reads the bundle from `target/`, or from
+`CARGO_TARGET_DIR` when that is set, which must then be an absolute path. It compiles with `tauri build --no-bundle` and then
 packages that binary with `tauri bundle` (the desktop package's `build` and
 `bundle` scripts); the Tauri CLI's bundle step does not run Cargo. Each step
 runs with at most three attempts. Every failed attempt is reported with its exit

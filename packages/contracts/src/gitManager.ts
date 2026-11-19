@@ -89,6 +89,8 @@ export const GitManagerCommitEntry = Schema.Struct({
   committerEmail: Schema.String,
   committedAtMs: NonNegativeInt,
   changedFiles: Schema.Array(TrimmedNonEmptyStringSchema),
+  /** Changed files the server left out to keep the entry within a history page. */
+  changedFilesOmitted: Schema.optional(NonNegativeInt),
 });
 export type GitManagerCommitEntry = typeof GitManagerCommitEntry.Type;
 
@@ -410,6 +412,11 @@ export const GitManagerGetCommitsInput = Schema.Struct({
   pinnedTips: Schema.optional(Schema.Array(TrimmedNonEmptyStringSchema)),
   offset: Schema.optional(NonNegativeInt),
   limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(100))),
+  /**
+   * The caller shows `changedFilesOmitted`, so the server may cut a page's first commit to fit the
+   * page target. Without it the first commit is sent whole, as older clients expect.
+   */
+  fitFirstCommit: Schema.optional(Schema.Boolean),
 });
 export type GitManagerGetCommitsInput = typeof GitManagerGetCommitsInput.Type;
 

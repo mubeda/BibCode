@@ -1,8 +1,96 @@
 diff --git a/react.js b/react.js
-index 5b171eb..3448e1d 100644
+index 5b171ebd6fa7ac86b0148fe17f897a0ca821d55e..3c6f46f1eb6a6b4aaf1eb158f7fb6a27e09d7903 100644
 --- a/react.js
 +++ b/react.js
-@@ -1978,2 +1978,8 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
+@@ -1593,6 +1593,24 @@ var MVCP_POSITION_EPSILON = 0.1;
+ var MVCP_ANCHOR_LOCK_TTL_MS = 300;
+ var MVCP_ANCHOR_LOCK_QUIET_PASSES_TO_RELEASE = 2;
+ var NATIVE_END_CLAMP_EPSILON = 1;
++// BiBCode patch: a row the reader toggles keeps its place. A data change can lock the anchor on
++// a row below it for 300 ms (a disclosure, a streamed delivery), and holding that row would move
++// the toggled row by its own growth. Until the toggled row's new size is measured, no row below
++// it is held; a row above it, or the toggled row itself, still is.
++var READER_TOGGLE_HOLD_TTL_MS = 1e3;
++function isBelowReaderToggle(state, id) {
++  const hold = state.readerToggleHold;
++  if (!hold) {
++    return false;
++  }
++  if (Date.now() > hold.expiresAt) {
++    state.readerToggleHold = void 0;
++    return false;
++  }
++  const toggledIndex = state.indexByKey.get(hold.key);
++  const index = state.indexByKey.get(id);
++  return toggledIndex !== void 0 && index !== void 0 && index > toggledIndex;
++}
+ function resolveAnchorLock(state, enableMVCPAnchorLock, mvcpData, now) {
+   if (!enableMVCPAnchorLock) {
+     state.mvcpAnchorLock = void 0;
+@@ -1604,7 +1622,7 @@ function resolveAnchorLock(state, enableMVCPAnchorLock, mvcpData, now) {
+   }
+   const isExpired = now > lock.expiresAt;
+   const isMissing = state.indexByKey.get(lock.id) === void 0;
+-  if (isExpired || isMissing || !mvcpData) {
++  if (isExpired || isMissing || !mvcpData || isBelowReaderToggle(state, lock.id)) {
+     state.mvcpAnchorLock = void 0;
+     return void 0;
+   }
+@@ -1613,6 +1631,10 @@ function resolveAnchorLock(state, enableMVCPAnchorLock, mvcpData, now) {
+ function updateAnchorLock(state, params) {
+   {
+     const { anchorId, anchorPosition, dataChanged, now, positionDiff } = params;
++    if (anchorId !== void 0 && isBelowReaderToggle(state, anchorId)) {
++      state.mvcpAnchorLock = void 0;
++      return;
++    }
+     const enableMVCPAnchorLock = !!dataChanged || !!state.mvcpAnchorLock;
+     const mvcpData = state.props.maintainVisibleContentPosition.data;
+     if (!enableMVCPAnchorLock || !mvcpData || state.scrollingTo || !anchorId || anchorPosition === void 0) {
+@@ -1755,7 +1777,7 @@ function prepareMVCP(ctx, dataChanged, adjustmentSource) {
+     } else if (scrollTarget !== void 0) {
+       targetId = getId(state, scrollTarget);
+     } else if (idsInView.length > 0 && state.didContainersLayout && !dataChanged) {
+-      targetId = idsInView.find((id) => indexByKey.get(id) !== void 0);
++      targetId = idsInView.find((id) => indexByKey.get(id) !== void 0 && !isBelowReaderToggle(state, id));
+     }
+     if (dataChanged && idsInView.length > 0 && state.didContainersLayout) {
+       for (let i = 0; i < idsInView.length; i++) {
+@@ -1802,6 +1824,9 @@ function prepareMVCP(ctx, dataChanged, adjustmentSource) {
+       if (shouldUseFallbackVisibleAnchor) {
+         for (let i = 0; i < idsInViewWithPositions.length; i++) {
+           const { id, position } = idsInViewWithPositions[i];
++          if (isBelowReaderToggle(state, id)) {
++            continue;
++          }
+           const index = indexByKey.get(id);
+           if (index !== void 0 && shouldRestorePosition) {
+             const item = data[index];
+@@ -1839,7 +1864,10 @@ function prepareMVCP(ctx, dataChanged, adjustmentSource) {
+           anchorPositionForLock = newPosition;
+         }
+       }
+-      if (scrollingToViewPosition && scrollingToViewPosition > 0) {
++      // BiBCode patch: a data change can leave the scroll's target index past the data (a
++      // settling turn drops its last rows). getId then returns null, and sizing a null key sets
++      // the list's total size to the row estimate, which clamps the next scroll to the top.
++      if (scrollingToViewPosition && scrollingToViewPosition > 0 && scrollTarget !== void 0 && scrollTarget < state.props.data.length) {
+         const newSize = getItemSize(ctx, targetId, scrollTarget, state.props.data[scrollTarget]);
+         const prevSize = scrollingTo == null ? void 0 : scrollingTo.itemSize;
+         if (newSize !== void 0 && prevSize !== void 0 && newSize !== prevSize) {
+@@ -1857,6 +1885,9 @@ function prepareMVCP(ctx, dataChanged, adjustmentSource) {
+         now,
+         positionDiff
+       });
++      if (!dataChanged && state.readerToggleHold && state.readerToggleHold.measured) {
++        state.readerToggleHold = void 0;
++      }
+       if (shouldQueueNativeMVCPAdjust()) {
+         state.pendingNativeMVCPAdjust = {
+           amount: positionDiff,
+@@ -1976,6 +2007,12 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
+   state.scrollTime = currentTime;
+   const scrollDelta = Math.abs(newScroll - prevScroll);
    const isUserScrollEvent = !!(options == null ? void 0 : options.fromNativeScrollEvent) && scrollDelta > 0.1 && !adjustChanged && scrollingTo === void 0 && !state.pendingNativeMVCPAdjust;
 +  if (isUserScrollEvent) {
 +    // BiBCode patch: a scroll the list did not make moves the rows on screen, so the anchor a
@@ -11,12 +99,16 @@ index 5b171eb..3448e1d 100644
 +    state.mvcpAnchorLock = void 0;
 +  }
    const didCancelMaintainScrollAtEnd = isUserScrollEvent && newScroll < prevScroll && !!(state.maintainingScrollAtEnd || state.pendingMaintainScrollAtEnd);
-@@ -2628,3 +2634,3 @@ function getPreservedEndAnchorOffsetDiff(ctx) {
+   if (didCancelMaintainScrollAtEnd) {
+     finishMaintainScrollAtEnd(ctx);
+@@ -2626,12 +2663,23 @@ function getPreservedEndAnchorOffsetDiff(ctx) {
+   const currentOffset = typeof state.lastNativeScroll === "number" && Number.isFinite(state.lastNativeScroll) ? state.lastNativeScroll : getObservedBootstrapInitialScrollOffset(state);
+   return resolveInitialScrollOffset(ctx, initialScroll) - currentOffset;
  }
 -function schedulePreservedEndAnchorCorrection(ctx) {
 +function schedulePreservedEndAnchorCorrection(ctx, immediate = false) {
    if (getPreservedEndAnchorOffsetDiff(ctx) === void 0) {
-@@ -2632,4 +2638,15 @@ function schedulePreservedEndAnchorCorrection(ctx) {
+     return false;
    }
 -  const correction = {};
 -  schedulePreservedEndAnchorCorrectionFrame(ctx, correction);
@@ -34,7 +126,11 @@ index 5b171eb..3448e1d 100644
 +    }
 +  }
    return true;
-@@ -2652,4 +2669,7 @@ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
+ }
+ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
+@@ -2650,8 +2698,11 @@ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
+     }
+     const hasObservedNativeScrollAfterRequest = !activeCorrection.lastRequestTime || ((_a3 = state.lastNativeScrollTime) != null ? _a3 : 0) > activeCorrection.lastRequestTime;
      if (hasObservedNativeScrollAfterRequest) {
 -      activeCorrection.lastRequestTime = Date.now();
 -      requestAdjust(ctx, offsetDiff);
@@ -44,22 +140,35 @@ index 5b171eb..3448e1d 100644
 +        requestAdjust(ctx, remaining);
 +      }
      }
-@@ -3144,3 +3164,3 @@ function checkFinishedScrollFallback(ctx) {
+     schedulePreservedEndAnchorCorrectionFrame(ctx, correction);
+   });
+@@ -3142,12 +3193,12 @@ function checkFinishedScrollFallback(ctx) {
+ }
+ 
  // src/core/initialScrollLifecycle.ts
 -function retargetActiveInitialScrollAtEnd(ctx) {
 +function retargetActiveInitialScrollAtEnd(ctx, immediate = false) {
    var _a3;
-@@ -3149,3 +3169,3 @@ function retargetActiveInitialScrollAtEnd(ctx) {
+   const state = ctx.state;
+   const initialScroll = state.initialScroll;
    if (state.didFinishInitialScroll) {
 -    return schedulePreservedEndAnchorCorrection(ctx);
 +    return schedulePreservedEndAnchorCorrection(ctx, immediate);
    }
-@@ -4277,3 +4297,3 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
+   if (!initialScroll || ((_a3 = state.initialScrollSession) == null ? void 0 : _a3.kind) === "offset" || initialScroll.viewPosition !== 1 || state.props.data.length === 0) {
+     return false;
+@@ -4275,7 +4326,7 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
+     startNoBuffer: visibleRange.startNoBuffer
+   });
    maybeEmitFirstVisibleItemChanged(state, visibleRange.startNoBuffer);
 -  if (visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
 +  if (viewabilityConfigCallbackPairs && visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
      updateViewableItems(
-@@ -4398,13 +4418,13 @@ function calculateItemsInView(ctx, params = {}) {
+       state,
+       ctx,
+@@ -4396,17 +4447,17 @@ function calculateItemsInView(ctx, params = {}) {
+         state.scrollForNextCalculateItemsInView = void 0;
+       } else if ((top === null || scrollTopBuffered > top) && (bottom === null || scrollBottomBuffered < bottom)) {
          if (!isInMVCPActiveMode(state)) {
 -          if (viewabilityConfigCallbackPairs) {
 -            updateViewabilityForCachedRange(
@@ -84,7 +193,21 @@ index 5b171eb..3448e1d 100644
 +            scrollBottom
 +          );
            (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
-@@ -5045,2 +5065,8 @@ function measureContainersInLayoutEffect(ctx, targetContainerIds = null) {
+           return;
+         }
+@@ -4945,6 +4996,9 @@ function applyItemSize(ctx, itemKey, sizeObj, resolvedMeasurementItem) {
+   let minIndexSizeChanged;
+   const prevSizeKnown = state.sizesKnown.get(itemKey);
+   const diff = updateOneItemSize(ctx, itemKey, sizeObj, resolvedMeasurementItem);
++  if (diff !== 0 && state.readerToggleHold && state.readerToggleHold.key === itemKey) {
++    state.readerToggleHold.measured = true;
++  }
+   const size = roundSize(horizontal ? sizeObj.width : sizeObj.height);
+   if (diff !== 0) {
+     minIndexSizeChanged = minIndexSizeChanged !== void 0 ? Math.min(minIndexSizeChanged, index) : index;
+@@ -5043,6 +5097,12 @@ function measureContainersInLayoutEffect(ctx, targetContainerIds = null) {
+     const element = viewRef == null ? void 0 : viewRef.current;
+     if (itemKey !== void 0 && element) {
        const rect = element.getBoundingClientRect();
 +      if (rect.width === 0 && rect.height === 0) {
 +        // BiBCode patch: a container under a hidden or detached ancestor measures 0 by 0. Taken as
@@ -93,7 +216,11 @@ index 5b171eb..3448e1d 100644
 +        continue;
 +      }
        setContainerLayoutBaseline(element, rect);
-@@ -5534,2 +5560,7 @@ function processContainerLayout({ containerId, ctx, rectangle, ref, state }) {
+       measurements.push({
+         containerId,
+@@ -5532,6 +5592,11 @@ function processContainerLayout({ containerId, ctx, rectangle, ref, state }) {
+         const element = ref.current;
+         const rect = (_a4 = element == null ? void 0 : element.getBoundingClientRect) == null ? void 0 : _a4.call(element);
          if (rect) {
 +          if (rect.width === 0 && rect.height === 0) {
 +            // BiBCode patch: the list was hidden before the shrink was confirmed; keep the size it
@@ -101,12 +228,20 @@ index 5b171eb..3448e1d 100644
 +            return;
 +          }
            layout = { height: rect.height, width: rect.width };
-@@ -7313,3 +7344,3 @@ function updateContentInsetEndAdjustment(ctx, previousContentInsetEndAdjustment)
+         }
+         applyLayout();
+@@ -7311,7 +7376,7 @@ function updateContentInsetEndAdjustment(ctx, previousContentInsetEndAdjustment)
+   if (insetDiff !== 0) {
+     const wasWithinEndThreshold = !!peek$(ctx, "isWithinMaintainScrollAtEndThreshold");
      updateScroll(ctx, state.scroll, true, { markHasScrolled: false });
 -    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx);
 +    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx, insetDiff > 0);
      if (!didRetargetInitialScroll && wasWithinEndThreshold && (insetDiff > 0)) {
-@@ -7590,2 +7621,41 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       requestAdjust(ctx, insetDiff);
+     }
+@@ -7588,6 +7653,52 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       }
+       return false;
      }),
 +    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
 +    // so none runs over them later: a request still waiting for layout to settle, and the
@@ -118,6 +253,13 @@ index 5b171eb..3448e1d 100644
 +    // adjustment, and a later pass would otherwise apply the same adjustment again. Keeping the
 +    // list at its end stops as well, including a pass already queued for the next frame after a
 +    // row grew. With nothing under way, the method changes nothing.
++    // BiBCode patch: see READER_TOGGLE_HOLD_TTL_MS. Called right before the toggle's update.
++    holdAnchorAboveRow: (key) => {
++      state.readerToggleHold = { expiresAt: Date.now() + READER_TOGGLE_HOLD_TTL_MS, key, measured: false };
++      if (state.mvcpAnchorLock && isBelowReaderToggle(state, state.mvcpAnchorLock.id)) {
++        state.mvcpAnchorLock = void 0;
++      }
++    },
 +    cancelScrollRequests: () => {
 +      var _a3;
 +      const animating = !!((_a3 = state.scrollingTo) == null ? void 0 : _a3.animated);
@@ -148,11 +290,101 @@ index 5b171eb..3448e1d 100644
 +      }
 +    },
      scrollToOffset: (params) => runScrollWithPromise(() => {
+       scrollTo(ctx, params);
+       return true;
 diff --git a/react.mjs b/react.mjs
-index cf549ca..88fc8b7 100644
+index cf549ca32946a9e35a883290c11423330bf8728b..92d44cc26409a7326c253de38e860a229c7f5229 100644
 --- a/react.mjs
 +++ b/react.mjs
-@@ -1957,2 +1957,8 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
+@@ -1572,6 +1572,24 @@ var MVCP_POSITION_EPSILON = 0.1;
+ var MVCP_ANCHOR_LOCK_TTL_MS = 300;
+ var MVCP_ANCHOR_LOCK_QUIET_PASSES_TO_RELEASE = 2;
+ var NATIVE_END_CLAMP_EPSILON = 1;
++// BiBCode patch: a row the reader toggles keeps its place. A data change can lock the anchor on
++// a row below it for 300 ms (a disclosure, a streamed delivery), and holding that row would move
++// the toggled row by its own growth. Until the toggled row's new size is measured, no row below
++// it is held; a row above it, or the toggled row itself, still is.
++var READER_TOGGLE_HOLD_TTL_MS = 1e3;
++function isBelowReaderToggle(state, id) {
++  const hold = state.readerToggleHold;
++  if (!hold) {
++    return false;
++  }
++  if (Date.now() > hold.expiresAt) {
++    state.readerToggleHold = void 0;
++    return false;
++  }
++  const toggledIndex = state.indexByKey.get(hold.key);
++  const index = state.indexByKey.get(id);
++  return toggledIndex !== void 0 && index !== void 0 && index > toggledIndex;
++}
+ function resolveAnchorLock(state, enableMVCPAnchorLock, mvcpData, now) {
+   if (!enableMVCPAnchorLock) {
+     state.mvcpAnchorLock = void 0;
+@@ -1583,7 +1601,7 @@ function resolveAnchorLock(state, enableMVCPAnchorLock, mvcpData, now) {
+   }
+   const isExpired = now > lock.expiresAt;
+   const isMissing = state.indexByKey.get(lock.id) === void 0;
+-  if (isExpired || isMissing || !mvcpData) {
++  if (isExpired || isMissing || !mvcpData || isBelowReaderToggle(state, lock.id)) {
+     state.mvcpAnchorLock = void 0;
+     return void 0;
+   }
+@@ -1592,6 +1610,10 @@ function resolveAnchorLock(state, enableMVCPAnchorLock, mvcpData, now) {
+ function updateAnchorLock(state, params) {
+   {
+     const { anchorId, anchorPosition, dataChanged, now, positionDiff } = params;
++    if (anchorId !== void 0 && isBelowReaderToggle(state, anchorId)) {
++      state.mvcpAnchorLock = void 0;
++      return;
++    }
+     const enableMVCPAnchorLock = !!dataChanged || !!state.mvcpAnchorLock;
+     const mvcpData = state.props.maintainVisibleContentPosition.data;
+     if (!enableMVCPAnchorLock || !mvcpData || state.scrollingTo || !anchorId || anchorPosition === void 0) {
+@@ -1734,7 +1756,7 @@ function prepareMVCP(ctx, dataChanged, adjustmentSource) {
+     } else if (scrollTarget !== void 0) {
+       targetId = getId(state, scrollTarget);
+     } else if (idsInView.length > 0 && state.didContainersLayout && !dataChanged) {
+-      targetId = idsInView.find((id) => indexByKey.get(id) !== void 0);
++      targetId = idsInView.find((id) => indexByKey.get(id) !== void 0 && !isBelowReaderToggle(state, id));
+     }
+     if (dataChanged && idsInView.length > 0 && state.didContainersLayout) {
+       for (let i = 0; i < idsInView.length; i++) {
+@@ -1781,6 +1803,9 @@ function prepareMVCP(ctx, dataChanged, adjustmentSource) {
+       if (shouldUseFallbackVisibleAnchor) {
+         for (let i = 0; i < idsInViewWithPositions.length; i++) {
+           const { id, position } = idsInViewWithPositions[i];
++          if (isBelowReaderToggle(state, id)) {
++            continue;
++          }
+           const index = indexByKey.get(id);
+           if (index !== void 0 && shouldRestorePosition) {
+             const item = data[index];
+@@ -1818,7 +1843,10 @@ function prepareMVCP(ctx, dataChanged, adjustmentSource) {
+           anchorPositionForLock = newPosition;
+         }
+       }
+-      if (scrollingToViewPosition && scrollingToViewPosition > 0) {
++      // BiBCode patch: a data change can leave the scroll's target index past the data (a
++      // settling turn drops its last rows). getId then returns null, and sizing a null key sets
++      // the list's total size to the row estimate, which clamps the next scroll to the top.
++      if (scrollingToViewPosition && scrollingToViewPosition > 0 && scrollTarget !== void 0 && scrollTarget < state.props.data.length) {
+         const newSize = getItemSize(ctx, targetId, scrollTarget, state.props.data[scrollTarget]);
+         const prevSize = scrollingTo == null ? void 0 : scrollingTo.itemSize;
+         if (newSize !== void 0 && prevSize !== void 0 && newSize !== prevSize) {
+@@ -1836,6 +1864,9 @@ function prepareMVCP(ctx, dataChanged, adjustmentSource) {
+         now,
+         positionDiff
+       });
++      if (!dataChanged && state.readerToggleHold && state.readerToggleHold.measured) {
++        state.readerToggleHold = void 0;
++      }
+       if (shouldQueueNativeMVCPAdjust()) {
+         state.pendingNativeMVCPAdjust = {
+           amount: positionDiff,
+@@ -1955,6 +1986,12 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
+   state.scrollTime = currentTime;
+   const scrollDelta = Math.abs(newScroll - prevScroll);
    const isUserScrollEvent = !!(options == null ? void 0 : options.fromNativeScrollEvent) && scrollDelta > 0.1 && !adjustChanged && scrollingTo === void 0 && !state.pendingNativeMVCPAdjust;
 +  if (isUserScrollEvent) {
 +    // BiBCode patch: a scroll the list did not make moves the rows on screen, so the anchor a
@@ -161,12 +393,16 @@ index cf549ca..88fc8b7 100644
 +    state.mvcpAnchorLock = void 0;
 +  }
    const didCancelMaintainScrollAtEnd = isUserScrollEvent && newScroll < prevScroll && !!(state.maintainingScrollAtEnd || state.pendingMaintainScrollAtEnd);
-@@ -2607,3 +2613,3 @@ function getPreservedEndAnchorOffsetDiff(ctx) {
+   if (didCancelMaintainScrollAtEnd) {
+     finishMaintainScrollAtEnd(ctx);
+@@ -2605,12 +2642,23 @@ function getPreservedEndAnchorOffsetDiff(ctx) {
+   const currentOffset = typeof state.lastNativeScroll === "number" && Number.isFinite(state.lastNativeScroll) ? state.lastNativeScroll : getObservedBootstrapInitialScrollOffset(state);
+   return resolveInitialScrollOffset(ctx, initialScroll) - currentOffset;
  }
 -function schedulePreservedEndAnchorCorrection(ctx) {
 +function schedulePreservedEndAnchorCorrection(ctx, immediate = false) {
    if (getPreservedEndAnchorOffsetDiff(ctx) === void 0) {
-@@ -2611,4 +2617,15 @@ function schedulePreservedEndAnchorCorrection(ctx) {
+     return false;
    }
 -  const correction = {};
 -  schedulePreservedEndAnchorCorrectionFrame(ctx, correction);
@@ -184,7 +420,11 @@ index cf549ca..88fc8b7 100644
 +    }
 +  }
    return true;
-@@ -2631,4 +2648,7 @@ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
+ }
+ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
+@@ -2629,8 +2677,11 @@ function schedulePreservedEndAnchorCorrectionFrame(ctx, correction) {
+     }
+     const hasObservedNativeScrollAfterRequest = !activeCorrection.lastRequestTime || ((_a3 = state.lastNativeScrollTime) != null ? _a3 : 0) > activeCorrection.lastRequestTime;
      if (hasObservedNativeScrollAfterRequest) {
 -      activeCorrection.lastRequestTime = Date.now();
 -      requestAdjust(ctx, offsetDiff);
@@ -194,22 +434,35 @@ index cf549ca..88fc8b7 100644
 +        requestAdjust(ctx, remaining);
 +      }
      }
-@@ -3123,3 +3143,3 @@ function checkFinishedScrollFallback(ctx) {
+     schedulePreservedEndAnchorCorrectionFrame(ctx, correction);
+   });
+@@ -3121,12 +3172,12 @@ function checkFinishedScrollFallback(ctx) {
+ }
+ 
  // src/core/initialScrollLifecycle.ts
 -function retargetActiveInitialScrollAtEnd(ctx) {
 +function retargetActiveInitialScrollAtEnd(ctx, immediate = false) {
    var _a3;
-@@ -3128,3 +3148,3 @@ function retargetActiveInitialScrollAtEnd(ctx) {
+   const state = ctx.state;
+   const initialScroll = state.initialScroll;
    if (state.didFinishInitialScroll) {
 -    return schedulePreservedEndAnchorCorrection(ctx);
 +    return schedulePreservedEndAnchorCorrection(ctx, immediate);
    }
-@@ -4256,3 +4276,3 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
+   if (!initialScroll || ((_a3 = state.initialScrollSession) == null ? void 0 : _a3.kind) === "offset" || initialScroll.viewPosition !== 1 || state.props.data.length === 0) {
+     return false;
+@@ -4254,7 +4305,7 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
+     startNoBuffer: visibleRange.startNoBuffer
+   });
    maybeEmitFirstVisibleItemChanged(state, visibleRange.startNoBuffer);
 -  if (visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
 +  if (viewabilityConfigCallbackPairs && visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
      updateViewableItems(
-@@ -4377,13 +4397,13 @@ function calculateItemsInView(ctx, params = {}) {
+       state,
+       ctx,
+@@ -4375,17 +4426,17 @@ function calculateItemsInView(ctx, params = {}) {
+         state.scrollForNextCalculateItemsInView = void 0;
+       } else if ((top === null || scrollTopBuffered > top) && (bottom === null || scrollBottomBuffered < bottom)) {
          if (!isInMVCPActiveMode(state)) {
 -          if (viewabilityConfigCallbackPairs) {
 -            updateViewabilityForCachedRange(
@@ -234,7 +487,21 @@ index cf549ca..88fc8b7 100644
 +            scrollBottom
 +          );
            (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
-@@ -5024,2 +5044,8 @@ function measureContainersInLayoutEffect(ctx, targetContainerIds = null) {
+           return;
+         }
+@@ -4924,6 +4975,9 @@ function applyItemSize(ctx, itemKey, sizeObj, resolvedMeasurementItem) {
+   let minIndexSizeChanged;
+   const prevSizeKnown = state.sizesKnown.get(itemKey);
+   const diff = updateOneItemSize(ctx, itemKey, sizeObj, resolvedMeasurementItem);
++  if (diff !== 0 && state.readerToggleHold && state.readerToggleHold.key === itemKey) {
++    state.readerToggleHold.measured = true;
++  }
+   const size = roundSize(horizontal ? sizeObj.width : sizeObj.height);
+   if (diff !== 0) {
+     minIndexSizeChanged = minIndexSizeChanged !== void 0 ? Math.min(minIndexSizeChanged, index) : index;
+@@ -5022,6 +5076,12 @@ function measureContainersInLayoutEffect(ctx, targetContainerIds = null) {
+     const element = viewRef == null ? void 0 : viewRef.current;
+     if (itemKey !== void 0 && element) {
        const rect = element.getBoundingClientRect();
 +      if (rect.width === 0 && rect.height === 0) {
 +        // BiBCode patch: a container under a hidden or detached ancestor measures 0 by 0. Taken as
@@ -243,7 +510,11 @@ index cf549ca..88fc8b7 100644
 +        continue;
 +      }
        setContainerLayoutBaseline(element, rect);
-@@ -5513,2 +5539,7 @@ function processContainerLayout({ containerId, ctx, rectangle, ref, state }) {
+       measurements.push({
+         containerId,
+@@ -5511,6 +5571,11 @@ function processContainerLayout({ containerId, ctx, rectangle, ref, state }) {
+         const element = ref.current;
+         const rect = (_a4 = element == null ? void 0 : element.getBoundingClientRect) == null ? void 0 : _a4.call(element);
          if (rect) {
 +          if (rect.width === 0 && rect.height === 0) {
 +            // BiBCode patch: the list was hidden before the shrink was confirmed; keep the size it
@@ -251,12 +522,20 @@ index cf549ca..88fc8b7 100644
 +            return;
 +          }
            layout = { height: rect.height, width: rect.width };
-@@ -7292,3 +7323,3 @@ function updateContentInsetEndAdjustment(ctx, previousContentInsetEndAdjustment)
+         }
+         applyLayout();
+@@ -7290,7 +7355,7 @@ function updateContentInsetEndAdjustment(ctx, previousContentInsetEndAdjustment)
+   if (insetDiff !== 0) {
+     const wasWithinEndThreshold = !!peek$(ctx, "isWithinMaintainScrollAtEndThreshold");
      updateScroll(ctx, state.scroll, true, { markHasScrolled: false });
 -    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx);
 +    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx, insetDiff > 0);
      if (!didRetargetInitialScroll && wasWithinEndThreshold && (insetDiff > 0)) {
-@@ -7569,2 +7600,41 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       requestAdjust(ctx, insetDiff);
+     }
+@@ -7567,6 +7632,52 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       }
+       return false;
      }),
 +    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
 +    // so none runs over them later: a request still waiting for layout to settle, and the
@@ -268,6 +547,13 @@ index cf549ca..88fc8b7 100644
 +    // adjustment, and a later pass would otherwise apply the same adjustment again. Keeping the
 +    // list at its end stops as well, including a pass already queued for the next frame after a
 +    // row grew. With nothing under way, the method changes nothing.
++    // BiBCode patch: see READER_TOGGLE_HOLD_TTL_MS. Called right before the toggle's update.
++    holdAnchorAboveRow: (key) => {
++      state.readerToggleHold = { expiresAt: Date.now() + READER_TOGGLE_HOLD_TTL_MS, key, measured: false };
++      if (state.mvcpAnchorLock && isBelowReaderToggle(state, state.mvcpAnchorLock.id)) {
++        state.mvcpAnchorLock = void 0;
++      }
++    },
 +    cancelScrollRequests: () => {
 +      var _a3;
 +      const animating = !!((_a3 = state.scrollingTo) == null ? void 0 : _a3.animated);
@@ -298,3 +584,5 @@ index cf549ca..88fc8b7 100644
 +      }
 +    },
      scrollToOffset: (params) => runScrollWithPromise(() => {
+       scrollTo(ctx, params);
+       return true;

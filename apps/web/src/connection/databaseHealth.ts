@@ -6,10 +6,15 @@ export type ConnectionDatabaseHealthStatus = "ready" | "incompatible" | "blocked
 export interface ConnectionDatabaseHealth {
   readonly status: ConnectionDatabaseHealthStatus;
   readonly message: string | null;
+  /** The store missed a request deadline. A restart clears it, so a reset is never offered. */
+  readonly timedOut?: true;
 }
 
+/** How long one connection database request may stay silent before it fails. */
+export const CONNECTION_DATABASE_DEADLINE_MS = 10_000;
+
 const READY_HEALTH: ConnectionDatabaseHealth = { status: "ready", message: null };
-const DELETION_BLOCKED_SETTLE_TIMEOUT_MS = 15_000;
+const DELETION_SETTLE_TIMEOUT_MS = 15_000;
 let health: ConnectionDatabaseHealth = READY_HEALTH;
 /**
  * Starting a deletion bumps the generation, so open requests that predate it
@@ -77,6 +82,15 @@ export function reportConnectionDatabaseUnavailable(cause: unknown): void {
   });
 }
 
+/**
+ * A request missed its deadline. Open monitors that predate it are muted, so a
+ * late success cannot report ready for a store the app already gave up on.
+ */
+export function reportConnectionDatabaseTimedOut(message: string): void {
+  openGeneration += 1;
+  publish({ status: "unavailable", message, timedOut: true });
+}
+
 export function getConnectionDatabaseHealth(): ConnectionDatabaseHealth {
   return health;
 }
@@ -93,53 +107,58 @@ export function deleteIncompatibleConnectionDatabase(): Promise<"deleted"> {
       return;
     }
     let settled = false;
-    let blockedTimer: ReturnType<typeof setTimeout> | undefined;
-    const clearBlockedTimer = () => {
-      if (blockedTimer !== undefined) {
-        clearTimeout(blockedTimer);
-        blockedTimer = undefined;
-      }
+    let blocked = false;
+    // A deletion the browser keeps queued, or never answers, must not leave
+    // the caller waiting forever. It settles as a missed deadline, and any
+    // event after that changes nothing, because the reset already failed.
+    const settleTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const message = blocked
+        ? "Deletion stayed blocked by other BiBCode tabs or windows. Close them, then quit BiBCode and open it again."
+        : "The local connection store did not answer the request to delete it. Quit BiBCode and open it again.";
+      reportConnectionDatabaseTimedOut(message);
+      reject(new Error(message));
+    }, DELETION_SETTLE_TIMEOUT_MS);
+    const settle = (finish: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(settleTimer);
+      finish();
     };
     // Invalidate pre-deletion open monitors; later opens publish normally.
     openGeneration += 1;
-    const request = indexedDB.deleteDatabase(CONNECTION_DATABASE_NAME);
+    let request: IDBOpenDBRequest;
+    try {
+      request = indexedDB.deleteDatabase(CONNECTION_DATABASE_NAME);
+    } catch (cause) {
+      settle(() => reject(cause));
+      return;
+    }
     request.addEventListener("blocked", () => {
+      if (settled) return;
+      blocked = true;
       publish({
         status: "blocked",
         message:
           "The browser queued connection database deletion until other BiBCode tabs and windows close.",
       });
-      // A deletion the browser keeps queued must not leave the caller
-      // waiting forever; settle with a descriptive failure while the queued
-      // deletion itself remains pending in the browser.
-      if (blockedTimer !== undefined) return;
-      blockedTimer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        reject(
-          new Error(
-            "Deletion stayed blocked by other BiBCode tabs or windows. Close them and try again.",
-          ),
-        );
-      }, DELETION_BLOCKED_SETTLE_TIMEOUT_MS);
     });
     request.addEventListener("error", () => {
-      clearBlockedTimer();
-      const error = request.error ?? new Error("Unknown IndexedDB deletion error.");
-      publish({
-        status: "unavailable",
-        message: `The connection database could not be deleted: ${String(error)}`,
+      settle(() => {
+        const error = request.error ?? new Error("Unknown IndexedDB deletion error.");
+        publish({
+          status: "unavailable",
+          message: `The connection database could not be deleted: ${String(error)}`,
+        });
+        reject(error);
       });
-      if (settled) return;
-      settled = true;
-      reject(error);
     });
     request.addEventListener("success", () => {
-      clearBlockedTimer();
-      publish(READY_HEALTH);
-      if (settled) return;
-      settled = true;
-      resolve("deleted");
+      settle(() => {
+        publish(READY_HEALTH);
+        resolve("deleted");
+      });
     });
   });
 }

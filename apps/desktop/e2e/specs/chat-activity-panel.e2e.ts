@@ -7,6 +7,7 @@ import * as NodePath from "node:path";
 import {
   configureDesktopActivityCodexExecutable,
   materializeDesktopActivitySession,
+  waitForDesktopActivityCodexInventory,
   startDesktopActivityComposerFollowupTurn,
   startDesktopActivityFollowupTurn,
   stopDesktopActivitySession,
@@ -127,6 +128,7 @@ async function openMaterializedFixtureChat(): Promise<{
   readonly threadId: string;
 }> {
   await ensureMainSidebarOpen();
+  const inventory = await waitForDesktopActivityCodexInventory();
   const materialized = await materializeDesktopActivitySession(preparedProjectPath);
   await configureDesktopActivityCodexExecutable(preparedCodexExecutable);
   expect(materialized.threadId).toBe(desktopActivityFixture.thread.id);
@@ -137,6 +139,7 @@ async function openMaterializedFixtureChat(): Promise<{
     JSON.stringify(
       {
         ...materialized,
+        inventory,
       },
       null,
       2,

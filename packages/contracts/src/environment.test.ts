@@ -69,6 +69,12 @@ describe("execution environment contracts", () => {
     expect(decodeTerminalCapabilities({}).codeReviews).toBe(false);
     expect(decodeTerminalCapabilities({ codeReviews: true }).codeReviews).toBe(true);
   });
+  it("reads read-only Codex reviews as off for an older server and keeps advertised support", () => {
+    expect(decodeTerminalCapabilities({}).readOnlyCodexReviews).toBe(false);
+    expect(decodeTerminalCapabilities({ readOnlyCodexReviews: true }).readOnlyCodexReviews).toBe(
+      true,
+    );
+  });
   it("sendRequests defaults to false and decodes true", () => {
     expect(decodeTerminalCapabilities({}).sendRequests).toBe(false);
     expect(decodeTerminalCapabilities({ sendRequests: true }).sendRequests).toBe(true);

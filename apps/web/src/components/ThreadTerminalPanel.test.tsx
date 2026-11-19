@@ -938,6 +938,36 @@ describe("ThreadTerminalPanel Send to agent", () => {
     ).not.toContain(SEND);
   });
 
+  it("neither toolbar shrinks the control, and the sidebar strip grows to hold it", () => {
+    const ai = new Set(["term-1"]);
+    const floating = renderToStaticMarkup(
+      <ThreadTerminalPanel {...panelProps({ aiTerminalIds: ai })} />,
+    );
+    const sidebar = renderToStaticMarkup(
+      <ThreadTerminalPanel
+        {...panelProps({
+          terminalIds: ["term-1", "term-2"],
+          activeTerminalId: "term-1",
+          aiTerminalIds: ai,
+        })}
+      />,
+    );
+    for (const markup of [floating, sidebar]) {
+      // React escapes "&" in class names as "&amp;".
+      const html = markup.replaceAll("&amp;", "&");
+      expect(html).not.toContain("[&_button]:size-5");
+      expect(html).not.toContain("[&_svg]:size-3.25");
+    }
+    expect(sidebar).toContain("min-h-8");
+    expect(sidebar).not.toContain("h-[22px]");
+    const plain = renderToStaticMarkup(
+      <ThreadTerminalPanel
+        {...panelProps({ terminalIds: ["term-1", "term-2"], activeTerminalId: "term-1" })}
+      />,
+    );
+    expect(plain).toContain("h-[22px]");
+  });
+
   it("the control reads the active terminal of a split sidebar", () => {
     const markup = renderToStaticMarkup(
       <ThreadTerminalPanel

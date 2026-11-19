@@ -1,6 +1,7 @@
 import { verifyDpopProof } from "@bibcode/shared/dpop";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import { decodeJwt } from "jose";
 import { afterEach, vi } from "vite-plus/test";
 
@@ -30,7 +31,15 @@ class FakeRequest {
   }
 }
 
-type IndexedDbFault = "none" | "open" | "read" | "write";
+// A "silent-" fault leaves that request without any event.
+type IndexedDbFault =
+  | "none"
+  | "open"
+  | "read"
+  | "write"
+  | "silent-open"
+  | "silent-read"
+  | "silent-write";
 
 function installFakeIndexedDb(
   options: {
@@ -58,9 +67,11 @@ function installFakeIndexedDb(
       transaction: () => {
         const transaction = new FakeRequest();
         return Object.assign(transaction, {
+          abort: () => undefined,
           objectStore: () => ({
             get: (key: IDBValidKey) => {
               const request = new FakeRequest();
+              if (options.fault === "silent-read") return request;
               queueMicrotask(() => {
                 if (options.fault === "read") {
                   request.error = new Error("read-denied");
@@ -73,6 +84,7 @@ function installFakeIndexedDb(
               return request;
             },
             put: (value: unknown, key: IDBValidKey) => {
+              if (options.fault === "silent-write") return;
               queueMicrotask(() => {
                 if (options.fault === "write") {
                   transaction.error = new Error("write-denied");
@@ -94,6 +106,7 @@ function installFakeIndexedDb(
   vi.stubGlobal("indexedDB", {
     open: (name: string) => {
       const request = new FakeRequest();
+      if (options.fault === "silent-open") return request;
       queueMicrotask(() => {
         if (options.fault === "open") {
           request.error = new Error("open-denied");
@@ -265,4 +278,31 @@ describe("browser DPoP proofs", () => {
       );
     }),
   );
+});
+
+describe("DPoP key storage that does not answer", () => {
+  const stalls = [
+    ["an open", "silent-open", () => readStoredBrowserDpopKey()],
+    ["a read", "silent-read", () => readStoredBrowserDpopKey()],
+    ["a write", "silent-write", () => writeStoredBrowserDpopKey({} as BrowserDpopKey)],
+  ] as const;
+
+  for (const [name, fault, operation] of stalls) {
+    it.effect(`fails ${name} that never settles with a clear error`, () =>
+      Effect.gen(function* () {
+        installFakeIndexedDb({ fault });
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        const fiber = yield* Effect.forkDetach(Effect.flip(operation()), {
+          startImmediately: true,
+        });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(10_000));
+
+        const exit = fiber.pollUnsafe();
+        expect(exit, `${name} was still waiting`).toBeDefined();
+        const error = Exit.isSuccess(exit!) ? exit.value : null;
+        expect(error).toBeInstanceOf(BrowserDpopError);
+        expect(error?.message).toContain("DPoP key storage did not answer");
+      }).pipe(Effect.ensuring(Effect.sync(() => vi.useRealTimers()))),
+    );
+  }
 });

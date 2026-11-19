@@ -397,7 +397,13 @@ vi.mock("../state/terminalSessions", () => ({
   useThreadRunningTerminalIds: () => h.runningTerminalIds,
 }));
 
+const updateEnvironmentSettingsMock = vi.hoisted(() =>
+  vi.fn(async (_patch: unknown) => ({ _tag: "Success" as const })),
+);
 vi.mock("../hooks/useSettings", () => ({
+  useUpdateEnvironmentSettings: () => updateEnvironmentSettingsMock,
+  readEnvironmentServerSettings: (environmentId: string) =>
+    h.environmentSettingsById.get(environmentId) ?? h.settings,
   useEnvironmentSettings: (
     environmentId: string,
     selector?: (settings: Record<string, unknown>) => unknown,
@@ -8231,6 +8237,235 @@ describe("ChatView send snapshot", () => {
     expect(startCalls[0]!.input).toMatchObject({
       input: { message: { text: "look at this screenshot" } },
     });
+  });
+
+  it("saves Codex's default over a saved default that names a retired model (#380)", async () => {
+    updateEnvironmentSettingsMock.mockClear();
+    h.settings = {
+      ...h.settings,
+      providerSessionDefaults: { codex: { model: "gpt-5.4", options: [] } },
+    };
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("retired-toast");
+    const send = async (offered: { slug: string }[]) => {
+      renderServerRoute();
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      (composer["composerAttachmentsRef"] as RefObject<unknown[]>).current = [];
+      (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
+        focusAtEnd: () => undefined,
+        resetCursorState: () => undefined,
+        addTerminalContext: () => false,
+        getSendContext: () => ({
+          attachments: [],
+          terminalContexts: [],
+          elementContexts: [],
+          previewAnnotations: [],
+          reviewComments: [],
+          selectedProvider: ProviderDriverKind.make("codex"),
+          selectedModel: "auto",
+          selectedProviderModels: offered,
+          selectedPromptEffort: null,
+          selectedModelSelection: { instanceId: codexInstanceId, model: "auto" },
+        }),
+      } as unknown as ChatComposerHandle;
+      (composer["promptRef"] as RefObject<string>).current = "hello";
+      await (composer["onSend"] as () => Promise<void>)();
+    };
+
+    // API-key sign-in: Codex still offers the model, so the saved default stays.
+    await send([{ slug: "auto" }, { slug: "gpt-5.4" }]);
+    expect(updateEnvironmentSettingsMock).not.toHaveBeenCalled();
+
+    // ChatGPT sign-in: the list leaves it out, so the default is saved again, then announced.
+    await send([{ slug: "auto" }, { slug: "gpt-6.2-sol" }]);
+    expect(updateEnvironmentSettingsMock).toHaveBeenCalledWith(
+      { providerSessionDefaults: { codex: { model: "auto", options: [] } } },
+      { ownedProviderSessionDefaults: ["codex"] },
+    );
+    await vi.waitFor(() =>
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({ title: "Codex retired gpt-5.4" })),
+    );
+  });
+
+  const sendCodexAuto = async () => {
+    renderServerRoute();
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    (composer["composerAttachmentsRef"] as RefObject<unknown[]>).current = [];
+    (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
+      focusAtEnd: () => undefined,
+      resetCursorState: () => undefined,
+      addTerminalContext: () => false,
+      getSendContext: () => ({
+        attachments: [],
+        terminalContexts: [],
+        elementContexts: [],
+        previewAnnotations: [],
+        reviewComments: [],
+        selectedProvider: ProviderDriverKind.make("codex"),
+        selectedModel: "auto",
+        selectedProviderModels: [{ slug: "auto" }, { slug: "gpt-6.2-sol" }],
+        selectedPromptEffort: null,
+        selectedModelSelection: { instanceId: codexInstanceId, model: "auto" },
+      }),
+    } as unknown as ChatComposerHandle;
+    (composer["promptRef"] as RefObject<string>).current = "hello";
+    await (composer["onSend"] as () => Promise<void>)();
+  };
+
+  it("keeps another window's saved default when a send clears a retired Codex default (#380)", async () => {
+    updateEnvironmentSettingsMock.mockClear();
+    h.settings = {
+      ...h.settings,
+      providerSessionDefaults: { codex: { model: "gpt-5.4", options: [] } },
+    };
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const claudeDefault = { model: "claude-sonnet-4-6", options: [] };
+    // Another window saves a Claude default while this send is in flight.
+    h.commandResults["thread.updateMetadata"] = (input) => {
+      const defaults = h.settings["providerSessionDefaults"] as Record<string, unknown>;
+      h.settings = {
+        ...h.settings,
+        providerSessionDefaults: { ...defaults, claudeAgent: claudeDefault },
+      };
+      return h.defaultCommandResult(input);
+    };
+
+    await sendCodexAuto();
+
+    expect(updateEnvironmentSettingsMock).toHaveBeenCalledWith(
+      {
+        providerSessionDefaults: {
+          codex: { model: "auto", options: [] },
+          claudeAgent: claudeDefault,
+        },
+      },
+      { ownedProviderSessionDefaults: ["codex"] },
+    );
+  });
+
+  it("owns only the Codex default when another window's save has not reached this one (#380)", async () => {
+    updateEnvironmentSettingsMock.mockClear();
+    // Window B saved a Claude default on the server; its config event has not arrived here.
+    h.settings = {
+      ...h.settings,
+      providerSessionDefaults: { codex: { model: "gpt-5.4", options: [] } },
+    };
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+
+    await sendCodexAuto();
+
+    // The server merges an owned provider into its own map, so B's default survives.
+    expect(updateEnvironmentSettingsMock).toHaveBeenCalledWith(
+      { providerSessionDefaults: { codex: { model: "auto", options: [] } } },
+      { ownedProviderSessionDefaults: ["codex"] },
+    );
+  });
+
+  it("shows one notice when the thread and the saved default name the same retired model (#380)", async () => {
+    updateEnvironmentSettingsMock.mockClear();
+    h.settings = {
+      ...h.settings,
+      providerSessionDefaults: { codex: { model: "gpt-5.4", options: [] } },
+    };
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("retired-toast");
+    add.mockClear();
+    try {
+      await sendCodexAuto();
+      await vi.waitFor(() => expect(updateEnvironmentSettingsMock).toHaveBeenCalledTimes(1));
+      await Promise.resolve();
+      const notices = add.mock.calls.filter(([toast]) =>
+        String(toast.title).startsWith("Codex retired"),
+      );
+      expect(notices).toHaveLength(1);
+      expect(notices[0]![0]).toMatchObject({
+        title: "Codex retired gpt-5.4",
+        description: "This thread and your saved Codex default now use Codex's default model.",
+      });
+    } finally {
+      add.mockRestore();
+    }
+  });
+
+  it("saves Codex's default over a retired saved default on a new chat's first send (#380)", async () => {
+    updateEnvironmentSettingsMock.mockClear();
+    h.settings = {
+      ...h.settings,
+      providerSessionDefaults: { codex: { model: "gpt-5.4", options: [] } },
+    };
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedGitStatus(true);
+    const draftId = newDraftId();
+    useComposerDraftStore
+      .getState()
+      .setLogicalProjectDraftThreadId(
+        "logical-project-1",
+        scopeProjectRef(environmentId, projectId),
+        draftId,
+        { threadId, createdAt: now, envMode: "local" },
+      );
+    publishSeededStoreState(useComposerDraftStore);
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("retired-toast");
+    // An earlier case's spy may still hold its notices.
+    add.mockClear();
+    try {
+      renderToStaticMarkup(
+        <ChatView
+          environmentId={environmentId}
+          threadId={threadId}
+          routeKind="draft"
+          draftId={draftId}
+        />,
+      );
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      (composer["composerAttachmentsRef"] as RefObject<unknown[]>).current = [];
+      (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
+        focusAtEnd: () => undefined,
+        resetCursorState: () => undefined,
+        addTerminalContext: () => false,
+        getSendContext: () => ({
+          attachments: [],
+          terminalContexts: [],
+          elementContexts: [],
+          previewAnnotations: [],
+          reviewComments: [],
+          selectedProvider: ProviderDriverKind.make("codex"),
+          selectedModel: "auto",
+          selectedProviderModels: [{ slug: "auto" }, { slug: "gpt-6.2-sol" }],
+          selectedPromptEffort: null,
+          selectedModelSelection: { instanceId: codexInstanceId, model: "auto" },
+        }),
+      } as unknown as ChatComposerHandle;
+      (composer["promptRef"] as RefObject<string>).current = "hello";
+      await (composer["onSend"] as () => Promise<void>)();
+
+      expect(h.commandCalls.filter((call) => call.key === "thread.startTurn")).toHaveLength(1);
+      expect(updateEnvironmentSettingsMock).toHaveBeenCalledTimes(1);
+      expect(updateEnvironmentSettingsMock).toHaveBeenCalledWith(
+        { providerSessionDefaults: { codex: { model: "auto", options: [] } } },
+        { ownedProviderSessionDefaults: ["codex"] },
+      );
+      await vi.waitFor(() =>
+        expect(
+          add.mock.calls.filter(([toast]) => toast.title === "Codex retired gpt-5.4"),
+        ).toHaveLength(1),
+      );
+    } finally {
+      add.mockRestore();
+    }
   });
 
   it("restores a send whose staging fails when the connection drops, and never resends it", async () => {

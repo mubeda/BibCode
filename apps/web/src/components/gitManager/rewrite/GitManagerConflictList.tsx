@@ -3,6 +3,7 @@ import { AlertTriangleIcon, CheckCircle2Icon, ChevronDownIcon, Undo2Icon } from 
 import { memo, useCallback, useState } from "react";
 
 import { Button } from "~/components/ui/button";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 import {
   Dialog,
   DialogDescription,
@@ -88,18 +89,16 @@ const GitManagerConflictRow = memo(function GitManagerConflictRow({
           : `${conflictCount} ${conflictCount === 1 ? "conflict" : "conflicts"}`}
       </span>
       {resolved ? (
-        <Button
-          aria-describedby={disabledReasonId}
+        <GitManagerDisabledReasonButton
           aria-label={`Undo resolution for ${conflict.path}`}
-          disabled={disabledReason !== null}
+          disabledReason={disabledReason}
           size="xs"
-          title={disabledReason ?? undefined}
           variant="ghost"
           onClick={undo}
         >
           <Undo2Icon aria-hidden="true" />
           Undo
-        </Button>
+        </GitManagerDisabledReasonButton>
       ) : conflict.kind === "binary" || conflict.kind === "submodule" ? (
         <details className="relative">
           <summary
@@ -112,30 +111,28 @@ const GitManagerConflictRow = memo(function GitManagerConflictRow({
             <ChevronDownIcon aria-hidden="true" className="size-3" />
           </summary>
           <div className="absolute end-0 z-20 mt-1 min-w-28 rounded-md border border-border bg-popover p-1 shadow-lg">
-            <Button
-              aria-describedby={disabledReasonId}
+            <GitManagerDisabledReasonButton
               aria-label={`Resolve ${conflict.path} with ours`}
               className="w-full justify-start"
-              disabled={disabledReason !== null}
+              disabledReason={disabledReason}
               size="xs"
-              title={disabledReason ?? undefined}
               variant="ghost"
+              wrapperClassName="flex"
               onClick={resolveOurs}
             >
               Ours
-            </Button>
-            <Button
-              aria-describedby={disabledReasonId}
+            </GitManagerDisabledReasonButton>
+            <GitManagerDisabledReasonButton
               aria-label={`Resolve ${conflict.path} with theirs`}
               className="w-full justify-start"
-              disabled={disabledReason !== null}
+              disabledReason={disabledReason}
               size="xs"
-              title={disabledReason ?? undefined}
               variant="ghost"
+              wrapperClassName="flex"
               onClick={resolveTheirs}
             >
               Theirs
-            </Button>
+            </GitManagerDisabledReasonButton>
           </div>
         </details>
       ) : null}
@@ -171,8 +168,6 @@ export const GitManagerConflictList = memo(function GitManagerConflictList({
   }, [onCommit]);
   const closeCommitWarning = useCallback(() => setCommitWarningOpen(false), []);
   const effectiveContinueReason = disabledReason ?? continueBlocked?.message ?? null;
-  const continueReasonId =
-    effectiveContinueReason === null ? undefined : "git-manager-conflicts-continue-reason";
 
   return (
     <section aria-label="Conflicted files" className="min-h-0">
@@ -193,20 +188,13 @@ export const GitManagerConflictList = memo(function GitManagerConflictList({
             Commit Resolved Files
           </Button>
         )}
-        <Button
-          aria-describedby={continueReasonId}
+        <GitManagerDisabledReasonButton
           aria-label="Continue operation"
-          disabled={effectiveContinueReason !== null}
-          title={effectiveContinueReason ?? undefined}
+          disabledReason={effectiveContinueReason}
           onClick={onContinue}
         >
           Continue
-        </Button>
-        {effectiveContinueReason === null ? null : (
-          <span className="sr-only" id={continueReasonId}>
-            {effectiveContinueReason}
-          </span>
-        )}
+        </GitManagerDisabledReasonButton>
       </div>
       <Dialog open={commitWarningOpen} onOpenChange={setCommitWarningOpen}>
         <DialogPopup>

@@ -2656,13 +2656,505 @@ fn permission_requests_round_trip_through_open_and_resolved_events() {
         runtime.open_permission_request(fixture.request, &fixture.resolution.request_id);
     events.extend(request_event);
     events.extend(
-        runtime.resolve_permission_request(
-            &fixture.resolution.request_id,
-            fixture.resolution.decision,
-        ),
+        runtime
+            .resolve_permission_request(&fixture.resolution.request_id, fixture.resolution.decision)
+            .expect("pending approval")
+            .events,
     );
 
     assert_trace_eq(&events, &fixture.expected_events);
+}
+
+fn runtime_with_bash_approval(suggestions: Value) -> ClaudeProviderRuntime {
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+    runtime.start_session(RuntimeMode::ApprovalRequired, None);
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "run a command".to_owned(),
+    });
+    runtime.open_permission_request(
+        serde_json::from_value(json!({
+            "toolName": "Bash",
+            "input": { "command": "touch made.txt" },
+            "toolUseId": "tool-use-1",
+            "suggestions": suggestions,
+        }))
+        .expect("permission request"),
+        "request-1",
+    );
+    runtime
+}
+
+/// The shape Claude 2.1 sends for a Bash command: one rule it would save to a settings file, the
+/// working folder, and a mode change.
+fn bash_suggestions() -> Value {
+    json!([
+        {
+            "type": "addRules",
+            "rules": [{ "toolName": "Bash", "ruleContent": "touch made.txt" }],
+            "behavior": "allow",
+            "destination": "localSettings"
+        },
+        { "type": "addDirectories", "directories": ["/work"], "destination": "session" },
+        { "type": "setMode", "mode": "acceptEdits", "destination": "session" }
+    ])
+}
+
+#[test]
+fn accept_for_session_applies_the_suggested_rules_to_the_session_only() {
+    let mut runtime = runtime_with_bash_approval(bash_suggestions());
+    let resolved = runtime
+        .resolve_permission_request("request-1", Decision::AcceptForSession)
+        .expect("pending approval");
+
+    // Every rule goes to the session, never to a settings file, and the mode stays as the
+    // thread shows it.
+    assert_eq!(
+        resolved.response,
+        json!({
+            "behavior": "allow",
+            "updatedInput": { "command": "touch made.txt" },
+            "updatedPermissions": [
+                {
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "touch made.txt" }],
+                    "behavior": "allow",
+                    "destination": "session"
+                },
+                { "type": "addDirectories", "directories": ["/work"], "destination": "session" }
+            ]
+        })
+    );
+    assert_eq!(resolved.events.len(), 1);
+    assert_eq!(
+        resolved.events[0].payload,
+        json!({ "decision": "acceptForSession" })
+    );
+}
+
+#[test]
+fn accept_allows_once_and_adds_no_session_rule() {
+    let mut runtime = runtime_with_bash_approval(bash_suggestions());
+    let resolved = runtime
+        .resolve_permission_request("request-1", Decision::Accept)
+        .expect("pending approval");
+
+    assert_eq!(
+        resolved.response,
+        json!({ "behavior": "allow", "updatedInput": { "command": "touch made.txt" } })
+    );
+    assert_eq!(resolved.events[0].payload, json!({ "decision": "accept" }));
+}
+
+#[test]
+fn accept_for_session_without_a_usable_rule_allows_once_and_says_so() {
+    for suggestions in [
+        json!([]),
+        json!([{ "type": "setMode", "mode": "acceptEdits", "destination": "session" }]),
+        // Malformed or not an allow: none of these is a rule to apply.
+        json!([{}]),
+        json!([{ "type": "addRules", "rules": [], "behavior": "allow" }]),
+        json!([{ "type": "addRules", "rules": [{ "toolName": "Bash" }], "behavior": "deny" }]),
+        json!([{ "type": "removeRules", "rules": [{ "toolName": "Bash" }], "behavior": "deny" }]),
+        // Entries that are not rules or folders.
+        json!([{ "type": "addRules", "rules": [{}], "behavior": "allow" }]),
+        json!([{ "type": "addDirectories", "directories": [null, ""] }]),
+    ] {
+        let mut runtime = runtime_with_bash_approval(suggestions);
+        let resolved = runtime
+            .resolve_permission_request("request-1", Decision::AcceptForSession)
+            .expect("pending approval");
+
+        assert_eq!(
+            resolved.response,
+            json!({ "behavior": "allow", "updatedInput": { "command": "touch made.txt" } })
+        );
+        assert_eq!(
+            resolved.events[0].payload,
+            json!({
+                "decision": "accept",
+                "detail": "Claude offered no session rule for this request, so it was approved once."
+            })
+        );
+    }
+}
+
+#[test]
+fn deny_refuses_the_tool() {
+    let mut runtime = runtime_with_bash_approval(bash_suggestions());
+    let resolved = runtime
+        .resolve_permission_request("request-1", Decision::Decline)
+        .expect("pending approval");
+
+    assert_eq!(
+        resolved.response,
+        json!({ "behavior": "deny", "message": "The user denied this tool use." })
+    );
+    assert_eq!(resolved.events[0].payload, json!({ "decision": "decline" }));
+}
+
+/// A started runtime in a turn, as when Claude asks its host about a tool.
+fn runtime_in_turn() -> ClaudeProviderRuntime {
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+    runtime.start_session(RuntimeMode::ApprovalRequired, None);
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "do the work".to_owned(),
+    });
+    runtime
+}
+
+/// The frame Claude Code 2.1 writes when a tool needs its host's answer.
+fn can_use_tool(request_id: &str, tool_name: &str, input: Value) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": tool_name,
+            "input": input,
+            "permission_suggestions": [{
+                "type": "addRules",
+                "rules": [{ "toolName": tool_name, "ruleContent": "touch made.txt" }],
+                "behavior": "allow",
+                "destination": "localSettings"
+            }],
+            "tool_use_id": "tool-use-1"
+        }
+    })
+}
+
+#[test]
+fn a_tool_that_needs_approval_opens_a_card_that_names_the_command() {
+    let mut runtime = runtime_in_turn();
+    let output = runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-request-1",
+            "Bash",
+            json!({ "command": "touch made.txt" }),
+        ),
+        0,
+    );
+
+    assert!(
+        output.control_responses.is_empty(),
+        "the person answers, not BiBCode"
+    );
+    assert_eq!(output.events.len(), 1);
+    let opened = &output.events[0];
+    assert_eq!(opened.event_type, "request.opened");
+    // The card's id is Claude's own request id, so the reply needs no mapping.
+    assert_eq!(opened.request_id.as_deref(), Some("cli-request-1"));
+    assert_eq!(opened.turn_id.as_deref(), Some("turn-1"));
+    assert_eq!(opened.payload["requestType"], "command_execution_approval");
+    assert_eq!(opened.payload["detail"], "touch made.txt");
+
+    // The session approval answers that request with a rule for this session only.
+    let resolved = runtime
+        .resolve_permission_request("cli-request-1", Decision::AcceptForSession)
+        .expect("pending approval");
+    assert_eq!(
+        resolved.response["updatedPermissions"][0]["destination"],
+        "session"
+    );
+    assert_eq!(resolved.events[0].turn_id.as_deref(), Some("turn-1"));
+}
+
+#[test]
+fn a_file_tool_card_names_the_tool_and_the_file() {
+    let mut runtime = runtime_in_turn();
+    let output = runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-request-1",
+            "Edit",
+            json!({ "file_path": "/work/src/main.rs" }),
+        ),
+        0,
+    );
+    assert_eq!(
+        output.events[0].payload["requestType"],
+        "file_change_approval"
+    );
+    assert_eq!(
+        output.events[0].payload["detail"],
+        "Edit: /work/src/main.rs"
+    );
+}
+
+#[test]
+fn a_request_is_settled_once() {
+    let mut runtime = runtime_in_turn();
+    runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-request-1",
+            "Bash",
+            json!({ "command": "touch made.txt" }),
+        ),
+        0,
+    );
+
+    assert!(
+        runtime
+            .resolve_permission_request("cli-request-1", Decision::Accept)
+            .is_some()
+    );
+    // A second answer, from another client or after a cancellation, finds nothing to answer.
+    assert!(
+        runtime
+            .resolve_permission_request("cli-request-1", Decision::Accept)
+            .is_none()
+    );
+    assert!(runtime.cancel_request("cli-request-1").is_empty());
+    assert!(
+        runtime
+            .resolve_permission_request("never-opened", Decision::Accept)
+            .is_none()
+    );
+    assert!(
+        runtime
+            .resolve_user_input_request("never-opened", json!({}))
+            .is_none()
+    );
+}
+
+#[test]
+fn cancel_denies_the_tool_and_stops_the_turn() {
+    let mut runtime = runtime_in_turn();
+    runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-request-1",
+            "Bash",
+            json!({ "command": "touch made.txt" }),
+        ),
+        0,
+    );
+    let resolved = runtime
+        .resolve_permission_request("cli-request-1", Decision::Cancel)
+        .expect("pending approval");
+    assert_eq!(resolved.response["behavior"], "deny");
+    assert_eq!(resolved.response["interrupt"], true);
+    assert_eq!(resolved.events[0].payload, json!({ "decision": "cancel" }));
+}
+
+#[test]
+fn a_request_claude_withdraws_closes_its_card_and_takes_no_answer() {
+    let mut runtime = runtime_in_turn();
+    runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-request-1",
+            "Bash",
+            json!({ "command": "touch made.txt" }),
+        ),
+        0,
+    );
+    let output = runtime.handle_raw_value(
+        &json!({ "type": "control_cancel_request", "request_id": "cli-request-1" }),
+        0,
+    );
+
+    assert!(output.control_responses.is_empty());
+    assert_eq!(output.events.len(), 1);
+    assert_eq!(output.events[0].event_type, "request.resolved");
+    assert_eq!(
+        output.events[0].request_id.as_deref(),
+        Some("cli-request-1")
+    );
+    assert_eq!(output.events[0].payload, json!({ "decision": "cancel" }));
+    assert!(
+        runtime
+            .resolve_permission_request("cli-request-1", Decision::Accept)
+            .is_none(),
+        "an answer that races the withdrawal loses"
+    );
+    // A withdrawal of something that is not pending does nothing.
+    let again = runtime.handle_raw_value(
+        &json!({ "type": "control_cancel_request", "request_id": "cli-request-1" }),
+        0,
+    );
+    assert!(again.events.is_empty());
+}
+
+#[test]
+fn a_question_opens_the_question_card_and_is_answered_as_the_tool_input() {
+    let mut runtime = runtime_in_turn();
+    let questions = json!([{
+        "question": "Red or blue?",
+        "header": "Color",
+        "options": [{ "label": "Red" }, { "label": "Blue" }]
+    }]);
+    let output = runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-question-1",
+            "AskUserQuestion",
+            json!({ "questions": questions }),
+        ),
+        0,
+    );
+    assert!(output.control_responses.is_empty());
+    assert_eq!(output.events[0].event_type, "user-input.requested");
+    assert_eq!(
+        output.events[0].request_id.as_deref(),
+        Some("cli-question-1")
+    );
+    // The question card requires a description on every option, which Claude may omit.
+    assert_eq!(
+        output.events[0].payload["questions"][0]["options"],
+        json!([
+            { "label": "Red", "description": "" },
+            { "label": "Blue", "description": "" }
+        ])
+    );
+
+    let resolved = runtime
+        .resolve_user_input_request("cli-question-1", json!({ "Red or blue?": "Blue" }))
+        .expect("pending question");
+    assert_eq!(
+        resolved.updated_input,
+        json!({ "questions": questions, "answers": { "Red or blue?": "Blue" } })
+    );
+    assert_eq!(resolved.events[0].event_type, "user-input.resolved");
+}
+
+#[test]
+fn leaving_plan_mode_is_denied_at_once_and_opens_no_card() {
+    let mut runtime = runtime_in_turn();
+    let output = runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-plan-1",
+            "ExitPlanMode",
+            json!({ "plan": "Create hello.txt" }),
+        ),
+        0,
+    );
+
+    // The plan is reviewed in BiBCode, which reads it from the tool call, so no card opens.
+    assert!(output.events.is_empty());
+    assert_eq!(output.control_responses.len(), 1);
+    let reply = &output.control_responses[0];
+    assert_eq!(reply["type"], "control_response");
+    assert_eq!(reply["response"]["request_id"], "cli-plan-1");
+    assert_eq!(reply["response"]["subtype"], "success");
+    assert_eq!(reply["response"]["response"]["behavior"], "deny");
+    assert!(
+        reply["response"]["response"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("End your turn"))
+    );
+}
+
+#[test]
+fn an_interrupt_or_a_stopped_process_closes_every_open_request() {
+    let mut runtime = runtime_in_turn();
+    runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-request-1",
+            "Bash",
+            json!({ "command": "touch made.txt" }),
+        ),
+        0,
+    );
+    runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-question-1",
+            "AskUserQuestion",
+            json!({ "questions": [{ "question": "Go on?" }] }),
+        ),
+        0,
+    );
+
+    let events = runtime.cancel_pending_requests();
+    let mut closed = events
+        .iter()
+        .map(|event| (event.event_type.as_str(), event.request_id.as_deref()))
+        .collect::<Vec<_>>();
+    closed.sort_unstable();
+    assert_eq!(
+        closed,
+        [
+            ("request.resolved", Some("cli-request-1")),
+            ("user-input.resolved", Some("cli-question-1")),
+        ]
+    );
+    assert!(runtime.cancel_pending_requests().is_empty());
+}
+
+#[test]
+fn a_turn_that_ends_closes_the_requests_it_left_open() {
+    let mut runtime = runtime_in_turn();
+    runtime.handle_raw_value(
+        &can_use_tool(
+            "cli-request-1",
+            "Bash",
+            json!({ "command": "touch made.txt" }),
+        ),
+        0,
+    );
+    let output = runtime.handle_raw_value(
+        &json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "stop_reason": "end_turn",
+            "session_id": "session-1",
+            "uuid": "result-1"
+        }),
+        0,
+    );
+    let types = output
+        .events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>();
+    let closed = types.iter().position(|kind| *kind == "request.resolved");
+    let completed = types.iter().position(|kind| *kind == "turn.completed");
+    assert!(closed.is_some() && closed < completed, "{types:?}");
+    // An answer from another client after the turn ended is refused.
+    assert!(
+        runtime
+            .resolve_permission_request("cli-request-1", Decision::Accept)
+            .is_none()
+    );
+}
+
+#[test]
+fn a_session_rule_keeps_only_its_valid_entries() {
+    let mut runtime = runtime_with_bash_approval(json!([{
+        "type": "addRules",
+        "rules": [
+            {},
+            { "toolName": "Bash", "ruleContent": 42 },
+            { "toolName": "Bash", "ruleContent": "touch made.txt" }
+        ],
+        "behavior": "allow",
+        "destination": "userSettings"
+    }]));
+    let resolved = runtime
+        .resolve_permission_request("request-1", Decision::AcceptForSession)
+        .expect("pending approval");
+    assert_eq!(
+        resolved.response["updatedPermissions"],
+        json!([{
+            "type": "addRules",
+            "rules": [{ "toolName": "Bash", "ruleContent": "touch made.txt" }],
+            "behavior": "allow",
+            "destination": "session"
+        }])
+    );
+}
+
+#[test]
+fn other_control_requests_are_not_treated_as_tool_requests() {
+    let mut runtime = runtime_in_turn();
+    let output = runtime.handle_raw_value(
+        &json!({
+            "type": "control_request",
+            "request_id": "cli-other-1",
+            "request": { "subtype": "something_else" }
+        }),
+        0,
+    );
+    assert!(output.events.is_empty());
+    assert!(output.control_responses.is_empty());
 }
 
 #[test]
@@ -2678,10 +3170,12 @@ fn ask_user_question_round_trips_structured_answers() {
     let mut events = runtime.handle_message(fixture.message);
     let opened = runtime.open_user_input_request(fixture.request, &fixture.resolution.request_id);
     events.extend(opened);
-    let resolved = runtime.resolve_user_input_request(
-        &fixture.resolution.request_id,
-        fixture.resolution.answers.clone(),
-    );
+    let resolved = runtime
+        .resolve_user_input_request(
+            &fixture.resolution.request_id,
+            fixture.resolution.answers.clone(),
+        )
+        .expect("pending question");
     assert_eq!(resolved.updated_input, fixture.expected_updated_input);
     events.extend(resolved.events);
 

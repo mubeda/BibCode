@@ -17,11 +17,21 @@ import { buildListInput } from "./pullRequestsList.logic";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { context, row } from "../testFixtures";
 import { gitlabContext } from "../detail/testFixtures";
+import { clearResourceRefusals } from "../../repositoryModule/resourceRefusal";
+import { expectLoadingModel } from "../../ui/loading-state.testing";
 const h = vi.hoisted(() => ({
   first: null as PullRequestsListPage | null,
   second: null as PullRequestsListPage | null,
   error: null as PullRequestsOperationError | null,
   pending: false,
+  // The stored copy's read is in flight, as after a change event.
+  snapshotPending: false,
+  // The error answers the first page's read only; later pages stay settled.
+  firstOnlyError: false,
+  // The error answers a later page's read only; the first page stays settled.
+  laterOnlyError: false,
+  // Only the first page's read is in flight.
+  firstOnly: false,
   awaitingRetry: false,
   autoCompleteRefresh: true,
   requests: vi.fn((args: { input: PullRequestsListInput }) => ({ kind: "list", ...args })),
@@ -62,14 +72,19 @@ vi.mock("../../../state/query", () => ({
         data: value,
         emission: value ? { _tag: "Success", value } : { _tag: "Initial" },
         error: null,
-        isPending: false,
+        isPending: atom.kind === "readSnapshot" && h.snapshotPending,
         refresh: read,
         revalidate: read,
         requiresRetry: false,
       };
     }
     const data = atom?.kind === "list" ? (atom.input.cursor === null ? h.first : h.second) : null;
-    const error = atom?.kind === "list" ? h.error : null;
+    const error =
+      atom?.kind === "list" &&
+      !(h.firstOnlyError && atom.input.cursor !== null) &&
+      !(h.laterOnlyError && atom.input.cursor === null)
+        ? h.error
+        : null;
     if (error && !h.failures.has(error))
       h.failures.set(error, { _tag: "Failure", cause: Cause.fail(error) });
     const refresh = () => {
@@ -87,7 +102,7 @@ vi.mock("../../../state/query", () => ({
       data,
       emission: error ? h.failures.get(error) : { _tag: "Success", value: data },
       error: error?.message ?? null,
-      isPending: h.pending,
+      isPending: h.pending && (!h.firstOnly || atom?.input.cursor === null),
       refresh,
       revalidate: refresh,
       requiresRetry: h.awaitingRetry,
@@ -179,6 +194,7 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   usePullRequestsStore.setState({ byProjectKey: {} });
+  clearResourceRefusals();
   h.first = {
     rows: [row],
     nextCursor: "next",
@@ -194,6 +210,10 @@ beforeEach(() => {
   h.error = null;
   h.failures.clear();
   h.pending = false;
+  h.snapshotPending = false;
+  h.firstOnlyError = false;
+  h.laterOnlyError = false;
+  h.firstOnly = false;
   h.awaitingRetry = false;
   h.autoCompleteRefresh = true;
   h.requests.mockClear();
@@ -567,6 +587,226 @@ it("shows an exhausted cached failure on remount without issuing another request
   await render();
   expect(container.textContent).toContain("The connection dropped.");
   expect(h.refresh).not.toHaveBeenCalled();
+});
+
+describe("PullRequestsListView loading feedback", () => {
+  const statuses = () => [...container.querySelectorAll('[role="status"]')];
+  it("labels a first load with a visible indicator and names the read", async () => {
+    h.first = null;
+    h.pending = true;
+    await render();
+    expectLoadingModel(container, ["Loading pull requests…"]);
+    expect(statuses()[0]?.querySelector("svg.animate-spin")).not.toBeNull();
+    expect(container.textContent).not.toContain("No open pull requests");
+  });
+  it("keeps the rows and shows a refresh label while a later read is in flight", async () => {
+    await render();
+    h.pending = true;
+    await render();
+    expect(container.textContent).toContain(row.title);
+    expectLoadingModel(container, ["Refreshing pull requests…"]);
+    h.pending = false;
+    await render();
+    expect(statuses()).toHaveLength(0);
+  });
+  it("hides retained rows when a refresh is refused, and keeps them for a recoverable failure", async () => {
+    await render();
+    expect(container.textContent).toContain(row.title);
+    h.error = new PullRequestsOperationError({
+      operation: "list",
+      code: "provider_error",
+      message: "Host timed out",
+      hostDetail: null,
+      retryable: true,
+    });
+    await render();
+    expect(container.textContent).toContain(row.title);
+    h.error = new PullRequestsOperationError({
+      operation: "list",
+      code: "forbidden",
+      message: "You can't view these",
+      hostDetail: null,
+      retryable: false,
+    });
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("can't view");
+    expect(container.textContent).not.toContain(row.title);
+    expect(container.textContent).not.toContain("Load more");
+  });
+  describe("a refusal stays in force until a later read of the same list succeeds", () => {
+    const refused = new PullRequestsOperationError({
+      operation: "list",
+      code: "forbidden",
+      message: "You can't view these",
+      hostDetail: null,
+      retryable: false,
+    });
+    const timedOut = new PullRequestsOperationError({
+      operation: "list",
+      code: "provider_error",
+      message: "Host timed out",
+      hostDetail: null,
+      retryable: true,
+    });
+    const steps = {
+      refusal: async () => {
+        h.error = refused;
+        await render();
+      },
+      timeout: async () => {
+        h.error = timedOut;
+        await render();
+      },
+      // The filters are already clear: the reset re-keys the pages with the same input.
+      clearFilters: async () => {
+        await act(async () => button("Clear filters").click());
+      },
+      pendingRefresh: async () => {
+        h.error = null;
+        h.pending = true;
+        h.autoCompleteRefresh = false;
+        await act(async () => handle.current!.refresh());
+        await render();
+      },
+      // The stored copy paints the refused rows again unless the refusal outlives the view.
+      reopen: async () => {
+        h.snapshot = storedList(row.title, 1);
+        await act(async () => root.unmount());
+        root = createRoot(container);
+        await render();
+      },
+    };
+    it.each<[string, (keyof typeof steps)[]]>([
+      ["refusal, then a timeout", ["refusal", "timeout"]],
+      ["timeout, then refusal, then timeout", ["timeout", "refusal", "timeout"]],
+      ["refusal, then a timeout, then Clear filters", ["refusal", "timeout", "clearFilters"]],
+      ["refusal, then a refresh still in flight", ["refusal", "pendingRefresh"]],
+      ["refusal, then a timeout, then reopening the list", ["refusal", "timeout", "reopen"]],
+    ])("%s", async (_name, order) => {
+      await render();
+      expect(container.textContent).toContain(row.title);
+      expect(button("Open 2")).toBeDefined();
+      for (const step of order) await steps[step]();
+      expect(container.textContent).not.toContain(row.title);
+      expect(container.textContent).not.toContain("Load more");
+      // The tab counts came from the refused list too.
+      expect(button("Open")).toBeDefined();
+      // Only a read the host answers lifts it.
+      h.error = null;
+      h.pending = false;
+      h.autoCompleteRefresh = true;
+      await act(async () => handle.current!.refresh());
+      await render();
+      expect(container.textContent).toContain(row.title);
+    });
+  });
+  it("hides later pages when only the first page's refresh is refused", async () => {
+    await render();
+    await act(async () => button("Load more").click());
+    expect(container.textContent).toContain("Second page");
+    h.firstOnlyError = true;
+    h.error = new PullRequestsOperationError({
+      operation: "list",
+      code: "forbidden",
+      message: "You can't view these",
+      hostDetail: null,
+      retryable: false,
+    });
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("can't view");
+    expect(container.textContent).not.toContain("Second page");
+    expect(container.textContent).not.toContain(row.title);
+  });
+  it("hides every page and the counts when only the Load more read is refused", async () => {
+    await render();
+    expect(button("Open 2")).toBeDefined();
+    h.laterOnlyError = true;
+    h.error = new PullRequestsOperationError({
+      operation: "list",
+      code: "forbidden",
+      message: "You can't view these",
+      hostDetail: null,
+      retryable: false,
+    });
+    await act(async () => button("Load more").click());
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("can't view");
+    expect(container.textContent).not.toContain("Second page");
+    expect(container.textContent).not.toContain(row.title);
+    // The tab counts came from the refused list too.
+    expect(button("Open")).toBeDefined();
+    // Retry reads the list again from its first page; the host's answer lifts the refusal.
+    h.error = null;
+    h.laterOnlyError = false;
+    await act(async () => button("Retry").click());
+    await render();
+    expect(h.refresh).toHaveBeenCalledWith(null);
+    expect(container.textContent).toContain(row.title);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+  it("shows a first-page failure that is not a refusal while page two is shown", async () => {
+    await render();
+    await act(async () => button("Load more").click());
+    h.firstOnlyError = true;
+    h.error = new PullRequestsOperationError({
+      operation: "list",
+      code: "provider_error",
+      message: "Host timed out",
+      hostDetail: null,
+      retryable: true,
+    });
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("timed out");
+    expect(container.textContent).toContain("Second page");
+  });
+  it("shows the refresh label while a change event's stored read is pending", async () => {
+    await render();
+    expect(statuses()).toHaveLength(0);
+    h.snapshotPending = true;
+    await render();
+    expect(statuses()[0]?.textContent).toContain("Refreshing pull requests…");
+  });
+  it("keeps later pages until a Refresh read answers", async () => {
+    await render();
+    await act(async () => button("Load more").click());
+    expect(container.textContent).toContain("Second page");
+    h.autoCompleteRefresh = false;
+    h.pending = true;
+    await act(async () => handle.current!.refresh());
+    expect(container.textContent).toContain("Second page");
+    h.pending = false;
+    h.first = { ...h.first!, rows: [...h.first!.rows] };
+    await render();
+    expect(container.textContent).not.toContain("Second page");
+    expect(container.textContent).toContain(row.title);
+  });
+  it("shows the refresh label for the first page's read while page two is shown", async () => {
+    await render();
+    await act(async () => button("Load more").click());
+    h.pending = true;
+    h.firstOnly = true;
+    await render();
+    expect(container.textContent).toContain("Second page");
+    expect(statuses()[0]?.textContent).toContain("Refreshing pull requests…");
+  });
+  it("keeps the empty message and Clear filters while a settled empty list refreshes", async () => {
+    h.first = { rows: [], nextCursor: null, totalCount: 0, counts: null };
+    await render();
+    expect(container.textContent).toContain("No open pull requests");
+    h.pending = true;
+    await render();
+    expect(container.textContent).toContain("No open pull requests");
+    expect(statuses()[0]?.textContent).toContain("Refreshing pull requests…");
+    expect(container.textContent).not.toContain("Loading pull requests…");
+  });
+  it("shows refresh feedback while a stored copy waits for the live page", async () => {
+    h.first = null;
+    h.pending = true;
+    h.snapshot = storedList("Stored copy", 1_000);
+    await render();
+    expect(container.textContent).toContain("Stored copy");
+    expect(statuses()[0]?.textContent).toContain("Refreshing pull requests…");
+  });
 });
 
 describe("PullRequestsListView GitHub snapshots", () => {

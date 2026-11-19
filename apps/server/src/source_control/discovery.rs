@@ -229,13 +229,14 @@ impl SourceControlDiscovery {
         cwd: PathBuf,
         cancellation: &CancellationToken,
     ) -> SourceControlDiscoveryResult {
-        let mut version_control_systems = Vec::with_capacity(VCS_PROBES.len());
-        for spec in VCS_PROBES {
+        // Every tool is probed at once: a missing, signed-out or offline CLI that waits out
+        // PROBE_TIMEOUT delays the answer by its own bound, not by the sum of all of them.
+        let vcs = futures_util::future::join_all(VCS_PROBES.iter().map(|spec| async {
             let result = self
                 .probe(&cwd, spec.executable, spec.version_args, None, cancellation)
                 .await;
             let available = result.as_ref().is_some_and(|output| output.exit_code == 0);
-            version_control_systems.push(VcsDiscoveryItem {
+            VcsDiscoveryItem {
                 kind: spec.kind,
                 label: spec.label.into(),
                 executable: spec.executable.into(),
@@ -252,11 +253,9 @@ impl SourceControlDiscovery {
                 } else {
                     WireOption::none()
                 },
-            });
-        }
-
-        let mut source_control_providers = Vec::with_capacity(PROVIDER_PROBES.len() + 1);
-        for spec in PROVIDER_PROBES {
+            }
+        }));
+        let providers = futures_util::future::join_all(PROVIDER_PROBES.iter().map(|spec| async {
             let version = self
                 .probe(
                     &cwd,
@@ -281,7 +280,7 @@ impl SourceControlDiscovery {
             } else {
                 unknown_auth("Hosting integration command was not found on the server PATH.")
             };
-            source_control_providers.push(SourceControlProviderDiscoveryItem {
+            SourceControlProviderDiscoveryItem {
                 kind: spec.kind,
                 label: spec.label.into(),
                 executable: Some(spec.executable.into()),
@@ -298,8 +297,10 @@ impl SourceControlDiscovery {
                     WireOption::none()
                 },
                 auth,
-            });
-        }
+            }
+        }));
+        let (version_control_systems, mut source_control_providers) =
+            futures_util::future::join(vcs, providers).await;
         source_control_providers.push(SourceControlProviderDiscoveryItem {
             kind: ProviderKind::Bitbucket,
             label: "Bitbucket".into(),
@@ -523,6 +524,53 @@ mod tests {
             .find(|item| item.executable == "jj")
             .expect("Jujutsu probe");
         assert_eq!(jj.status, DiscoveryStatus::Missing);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_probes_every_tool_at_once_and_keeps_the_order() {
+        let sandbox = crate::test_support::TestSandbox::new("discovery-concurrent");
+        let directory = sandbox.path("bin");
+        std::fs::create_dir(&directory).unwrap();
+        for executable in ["jj", "gh", "glab", "az"] {
+            crate::test_support::TestSandbox::write_executable(
+                &directory.join(executable),
+                "#!/bin/sh\nsleep 1\necho 'tool 1.0'\n",
+            );
+        }
+        let discovery = SourceControlDiscovery::with_executable_dir_for_integration_test(directory);
+        let started = std::time::Instant::now();
+        let result = discovery
+            .discover(sandbox.root().to_path_buf(), &CancellationToken::new())
+            .await;
+        let elapsed = started.elapsed();
+        // One after another this takes at least 7 s: jj once, gh, glab and az twice each
+        // (version, then sign-in). Together it is the longest chain, about 2 s.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "discovery took {elapsed:?}"
+        );
+        assert_eq!(
+            result
+                .version_control_systems
+                .iter()
+                .map(|item| item.kind)
+                .collect::<Vec<_>>(),
+            [VcsDiscoveryKind::Git, VcsDiscoveryKind::Jj]
+        );
+        assert_eq!(
+            result
+                .source_control_providers
+                .iter()
+                .map(|item| (item.kind, item.status))
+                .collect::<Vec<_>>(),
+            [
+                (ProviderKind::Github, DiscoveryStatus::Available),
+                (ProviderKind::Gitlab, DiscoveryStatus::Available),
+                (ProviderKind::AzureDevops, DiscoveryStatus::Available),
+                (ProviderKind::Bitbucket, DiscoveryStatus::Missing),
+            ]
+        );
     }
 
     #[cfg(unix)]

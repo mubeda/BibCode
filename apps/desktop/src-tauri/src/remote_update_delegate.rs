@@ -385,11 +385,14 @@ mod tests {
         assert!(window_allows_install(app.handle()).await);
 
         // With a main window the install waits for the web: Stay refuses it, Allow lets it run.
+        // Its webview data stays in a temporary folder, not the local app-data folder.
+        let webview_data = tempfile::tempdir().expect("webview data folder");
         let _window = tauri::WebviewWindowBuilder::new(
             &app,
             crate::window::MAIN_WINDOW_LABEL,
             Default::default(),
         )
+        .data_directory(webview_data.path().to_path_buf())
         .build()
         .expect("mock webview");
         let guard = app.state::<crate::window::CloseGuard>();

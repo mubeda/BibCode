@@ -168,6 +168,8 @@ const runtimeModeConfig: Record<
 };
 
 const runtimeModeOptions = Object.keys(runtimeModeConfig) as RuntimeMode[];
+const READ_ONLY_REVIEW_REASON =
+  "Codex runs reviews on their own in its read-only sandbox, so the mode does not apply.";
 const ACTIVE_CONTROL_CLASSNAME =
   "border-foreground/12 bg-foreground/10 text-foreground hover:border-foreground/18 hover:bg-foreground/15 hover:text-foreground dark:border-foreground/18 dark:bg-foreground/14 dark:hover:border-foreground/24 dark:hover:bg-foreground/20 [&_svg]:!text-foreground";
 const COMPOSER_FLOATING_LAYER_SELECTOR = [
@@ -272,6 +274,7 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
   interactionModeAvailability: ProviderControlAvailability;
   interactionMode: ProviderInteractionMode;
   runtimeMode: RuntimeMode;
+  readOnlyReview: boolean;
   showPlanToggle: boolean;
   planSidebarLabel: string;
   planSidebarOpen: boolean;
@@ -332,55 +335,75 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
     <>
       <Separator orientation="vertical" className="mx-0.5 hidden h-4 sm:block" />
 
-      <Tooltip>
-        <Select
-          value={props.runtimeMode}
-          onValueChange={(value) => props.onRuntimeModeChange(value!)}
-        >
+      {props.readOnlyReview ? (
+        <Tooltip>
           <TooltipTrigger
             render={
-              <SelectTrigger
+              <Button
                 variant="ghost"
                 size="sm"
-                className={cn(
-                  "shrink-0 px-2 text-foreground/80 hover:text-foreground [&_[data-slot=select-icon]]:hidden",
-                  isFullAccess ? "[&_svg]:text-destructive" : "[&_svg]:text-foreground/80",
-                )}
-                aria-label={runtimeModeOption.label}
+                type="button"
+                className="shrink-0 px-2 text-muted-foreground"
+                aria-label="Read-only review"
+                aria-disabled
               />
             }
           >
-            <RuntimeModeIcon className="size-4" />
+            <LockIcon className="size-4" />
           </TooltipTrigger>
-          <SelectPopup alignItemWithTrigger={false}>
-            {runtimeModeOptions.map((mode) => {
-              const option = runtimeModeConfig[mode];
-              const OptionIcon = option.icon;
-              return (
-                <SelectItem key={mode} value={mode} className="min-w-64 py-2">
-                  <div className="grid min-w-0 gap-0.5">
-                    <span className="inline-flex items-center gap-1.5 font-medium text-foreground">
-                      <OptionIcon
-                        className={cn(
-                          "size-3.5 shrink-0",
-                          isFullAccess && mode === "full-access"
-                            ? "text-destructive"
-                            : "text-muted-foreground",
-                        )}
-                      />
-                      {option.label}
-                    </span>
-                    <span className="text-muted-foreground text-xs leading-4">
-                      {option.description}
-                    </span>
-                  </div>
-                </SelectItem>
-              );
-            })}
-          </SelectPopup>
-        </Select>
-        <TooltipPopup side="top">{runtimeModeOption.description}</TooltipPopup>
-      </Tooltip>
+          <TooltipPopup side="top">{READ_ONLY_REVIEW_REASON}</TooltipPopup>
+        </Tooltip>
+      ) : (
+        <Tooltip>
+          <Select
+            value={props.runtimeMode}
+            onValueChange={(value) => props.onRuntimeModeChange(value!)}
+          >
+            <TooltipTrigger
+              render={
+                <SelectTrigger
+                  variant="ghost"
+                  size="sm"
+                  className={cn(
+                    "shrink-0 px-2 text-foreground/80 hover:text-foreground [&_[data-slot=select-icon]]:hidden",
+                    isFullAccess ? "[&_svg]:text-destructive" : "[&_svg]:text-foreground/80",
+                  )}
+                  aria-label={runtimeModeOption.label}
+                />
+              }
+            >
+              <RuntimeModeIcon className="size-4" />
+            </TooltipTrigger>
+            <SelectPopup alignItemWithTrigger={false}>
+              {runtimeModeOptions.map((mode) => {
+                const option = runtimeModeConfig[mode];
+                const OptionIcon = option.icon;
+                return (
+                  <SelectItem key={mode} value={mode} className="min-w-64 py-2">
+                    <div className="grid min-w-0 gap-0.5">
+                      <span className="inline-flex items-center gap-1.5 font-medium text-foreground">
+                        <OptionIcon
+                          className={cn(
+                            "size-3.5 shrink-0",
+                            isFullAccess && mode === "full-access"
+                              ? "text-destructive"
+                              : "text-muted-foreground",
+                          )}
+                        />
+                        {option.label}
+                      </span>
+                      <span className="text-muted-foreground text-xs leading-4">
+                        {option.description}
+                      </span>
+                    </div>
+                  </SelectItem>
+                );
+              })}
+            </SelectPopup>
+          </Select>
+          <TooltipPopup side="top">{runtimeModeOption.description}</TooltipPopup>
+        </Tooltip>
+      )}
 
       {interactionModeToggle}
 
@@ -609,6 +632,8 @@ export interface ChatComposerProps {
   // Mode
   runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
+  /** The server's `readOnlyCodexReviews` capability: a Codex review ignores the runtime mode. */
+  readOnlyCodexReviews?: boolean;
 
   // Provider / model
   lockedProvider: ProviderDriverKind | null;
@@ -727,6 +752,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     planSidebarOpen,
     runtimeMode,
     interactionMode,
+    readOnlyCodexReviews = false,
     lockedProvider,
     providerBindingInstanceId,
     lockProviderPickerToActiveInstance,
@@ -851,6 +877,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     providerInstanceEntries.find((entry) => entry.instanceId === providerBindingInstanceId)
       ?.driverKind ?? ProviderDriverKind.make("codex");
   const selectedProvider: ProviderDriverKind = lockedProvider ?? unlockedSelectedProvider;
+  // #376: the server runs a Codex review read-only with no approvals, whatever mode is stored.
+  const readOnlyReview =
+    readOnlyCodexReviews && activeThread?.codeReview === true && selectedProvider === "codex";
   const lockedContinuationGroupKey = useMemo((): string | null => {
     if (!lockedProvider || !activeThread) return null;
     return (
@@ -2469,6 +2498,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               <ComposerPendingApprovalPanel
                 approval={activePendingApproval}
                 pendingCount={pendingApprovals.length}
+                showDetail
               />
               <div className="flex flex-wrap items-center justify-end gap-2 px-3 pb-3 sm:px-4">
                 <ComposerPendingApprovalActions
@@ -2936,6 +2966,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   interactionModeAvailability={composerProviderControls.interactionModeAvailability}
                   interactionMode={interactionMode}
                   runtimeMode={runtimeMode}
+                  readOnlyReview={readOnlyReview}
                   showPlanToggle={showPlanSidebarToggle}
                   planSidebarLabel={planSidebarLabel}
                   planSidebarOpen={planSidebarOpen}

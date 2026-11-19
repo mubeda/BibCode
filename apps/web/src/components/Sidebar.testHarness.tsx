@@ -112,6 +112,7 @@ const h = vi.hoisted(() => {
       const domProps = new Set([
         "aria-current",
         "aria-describedby",
+        "aria-expanded",
         "aria-label",
         "aria-labelledby",
         "autoFocus",
@@ -304,7 +305,11 @@ const h = vi.hoisted(() => {
 vi.mock("@tanstack/react-router", () => ({
   Link: h.mk("Link", "a"),
   useNavigate: () => h.spies.navigate,
-  useRouter: () => ({ navigate: h.spies.routerNavigate }),
+  useRouter: () => ({
+    navigate: h.spies.routerNavigate,
+    buildLocation: ({ to }: { to: string }) => ({ pathname: to }),
+    state: { location: { pathname: h.state.pathname } },
+  }),
   useLocation: (opts?: { select?: (loc: { pathname: string }) => unknown }) =>
     opts?.select ? opts.select({ pathname: h.state.pathname }) : { pathname: h.state.pathname },
   useParams: (opts?: { select?: (params: Record<string, string>) => unknown }) =>

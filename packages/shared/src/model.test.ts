@@ -10,6 +10,9 @@ import {
 import {
   applyClaudePromptEffortPrefix,
   buildProviderOptionSelectionsFromDescriptors,
+  fallbackModelOption,
+  replacedRetiredCodexModel,
+  retiredCodexSessionDefault,
   createModelCapabilities,
   createModelSelection,
   getModelSelectionBooleanOptionValue,
@@ -702,7 +705,8 @@ describe("resolveModelSlugForProvider", () => {
 
   it("falls back to the provider default when the model is empty", () => {
     expect(resolveModelSlugForProvider(CLAUDE, null)).toBe("claude-sonnet-5");
-    expect(resolveModelSlugForProvider(CODEX, "")).toBe("gpt-5.4");
+    // Codex has no built-in default model: "auto" names none (#380).
+    expect(resolveModelSlugForProvider(CODEX, "")).toBe("auto");
   });
 
   it("falls back to the global default for an unknown provider", () => {
@@ -820,5 +824,109 @@ describe("applyClaudePromptEffortPrefix", () => {
     expect(applyClaudePromptEffortPrefix("Ultrathink: already", "ultrathink")).toBe(
       "Ultrathink: already",
     );
+  });
+});
+
+describe("retiredCodexSessionDefault (#380, R4)", () => {
+  const chatGptList = [{ slug: "auto" }, { slug: "gpt-6.2-sol" }];
+  it("names the retired model of a saved default that Codex no longer offers", () => {
+    expect(retiredCodexSessionDefault({ saved: { model: "gpt-5.4" }, offered: chatGptList })).toBe(
+      "gpt-5.4",
+    );
+    expect(
+      retiredCodexSessionDefault({ saved: { model: "gpt-5.4-mini" }, offered: chatGptList }),
+    ).toBe("gpt-5.4-mini");
+  });
+
+  it("keeps a default Codex still offers, any other model, and one read before the list", () => {
+    // API-key sign-in: the list still offers the model.
+    expect(
+      retiredCodexSessionDefault({
+        saved: { model: "gpt-5.4" },
+        offered: [...chatGptList, { slug: "gpt-5.4" }],
+      }),
+    ).toBeNull();
+    expect(
+      retiredCodexSessionDefault({ saved: { model: "gpt-6.2-sol" }, offered: chatGptList }),
+    ).toBeNull();
+    expect(
+      retiredCodexSessionDefault({ saved: { model: "gpt-5.4" }, offered: [{ slug: "auto" }] }),
+    ).toBeNull();
+    expect(retiredCodexSessionDefault({ saved: undefined, offered: chatGptList })).toBeNull();
+  });
+});
+
+describe("replacedRetiredCodexModel (#380)", () => {
+  const codex = ProviderInstanceId.make("codex");
+  const CODEX_DRIVER = ProviderDriverKind.make("codex");
+  const sent = { instanceId: codex, model: "auto" };
+  // ChatGPT sign-in: Codex's list no longer offers the retired models.
+  const chatgptList = [{ slug: "auto" }, { slug: "gpt-6.2-sol" }];
+  const replaced = (model: string, overrides: object = {}) =>
+    replacedRetiredCodexModel({
+      driver: CODEX_DRIVER,
+      stored: { instanceId: codex, model },
+      sent,
+      offered: chatgptList,
+      ...overrides,
+    });
+
+  it("names the retired model a thread stored when the send replaced it with Codex's default", () => {
+    expect(replaced("gpt-5.4")).toBe("gpt-5.4");
+    expect(replaced("gpt-5.4-mini")).toBe("gpt-5.4-mini");
+    // Through an alias.
+    expect(replaced("gpt-5-codex")).toBe("gpt-5.4");
+  });
+
+  it("is null when the stored model is sent unchanged", () => {
+    expect(replaced("gpt-5.4", { sent: { instanceId: codex, model: "gpt-5.4" } })).toBeNull();
+  });
+
+  it("is null when Codex still offers the model and the person chose the default", () => {
+    // API-key sign-in: the list still has it, so switching away was deliberate.
+    expect(replaced("gpt-5.4", { offered: [{ slug: "auto" }, { slug: "gpt-5.4" }] })).toBeNull();
+  });
+
+  it("is null before Codex's own list is read", () => {
+    expect(replaced("gpt-5.4", { offered: [{ slug: "auto" }] })).toBeNull();
+    expect(replaced("gpt-5.4", { offered: [] })).toBeNull();
+  });
+
+  it("is null for a model Codex still runs, no stored model, another instance or provider", () => {
+    expect(replaced("gpt-6.2-sol")).toBeNull();
+    expect(replaced("auto")).toBeNull();
+    expect(replaced("gpt-5.4", { stored: null })).toBeNull();
+    expect(
+      replaced("gpt-5.4", {
+        stored: { instanceId: ProviderInstanceId.make("codex-work"), model: "gpt-5.4" },
+      }),
+    ).toBeNull();
+    expect(replaced("gpt-5.4", { driver: ProviderDriverKind.make("cursor") })).toBeNull();
+  });
+});
+
+describe("fallbackModelOption (#380)", () => {
+  const CODEX_DRIVER = ProviderDriverKind.make("codex");
+  const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
+  const option = (slug: string, isCustom = false) => ({ slug, isCustom });
+
+  it("prefers Codex's auto entry wherever a saved order put it", () => {
+    expect(fallbackModelOption(CODEX_DRIVER, [option("gpt-6.2-sol"), option("auto")])?.slug).toBe(
+      "auto",
+    );
+  });
+
+  it("keeps the listed order for other providers, even with a model named auto", () => {
+    expect(
+      fallbackModelOption(CLAUDE_DRIVER, [option("claude-sonnet-5"), option("auto")])?.slug,
+    ).toBe("claude-sonnet-5");
+  });
+
+  it("falls back to the first built-in model, then to the first model", () => {
+    expect(
+      fallbackModelOption(CODEX_DRIVER, [option("mine", true), option("gpt-6.2-sol")])?.slug,
+    ).toBe("gpt-6.2-sol");
+    expect(fallbackModelOption(CODEX_DRIVER, [option("mine", true)])?.slug).toBe("mine");
+    expect(fallbackModelOption(CODEX_DRIVER, [])).toBeNull();
   });
 });

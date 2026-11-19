@@ -271,6 +271,28 @@ describe("RPC wire fixture exporter", () => {
     });
   });
 
+  it("pairs alreadyRemoved only with thread-not-found, as the server does", async () => {
+    await runExporter();
+    const removalFailures = readManifest()
+      .typedFailureFixtures.map((path) => {
+        const contents = io.writes.get(NodePath.join(outputDirectory, path));
+        return (
+          JSON.parse(contents!) as {
+            readonly exit: {
+              readonly cause: ReadonlyArray<{
+                readonly error: { _tag: string; reason?: string; alreadyRemoved?: boolean };
+              }>;
+            };
+          }
+        ).exit.cause[0]!.error;
+      })
+      .filter((error) => error._tag === "WorktreeRemovalError");
+    expect(removalFailures.length).toBeGreaterThan(0);
+    for (const error of removalFailures.filter((error) => error.alreadyRemoved === true)) {
+      expect(error.reason).toBe("thread-not-found");
+    }
+  });
+
   it.each([
     [7, "7"],
     [null, "unknown"],

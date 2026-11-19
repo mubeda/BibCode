@@ -9,11 +9,15 @@ const h = vi.hoisted(() => ({
   activeEnvironmentId: null as string | null,
   setActiveEnvironmentId: vi.fn(),
   navigate: vi.fn(),
+  mobile: { isMobile: false, setOpenMobile: vi.fn() },
   catalogCommandCalls: [] as Array<string>,
   buttons: [] as Array<Record<string, unknown>>,
   menuItems: [] as Array<Record<string, unknown>>,
   updateSnapshots: new Map<string, unknown>(),
+  showContextMenu: vi.fn<(items: unknown, position: unknown) => Promise<string | null>>(),
   reset() {
+    h.showContextMenu.mockReset();
+    h.showContextMenu.mockResolvedValue(null);
     h.environments = [];
     h.isReady = true;
     h.activeEnvironmentId = null;
@@ -69,8 +73,17 @@ vi.mock("../../connection/catalog", () => ({
     },
   ),
 }));
+vi.mock("../../localApi", () => ({
+  readLocalApi: () => ({ contextMenu: { show: h.showContextMenu } }),
+}));
+vi.mock("../ui/toast", () => ({ toastManager: { add: vi.fn() } }));
+vi.mock("~/components/ui/sidebar", () => ({ useSidebar: () => h.mobile }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => h.navigate,
+  useRouter: () => ({
+    buildLocation: () => ({ pathname: "/environment/target/terminal" }),
+    state: { location: { pathname: "/" } },
+  }),
 }));
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: { children?: ReactNode }) => <>{children}</>,
@@ -317,6 +330,177 @@ describe("EnvironmentRail", () => {
     renderRail();
     for (const effect of effects) effect();
     expect(h.setActiveEnvironmentId).toHaveBeenCalledExactlyOnceWith(ENV_PRIMARY);
+  });
+
+  describe("server commands menu (#378)", () => {
+    const BOTH_COMMANDS = [
+      { id: "terminal", label: "Open terminal" },
+      { id: "dashboard", label: "Dashboard" },
+    ];
+
+    function railWith(...extra: ReturnType<typeof environment>[]) {
+      h.reset();
+      h.environments = [
+        environment({
+          environmentId: ENV_PRIMARY,
+          label: "Local",
+          target: { _tag: "PrimaryConnectionTarget" },
+        }),
+        ...extra,
+      ];
+      h.activeEnvironmentId = ENV_PRIMARY;
+      renderRail();
+    }
+
+    const remoteServer = (phase = "connected") =>
+      environment({
+        environmentId: ENV_REMOTE,
+        label: "Server A",
+        target: { _tag: "BearerConnectionTarget", connectionId: "paired-1" },
+        phase,
+      });
+
+    function rightClick(testId: string) {
+      const preventDefault = vi.fn();
+      const button = buttonByTestId(testId);
+      expect(button, testId).toBeDefined();
+      (button!.onContextMenu as (event: unknown) => void)({
+        preventDefault,
+        clientX: 40,
+        clientY: 80,
+      });
+      return preventDefault;
+    }
+
+    function keyDown(testId: string, init: Record<string, unknown>) {
+      const event = {
+        shiftKey: false,
+        ctrlKey: false,
+        altKey: false,
+        metaKey: false,
+        preventDefault: vi.fn(),
+        stopPropagation: vi.fn(),
+        currentTarget: { getBoundingClientRect: () => ({ left: 12.4, bottom: 52.6 }) },
+        ...init,
+      };
+      (buttonByTestId(testId)!.onKeyDown as (event: unknown) => void)(event);
+      return event;
+    }
+
+    it("right-click on a saved server shows Open terminal then Dashboard and runs the pick", async () => {
+      railWith(remoteServer());
+      h.showContextMenu.mockResolvedValue("dashboard");
+      const preventDefault = rightClick(`environment-rail-entry-${ENV_REMOTE}`);
+      expect(preventDefault, "the browser menu must not appear").toHaveBeenCalled();
+      expect(h.showContextMenu).toHaveBeenCalledExactlyOnceWith(BOTH_COMMANDS, { x: 40, y: 80 });
+      await vi.waitFor(() =>
+        expect(h.navigate).toHaveBeenCalledExactlyOnceWith({
+          to: "/environment/$environmentId/dashboard",
+          params: { environmentId: ENV_REMOTE },
+        }),
+      );
+      expect(
+        h.setActiveEnvironmentId,
+        "the menu never changes the selection",
+      ).not.toHaveBeenCalled();
+    });
+
+    it("right-click on Local targets this device, also before anything is selected", async () => {
+      railWith(remoteServer());
+      h.activeEnvironmentId = null;
+      renderRail();
+      h.showContextMenu.mockResolvedValue("terminal");
+      rightClick("environment-rail-local");
+      expect(h.showContextMenu).toHaveBeenCalledExactlyOnceWith(BOTH_COMMANDS, { x: 40, y: 80 });
+      await vi.waitFor(() =>
+        expect(h.navigate).toHaveBeenCalledExactlyOnceWith({
+          to: "/environment/$environmentId/terminal",
+          params: { environmentId: ENV_PRIMARY },
+          search: { open: expect.any(Number) },
+        }),
+      );
+    });
+
+    it("the Local menu acts on the local backend in view, and Local keeps its picker", async () => {
+      railWith(
+        environment({
+          environmentId: ENV_WSL,
+          label: "Ubuntu",
+          target: { _tag: "BearerConnectionTarget", connectionId: "local:wsl-ubuntu" },
+        }),
+      );
+      h.activeEnvironmentId = ENV_WSL;
+      renderRail();
+      expect(h.menuItems.map((item) => item.children)).toEqual(["This device", "Ubuntu"]);
+      h.showContextMenu.mockResolvedValue("terminal");
+      rightClick("environment-rail-local");
+      await vi.waitFor(() =>
+        expect(h.navigate).toHaveBeenCalledWith({
+          to: "/environment/$environmentId/terminal",
+          params: { environmentId: ENV_WSL },
+          search: { open: expect.any(Number) },
+        }),
+      );
+    });
+
+    it("Shift+F10 and the Menu key open the menu at the icon, once", () => {
+      railWith(remoteServer());
+      const testId = `environment-rail-entry-${ENV_REMOTE}`;
+      const shiftF10 = keyDown(testId, { key: "F10", shiftKey: true });
+      expect(shiftF10.preventDefault).toHaveBeenCalled();
+      expect(shiftF10.stopPropagation).toHaveBeenCalled();
+      expect(h.showContextMenu).toHaveBeenCalledExactlyOnceWith(BOTH_COMMANDS, { x: 12, y: 53 });
+      // Chromium follows the shortcut with a contextmenu event; it must not open a second menu.
+      rightClick(testId);
+      expect(h.showContextMenu).toHaveBeenCalledTimes(1);
+
+      railWith(remoteServer());
+      keyDown("environment-rail-local", { key: "ContextMenu" });
+      expect(h.showContextMenu).toHaveBeenCalledExactlyOnceWith(BOTH_COMMANDS, { x: 12, y: 53 });
+    });
+
+    it("arrow keys still move focus and do not open the menu", () => {
+      railWith(remoteServer());
+      const arrow = keyDown(`environment-rail-entry-${ENV_REMOTE}`, { key: "ArrowDown" });
+      expect(arrow.preventDefault).not.toHaveBeenCalled();
+      expect(arrow.stopPropagation, "the radiogroup handler still sees it").not.toHaveBeenCalled();
+      expect(h.showContextMenu).not.toHaveBeenCalled();
+    });
+
+    it("an offline server lists both commands disabled with the reason", async () => {
+      railWith(remoteServer("disconnected"));
+      rightClick(`environment-rail-entry-${ENV_REMOTE}`);
+      const reason = "Server A is not connected.";
+      expect(h.showContextMenu).toHaveBeenCalledExactlyOnceWith(
+        [
+          { id: "terminal", label: "Open terminal", disabled: true, description: reason },
+          { id: "dashboard", label: "Dashboard", disabled: true, description: reason },
+        ],
+        { x: 40, y: 80 },
+      );
+      await Promise.resolve();
+      expect(h.navigate).not.toHaveBeenCalled();
+    });
+
+    it("closes the phone sidebar so the opened panel is visible", async () => {
+      railWith(remoteServer());
+      h.mobile = { isMobile: true, setOpenMobile: vi.fn() };
+      renderRail();
+      h.showContextMenu.mockResolvedValue("dashboard");
+      rightClick(`environment-rail-entry-${ENV_REMOTE}`);
+      await vi.waitFor(() => expect(h.navigate).toHaveBeenCalled());
+      expect(h.mobile.setOpenMobile).toHaveBeenCalledExactlyOnceWith(false);
+      h.mobile = { isMobile: false, setOpenMobile: vi.fn() };
+    });
+
+    it("dismissing the menu opens nothing and selects nothing", async () => {
+      railWith(remoteServer());
+      rightClick(`environment-rail-entry-${ENV_REMOTE}`);
+      await h.showContextMenu.mock.results[0]!.value;
+      await Promise.resolve();
+      expect(h.navigate).not.toHaveBeenCalled();
+      expect(h.setActiveEnvironmentId).not.toHaveBeenCalled();
+    });
   });
 
   it("does not reset while the catalog is loading", () => {

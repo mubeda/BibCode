@@ -1,6 +1,6 @@
 import { memo, useCallback } from "react";
 
-import { Button } from "~/components/ui/button";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 import {
   Dialog,
   DialogDescription,
@@ -61,41 +61,21 @@ export const GitManagerSwitchWithChangesDialog = memo(function GitManagerSwitchW
           )}
         </div>
         <DialogFooter>
-          <Button
-            aria-describedby={
-              leaveChangesDisabledReason === null
-                ? undefined
-                : "git-manager-switch-stash-disabled-reason"
-            }
-            disabled={busy || leaveChangesDisabledReason !== null}
-            title={leaveChangesDisabledReason ?? undefined}
+          <GitManagerDisabledReasonButton
+            disabled={busy}
+            disabledReason={leaveChangesDisabledReason}
             variant="outline"
             onClick={leaveChanges}
           >
             Leave my changes
-          </Button>
-          {leaveChangesDisabledReason === null ? null : (
-            <span className="sr-only" id="git-manager-switch-stash-disabled-reason">
-              {leaveChangesDisabledReason}
-            </span>
-          )}
-          <Button
-            aria-describedby={
-              branchDisabledReason === null
-                ? undefined
-                : "git-manager-switch-branch-disabled-reason"
-            }
-            disabled={busy || branchDisabledReason !== null}
-            title={branchDisabledReason ?? undefined}
+          </GitManagerDisabledReasonButton>
+          <GitManagerDisabledReasonButton
+            disabled={busy}
+            disabledReason={branchDisabledReason}
             onClick={bringChanges}
           >
             Bring my changes
-          </Button>
-          {branchDisabledReason === null ? null : (
-            <span className="sr-only" id="git-manager-switch-branch-disabled-reason">
-              {branchDisabledReason}
-            </span>
-          )}
+          </GitManagerDisabledReasonButton>
         </DialogFooter>
       </DialogPopup>
     </Dialog>

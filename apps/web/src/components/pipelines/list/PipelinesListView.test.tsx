@@ -23,6 +23,8 @@ import {
   RepositoryModule,
   type RepositoryModuleValue,
 } from "../../repositoryModule/RepositoryModule";
+import { clearResourceRefusals } from "../../repositoryModule/resourceRefusal";
+import { expectLoadingModel } from "../../ui/loading-state.testing";
 import { pipelinesModule } from "../pipelinesModule";
 import { pipelineRow, pipelinesPage } from "../testFixtures";
 import { buildPipelinesListInput } from "./pipelinesList.logic";
@@ -32,6 +34,14 @@ const h = vi.hoisted(() => ({
   second: null as PipelinesListPage | null,
   error: null as PullRequestsOperationError | null,
   pending: false,
+  // The stored copy's read is in flight, as after a change event.
+  snapshotPending: false,
+  // The error answers the first page's read only; later pages stay settled.
+  firstOnlyError: false,
+  // The error answers a later page's read only; the first page stays settled.
+  laterOnlyError: false,
+  // Only the first page's read is in flight, as a timer refresh leaves page two alone.
+  firstOnly: false,
   failures: new Map<object, unknown>(),
   snapshot: null as PipelinesSnapshot | null,
   nextSnapshot: null as PipelinesSnapshot | null,
@@ -98,7 +108,7 @@ vi.mock("../../../state/query", () => ({
         data: value,
         emission,
         error: null,
-        isPending: false,
+        isPending: atom.kind === "readSnapshot" && h.snapshotPending,
         refresh: read,
         revalidate: read,
         requiresRetry: false,
@@ -115,7 +125,11 @@ vi.mock("../../../state/query", () => ({
         requiresRetry: false,
       };
     const data = atom.input.cursor === null ? h.first : h.second;
-    const error = h.error;
+    const error =
+      (h.firstOnlyError && atom.input.cursor !== null) ||
+      (h.laterOnlyError && atom.input.cursor === null)
+        ? null
+        : h.error;
     if (error && !h.failures.has(error))
       h.failures.set(error, { _tag: "Failure", cause: Cause.fail(error) });
     // A read stays pending until `settle`, then answers with a new copy of the page.
@@ -135,7 +149,7 @@ vi.mock("../../../state/query", () => ({
       data,
       emission: error ? h.failures.get(error) : { _tag: "Success", value: data },
       error: error?.message ?? null,
-      isPending: h.pending,
+      isPending: h.pending && (!h.firstOnly || atom.input.cursor === null),
       refresh: read,
       revalidate: read,
       requiresRetry: false,
@@ -171,6 +185,7 @@ let container: HTMLDivElement;
 let root: Root;
 const handle = createRef<PipelinesListViewHandle>();
 const onFiltersChange = vi.fn();
+const onBackoffChange = vi.fn();
 
 function moduleValue(
   repositoryContext: typeof context,
@@ -219,7 +234,7 @@ async function render(
           ref={handle}
           filters={options.filters ?? DEFAULT_PIPELINES_FILTERS}
           onFiltersChange={onFiltersChange}
-          onBackoffChange={vi.fn()}
+          onBackoffChange={onBackoffChange}
         />
       </RepositoryModule.Provider>,
     ),
@@ -251,11 +266,16 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   usePipelinesStore.setState({ byProjectKey: {} });
+  clearResourceRefusals();
   localStorage.clear();
   h.first = pipelinesPage([pipelineRow], { nextCursor: "c2" });
   h.second = pipelinesPage([{ ...pipelineRow, id: 4700, label: "#4700", title: "Second page" }]);
   h.error = null;
   h.pending = false;
+  h.snapshotPending = false;
+  h.firstOnlyError = false;
+  h.laterOnlyError = false;
+  h.firstOnly = false;
   h.failures.clear();
   h.snapshot = null;
   h.nextSnapshot = null;
@@ -269,6 +289,7 @@ beforeEach(() => {
   h.reads.mockClear();
   h.inflight = [];
   onFiltersChange.mockClear();
+  onBackoffChange.mockClear();
   setVisibility("visible");
 });
 afterEach(async () => {
@@ -296,6 +317,101 @@ describe("PipelinesListView", () => {
     expect(row.querySelector('[aria-label="build: passed"]')?.getAttribute("title")).toBe(
       "build: passed",
     );
+  });
+
+  it("hides retained rows and actions when a refresh is refused, and keeps them for a recoverable failure", async () => {
+    await render();
+    expect(container.textContent).toContain("Fix connection recovery");
+    h.error = new PullRequestsOperationError({
+      operation: "pipelines.list",
+      code: "provider_error",
+      message: "GitLab timed out.",
+      hostDetail: null,
+      retryable: true,
+    });
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("timed out");
+    expect(container.textContent).toContain("Fix connection recovery");
+    h.error = new PullRequestsOperationError({
+      operation: "pipelines.list",
+      code: "forbidden",
+      message: "You can't view these pipelines.",
+      hostDetail: null,
+      retryable: false,
+    });
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("can't view");
+    expect(container.textContent).not.toContain("Fix connection recovery");
+    expect(container.querySelector('[role="table"]')).toBeNull();
+    expect(container.textContent).not.toContain("Load more");
+  });
+
+  it("keeps later pages, and the rows, until a Refresh read succeeds", async () => {
+    await render();
+    await act(async () => button("Load more").click());
+    await settle();
+    expect(container.textContent).toContain("Second page");
+    await act(async () => handle.current!.refresh());
+    expect(container.textContent).toContain("Second page");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "Refreshing pipelines…",
+    );
+    await settle();
+    expect(container.textContent).not.toContain("Second page");
+    expect(container.textContent).toContain("Fix connection recovery");
+  });
+
+  it("shows the refresh label for the first page's read while page two is shown", async () => {
+    await render();
+    await act(async () => button("Load more").click());
+    await settle();
+    h.pending = true;
+    h.firstOnly = true;
+    await render();
+    expect(container.textContent).toContain("Second page");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "Refreshing pipelines…",
+    );
+  });
+
+  it("shows the refresh label while a stored first page waits for the live one", async () => {
+    h.first = null;
+    h.pending = true;
+    h.snapshot = stored("Stored title", 1_000);
+    await render();
+    expect(container.textContent).toContain("Stored title");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "Refreshing pipelines…",
+    );
+  });
+
+  it("keeps the empty message and Clear filter while a settled empty list refreshes", async () => {
+    h.first = pipelinesPage([]);
+    const filters = { ...DEFAULT_PIPELINES_FILTERS, ref: "release" };
+    await render({ filters });
+    expect(container.textContent).toContain("Clear filter");
+    h.pending = true;
+    await render({ filters });
+    expect(container.textContent).toContain("Clear filter");
+    const status = container.querySelector('[role="status"]');
+    expect(status?.textContent).toContain("Refreshing pipelines…");
+    expect(container.textContent).not.toContain("Loading pipelines…");
+  });
+
+  it("labels a first load, then keeps the rows beside a refresh label", async () => {
+    h.first = null;
+    h.pending = true;
+    await render();
+    expectLoadingModel(container, ["Loading pipelines…"]);
+    expect(container.querySelector('[role="status"] svg.animate-spin')).not.toBeNull();
+    h.pending = false;
+    h.first = pipelinesPage([{ ...pipelineRow, title: "Live title" }], { revision: 1 });
+    await render();
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    h.pending = true;
+    await render();
+    expect(container.textContent).toContain("Live title");
+    expectLoadingModel(container, ["Refreshing pipelines…"]);
   });
 
   it("paints the stored first page before the live read answers, then the live one", async () => {
@@ -437,6 +553,167 @@ describe("PipelinesListView", () => {
     expect(container.textContent).toContain("Fix connection recovery");
     expect(value.actions.consumeFreshPage).toHaveBeenCalledWith(key);
     expect(h.reads).not.toHaveBeenCalled();
+  });
+
+  describe("a refusal stays in force until a later read of the same list succeeds", () => {
+    const refused = new PullRequestsOperationError({
+      operation: "pipelines.list",
+      code: "forbidden",
+      message: "You can't view these",
+      hostDetail: null,
+      retryable: false,
+    });
+    const timedOut = new PullRequestsOperationError({
+      operation: "pipelines.list",
+      code: "provider_error",
+      message: "Host timed out",
+      hostDetail: null,
+      retryable: true,
+    });
+    const filtered = { ...DEFAULT_PIPELINES_FILTERS, ref: "release" };
+    const steps = {
+      refusal: async () => {
+        h.error = refused;
+        await render({ filters: filtered });
+      },
+      timeout: async () => {
+        h.error = timedOut;
+        await render({ filters: filtered });
+      },
+      // Clearing the filter shows another list; setting it again re-keys this one's pages.
+      filterRoundTrip: async () => {
+        await render();
+        await render({ filters: filtered });
+      },
+      pendingRefresh: async () => {
+        h.error = null;
+        await act(async () => handle.current!.refresh());
+      },
+      // The stored copy paints the refused rows again unless the refusal outlives the view.
+      reopen: async () => {
+        h.snapshot = stored("Fix connection recovery", 1);
+        await act(async () => root.unmount());
+        root = createRoot(container);
+        await render({ filters: filtered });
+      },
+    };
+    it.each<[string, (keyof typeof steps)[]]>([
+      ["refusal, then a timeout", ["refusal", "timeout"]],
+      ["timeout, then refusal, then timeout", ["timeout", "refusal", "timeout"]],
+      [
+        "refusal, then a timeout, then a filter round trip",
+        ["refusal", "timeout", "filterRoundTrip"],
+      ],
+      ["refusal, then a refresh still in flight", ["refusal", "pendingRefresh"]],
+      ["refusal, then a timeout, then reopening the list", ["refusal", "timeout", "reopen"]],
+    ])("%s", async (_name, order) => {
+      await render({ filters: filtered });
+      expect(container.textContent).toContain("Fix connection recovery");
+      expect(button("All 1")).toBeDefined();
+      for (const step of order) await steps[step]();
+      expect(container.textContent).not.toContain("Fix connection recovery");
+      expect(container.querySelector('[aria-label="Retry pipeline #4821"]')).toBeNull();
+      // The tab count came from the refused list too.
+      expect(button("All")).toBeDefined();
+      // Only a read the host answers lifts it.
+      h.error = null;
+      await act(async () => handle.current!.refresh());
+      await settle();
+      expect(container.textContent).toContain("Fix connection recovery");
+    });
+  });
+  it("hides later pages when only the first page's refresh is refused", async () => {
+    await render();
+    await act(async () => button("Load more").click());
+    await settle();
+    expect(container.textContent).toContain("Second page");
+    h.firstOnlyError = true;
+    h.error = new PullRequestsOperationError({
+      operation: "pipelines.list",
+      code: "forbidden",
+      message: "You can't view these pipelines.",
+      hostDetail: null,
+      retryable: false,
+    });
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("can't view");
+    expect(container.textContent).not.toContain("Second page");
+    expect(container.querySelector('[role="table"]')).toBeNull();
+  });
+
+  it("hides every page and the count when only the Load more read is refused", async () => {
+    await render();
+    expect(button("All 1")).toBeDefined();
+    h.laterOnlyError = true;
+    h.error = new PullRequestsOperationError({
+      operation: "pipelines.list",
+      code: "forbidden",
+      message: "You can't view these pipelines.",
+      hostDetail: null,
+      retryable: false,
+    });
+    await act(async () => button("Load more").click());
+    await settle();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("can't view");
+    expect(container.textContent).not.toContain("Second page");
+    expect(container.querySelector('[role="table"]')).toBeNull();
+    // The tab count came from the refused list too.
+    expect(button("All")).toBeDefined();
+    // Retry reads the list again from its first page; the host's answer lifts the refusal.
+    h.error = null;
+    h.laterOnlyError = false;
+    h.reads.mockClear();
+    await act(async () => button("Retry").click());
+    await settle();
+    expect(h.reads).toHaveBeenCalledWith(null);
+    expect(container.textContent).toContain("Fix connection recovery");
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("counts down a first-page rate limit while page two is shown", async () => {
+    await render();
+    await act(async () => button("Load more").click());
+    await settle();
+    h.firstOnlyError = true;
+    h.error = new PullRequestsOperationError({
+      operation: "pipelines.list",
+      code: "rate_limited",
+      message: "GitLab's rate limit was reached.",
+      hostDetail: null,
+      retryable: true,
+      retryAfterSeconds: 3,
+    });
+    await render();
+    expect(container.textContent).toContain("Trying again in 3 s.");
+    expect(button("Retry").disabled).toBe(true);
+    expect(onBackoffChange).toHaveBeenLastCalledWith(true);
+  });
+
+  it("shows a first-page failure that is not a refusal while page two is shown", async () => {
+    await render();
+    await act(async () => button("Load more").click());
+    await settle();
+    h.firstOnlyError = true;
+    h.error = new PullRequestsOperationError({
+      operation: "pipelines.list",
+      code: "provider_error",
+      message: "GitLab timed out.",
+      hostDetail: null,
+      retryable: true,
+    });
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("timed out");
+    expect(container.textContent).toContain("Second page");
+  });
+
+  it("shows the refresh label while a change event's stored read is pending", async () => {
+    await render();
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    h.snapshotPending = true;
+    await render();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "Refreshing pipelines…",
+    );
   });
 
   it("counts down a rate limit and reads again when it passes", async () => {

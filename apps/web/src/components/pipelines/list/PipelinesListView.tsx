@@ -29,9 +29,11 @@ import { usePullRequestsQuery } from "../../pullRequests/shared/usePullRequestsQ
 import { useDocumentVisible } from "../../pullRequests/useDocumentVisible";
 import { useRepositoryModule } from "../../repositoryModule/RepositoryModule";
 import { shownCopy, type ShownCopy } from "../../repositoryModule/snapshotDisplay.logic";
+import { type ResourceRefusal, useResourceRefusal } from "../../repositoryModule/resourceRefusal";
 import { useVisibleModuleRefresh } from "../../repositoryModule/useVisibleModuleRefresh";
 import { Button } from "../../ui/button";
 import { PermissionButton } from "../../ui/permission-button";
+import { LoadingState, RefreshRegion } from "../../ui/loading-state";
 import { Skeleton } from "../../ui/skeleton";
 import { Tabs, TabsList, TabsTab } from "../../ui/tabs";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
@@ -64,7 +66,7 @@ const EMPTY_PAGES: readonly PipelinesLoadedPage[] = [];
 const getRowSize = () => PIPELINES_ROW_HEIGHT;
 const rowKey = (row: PipelinesRow) => String(row.id);
 
-function operationError(query: EnvironmentQueryView<unknown>) {
+function operationError(query: Pick<EnvironmentQueryView<unknown>, "emission">) {
   const failure =
     query.emission._tag === "Failure" ? squashAtomCommandFailure(query.emission) : null;
   return isOperationError(failure) ? failure : null;
@@ -78,6 +80,8 @@ function PipelinesPages({
   firstQuery,
   emptyCopy,
   hasFilter,
+  firstRefused,
+  onPageRefused,
   onClearFilters,
   onTimerRetry,
   onBackoffChange,
@@ -87,6 +91,10 @@ function PipelinesPages({
   projectRef: ScopedProjectRef;
   input: PipelinesListInput;
   firstQuery: EnvironmentQueryView<PipelinesListPage>;
+  /** The host refused this list: every page loaded here, rows and actions, stays hidden. */
+  firstRefused: boolean;
+  /** A later page was refused: the whole list is, as for a first-page refusal. */
+  onPageRefused: (event: { readonly refused: ResourceRefusal }) => void;
   /** What the list says when it has no rows. */
   emptyCopy: string;
   /** A branch or workflow filter is set, so an empty list offers to clear it. */
@@ -114,15 +122,26 @@ function PipelinesPages({
     [cursor, input, scope.environmentId],
   );
   const nextQuery = usePullRequestsQuery(nextAtom);
-  const query = cursor === null ? firstQuery : nextQuery;
+  // One report per failed read: a Retry the host refuses again is a new refusal.
+  const nextEmission = nextQuery.emission;
+  useEffect(() => {
+    const failure = operationError({ emission: nextEmission });
+    if (failure?.code === "forbidden" || failure?.code === "not_found")
+      onPageRefused({ refused: failure.code });
+  }, [nextEmission, onPageRefused]);
+  // Any first-page failure owns the alert, the countdown and Retry.
+  const query = cursor === null || firstQuery.error !== null ? firstQuery : nextQuery;
+  const firstData = firstRefused ? null : firstQuery.data;
   const rows = useMemo(
     () =>
-      mergePipelineRows([
-        ...(firstQuery.data ? [firstQuery.data] : EMPTY_PAGES),
-        ...(cursor === null ? EMPTY_PAGES : laterPages),
-        ...(cursor !== null && nextQuery.data ? [nextQuery.data] : EMPTY_PAGES),
-      ]),
-    [cursor, firstQuery.data, laterPages, nextQuery.data],
+      firstRefused
+        ? EMPTY_ROWS
+        : mergePipelineRows([
+            ...(firstData ? [firstData] : EMPTY_PAGES),
+            ...(cursor === null ? EMPTY_PAGES : laterPages),
+            ...(cursor !== null && nextQuery.data ? [nextQuery.data] : EMPTY_PAGES),
+          ]),
+    [cursor, firstData, firstRefused, laterPages, nextQuery.data],
   );
   const savedScrollTop = usePipelinesStore((state) => state.selectViewState(projectRef).scrollTop);
   const scrollTopRef = useRef(savedScrollTop);
@@ -132,13 +151,27 @@ function PipelinesPages({
     [projectRef],
   );
   const refreshFirstPage = firstQuery.refresh;
-  const refresh = useCallback(() => {
+  // A manual Refresh keeps the loaded pages, selection and scroll until its read succeeds.
+  const resetFromRef = useRef<{ readonly data: unknown } | null>(null);
+  const resetPages = useCallback(() => {
     setCursors([null]);
     setLaterPages(EMPTY_PAGES);
     scrollTopRef.current = 0;
     scrollRef.current?.scrollToOffset({ offset: 0, animated: false });
+  }, []);
+  const refresh = useCallback(() => {
+    resetFromRef.current = { data: firstQuery.data };
     refreshFirstPage();
-  }, [refreshFirstPage]);
+  }, [firstQuery.data, refreshFirstPage]);
+  useEffect(() => {
+    // The same data means the read has not answered yet; a failed read leaves the reset
+    // waiting for the next successful one.
+    const from = resetFromRef.current;
+    if (from === null || firstQuery.isPending || firstQuery.error !== null) return;
+    if (firstQuery.data === from.data) return;
+    resetFromRef.current = null;
+    resetPages();
+  }, [firstQuery.data, firstQuery.error, firstQuery.isPending, resetPages]);
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
   const error = operationError(query);
   const refreshContext = useContext(PullRequestsContextRefresh);
@@ -147,7 +180,7 @@ function PipelinesPages({
   }, [error, refreshContext]);
   const waitSeconds = useRateLimitCountdown(
     error,
-    cursor === null ? onTimerRetry : query.revalidate,
+    query === firstQuery ? onTimerRetry : query.revalidate,
   );
   const backedOff = waitSeconds !== null;
   useEffect(() => {
@@ -186,13 +219,15 @@ function PipelinesPages({
     revalidateFirstPage();
     if (cursor !== null) revalidatePage();
   }, [cursor, revalidateFirstPage, revalidatePage]);
-  const total = firstQuery.data?.total ?? null;
-  const loaded = query.data !== null && !query.isPending;
+  const total = firstData?.total ?? null;
+  // A zero-row page is a resolved page: only the absence of one is a first load.
+  const resolved = firstData !== null;
+  const rereading = firstQuery.isPending || nextQuery.isPending;
   return (
     <PipelineActions.Provider
       scope={scope}
       provider={context.provider}
-      revision={firstQuery.data?.revision ?? null}
+      revision={firstData?.revision ?? null}
       onSettled={onActionSettled}
     >
       <PipelinesColumnsRoot
@@ -214,7 +249,8 @@ function PipelinesPages({
               <PermissionButton
                 size="sm"
                 variant="outline"
-                onClick={query.refresh}
+                // A refused later page re-reads the list from its first page, which lifts it.
+                onClick={firstRefused && query === nextQuery ? refresh : query.refresh}
                 permission={
                   waitSeconds !== null
                     ? {
@@ -234,73 +270,78 @@ function PipelinesPages({
             </div>
           </div>
         ) : null}
-        {rows.length > 0 ? (
-          <div
-            role="table"
-            aria-label="Pipelines"
-            // The header is row 1; -1 says the host's total is not known (a capped count).
-            aria-rowcount={total !== null && !total.capped ? total.count + 1 : -1}
-            className="flex min-h-0 flex-1 flex-col"
-          >
-            <PipelinesListHeader />
-            <LegendList<PipelinesRow>
-              ref={scrollRef}
-              className="min-h-0 flex-1 overflow-x-hidden"
-              role="rowgroup"
-              data={rows}
-              estimatedItemSize={PIPELINES_ROW_HEIGHT}
-              getFixedItemSize={getRowSize}
-              keyExtractor={rowKey}
-              initialScrollOffset={savedScrollTop}
-              renderItem={renderRow}
-              onScroll={(event) => {
-                scrollTopRef.current = event.nativeEvent.contentOffset.y;
-              }}
-            />
-          </div>
-        ) : null}
-        {query.isPending && rows.length === 0 ? (
-          <div role="status" className="space-y-2 p-4">
-            <span className="sr-only">Loading pipelines…</span>
+        {rereading && !resolved ? (
+          <LoadingState label="Loading pipelines…">
             <Skeleton className="h-14 w-full" />
             <Skeleton className="h-14 w-full" />
             <Skeleton className="h-14 w-full" />
-          </div>
+          </LoadingState>
         ) : null}
-        {rows.length === 0 && loaded && message === null ? (
-          <div className="space-y-3 p-6 text-sm text-muted-foreground">
-            <p>{emptyCopy}</p>
-            {hasFilter ? (
-              <Button size="sm" variant="outline" onClick={onClearFilters}>
-                Clear filter
-              </Button>
-            ) : null}
-          </div>
-        ) : null}
-        {nextCursor !== null && !cursors.includes(nextCursor) && message === null ? (
-          <div className="border-t border-border p-3">
-            <PermissionButton
-              size="sm"
-              variant="outline"
-              permission={{
-                allowed: !query.isPending,
-                reason: query.isPending ? "Loading…" : null,
-              }}
-              onClick={loadMore}
+        <RefreshRegion
+          className="flex min-h-0 flex-1 flex-col"
+          refreshing={rereading && resolved}
+          status={firstQuery.isPending ? "Refreshing pipelines…" : "Loading more pipelines…"}
+        >
+          {rows.length > 0 ? (
+            <div
+              role="table"
+              aria-label="Pipelines"
+              // The header is row 1; -1 says the host's total is not known (a capped count).
+              aria-rowcount={total !== null && !total.capped ? total.count + 1 : -1}
+              className="flex min-h-0 flex-1 flex-col"
             >
-              Load more
-            </PermissionButton>
-          </div>
-        ) : null}
-        {/* GitHub stops a filtered list at 1,000 runs; GitLab pages to the end. */}
-        {context.provider === "github" &&
-        nextCursor === null &&
-        rows.length > 0 &&
-        total?.capped ? (
-          <p className="border-t border-border p-3 text-xs text-muted-foreground">
-            GitHub returns at most 1,000 filtered runs.
-          </p>
-        ) : null}
+              <PipelinesListHeader />
+              <LegendList<PipelinesRow>
+                ref={scrollRef}
+                className="min-h-0 flex-1 overflow-x-hidden"
+                role="rowgroup"
+                data={rows}
+                estimatedItemSize={PIPELINES_ROW_HEIGHT}
+                getFixedItemSize={getRowSize}
+                keyExtractor={rowKey}
+                initialScrollOffset={savedScrollTop}
+                renderItem={renderRow}
+                onScroll={(event) => {
+                  scrollTopRef.current = event.nativeEvent.contentOffset.y;
+                }}
+              />
+            </div>
+          ) : null}
+          {rows.length === 0 && resolved && message === null ? (
+            <div className="space-y-3 p-6 text-sm text-muted-foreground">
+              <p>{emptyCopy}</p>
+              {hasFilter ? (
+                <Button size="sm" variant="outline" onClick={onClearFilters}>
+                  Clear filter
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+          {nextCursor !== null && !cursors.includes(nextCursor) && message === null ? (
+            <div className="border-t border-border p-3">
+              <PermissionButton
+                size="sm"
+                variant="outline"
+                permission={{
+                  allowed: !query.isPending,
+                  reason: query.isPending ? "Loading…" : null,
+                }}
+                onClick={loadMore}
+              >
+                Load more
+              </PermissionButton>
+            </div>
+          ) : null}
+          {/* GitHub stops a filtered list at 1,000 runs; GitLab pages to the end. */}
+          {context.provider === "github" &&
+          nextCursor === null &&
+          rows.length > 0 &&
+          total?.capped ? (
+            <p className="border-t border-border p-3 text-xs text-muted-foreground">
+              GitHub returns at most 1,000 filtered runs.
+            </p>
+          ) : null}
+        </RefreshRegion>
       </PipelinesColumnsRoot>
     </PipelineActions.Provider>
   );
@@ -382,21 +423,32 @@ export function PipelinesListView({
     pipelinesEnvironment.requestTimerRead(firstTarget);
     revalidateFirstPage();
   }, [firstTarget, revalidateFirstPage]);
-  const displayedFirstPage = nextShownList?.payload ?? null;
+  // A refusal hides every copy of this list, the stored one, the count and the workflow
+  // choices included, until the host answers a later read of the same list.
+  const [pageRefusal, setPageRefusal] = useState<{ readonly refused: ResourceRefusal } | null>(
+    null,
+  );
+  const liveError = operationError(firstQuery);
+  const refused =
+    useResourceRefusal(
+      `pipelines.list:${context.host}/${context.repository}:${environmentRpcKey(firstTarget)}`,
+      firstQuery,
+      liveError?.code === "forbidden" || liveError?.code === "not_found" ? liveError.code : null,
+      pageRefusal,
+    ) !== null;
+  const displayedFirstPage = refused ? null : (nextShownList?.payload ?? null);
   useVisibleModuleRefresh({
     enabled: listTimerEnabled(context.provider, displayedFirstPage?.rows ?? EMPTY_ROWS),
     succeeded: firstQuery.data !== null && firstQuery.error === null && !firstQuery.isPending,
     paused,
     revalidate: timerRead,
   });
-  const displayedFirstQuery: EnvironmentQueryView<PipelinesListPage> =
-    displayedFirstPage === null
-      ? firstQuery
-      : {
-          ...firstQuery,
-          data: displayedFirstPage,
-          isPending: firstQuery.data === null ? false : firstQuery.isPending,
-        };
+  // The stored copy's read is what a change event updates the screen from.
+  const displayedFirstQuery: EnvironmentQueryView<PipelinesListPage> = {
+    ...firstQuery,
+    data: refused ? null : (displayedFirstPage ?? firstQuery.data),
+    isPending: firstQuery.isPending || snapshotQuery.isPending,
+  };
   useEffect(() => {
     if (freshPageKey !== null) consumeFreshPage(freshPageKey);
   }, [consumeFreshPage, freshPageKey]);
@@ -404,8 +456,9 @@ export function PipelinesListView({
   // GitHub's Workflow choices ride on its first page; the last ones stay while
   // another filter's page loads.
   const pageWorkflows = displayedFirstPage?.workflows ?? null;
-  const [workflows, setWorkflows] = useState(pageWorkflows);
-  if (pageWorkflows !== null && pageWorkflows !== workflows) setWorkflows(pageWorkflows);
+  const [keptWorkflows, setWorkflows] = useState(pageWorkflows);
+  if (pageWorkflows !== null && pageWorkflows !== keptWorkflows) setWorkflows(pageWorkflows);
+  const workflows = refused ? null : keptWorkflows;
   const hasFilter = filters.ref !== null || filters.workflowId !== null;
   const clearFilters = () => onFiltersChange({ ...filters, ref: null, workflowId: null });
   return (
@@ -451,6 +504,8 @@ export function PipelinesListView({
         firstQuery={displayedFirstQuery}
         emptyCopy={emptyListCopy({ provider: context.provider, filters, workflows })}
         hasFilter={hasFilter}
+        firstRefused={refused}
+        onPageRefused={setPageRefusal}
         onClearFilters={clearFilters}
         onTimerRetry={timerRead}
         onBackoffChange={onBackoffChange}

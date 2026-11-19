@@ -676,6 +676,39 @@ describe("resolveProviderSessionDefault", () => {
     expect(configuredResult.effort).toBe("low");
   });
 
+  // #380: Codex's live list tells which models the current sign-in can run. With ChatGPT sign-in
+  // it no longer lists gpt-5.4, and the first entry is "auto", Codex's own default.
+  describe("a stored Codex model that Codex retired", () => {
+    const chatgptList = [model("auto", []), model("gpt-6.2-sol", [])];
+    const apiKeyList = [model("auto", []), model("gpt-6.2-sol", []), model("gpt-5.4", [])];
+
+    it.each([
+      ["a thread", { explicitSelection: createModelSelection(CODEX_ID, "gpt-5.4") }],
+      ["a saved default", { configuredDefault: { model: "gpt-5.4-mini" } }],
+      ["an alias", { explicitSelection: createModelSelection(CODEX_ID, "gpt-5-codex") }],
+    ])("starts %s without a model when the list no longer offers it", (_name, source) => {
+      const result = resolveProviderSessionDefault({
+        driver: CODEX,
+        instanceId: CODEX_ID,
+        models: chatgptList,
+        ...source,
+      });
+      expect(result.modelSelection.model).toBe("auto");
+      expect(result.fallback?.reason).toBe("configured-model-unavailable");
+    });
+
+    it("keeps the stored model when the list still offers it", () => {
+      const result = resolveProviderSessionDefault({
+        driver: CODEX,
+        instanceId: CODEX_ID,
+        models: apiKeyList,
+        explicitSelection: createModelSelection(CODEX_ID, "gpt-5.4"),
+      });
+      expect(result.modelSelection.model).toBe("gpt-5.4");
+      expect(result.fallback).toBeNull();
+    });
+  });
+
   it("uses the first non-custom model before an earlier custom model", () => {
     const custom = model("custom-first", [], { isCustom: true });
     const builtIn = model("built-in-second", []);

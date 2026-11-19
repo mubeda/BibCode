@@ -434,6 +434,40 @@ export async function prepareRelaunchedDesktopUiSession(
   await withinRecoveryDeadline(deadline, "plugin wait", steps.waitForPlugin);
 }
 
+/**
+ * Whether the runner's closing DELETE failed only because teardown already ended the app on
+ * purpose: a dead-session error while no embedded driver answers any more.
+ */
+export async function isEndedApplicationSessionDelete(
+  error: unknown,
+  isRunning: () => Promise<boolean> = isDesktopUiApplicationRunning,
+): Promise<boolean> {
+  return isDeadDesktopUiWebviewError(error) && !(await isRunning());
+}
+
+/**
+ * After teardown ends the app, the runner still deletes the session and the refused request
+ * fails the worker. Only that one DELETE, in that one worker, is accepted as a clean end.
+ */
+export function acceptEndedApplicationSessionDelete(): void {
+  // WebdriverIO overwrites protocol commands too, but its types list only browser commands.
+  const overwrite = browser.overwriteCommand as unknown as (
+    name: "deleteSession",
+    command: (
+      original: (...args: unknown[]) => Promise<unknown>,
+      ...args: unknown[]
+    ) => Promise<unknown>,
+  ) => void;
+  overwrite.call(browser, "deleteSession", async (deleteSession, ...args) => {
+    try {
+      return await deleteSession(...args);
+    } catch (error) {
+      if (await isEndedApplicationSessionDelete(error)) return undefined;
+      throw error;
+    }
+  });
+}
+
 /** Ends an app this helper relaunched, if it still runs: only a process this helper started. */
 export async function stopRelaunchedDesktopUiApplication(): Promise<void> {
   const child = relaunched;

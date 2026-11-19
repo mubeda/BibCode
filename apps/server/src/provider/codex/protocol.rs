@@ -474,10 +474,11 @@ impl JsonRpcConnection {
     }
 
     pub async fn close(&self) {
+        // Sent even after a failure closed the connection, so the writer releases stdin.
+        let _ = self.inner.writer.send(WriterMessage::Close);
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let _ = self.inner.writer.send(WriterMessage::Close);
         let mut reason = self.inner.close_reason.lock().await;
         if reason.is_none() {
             *reason = Some("closed by runtime".to_owned());
@@ -1393,5 +1394,36 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn close_after_the_peer_exited_releases_stdin_and_the_incoming_channel() {
+        let (stdout, stdout_peer) = duplex(4096);
+        let (mut stdin_peer, stdin) = duplex(4096);
+        let (stderr, stderr_peer) = duplex(4096);
+        let (connection, mut incoming) =
+            JsonRpcConnection::spawn(stdout, stdin, stderr, ConnectionConfig::default());
+        drop((stdout_peer, stderr_peer));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !connection.inner.closed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("EOF closes the connection");
+        connection.close().await;
+        let mut buffer = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut stdin_peer, &mut buffer),
+        )
+        .await
+        .expect("stdin is released")
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while incoming.recv().await.is_some() {}
+        })
+        .await
+        .expect("every task holding the incoming channel ended");
     }
 }

@@ -300,6 +300,11 @@ export class WorktreeRemovalError extends Schema.TaggedError<WorktreeRemovalErro
     reason: WorktreeRemovalErrorReason,
     message: WorktreeMessage,
     currentGeneration: Schema.optional(NonNegativeInt),
+    /**
+     * On `thread-not-found`: the thread's removal had already finished. An optional field, not a
+     * reason, so a client that predates it still decodes the failure.
+     */
+    alreadyRemoved: Schema.optional(Schema.Boolean),
   },
 ) {}
 

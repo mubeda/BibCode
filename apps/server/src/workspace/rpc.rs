@@ -33,6 +33,9 @@ use super::watcher::{WatchScope, WatchScopeFuture, WatchSubscription, WorkspaceW
 use super::{EntryKind, SearchLimits, WorkspaceError, WorkspaceSearchIndex, WorkspaceService};
 
 const PROJECT_ENTRIES_MAX_LIMIT: usize = 200;
+/// The most one page of a paged list encodes to (#390). It leaves room for the RPC envelope under
+/// the 1 MiB logical message a remote client accepts.
+const PROJECT_ENTRIES_PAGE_TARGET_BYTES: usize = 1024 * 1024 - 64 * 1024;
 
 pub const TASK_SIX_RPC_METHODS: [&str; 18] = [
     "projects.searchEntries",
@@ -556,13 +559,24 @@ impl WorkspaceRpc {
                 let input: ListInput = decode(payload)?;
                 let _admission = self.acquire_path(&input.cwd).await?;
                 // Out-of-band filesystem changes are invisible to the cached snapshot, so a
-                // request must opt in before paying for a full rebuild.
-                if input.refresh == Some(true) {
+                // request must opt in before paying for a full rebuild. A later page never
+                // rebuilds: that would end the snapshot it pages.
+                if input.refresh == Some(true) && input.cursor.is_none() {
                     self.refresh_index(Path::new(&input.cwd)).await;
                 }
                 let index = self.index(&input.cwd).await.map_err(|error| {
                     entries_wire_error("ProjectListEntriesError", &input.cwd, &error)
                 })?;
+                // `limit` wins over paging; neither keeps the whole-list reply older clients read.
+                if input.limit.is_none() && (input.paged == Some(true) || input.cursor.is_some()) {
+                    let page = index
+                        .page(input.cursor.as_deref(), PROJECT_ENTRIES_PAGE_TARGET_BYTES)
+                        .await
+                        .map_err(|_| stale_cursor_wire_error(&input.cwd))?;
+                    return encode(page).map_err(|error| {
+                        entries_wire_error("ProjectListEntriesError", &input.cwd, &error)
+                    });
+                }
                 let limit = input
                     .limit
                     .map(|limit| limit.clamp(1, PROJECT_ENTRIES_MAX_LIMIT));
@@ -1567,6 +1581,16 @@ fn entries_wire_error(tag: &str, cwd: &str, error: &WorkspaceError) -> Value {
     })
 }
 
+/// The page cursor names a list the index no longer holds; the client lists again from the start.
+fn stale_cursor_wire_error(cwd: &str) -> Value {
+    json!({
+        "_tag": "ProjectListEntriesError",
+        "cwd": cwd,
+        "failure": "search_index_cursor_stale",
+        "message": "The workspace file list changed while it was being read.",
+    })
+}
+
 fn filesystem_wire_error(input: &BrowseInput, error: &WorkspaceError) -> Value {
     json!({
         "_tag": "FilesystemBrowseError",
@@ -1746,6 +1770,10 @@ struct ListInput {
     cwd: String,
     limit: Option<usize>,
     refresh: Option<bool>,
+    /// Asks for the first page of a paged list (#390).
+    paged: Option<bool>,
+    /// The previous page's `nextCursor`.
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1904,6 +1932,94 @@ mod tests {
         initialize_index_git_workspace(root.path());
         std::fs::write(root.path().join("tracked.txt"), "tracked").expect("fixture");
         root
+    }
+
+    /// 260 folders of `components` files each, with paths of about 80 bytes (#390): 95 makes
+    /// 24,991 entries, just under the 25,000-entry snapshot cap; 100 passes it.
+    fn large_entry_workspace(components: usize) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("large workspace root");
+        for package in 0..10 {
+            for feature in 0..26 {
+                let directory = root.path().join(format!(
+                    "packages/package-name-{package:02}/src/components/feature-area-{feature:03}"
+                ));
+                std::fs::create_dir_all(&directory).expect("fixture directory");
+                for component in 0..components {
+                    std::fs::write(
+                        directory.join(format!("ComponentName{component:03}.test.tsx")),
+                        "",
+                    )
+                    .expect("fixture file");
+                }
+            }
+        }
+        root
+    }
+
+    /// A paged list keeps each page within the budget and concatenates to the whole list; an
+    /// omitted `limit` and cursor still answer the whole list at once, which older clients read;
+    /// a cursor from an older snapshot is refused; `limit` keeps its 200 cap (#390).
+    #[tokio::test]
+    async fn a_paged_list_stays_within_the_page_budget_and_matches_the_whole_list() {
+        let root = large_entry_workspace(95);
+        let cwd = root.path().to_string_lossy().into_owned();
+        let rpc = WorkspaceRpc::new(WorkspaceService::default());
+        let whole = rpc
+            .handle("projects.listEntries", json!({ "cwd": cwd }))
+            .await
+            .expect("whole list");
+        let whole_bytes = serde_json::to_vec(&whole).expect("reply JSON").len();
+        assert_eq!(whole["entries"].as_array().expect("entries").len(), 24_991);
+        assert_eq!(whole["truncated"], false);
+        assert!(whole.get("nextCursor").is_none());
+
+        let mut request = json!({ "cwd": cwd, "paged": true });
+        let (mut entries, mut sizes, mut second_cursor) = (Vec::new(), Vec::new(), None);
+        loop {
+            let page = rpc
+                .handle("projects.listEntries", request.clone())
+                .await
+                .expect("page");
+            let bytes = serde_json::to_vec(&page).expect("page JSON").len();
+            assert!(
+                bytes <= PROJECT_ENTRIES_PAGE_TARGET_BYTES,
+                "page is {bytes} bytes"
+            );
+            assert_eq!(page["truncated"], false);
+            sizes.push(bytes);
+            entries.extend(page["entries"].as_array().expect("entries").iter().cloned());
+            let Some(cursor) = page["nextCursor"].as_str() else {
+                break;
+            };
+            second_cursor.get_or_insert_with(|| cursor.to_owned());
+            request = json!({ "cwd": cwd, "cursor": cursor });
+        }
+        eprintln!(
+            "listEntries: whole {whole_bytes} bytes; {} pages of {sizes:?} bytes",
+            sizes.len()
+        );
+        assert!(sizes.len() > 1);
+        assert_eq!(Value::Array(entries), whole["entries"]);
+
+        rpc.refresh_index(root.path()).await;
+        let stale = rpc
+            .handle(
+                "projects.listEntries",
+                json!({ "cwd": cwd, "cursor": second_cursor.expect("second page") }),
+            )
+            .await
+            .expect_err("stale cursor");
+        assert_eq!(stale["failure"], "search_index_cursor_stale");
+
+        let limited = rpc
+            .handle(
+                "projects.listEntries",
+                json!({ "cwd": cwd, "limit": 1000, "paged": true }),
+            )
+            .await
+            .expect("limited list");
+        assert_eq!(limited["entries"].as_array().expect("entries").len(), 200);
+        assert_eq!(limited["truncated"], true);
     }
 
     fn index_benchmark_workspace() -> tempfile::TempDir {

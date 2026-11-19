@@ -42,6 +42,32 @@ const decodeAdoptionError = Schema.decodeUnknownSync(WorktreeAdoptionError);
 const encodeAdoptionError = Schema.encodeSync(WorktreeAdoptionError);
 const decodeRemovalError = Schema.decodeUnknownSync(WorktreeRemovalError);
 const encodeRemovalError = Schema.encodeSync(WorktreeRemovalError);
+// The error schema of the release before the field: same reasons, no extra field.
+const priorClientError = Schema.Struct({
+  _tag: Schema.Literal("WorktreeRemovalError"),
+  reason: Schema.Literals([
+    "thread-not-found",
+    "environment-unsupported",
+    "command-conflict",
+    "cleanup-capacity",
+    "session-running",
+    "ownership-conflict",
+    "stale-generation",
+    "stale-plan",
+    "dirty-confirmation-required",
+    "prune-confirmation-required",
+    "protected-target",
+    "locked",
+    "replacement-conflict",
+    "repository-mismatch",
+    "git-failed",
+    "orchestration-failed",
+    "internal",
+  ]),
+  message: Schema.String,
+});
+
+const decodePrior = Schema.decodeUnknownSync(priorClientError);
 const decodeOperationError = Schema.decodeUnknownSync(WorktreeOperationError);
 const encodeOperationError = Schema.encodeSync(WorktreeOperationError);
 const decodeWorkspaceUnavailableError = Schema.decodeUnknownSync(WorkspaceUnavailableError);
@@ -539,6 +565,20 @@ describe("worktree catalog schemas", () => {
         decodeRemovalResult(encodeRemovalResult(decodeRemovalResult(result))),
       ),
     ).toEqual(results);
+  });
+
+  it("keeps an already-removed answer decodable by a client without the alreadyRemoved field", () => {
+    const wire = {
+      _tag: "WorktreeRemovalError",
+      reason: "thread-not-found",
+      message: "The workspace thread was not found.",
+      alreadyRemoved: true,
+    };
+    expect(decodePrior(wire).reason).toBe("thread-not-found");
+    expect(decodeRemovalError(wire).alreadyRemoved).toBe(true);
+    expect(decodeRemovalError({ ...wire, alreadyRemoved: undefined }).alreadyRemoved).toBe(
+      undefined,
+    );
   });
 
   it("decodes every removal outcome and actionable error reason", () => {

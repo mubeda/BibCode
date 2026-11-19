@@ -33,6 +33,33 @@ afterEach(async () => {
 });
 
 describe("PullRequestsQueryState", () => {
+  it("labels a first load with a visible indicator and names the read", async () => {
+    view = await mount(
+      <PullRequestsQueryState label="merge request !5" query={queryView({ isPending: true })}>
+        <p>Merge request body</p>
+      </PullRequestsQueryState>,
+    );
+    const status = document.querySelector('[role="status"]');
+    expect(status?.textContent).toContain("Loading merge request !5…");
+    // The status stays outside any busy region so its announcement is not deferred.
+    expect(status?.getAttribute("aria-busy")).toBeNull();
+    expect(status?.querySelector("svg.animate-spin")).not.toBeNull();
+    expect(document.body.textContent).not.toContain("Merge request body");
+  });
+
+  it("keeps loaded content on screen while a refresh runs", async () => {
+    view = await mount(
+      <PullRequestsQueryState
+        label="merge request !5"
+        query={queryView({ data: { title: "Fix" }, isPending: true })}
+      >
+        <p>Merge request body</p>
+      </PullRequestsQueryState>,
+    );
+    expect(document.body.textContent).toContain("Merge request body");
+    expect(document.querySelector('[role="status"]')).toBeNull();
+  });
+
   it("renders the alert banner and children when data and an error are both present", async () => {
     const error = new PullRequestsOperationError({
       operation: "get",

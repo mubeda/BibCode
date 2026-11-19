@@ -90,7 +90,8 @@ describe("GitManagerMultiCommitOperationDialog", () => {
     const cancel = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
       (button) => button.textContent === "Cancel",
     );
-    expect(confirm).toMatchObject({ disabled: true, title: reason });
+    expect(confirm?.disabled).toBe(true);
+    expect(confirm?.parentElement?.title).toBe(reason);
     expect(document.body.textContent).toContain(reason);
     expect(cancel?.disabled).toBe(false);
     await act(async () => cancel?.click());
@@ -256,10 +257,11 @@ describe("GitManagerMultiCommitOperationDialog", () => {
     const branch = document.body.querySelector<HTMLButtonElement>(
       '[aria-label="Choose branch held/rewrite"]',
     );
-    expect(branch).toMatchObject({ disabled: true, title: message });
-    expect(branch?.getAttribute("aria-describedby")).toBe(
-      "git-manager-branch-choice-tip-held-reason",
-    );
+    expect(branch?.disabled).toBe(true);
+    expect(branch?.parentElement?.title).toBe(message);
+    expect(
+      document.getElementById(branch?.getAttribute("aria-describedby") ?? "")?.textContent,
+    ).toBe(message);
     expect(document.body.textContent).toContain(message);
   });
 });

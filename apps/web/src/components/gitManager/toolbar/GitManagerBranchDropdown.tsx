@@ -23,7 +23,7 @@ import {
   useState,
 } from "react";
 
-import { Button } from "~/components/ui/button";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 import { Input } from "~/components/ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { cn } from "~/lib/utils";
@@ -517,34 +517,26 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
           )}
         </div>
         <div className="flex items-center gap-2 border-t border-border p-2">
-          <Button
-            aria-describedby={
-              branchDisabledReason === null ? undefined : "git-manager-create-branch-reason"
-            }
-            className="min-w-0 flex-1 justify-start"
-            disabled={branchDisabledReason !== null}
+          <GitManagerDisabledReasonButton
+            className="w-full min-w-0 justify-start"
+            disabledReason={branchDisabledReason}
             size="sm"
-            title={branchDisabledReason ?? undefined}
             variant="ghost"
+            wrapperClassName="flex min-w-0 flex-1"
             onClick={handleCreateBranch}
           >
             <PlusIcon aria-hidden="true" />
             <span className="min-w-0 flex-1 truncate">New branch</span>
-          </Button>
-          <Button
-            aria-describedby={
-              mergeDisabledReason === null && currentBranchName !== null
-                ? undefined
-                : "git-manager-branch-merge-reason"
-            }
-            className={cn("min-w-0 flex-1 justify-start", mergeMode && "bg-accent")}
-            disabled={mergeDisabledReason !== null || currentBranchName === null}
-            size="sm"
-            title={
+          </GitManagerDisabledReasonButton>
+          <GitManagerDisabledReasonButton
+            className={cn("w-full min-w-0 justify-start", mergeMode && "bg-accent")}
+            disabledReason={
               mergeDisabledReason ??
-              (currentBranchName === null ? "Check out a branch before merging." : undefined)
+              (currentBranchName === null ? "Check out a branch before merging." : null)
             }
+            size="sm"
             variant="ghost"
+            wrapperClassName="flex min-w-0 flex-1"
             onClick={handleMergeMode}
           >
             <GitMergeIcon aria-hidden="true" />
@@ -553,17 +545,7 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
                 ? "Select a branch above"
                 : `Choose a branch to merge into ${currentBranchName ?? "HEAD"}`}
             </span>
-          </Button>
-          {branchDisabledReason === null ? null : (
-            <span className="sr-only" id="git-manager-create-branch-reason">
-              {branchDisabledReason}
-            </span>
-          )}
-          {mergeDisabledReason === null && currentBranchName !== null ? null : (
-            <span className="sr-only" id="git-manager-branch-merge-reason">
-              {mergeDisabledReason ?? "Check out a branch before merging."}
-            </span>
-          )}
+          </GitManagerDisabledReasonButton>
         </div>
       </PopoverPopup>
     </Popover>

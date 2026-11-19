@@ -56,15 +56,24 @@ async fn unchanged_pinned_page_reads_keep_the_same_generation() {
     let repository = GitRepository::default();
     let cancellation = CancellationToken::new();
 
-    let first = page(&repository, fixture.path(), None, 0, 1, &cancellation)
-        .await
-        .expect("first commit page");
+    let first = page(
+        &repository,
+        fixture.path(),
+        None,
+        0,
+        1,
+        false,
+        &cancellation,
+    )
+    .await
+    .expect("first commit page");
     let second = page(
         &repository,
         fixture.path(),
         Some(&first.pinned_tips),
         1,
         1,
+        false,
         &cancellation,
     )
     .await
@@ -83,9 +92,17 @@ async fn refs_and_page_reads_agree_on_generation() {
     let refs = build_refs_snapshot(&repository, fixture.path(), &cancellation)
         .await
         .expect("refs snapshot");
-    let commits = page(&repository, fixture.path(), None, 0, 1, &cancellation)
-        .await
-        .expect("commit page");
+    let commits = page(
+        &repository,
+        fixture.path(),
+        None,
+        0,
+        1,
+        false,
+        &cancellation,
+    )
+    .await
+    .expect("commit page");
 
     assert_eq!(commits.generation, refs.generation);
 }

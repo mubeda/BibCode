@@ -1,4 +1,4 @@
-import type { EnvironmentId, ServerConfig } from "@bibcode/contracts";
+import { CODEX_AUTO_MODEL, type EnvironmentId, type ServerConfig } from "@bibcode/contracts";
 
 import type { SidebarThreadSummary } from "../../types";
 import { formatWorktreePathForDisplay } from "../../worktreeCleanup";
@@ -57,7 +57,8 @@ export function buildWorkspaceModelLabels(
       for (const model of provider.models ?? []) {
         // Only short names: a model without one falls back to its slug in
         // `resolveWorkspaceModelLabel`, never to its (often descriptive) name.
-        if (!model.shortName) continue;
+        // Codex's "auto" is the exception: its slug says nothing, its name says "Codex default".
+        if (!model.shortName && model.slug !== CODEX_AUTO_MODEL) continue;
         labels.set(
           workspaceModelLabelKey(environmentId, provider.instanceId, model.slug),
           getTriggerDisplayModelName(model),

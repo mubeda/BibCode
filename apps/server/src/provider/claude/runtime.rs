@@ -201,10 +201,14 @@ mod tests {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 pub enum Decision {
     Accept,
-    Deny,
+    AcceptForSession,
+    /// Refuses this tool use; the turn goes on.
+    Decline,
+    /// Refuses this tool use and stops the turn.
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +233,13 @@ pub struct UserInputRequestInput {
     pub tool_name: String,
     pub input: Value,
     pub tool_use_id: String,
+}
+
+/// What a resolved approval tells Claude: the body of the `control_response`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPermission {
+    pub response: Value,
+    pub events: Vec<CanonicalEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,12 +283,15 @@ struct InFlightTool {
 #[derive(Debug, Clone)]
 struct PendingApproval {
     provider_item_id: String,
+    /// The turn that asked, which may have ended by the time the request is settled.
+    turn_id: Option<String>,
     raw: Value,
 }
 
 #[derive(Debug, Clone)]
 struct PendingUserInput {
     provider_item_id: String,
+    turn_id: Option<String>,
     original_input: Value,
     raw: Value,
 }
@@ -1571,6 +1585,9 @@ impl ClaudeBackgroundTasks {
 #[derive(Debug, Default)]
 pub struct ClaudeRuntimeOutput {
     pub events: Vec<CanonicalEvent>,
+    /// `control_response` frames the driver must write to Claude: answers the runtime gives by
+    /// itself to a request Claude sent.
+    pub control_responses: Vec<Value>,
     pub activity: Vec<ProviderActivityMutation>,
     pub native_event_id: Option<String>,
     /// How much work Claude runs outside a turn (live background tasks, answers it owes), when
@@ -1604,6 +1621,9 @@ pub struct ClaudeProviderRuntime {
     /// open: it can replay the task notification just before that turn's `result` (#165). Each
     /// opens when the turn before it ends, so idle suspension waits for its own `result`.
     follow_ups_after_turn: usize,
+    /// Follow-ups still owed when the open follow-up turn began; its own output answers none of
+    /// them.
+    follow_ups_carried: usize,
     /// Task notifications replayed while a delivered write still awaits its replay. A result
     /// ignored in that window answered one of them; the rest follow the turn once the write is
     /// replayed or acknowledged, as a `/compact` is from its `result` alone.
@@ -1657,6 +1677,10 @@ pub struct ClaudeProviderRuntime {
     /// The open turn produced assistant text, a tool call or a compaction. A context-limit
     /// failure before any is one compacting can fix by sending the message again.
     turn_produced_output: bool,
+    /// Claude streamed main-thread text while no turn was open: an answer to a background task
+    /// it started by itself with no replay (Claude Code 2.1.326). Each text by the turn and item
+    /// it was stored under, oldest first; its `result` ends them all.
+    texts_outside_turn: Vec<(Option<String>, Option<String>)>,
 }
 
 /// A copy whose first `system/init` names a session ID BiBCode did not assign: Claude would
@@ -1684,6 +1708,7 @@ impl ClaudeProviderRuntime {
             turn_open: false,
             turn_input_awaiting_replay: None,
             follow_ups_after_turn: 0,
+            follow_ups_carried: 0,
             follow_ups_awaiting_replay: 0,
             turn_input_cancellation: CancellationToken::new(),
             delivery_acknowledgement_cancellation: CancellationToken::new(),
@@ -1712,6 +1737,7 @@ impl ClaudeProviderRuntime {
             turn_compaction_id: None,
             pending_turn_started: None,
             turn_produced_output: false,
+            texts_outside_turn: Vec::new(),
         }
     }
 
@@ -1763,6 +1789,7 @@ impl ClaudeProviderRuntime {
             json!({ "reason": "copy_session_id_mismatch" }),
         ));
         ClaudeRuntimeOutput {
+            control_responses: Vec::new(),
             events,
             ..ClaudeRuntimeOutput::default()
         }
@@ -1817,6 +1844,7 @@ impl ClaudeProviderRuntime {
         self.stop_turn_input();
         self.reset_delivery_acknowledgements();
         self.follow_ups_after_turn = 0;
+        self.follow_ups_carried = 0;
         self.follow_ups_awaiting_replay = 0;
         self.runtime_mode = Some(runtime_mode);
         vec![
@@ -1985,6 +2013,9 @@ impl ClaudeProviderRuntime {
         if self.halted.is_some() {
             return ClaudeRuntimeOutput::default();
         }
+        if !authenticated_hook && let Some(output) = self.handle_host_request(value) {
+            return output;
+        }
         if !authenticated_hook
             && value.get("type").and_then(Value::as_str) == Some("system")
             && value.get("subtype").and_then(Value::as_str) == Some("init")
@@ -2010,8 +2041,10 @@ impl ClaudeProviderRuntime {
         let turn_was_open = self.turn_open;
         let mut output = self.handle_non_usage_raw_value(value, emitted_at_ms, authenticated_hook);
         output.background_tasks = background_tasks;
-        if turn_was_open
-            && !self.turn_open
+        // A turn's end, or the end of an answer Claude gave with no turn open.
+        let idle_answer_ended = !turn_was_open
+            && value.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification");
+        if (turn_was_open && !self.turn_open || idle_answer_ended)
             && !authenticated_hook
             && value.get("type").and_then(Value::as_str) == Some("result")
         {
@@ -2049,10 +2082,19 @@ impl ClaudeProviderRuntime {
     /// acknowledged. A replay that arrives while another turn is still open starts its turn when
     /// that one ends.
     fn start_provider_turn(&mut self, value: &Value) -> Vec<CanonicalEvent> {
-        let follow_up = value.get("type").and_then(Value::as_str) == Some("user")
+        let kind = value.get("type").and_then(Value::as_str);
+        let main_thread = value.get("parent_tool_use_id").is_none_or(Value::is_null);
+        let follow_up = kind == Some("user")
             && value.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
-            && value.get("parent_tool_use_id").is_none_or(Value::is_null);
+            && main_thread;
         if !follow_up {
+            // Model output after replays in the open turn: that turn answers them, under its
+            // one `result`, so no turn follows for them (#389).
+            // Notifications counted before this turn opened keep their turns.
+            if self.turn_open && main_thread && matches!(kind, Some("stream_event" | "assistant")) {
+                self.follow_ups_after_turn =
+                    self.follow_ups_after_turn.min(self.follow_ups_carried);
+            }
             return Vec::new();
         }
         if self.turn_input_awaiting_replay.is_some() {
@@ -2143,6 +2185,7 @@ impl ClaudeProviderRuntime {
                 self.correlated_activity_enabled = true;
             }
             return ClaudeRuntimeOutput {
+                control_responses: Vec::new(),
                 events: Vec::new(),
                 activity,
                 native_event_id: has_control_effects
@@ -2191,6 +2234,7 @@ impl ClaudeProviderRuntime {
                 _ => Vec::new(),
             };
             return ClaudeRuntimeOutput {
+                control_responses: Vec::new(),
                 events,
                 activity,
                 native_event_id: has_control_effects
@@ -2247,6 +2291,7 @@ impl ClaudeProviderRuntime {
             ClaudeMessageRoute::SuppressedChildText => Vec::new(),
         };
         ClaudeRuntimeOutput {
+            control_responses: Vec::new(),
             events,
             activity,
             native_event_id: has_control_effects
@@ -2506,6 +2551,7 @@ impl ClaudeProviderRuntime {
             observation_state: ActivityObservationState::Live,
         });
         ClaudeRuntimeOutput {
+            control_responses: Vec::new(),
             events: Vec::new(),
             activity,
             native_event_id: Some(recovered.native_event_id),
@@ -2545,6 +2591,73 @@ impl ClaudeProviderRuntime {
         events
     }
 
+    /// Handles a request Claude sent to its host over the stream: a tool that needs the person's
+    /// approval or answer (`can_use_tool`), or the withdrawal of one (`control_cancel_request`).
+    /// Claude sends these only when it was started with `--permission-prompt-tool stdio`.
+    /// `None` when `value` is neither.
+    fn handle_host_request(&mut self, value: &Value) -> Option<ClaudeRuntimeOutput> {
+        let request_id = value.get("request_id").and_then(Value::as_str)?;
+        match value.get("type").and_then(Value::as_str)? {
+            "control_cancel_request" => Some(ClaudeRuntimeOutput {
+                events: self.cancel_request(request_id),
+                ..ClaudeRuntimeOutput::default()
+            }),
+            "control_request" => {
+                let request = value.get("request")?;
+                if request.get("subtype").and_then(Value::as_str) != Some("can_use_tool") {
+                    return None;
+                }
+                let tool_name = request
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let input = request.get("input").cloned().unwrap_or(Value::Null);
+                let tool_use_id = request
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let mut output = ClaudeRuntimeOutput::default();
+                match tool_name.as_str() {
+                    // The plan is read from the tool call and reviewed in BiBCode, so Claude's
+                    // own approval of it is never given here.
+                    "ExitPlanMode" => output.control_responses.push(control_response(
+                        request_id,
+                        &json!({ "behavior": "deny", "message": EXIT_PLAN_MODE_DENIAL }),
+                    )),
+                    "AskUserQuestion" => {
+                        output.events = self.open_user_input_request(
+                            UserInputRequestInput {
+                                tool_name,
+                                input,
+                                tool_use_id,
+                            },
+                            request_id,
+                        );
+                    }
+                    _ => {
+                        output.events = self.open_permission_request(
+                            PermissionRequestInput {
+                                tool_name,
+                                input,
+                                tool_use_id,
+                                suggestions: request
+                                    .get("permission_suggestions")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            },
+                            request_id,
+                        );
+                    }
+                }
+                Some(output)
+            }
+            _ => None,
+        }
+    }
+
     pub fn open_permission_request(
         &mut self,
         input: PermissionRequestInput,
@@ -2558,6 +2671,7 @@ impl ClaudeProviderRuntime {
             request_id.to_owned(),
             PendingApproval {
                 provider_item_id: provider_item_id.clone(),
+                turn_id: self.current_turn_id.clone(),
                 raw: json!({
                     "requestId": request_id,
                     "providerItemId": provider_item_id,
@@ -2567,35 +2681,86 @@ impl ClaudeProviderRuntime {
                 }),
             },
         );
+        let mut payload = json!({
+            "requestType": classify_request_type(&input.tool_name),
+            "toolName": input.tool_name,
+            "input": input.input,
+            "suggestions": input.suggestions,
+        });
+        // What the approval card shows: the command, the file or the tool being approved.
+        if let Some(detail) = permission_request_detail(&input.tool_name, &input.input) {
+            payload["detail"] = json!(detail);
+        }
         vec![self.event(
             "request.opened",
             self.current_turn_id.clone(),
             Some(request_id.to_owned()),
             Some(json!({ "providerItemId": input.tool_use_id })),
-            json!({
-                "requestType": classify_request_type(&input.tool_name),
-                "toolName": input.tool_name,
-                "input": input.input,
-                "suggestions": input.suggestions,
-            }),
+            payload,
         )]
     }
 
+    /// Settles a pending approval: the reply for Claude and the event that closes the card.
+    /// `None` when the request is not pending (already answered, cancelled, or never opened), so
+    /// exactly one decision or cancellation wins.
     pub fn resolve_permission_request(
         &mut self,
         request_id: &str,
         decision: Decision,
-    ) -> Vec<CanonicalEvent> {
-        let Some(pending) = self.pending_approvals.remove(request_id) else {
-            return Vec::new();
+    ) -> Option<ResolvedPermission> {
+        let pending = self.pending_approvals.remove(request_id)?;
+        let session_rules = match decision {
+            Decision::AcceptForSession => session_permission_updates(&pending.raw["suggestions"]),
+            Decision::Accept | Decision::Decline | Decision::Cancel => Vec::new(),
         };
-        vec![self.event(
+        // Claude Code before 2.1.207 rejects an allow without `updatedInput`, so the reply echoes
+        // the input Claude asked about.
+        let allow = |session_rules: Option<&[Value]>| {
+            let mut response = json!({ "behavior": "allow" });
+            let input = &pending.raw["input"];
+            if !input.is_null() {
+                response["updatedInput"] = input.clone();
+            }
+            if let Some(rules) = session_rules {
+                response["updatedPermissions"] = json!(rules);
+            }
+            response
+        };
+        let (response, payload) = match decision {
+            Decision::Decline => (
+                json!({ "behavior": "deny", "message": "The user denied this tool use." }),
+                json!({ "decision": decision }),
+            ),
+            Decision::Cancel => (
+                json!({
+                    "behavior": "deny",
+                    "message": "The user stopped the turn.",
+                    "interrupt": true,
+                }),
+                json!({ "decision": decision }),
+            ),
+            Decision::AcceptForSession if !session_rules.is_empty() => {
+                (allow(Some(&session_rules)), json!({ "decision": decision }))
+            }
+            // No rule to apply: a one-time allow, recorded as one, with the reason.
+            Decision::AcceptForSession => (
+                allow(None),
+                // `detail` is the line the thread shows on the resolved row.
+                json!({
+                    "decision": Decision::Accept,
+                    "detail": "Claude offered no session rule for this request, so it was approved once.",
+                }),
+            ),
+            Decision::Accept => (allow(None), json!({ "decision": decision })),
+        };
+        let events = vec![self.event(
             "request.resolved",
-            self.current_turn_id.clone(),
+            pending.turn_id,
             Some(request_id.to_owned()),
             Some(json!({ "providerItemId": pending.provider_item_id })),
-            json!({ "decision": decision }),
-        )]
+            payload,
+        )];
+        Some(ResolvedPermission { response, events })
     }
 
     pub fn open_user_input_request(
@@ -2609,6 +2774,7 @@ impl ClaudeProviderRuntime {
             request_id.to_owned(),
             PendingUserInput {
                 provider_item_id: provider_item_id.clone(),
+                turn_id: self.current_turn_id.clone(),
                 original_input: input.input.clone(),
                 raw: json!({
                     "requestId": request_id,
@@ -2626,15 +2792,13 @@ impl ClaudeProviderRuntime {
         )]
     }
 
+    /// Settles a pending question. `None` when it is not pending, as for an approval.
     pub fn resolve_user_input_request(
         &mut self,
         request_id: &str,
         answers: Value,
-    ) -> ResolvedUserInput {
-        let pending = self
-            .pending_user_inputs
-            .remove(request_id)
-            .expect("pending user input request");
+    ) -> Option<ResolvedUserInput> {
+        let pending = self.pending_user_inputs.remove(request_id)?;
         let updated_input = json!({
             "questions": pending
                 .original_input
@@ -2645,21 +2809,61 @@ impl ClaudeProviderRuntime {
         });
         let events = vec![self.event(
             "user-input.resolved",
-            self.current_turn_id.clone(),
+            pending.turn_id,
             Some(request_id.to_owned()),
             Some(json!({ "providerItemId": pending.provider_item_id })),
             json!({ "answers": answers }),
         )];
-        ResolvedUserInput {
+        Some(ResolvedUserInput {
             updated_input,
             events,
+        })
+    }
+
+    /// Closes a request Claude withdrew, or that its owner (the turn or the process) left
+    /// behind. Nothing is written to Claude for it. Empty when the request is not pending.
+    pub fn cancel_request(&mut self, request_id: &str) -> Vec<CanonicalEvent> {
+        if let Some(pending) = self.pending_approvals.remove(request_id) {
+            return vec![self.event(
+                "request.resolved",
+                pending.turn_id,
+                Some(request_id.to_owned()),
+                Some(json!({ "providerItemId": pending.provider_item_id })),
+                json!({ "decision": Decision::Cancel }),
+            )];
         }
+        if let Some(pending) = self.pending_user_inputs.remove(request_id) {
+            return vec![self.event(
+                "user-input.resolved",
+                pending.turn_id,
+                Some(request_id.to_owned()),
+                Some(json!({ "providerItemId": pending.provider_item_id })),
+                json!({ "answers": {}, "cancelled": true }),
+            )];
+        }
+        Vec::new()
+    }
+
+    /// Closes every pending request. A request belongs to the Claude process and the turn that
+    /// asked, so an interrupt or the end of the process leaves nobody to answer it.
+    pub fn cancel_pending_requests(&mut self) -> Vec<CanonicalEvent> {
+        let request_ids = self
+            .pending_approvals
+            .keys()
+            .chain(self.pending_user_inputs.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        request_ids
+            .iter()
+            .flat_map(|request_id| self.cancel_request(request_id))
+            .collect()
     }
 
     pub fn handle_stream_failure(&mut self, error: &str) -> Vec<CanonicalEvent> {
         self.stop_turn_input();
         self.delivery_acknowledgement_cancellation.cancel();
         self.follow_ups_after_turn = 0;
+        self.follow_ups_carried = 0;
         self.follow_ups_awaiting_replay = 0;
         let error_message = if is_interrupted_error(error) {
             "Claude runtime interrupted.".to_owned()
@@ -2714,6 +2918,7 @@ impl ClaudeProviderRuntime {
         self.current_turn_id = snapshot.turn_id;
         self.turn_open = self.current_turn_id.is_some();
         self.follow_ups_after_turn = 0;
+        self.follow_ups_carried = 0;
         self.follow_ups_awaiting_replay = 0;
         self.runtime_mode = Some(snapshot.runtime_mode);
         self.pending_approvals = snapshot
@@ -2726,6 +2931,7 @@ impl ClaudeProviderRuntime {
                     request_id,
                     PendingApproval {
                         provider_item_id,
+                        turn_id: None,
                         raw: value,
                     },
                 ))
@@ -2741,6 +2947,7 @@ impl ClaudeProviderRuntime {
                     request_id,
                     PendingUserInput {
                         provider_item_id,
+                        turn_id: None,
                         original_input: json!({
                             "questions": value.get("questions").cloned().unwrap_or_else(|| json!([])),
                         }),
@@ -2844,17 +3051,28 @@ impl ClaudeProviderRuntime {
             StreamEvent::ContentBlockDelta {
                 index: _,
                 delta: ContentBlockDelta::TextDelta { text },
-            } => vec![self.item_event(
-                "content.delta",
-                self.current_turn_id.clone(),
-                None,
-                None,
-                json!({
-                    "streamKind": "assistant_text",
-                    "delta": text,
-                }),
-                self.active_assistant_item_id.clone(),
-            )],
+            } => {
+                if !self.turn_open && parent_tool_use_id.is_none() {
+                    let text = (
+                        self.current_turn_id.clone(),
+                        self.active_assistant_item_id.clone(),
+                    );
+                    if !self.texts_outside_turn.contains(&text) {
+                        self.texts_outside_turn.push(text);
+                    }
+                }
+                vec![self.item_event(
+                    "content.delta",
+                    self.current_turn_id.clone(),
+                    None,
+                    None,
+                    json!({
+                        "streamKind": "assistant_text",
+                        "delta": text,
+                    }),
+                    self.active_assistant_item_id.clone(),
+                )]
+            }
             // A fragment of the tool's input is not a step of its own: recording each one as an
             // update made them most of a thread's activity (#167). The input is reported once,
             // complete, when its block stops.
@@ -2970,9 +3188,55 @@ impl ClaudeProviderRuntime {
             );
             return Vec::new();
         }
+        // A turn Claude started by itself with no replay opened no turn here, so its `result`
+        // completes none: the last turn already ended. It still ends the text it streamed,
+        // under the turn and item that text was stored with, completes a tool, thinking block or
+        // compaction it left open and withdraws a request it abandoned, as a turn's end does.
+        if !self.turn_open
+            && message
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.kind == "task-notification")
+        {
+            let mut events = self.flush_incomplete_tools();
+            events.extend(self.cancel_pending_requests());
+            events.extend(self.end_compaction(None));
+            for (message_id, index) in std::mem::take(&mut self.open_reasoning_blocks) {
+                events.push(self.item_event(
+                    "item.completed",
+                    self.current_turn_id.clone(),
+                    None,
+                    None,
+                    json!({ "itemType": "reasoning" }),
+                    message_id.map(|message_id| format!("{message_id}:{index}")),
+                ));
+            }
+            let texts = std::mem::take(&mut self.texts_outside_turn);
+            let last = texts.len().saturating_sub(1);
+            for (index, (turn_id, item_id)) in texts.into_iter().enumerate() {
+                // Only the last completion ends the answer, so one context query follows it.
+                let payload = if index < last {
+                    json!({ "answerContinues": true })
+                } else {
+                    json!({})
+                };
+                events.push(self.item_event(
+                    "assistant.message.completed",
+                    turn_id,
+                    None,
+                    None,
+                    payload,
+                    item_id,
+                ));
+            }
+            return events;
+        }
         self.stop_turn_input();
         self.turn_open = false;
         let mut events = self.flush_incomplete_tools();
+        // A request belongs to the turn that asked. Claude withdraws it before the turn ends;
+        // one it did not withdraw has nobody left to read an answer.
+        events.extend(self.cancel_pending_requests());
         events.extend(self.end_compaction(None));
         let interrupted = is_interrupted_result(&message);
         let failed = message.is_error && !interrupted;
@@ -3043,6 +3307,7 @@ impl ClaudeProviderRuntime {
             self.follow_ups_after_turn -= 1;
             events.extend(self.start_follow_up_turn());
         }
+        self.follow_ups_carried = self.follow_ups_after_turn;
         events
     }
 
@@ -3512,6 +3777,99 @@ fn claude_hook_native_event_id(value: &Value) -> Option<String> {
     Some(format!("claude:hook:{encoded}"))
 }
 
+/// What Claude is told when it asks to leave plan mode. Without a host, Claude Code has no
+/// `ExitPlanMode` tool at all and the turn ends with the plan as text. This keeps that outcome.
+const EXIT_PLAN_MODE_DENIAL: &str = "The plan is shown to the user in BiBCode, who reviews it there. Do not carry out the plan. End your turn now and wait for the user's decision.";
+
+/// The `control_response` frame that answers Claude's request `request_id`.
+#[must_use]
+pub fn control_response(request_id: &str, response: &Value) -> Value {
+    json!({
+        "type": "control_response",
+        "response": { "request_id": request_id, "subtype": "success", "response": response },
+    })
+}
+
+/// One line for the approval card: the command, else the file or target, else the tool.
+fn permission_request_detail(tool_name: &str, input: &Value) -> Option<String> {
+    let field = [
+        "command",
+        "file_path",
+        "notebook_path",
+        "path",
+        "url",
+        "pattern",
+        "query",
+    ]
+    .into_iter()
+    .find_map(|key| input.get(key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|value| !value.is_empty());
+    let detail = match field {
+        Some(value) if classify_request_type(tool_name) == "command_execution_approval" => {
+            value.to_owned()
+        }
+        Some(value) => format!("{tool_name}: {value}"),
+        None => tool_name.trim().to_owned(),
+    };
+    (!detail.is_empty()).then_some(detail)
+}
+
+/// The rules Claude suggested for "always allow", limited to this session.
+///
+/// Claude may suggest saving a rule to a settings file, which would outlive the session, so every
+/// destination becomes `session`. A suggested mode change is dropped: it would move the session
+/// to another permission mode while the thread still shows the one the person chose.
+fn session_permission_updates(suggestions: &Value) -> Vec<Value> {
+    // Only what "always allow" means: more allow rules and more readable folders. Anything else,
+    // a malformed entry included, is not a rule to apply.
+    let items = |update: &Value, key: &str| update[key].as_array().cloned().unwrap_or_default();
+    let is_rule = |rule: &Value| {
+        rule["toolName"]
+            .as_str()
+            .is_some_and(|name| !name.trim().is_empty())
+            && (rule.get("ruleContent").is_none() || rule["ruleContent"].is_string())
+    };
+    let is_directory = |directory: &Value| {
+        directory
+            .as_str()
+            .is_some_and(|path| !path.trim().is_empty())
+    };
+    suggestions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|suggestion| {
+            let mut update = suggestion.as_object()?.clone();
+            match suggestion["type"].as_str()? {
+                "addRules" if suggestion["behavior"] == "allow" => {
+                    let rules = items(suggestion, "rules")
+                        .into_iter()
+                        .filter(is_rule)
+                        .collect::<Vec<_>>();
+                    if rules.is_empty() {
+                        return None;
+                    }
+                    update.insert("rules".to_owned(), json!(rules));
+                }
+                "addDirectories" => {
+                    let directories = items(suggestion, "directories")
+                        .into_iter()
+                        .filter(is_directory)
+                        .collect::<Vec<_>>();
+                    if directories.is_empty() {
+                        return None;
+                    }
+                    update.insert("directories".to_owned(), json!(directories));
+                }
+                _ => return None,
+            }
+            update.insert("destination".to_owned(), json!("session"));
+            Some(Value::Object(update))
+        })
+        .collect()
+}
+
 fn claude_control_fact_native_event_id(value: &Value) -> Option<String> {
     let mut fields = Vec::with_capacity(12);
     if value.get("type").and_then(Value::as_str) == Some("system") {
@@ -3876,10 +4234,23 @@ fn normalize_questions(input: &Value) -> Vec<Value> {
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("Question {}", index + 1));
+                    // The question card shows only options with a label and a description, and
+                    // Claude may omit the description.
                     let options = question
                         .get("options")
                         .and_then(Value::as_array)
-                        .cloned()
+                        .map(|options| {
+                            options
+                                .iter()
+                                .map(|option| {
+                                    let mut option = option.clone();
+                                    if option.is_object() && !option["description"].is_string() {
+                                        option["description"] = json!("");
+                                    }
+                                    option
+                                })
+                                .collect::<Vec<_>>()
+                        })
                         .unwrap_or_default();
                     Some(json!({
                         "id": id,
@@ -7173,3 +7544,7 @@ mod compaction_turn_tests;
 #[cfg(test)]
 #[path = "turn_end_activity_tests.rs"]
 mod turn_end_activity_tests;
+
+#[cfg(test)]
+#[path = "follow_up_turn_tests.rs"]
+mod follow_up_turn_tests;

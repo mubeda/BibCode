@@ -19,15 +19,17 @@ only this warning appears at the bottom while requests are slow.
 
 The Host dashboard shows the computer a BiBCode server runs on: its CPU, its
 memory and its disks. Each environment has one, so you can look at a remote
-server's host as well as this machine. Open it from any of three places:
+server's host as well as this machine. It opens in two forms.
 
-- the **Environment actions** menu on the environment card in the left panel;
-- **Settings → Remote Servers**, the **Host dashboard** button on a connected
-  server;
-- the **Resource Manager** popover in the status bar, its **Host dashboard**
-  button.
+- As a center panel, from the **Dashboard** command of a server (see
+  [Server commands](#server-commands)) or from **Host dashboard** in the
+  **Environment actions** menu on the environment card. Each server has one
+  Dashboard panel; running the command again shows the panel already open.
+- As a panel on the right, from **Settings → Remote Servers** (the **Host
+  dashboard** button on a connected server) or from the **Resource Manager**
+  popover in the status bar (its **Host dashboard** button).
 
-The dashboard opens as a panel on the right. Its sections are:
+Both forms show the same sections:
 
 - **CPU** shows the current use and the number of cores, with a chart of the
   last 15 minutes.
@@ -73,6 +75,47 @@ the volumes from the last list that did. CPU and memory keep updating.
 An agent can read the same figures with the `host_metrics` MCP tool; it
 returns mount points only for a file system root such as `/` or `C:\`. See the
 [MCP reference](../reference/mcp.md).
+
+## Server commands
+
+Every server offers two commands where you choose it:
+
+- **Open terminal** opens a terminal in the center panel, on that server, in
+  the home folder of the user the server runs as (the folder the server's
+  `USERPROFILE`, then `HOME`, names on Windows and `HOME` elsewhere, as for `~`
+  in the folder picker).
+- **Dashboard** opens that server's [Host dashboard](#host-dashboard) in the
+  center panel.
+
+You reach them in three places:
+
+- In the Environments view, right-click a rail icon (the **Local** monitor or
+  a saved server's letters), or focus it and press Shift+F10 or the Menu key.
+  The menu acts on that server and does not change the rail selection. On
+  **Local** it acts on the local backend in view, or on this device.
+- On a server card in the Repositories view, the terminal and gauge buttons
+  after **Git Manager**.
+- On the environment card at the top of the Environments view, the same two
+  buttons next to its **…** menu.
+
+Each server has one terminal panel and one Dashboard panel. Running a command
+again shows the panel already open; **Open terminal** keeps a running shell and
+moves the keyboard focus to it, and starts a new shell if the last one exited.
+The terminal belongs to the server, not to a chat. Leaving its panel keeps the
+shell running. When the shell exits (for example after `exit`), the panel
+closes and the view you opened it from comes back; the next **Open terminal**
+starts a new shell. Its selection menu offers **Copy** only, and links
+open in the system browser rather than in a chat's preview. On a phone the
+sidebar closes so the panel is visible. After a reload the panel comes back for
+the same server; if that server is no longer saved, the panel says it is not
+available.
+
+While a server is not connected, both commands are disabled and say why: the
+menu item carries the reason, and the button's tooltip shows it. If the home
+folder cannot be read, the server does not start the shell, or the connection
+drops while the terminal opens, a **Could not open terminal** notice names the
+reason and the previous view comes back. Run **Open terminal** again once the
+server is connected.
 
 ## Left Panel
 
@@ -230,8 +273,9 @@ The glyph's shape carries the status: a hand (needs approval), a question mark
 (waiting for your answer), a spinner (working or connecting), a warning
 triangle (failed), a checklist (plan ready), a filled dot (finished, not opened
 yet) and a hollow ring (idle). A collapsed project and the **Show more** row
-show the most urgent glyph among the cards they hide. A collapsed project keeps
-only the card you are viewing visible; its other cards and discovered worktrees
+show the most urgent glyph among the cards they hide. A collapsed project hides
+all its cards and discovered worktrees, the card of the chat you are viewing
+included, and its header stays highlighted while it holds that chat. The cards
 appear again when you expand it.
 
 - The primary card represents the project's live checkout. Its title is the
@@ -735,7 +779,8 @@ reading in the chat does not move that line.
 name: a review, a second opinion, the work of one thread handed to another, or a plain message.
 You choose what is sent and see it before it goes. Nothing reaches either agent until you press
 **Send**. The control is in the composer footer of every chat panel, left of **History**, and in
-the toolbar of every AI Terminal. A plain terminal has none. On a server too old to support it,
+the toolbar of every AI Terminal, where it is the highlighted (primary color) button so it is easy
+to find. A plain terminal has none. On a server too old to support it,
 the control is disabled and says "Update the BiBCode server on this environment to use Send to
 agent." Your own requests work whether or not [agent messaging](./mcp.md#agents-messaging-each-other)
 is on.
@@ -837,7 +882,7 @@ quoted in the note, because a Message needs an agent first; nothing is typed int
   the preview types nothing into the terminal.
 - _As a target_, a terminal agent never gets your text typed for you. BiBCode stores the request
   and tells the agent with one fixed line, "BiBCode: you have new messages. Run `bibcode agent
-  inbox` to read them.", once its agent waits for a prompt and nothing was typed meanwhile. The
+  inbox` to read them, and answer each one that asks for a reply.", once its agent waits for a prompt and nothing was typed meanwhile. The
   agent reads the request there as coming from the user, and answers with
   `bibcode agent reply`. Only a Claude, Codex or OpenCode AI Terminal that BiBCode observes can
   be told. A Claude Code terminal is ready for the line only after Claude's own idle notice,
@@ -1190,7 +1235,10 @@ The toolbar has three segments:
    commit. A new branch never tracks its source, so one started from
    `origin/main` publishes under its own name. **Check out after creating** is
    on by default; turn it off to only create the branch, leaving the checked-out
-   branch and working tree as they were. The same segment exposes
+   branch and working tree as they were. Before the first commit, **From** is
+   the current HEAD and checkout stays on while it is, because Git can start a
+   branch with no commit only by switching to it. Pick another start point to
+   create without checking out. The same segment exposes
    tag creation, deletion, and push actions. Symbolic remote default pointers
    such as `origin/HEAD` are not branch rows, while an actual local branch named
    `origin` remains available.
@@ -1287,7 +1335,8 @@ is passed over. They stop at the first and last change of the list, and the
 disabled button says so.
 
 The **History** tab pages a flat commit list and shows the selected commit's
-metadata, changed files, and diff. New repository generations are spliced above
+metadata, changed files, and diff. A commit that changed too many files to send
+at once lists the first ones and says how many more are not listed. New repository generations are spliced above
 the loaded tip-pinned snapshot; repositories beyond the pin limit show the
 less-stable paging warning. A next page that fails to load shows its error at
 the end of the list and is requested again only when you scroll back to the end
@@ -1323,7 +1372,20 @@ that would conflict stays disabled with a hint to check that branch out and
 merge there, and a branch checked out in another worktree is blocked with the
 worktree's path. On Git older than 2.38 there is no preview: a merge into the
 checked-out branch stays available, and merging into another branch is
-disabled. **Rebase…** opens a branch chooser
+disabled. The top-right toolbar also has **New branch**, which opens the same
+dialog as the branch dropdown's **New branch** with **From** set to the
+checked-out branch (or the current HEAD when detached), and
+**Merge <branch> into…**, which opens the merge dialog with the checked-out
+branch fixed as the source. Choose the branch to merge into; **Into** stays
+empty and Merge stays disabled until you do, and the merge follows the
+merge-into rules above. **Merge <branch> into…** is disabled, with the reason
+in its tooltip, when no branch is checked out, the server does not support
+merging into another branch (the server reads its Git version once at startup
+and withdraws the capability on Git older than 2.38, so the tooltip names that
+version), or there is no other local branch. Choosing a branch that has since been
+checked out keeps Merge disabled too; use **Merge…** for the checked-out
+branch.
+**Rebase…** opens a branch chooser
 and warns when the rewrite will require updating an upstream with
 force-with-lease.
 Repositories with a merge, rebase, cherry-pick, or revert in progress show a
@@ -1388,6 +1450,25 @@ opens directly, with several it asks which environment to read from. An
 environment that is not connected is listed as "Not connected" and cannot be
 picked; when only one is connected, it opens directly. The project
 header stays highlighted on the list and detail routes, including after reload.
+
+While a list or detail loads for the first time, the panel shows a spinner with a
+label such as **Loading pull requests…**; a connecting environment shows its
+reason the same way, not as "unavailable". A later refresh keeps the content on
+screen and adds a short **Refreshing…** line above it. Each wait is named once: a
+pull request tab opened for the first time says **Loading Commits…** (or its own
+name) rather than also showing **Refreshing…**. Screen readers hear each line as
+soon as it appears, and the content being read is marked busy. Pipelines and Git
+Manager History, Changes and Tags behave the same; a failed first read of Tags
+says so with Retry instead of listing no tags. Spinners and skeletons stop moving
+when the system asks for reduced motion.
+
+When the host refuses a pull request list, a pull request, a pipelines list or a pipeline
+(you lost access, or it no longer exists), on its first page or on **Load more**,
+the panel hides everything it held for it, including the tab counts, until a later read of the same list,
+request or pipeline succeeds. A timeout on Retry, a refresh still running, clearing the
+filters, leaving and reopening the page, or reloading the window does not bring
+the hidden rows back. The refusal is kept for the window's session, so a new
+window shows the stored copy until its first read is refused again.
 
 ### Availability and setup
 
@@ -2425,7 +2506,7 @@ operations and amend.
 
 #### Review changes
 
-**Review changes**, the icon button in the Source Control header, starts a code
+**Review**, the button with the bot icon in the Source Control header, starts a code
 review of the checkout the panel shows:
 
 - **Scope.** With commits on the branch that are not on `origin/<default
@@ -2455,6 +2536,11 @@ review of the checkout the panel shows:
   | OpenCode chat              | "Edits and commands ask for your approval."                        |
   | Cursor, Grok or other chat | "Told not to edit. BiBCode cannot block edits for this agent."     |
 
+  The Codex chat line above is the one for a server that does not advertise
+  `readOnlyCodexReviews` (an older server). With the capability, a Codex chat
+  review does not ask before commands, and the line reads "Runs on its own in
+  Codex's read-only sandbox, like the Codex terminal review."
+
   These are the settings BiBCode starts the review with, not a guarantee that
   nothing is edited. A Claude review loads your user Claude settings and the
   repository's project and local Claude settings, as every Claude chat does, so
@@ -2465,7 +2551,13 @@ review of the checkout the panel shows:
 - **A chat review** opens as a chat panel of the current thread, in a tab named
   **Code review · \<agent\>**, on the same checkout. It starts with **Supervised**
   runtime access, and in plan mode for Claude only. The composer's pickers can
-  change both, as in any chat. Its first message is the review prompt. If that
+  change both, as in any chat. A Codex chat review does not ask before
+  commands: the server runs it in Codex's read-only sandbox without approvals,
+  as the Codex terminal review runs, so in place of the runtime picker the
+  composer shows a disabled **Read-only review** lock that says why on hover or
+  focus (an older server keeps the picker). A
+  command the sandbox blocks fails, and an approval or question Codex still
+  sends is declined at once, so no card opens. Its first message is the review prompt. If that
   message cannot be sent, the panel stays open with the prompt in its composer.
 - **A review's findings offer no Implement.** When a Claude review ends with a
   plan, its card reads **Review findings**, with copy and download but no
@@ -2512,6 +2604,9 @@ The Files surface is a full file manager for the active workspace:
 - Git-ignored files and directory roots remain visible with ignored styling,
   and the contents below an ignored directory are loaded eagerly with the rest
   of the tree.
+- A large workspace's list arrives in several parts. While a refresh reads them,
+  the tree keeps showing the previous list and swaps to the new one only once it
+  is complete.
 - A file opens in its own tab beside the Files tab, whether you click it in the
   tree, in a diff, in a chat link or through a UI suggestion. A file that
   already has a tab is focused, not duplicated. The Files tab stays in the

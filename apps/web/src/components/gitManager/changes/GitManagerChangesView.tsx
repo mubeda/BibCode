@@ -29,6 +29,7 @@ import {
 } from "react";
 
 import { Button } from "~/components/ui/button";
+import { LoadingState, RefreshRegion } from "~/components/ui/loading-state";
 import { RetryButton, type RetryButtonProps } from "~/components/ui/retry-button";
 import { Checkbox } from "~/components/ui/checkbox";
 import { useOpenInPreferredEditor } from "~/editorPreferences";
@@ -72,6 +73,7 @@ import {
   type ChangeFilters,
   type ChangeRow,
 } from "./changesList.logic";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 
 export interface GitManagerChangesViewProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
@@ -94,6 +96,7 @@ type ChangeContextAction =
   | "reveal"
   | "open-editor";
 
+const REFRESH_STATUS = "Refreshing changes…";
 const EMPTY_PATHS: ReadonlyArray<string> = Object.freeze([]);
 const EMPTY_EDITORS: ReadonlyArray<EditorId> = Object.freeze([]);
 const EMPTY_FILES: VcsStatusResult["workingTree"]["files"] = Object.freeze([]);
@@ -720,19 +723,15 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
       : errorPanel("Could not load changes", message, retry);
   }
   if (statusQuery.data === null || refsQuery.data === null || refsRecovering) {
-    return (
-      <div
-        className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground"
-        role="status"
-      >
-        Connecting to changes…
-      </div>
-    );
+    return <LoadingState className="flex-1" label="Connecting to changes…" />;
   }
 
   const filterActive = rows.filterActive;
   const noLocalChanges = rows.totalCount === 0;
   const mainCheckoutCwd = project?.workspaceRoot ?? cwd;
+  // Status is a stream that waits between emissions; only the refs read is a reread. It
+  // names the changed files; the diff pane's own read keeps its own status.
+  const refreshing = refsQuery.isPending;
 
   return (
     <section className="flex h-full min-h-0 min-w-0 flex-1 flex-col" aria-label="Changes">
@@ -770,21 +769,15 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
           cwd={cwd}
           mainCheckoutCwd={mainCheckoutCwd}
         />
-        <Button
-          aria-describedby={commitOperationsAvailable ? undefined : "git-manager-discard-disabled"}
-          disabled={!commitOperationsAvailable || mutationBusy || allChangedPaths.length === 0}
+        <GitManagerDisabledReasonButton
+          disabled={mutationBusy || allChangedPaths.length === 0}
+          disabledReason={commitOperationsAvailable ? null : commitDisabledReason}
           size="sm"
-          title={commitDisabledReason ?? undefined}
           variant="destructive-outline"
           onClick={requestDiscardAll}
         >
           Discard All
-        </Button>
-        {commitOperationsAvailable ? null : (
-          <span className="sr-only" id="git-manager-discard-disabled">
-            {commitDisabledReason}
-          </span>
-        )}
+        </GitManagerDisabledReasonButton>
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/70 px-2 py-1.5">
         {FILTER_NAMES.map((name) => (
@@ -802,16 +795,24 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
         ))}
       </div>
       {noLocalChanges ? (
-        <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-center">
+        <RefreshRegion
+          className="flex min-h-0 flex-1 items-center justify-center p-6 text-center"
+          refreshing={refreshing}
+          status={REFRESH_STATUS}
+        >
           <p className="text-sm text-muted-foreground">No local changes</p>
-        </div>
+        </RefreshRegion>
       ) : rows.length === 0 && filterActive ? (
-        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+        <RefreshRegion
+          className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center"
+          refreshing={refreshing}
+          status={REFRESH_STATUS}
+        >
           <p className="text-sm text-muted-foreground">No changed files match these filters.</p>
           <Button size="sm" variant="outline" onClick={clearFilters}>
             Clear filters
           </Button>
-        </div>
+        </RefreshRegion>
       ) : (
         <>
           <div className="flex h-8 shrink-0 items-center gap-2 border-b border-border px-2 text-xs">
@@ -856,14 +857,20 @@ export const GitManagerChangesView = memo(function GitManagerChangesView({
               )
             }
             list={
-              <GitManagerChangesList
-                rows={rows}
-                selectedPath={selectedPath}
-                onContextMenu={handleContextMenu}
-                onOpenExternal={handleOpenExternal}
-                onSelect={handleSelect}
-                onToggle={handleToggle}
-              />
+              <RefreshRegion
+                className="flex min-h-0 flex-1 flex-col"
+                refreshing={refreshing}
+                status={REFRESH_STATUS}
+              >
+                <GitManagerChangesList
+                  rows={rows}
+                  selectedPath={selectedPath}
+                  onContextMenu={handleContextMenu}
+                  onOpenExternal={handleOpenExternal}
+                  onSelect={handleSelect}
+                  onToggle={handleToggle}
+                />
+              </RefreshRegion>
             }
             onKeyDown={handleNavigationKeyDown}
           />

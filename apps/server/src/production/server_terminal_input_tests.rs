@@ -939,6 +939,147 @@ async fn begin_thread_input(fixture: &mut Fixture, thread_id: &str, cwd: &Path) 
         .to_owned()
 }
 
+fn server_terminal_open(cwd: &Path) -> Value {
+    json!({"threadId": "server-terminal", "terminalId": "server-terminal", "cwd": cwd, "env": {}, "centerPanel": true})
+}
+
+fn latest_process(fixture: &Fixture) -> Arc<RecordingPty> {
+    fixture
+        .backend
+        .process
+        .lock()
+        .expect("process")
+        .clone()
+        .expect("a spawned process")
+}
+
+async fn wait_for_live_sessions(fixture: &Fixture, count: usize) {
+    tokio::time::timeout(DEADLINE, async {
+        while fixture.services.terminal.live_session_count().await != count {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("live session count");
+}
+
+/// A thread row with the server terminal's id (#378), live or deleted, left by an older server
+/// that accepted it, neither lends the server terminal a workspace nor stops it opening, even
+/// when that row's workspace is unavailable and ordinary admission refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_server_terminal_opens_past_a_thread_row_with_its_id() {
+    let mut fixture = Fixture::start().await;
+    let baseline = fixture.services.terminal.live_session_count().await;
+    let home = fixture.root.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let worktree = fixture.worktree.to_string_lossy().into_owned();
+    let _removal = fixture
+        .registry
+        .mark_removing("thread-other", &fixture.worktree)
+        .await
+        .expect("physical identity resolves");
+    let mut deleted = thread_row_in("server-terminal", "project-input", Some(worktree.clone()));
+    deleted.deleted_at = Some("2026-10-13T00:00:00Z".to_owned());
+    for row in [
+        thread_row_in("server-terminal", "project-input", Some(worktree.clone())),
+        deleted,
+    ] {
+        fixture
+            .repositories
+            .upsert_thread(row)
+            .await
+            .expect("thread");
+        let opened = success(
+            fixture
+                .request("terminal.open", server_terminal_open(&home))
+                .await,
+        );
+        assert_eq!(opened["status"], "running", "{opened}");
+    }
+    assert_eq!(
+        fixture.services.terminal.live_session_count().await,
+        baseline + 1
+    );
+    fixture.shutdown().await;
+}
+
+/// Thread-wide cleanup, as a thread's deletion runs it, never reaches the server terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn thread_cleanup_leaves_the_server_terminal_running() {
+    let mut fixture = Fixture::start().await;
+    let home = fixture.root.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    success(
+        fixture
+            .request("terminal.open", server_terminal_open(&home))
+            .await,
+    );
+    let shell = latest_process(&fixture);
+    fixture
+        .services
+        .close_thread_terminals("server-terminal")
+        .await;
+    assert!(shell.exit.borrow().is_none(), "the server shell was closed");
+    fixture.shutdown().await;
+}
+
+/// Two windows (#378): A's shell exits, B opens the terminal again, then everything A can
+/// still send arrives late. Only `terminal.open` starts a shell and no client closes one, so
+/// B's shell is still the session's and still running at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_window_cannot_end_or_replace_the_reopened_server_shell() {
+    let mut fixture = Fixture::start().await;
+    let baseline = fixture.services.terminal.live_session_count().await;
+    let home = fixture.root.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let first = success(
+        fixture
+            .request("terminal.open", server_terminal_open(&home))
+            .await,
+    );
+    latest_process(&fixture).exit.send_replace(Some(PtyExit {
+        exit_code: Some(0),
+        signal: None,
+    }));
+    wait_for_live_sessions(&fixture, baseline).await;
+
+    let second = success(
+        fixture
+            .request("terminal.open", server_terminal_open(&home))
+            .await,
+    );
+    assert_ne!(first["generation"], second["generation"]);
+    let shell = latest_process(&fixture);
+
+    // A's late traffic: its attach (no working directory), its input and its size, and a
+    // thread-wide cleanup of the reserved id. None of them starts, restarts or closes a shell.
+    let key = json!({"threadId": "server-terminal", "terminalId": "server-terminal"});
+    fixture.send("terminal.attach", key.clone()).await;
+    let _ = fixture.reply().await;
+    let mut write = key.clone();
+    write["data"] = json!("late");
+    let _ = fixture.request("terminal.write", write).await;
+    let mut resize = key;
+    resize["cols"] = json!(100);
+    resize["rows"] = json!(30);
+    let _ = fixture.request("terminal.resize", resize).await;
+    fixture
+        .services
+        .close_thread_terminals("server-terminal")
+        .await;
+
+    assert!(shell.exit.borrow().is_none(), "B's shell was ended");
+    assert!(
+        Arc::ptr_eq(&shell, &latest_process(&fixture)),
+        "a late message started another shell"
+    );
+    assert_eq!(
+        fixture.services.terminal.live_session_count().await,
+        baseline + 1
+    );
+    fixture.shutdown().await;
+}
+
 fn project_moved(project_id: &str, workspace_root: &Path) -> OrchestrationEvent {
     let mut event = orchestration_event(
         "project.meta-updated",

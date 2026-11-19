@@ -73,12 +73,13 @@ export function selectInboxRows<Row extends InboxAgentRowFields>(
 /**
  * How far the agent lists can be trusted. `partial` covers an offline,
  * reconnecting or still-synchronizing environment (its rows may be missing or
- * stale) and an unreadable saved-server catalog.
+ * stale) and an unreadable saved-server catalog. `failed` means the connection
+ * runtime could not start, so the lists never load.
  */
-export type InboxDataState = "loading" | "partial" | "complete";
+export type InboxDataState = "loading" | "failed" | "partial" | "complete";
 
 export function resolveInboxDataState(summary: EnvironmentShellSummary): InboxDataState {
-  if (!summary.catalogReady) return "loading";
+  if (!summary.catalogReady) return summary.catalogFailed === true ? "failed" : "loading";
   if (!summary.hasSnapshot && summary.statuses.some(isTransientStatus)) return "loading";
   const complete =
     summary.catalogHealth.status === "ready" &&
@@ -224,7 +225,9 @@ export function resolveInboxSelection(input: {
   readonly dataState: InboxDataState;
 }): { readonly category: InboxCategory; readonly settle: InboxCategory | null } {
   if (input.persisted !== null) return { category: input.persisted, settle: null };
-  if (input.dataState === "loading") return { category: "all", settle: null };
+  if (input.dataState === "loading" || input.dataState === "failed") {
+    return { category: "all", settle: null };
+  }
   const category = input.counts.attention > 0 ? "attention" : "all";
   return { category, settle: input.dataState === "complete" ? category : null };
 }

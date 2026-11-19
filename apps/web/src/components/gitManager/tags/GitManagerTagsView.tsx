@@ -10,10 +10,12 @@ import { memo, useCallback, useMemo, type ReactNode } from "react";
 
 import { Button } from "~/components/ui/button";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "~/components/ui/collapsible";
+import { LoadingState, RefreshRegion } from "~/components/ui/loading-state";
 import { cn } from "~/lib/utils";
 
 import { gitManagerEnvironment } from "../../../state/gitManager";
 import { useEnvironmentQuery } from "../../../state/query";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 import {
   LOCAL_TAG_SECTION,
   buildLocalTagRows,
@@ -34,6 +36,14 @@ export interface GitManagerTagsViewProps {
   readonly collapsedSections: ReadonlyArray<string>;
   readonly onSectionCollapsedChange: (section: string, collapsed: boolean) => void;
   readonly onTagAction: (action: GitManagerTagRowAction, tag: string) => void;
+  /** The refs snapshot has not arrived: `tags` and `remotes` are placeholders, not answers. */
+  readonly refsPending?: boolean;
+  /** The refs read failed; with no earlier snapshot (`refsLoaded` false) the tags are unknown. */
+  readonly refsError?: string | null;
+  readonly refsLoaded?: boolean;
+  /** A reread runs while the last snapshot stays on screen. */
+  readonly refsRefreshing?: boolean;
+  readonly onRetryRefs?: () => void;
 }
 
 const ROW_CLASS =
@@ -116,27 +126,27 @@ function LocalTagRows({
           <span className="font-mono text-xs text-muted-foreground">{row.shortSha}</span>
           <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/tag-row:opacity-100">
             {canPush ? (
-              <Button
+              <GitManagerDisabledReasonButton
                 aria-label={`Push tag ${row.name}`}
-                disabled={tagDisabledReason !== null}
+                disabledReason={tagDisabledReason}
+                enabledTitle={`Push ${row.name} to a remote`}
                 size="xs"
-                title={tagDisabledReason ?? `Push ${row.name} to a remote`}
                 variant="ghost"
                 onClick={() => onTagAction("push", row.name)}
               >
                 <CloudUploadIcon aria-hidden="true" />
-              </Button>
+              </GitManagerDisabledReasonButton>
             ) : null}
-            <Button
+            <GitManagerDisabledReasonButton
               aria-label={`Delete tag ${row.name}`}
-              disabled={tagDisabledReason !== null}
+              disabledReason={tagDisabledReason}
+              enabledTitle={`Delete local tag ${row.name}`}
               size="xs"
-              title={tagDisabledReason ?? `Delete local tag ${row.name}`}
               variant="ghost"
               onClick={() => onTagAction("delete", row.name)}
             >
               <Trash2Icon aria-hidden="true" />
-            </Button>
+            </GitManagerDisabledReasonButton>
           </span>
         </li>
       ))}
@@ -193,55 +203,66 @@ function RemoteTagsSection({
           variant="ghost"
           onClick={retry}
         >
-          <RefreshCwIcon aria-hidden="true" className={cn(query.isPending && "animate-spin")} />
+          <RefreshCwIcon
+            aria-hidden="true"
+            className={cn(query.isPending && "motion-safe:animate-spin")}
+          />
         </Button>
       }
       onCollapsedChange={onCollapsedChange}
     >
-      {summary.kind === "ready" ? (
-        <ul aria-label={`Tags on ${remote}`} className="space-y-0.5">
-          {rows.map((row) => {
-            const presence = describeRemoteTagPresence(row.presence);
-            return (
-              <li
-                key={row.name}
-                className={ROW_CLASS}
-                data-presence={row.presence}
-                data-testid={`git-manager-remote-tag-${remote}-${row.name}`}
-              >
-                <TagIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 flex-1 truncate font-mono">{row.name}</span>
-                {presence === null ? null : (
-                  <span className="rounded bg-muted px-1.5 text-xs text-muted-foreground">
-                    {presence}
-                  </span>
-                )}
-                <span className="font-mono text-xs text-muted-foreground">{row.shortSha}</span>
-              </li>
-            );
-          })}
-        </ul>
-      ) : (
-        <p
-          aria-live="polite"
-          className={cn(
-            "px-2 py-1.5 text-xs",
-            summary.kind === "error" || summary.kind === "unavailable"
-              ? "text-destructive"
-              : "text-muted-foreground",
-          )}
-        >
-          {summary.message}
-          {summary.kind === "error" || summary.kind === "unavailable" ? (
-            <Button className="ml-2" size="xs" variant="outline" onClick={retry}>
-              Retry
-            </Button>
-          ) : null}
-        </p>
-      )}
-      {summary.kind === "ready" && summary.message !== null ? (
-        <p className="px-2 py-1 text-xs text-muted-foreground">{summary.message}</p>
-      ) : null}
+      {/* An empty or failed result is still on screen while the reread runs. */}
+      <RefreshRegion
+        refreshing={query.isPending && result !== null}
+        status={`Refreshing tags from ${remote}…`}
+      >
+        {summary.kind === "loading" ? (
+          <LoadingState
+            className="px-2 py-1.5"
+            label={summary.message ?? `Loading tags from ${remote}…`}
+          />
+        ) : summary.kind === "ready" ? (
+          <ul aria-label={`Tags on ${remote}`} className="space-y-0.5">
+            {rows.map((row) => {
+              const presence = describeRemoteTagPresence(row.presence);
+              return (
+                <li
+                  key={row.name}
+                  className={ROW_CLASS}
+                  data-presence={row.presence}
+                  data-testid={`git-manager-remote-tag-${remote}-${row.name}`}
+                >
+                  <TagIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate font-mono">{row.name}</span>
+                  {presence === null ? null : (
+                    <span className="rounded bg-muted px-1.5 text-xs text-muted-foreground">
+                      {presence}
+                    </span>
+                  )}
+                  <span className="font-mono text-xs text-muted-foreground">{row.shortSha}</span>
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <p
+            aria-live="polite"
+            className={cn(
+              "px-2 py-1.5 text-xs",
+              summary.kind === "error" || summary.kind === "unavailable"
+                ? "text-destructive"
+                : "text-muted-foreground",
+            )}
+          >
+            {summary.message}
+            {summary.kind === "error" || summary.kind === "unavailable" ? (
+              <Button className="ml-2" size="xs" variant="outline" onClick={retry}>
+                Retry
+              </Button>
+            ) : null}
+          </p>
+        )}
+      </RefreshRegion>
     </TagSection>
   );
 }
@@ -258,44 +279,90 @@ export const GitManagerTagsView = memo(function GitManagerTagsView({
   collapsedSections,
   onSectionCollapsedChange,
   onTagAction,
+  refsPending = false,
+  refsError = null,
+  refsLoaded = true,
+  refsRefreshing = false,
+  onRetryRefs,
 }: GitManagerTagsViewProps) {
   const collapsed = useMemo(() => new Set(collapsedSections), [collapsedSections]);
+  if (refsPending) {
+    return (
+      <section
+        aria-label="Tags"
+        className="flex min-h-0 flex-1 flex-col"
+        data-testid="git-manager-tags"
+      >
+        <LoadingState label="Loading tags…" />
+      </section>
+    );
+  }
+  const refsAlert =
+    refsError === null ? null : (
+      <div role="alert" className="space-y-2 px-2 text-xs">
+        <p className="text-destructive">Couldn’t load tags: {refsError}</p>
+        <Button size="xs" variant="outline" disabled={refsRefreshing} onClick={onRetryRefs}>
+          Retry
+        </Button>
+      </div>
+    );
+  // Without a snapshot the local tags and remotes are unknown, so none are listed.
+  if (!refsLoaded && refsAlert !== null) {
+    return (
+      <section
+        aria-label="Tags"
+        className="flex min-h-0 flex-1 flex-col"
+        data-testid="git-manager-tags"
+      >
+        {refsAlert}
+      </section>
+    );
+  }
   return (
     <section
       aria-label="Tags"
       className="flex min-h-0 flex-1 flex-col gap-2 overflow-auto"
       data-testid="git-manager-tags"
     >
-      <TagSection
-        collapsed={collapsed.has(LOCAL_TAG_SECTION)}
-        count={tags.length}
-        section={LOCAL_TAG_SECTION}
-        title="Local"
-        onCollapsedChange={onSectionCollapsedChange}
+      {refsAlert}
+      {/* The refs read lists the local tags and the remotes; each remote's tags are its own read. */}
+      <RefreshRegion
+        className="flex flex-col gap-2"
+        refreshing={refsRefreshing}
+        status="Refreshing tags…"
       >
-        <LocalTagRows
-          canPush={remotes.length > 0}
-          tagDisabledReason={tagDisabledReason}
-          tags={tags}
-          onTagAction={onTagAction}
-        />
-      </TagSection>
-      {remotes.length === 0 ? (
-        <p className="px-2 text-xs text-muted-foreground">
-          No remote configured, so there are no remote tags to show.
-        </p>
-      ) : (
-        remotes.map((remote) => (
-          <RemoteTagsSection
-            key={remote}
-            collapsed={collapsed.has(remoteTagSection(remote))}
-            localTags={tags}
-            remote={remote}
-            scope={scope}
-            onCollapsedChange={onSectionCollapsedChange}
+        <TagSection
+          collapsed={collapsed.has(LOCAL_TAG_SECTION)}
+          count={tags.length}
+          section={LOCAL_TAG_SECTION}
+          title="Local"
+          onCollapsedChange={onSectionCollapsedChange}
+        >
+          <LocalTagRows
+            canPush={remotes.length > 0}
+            tagDisabledReason={tagDisabledReason}
+            tags={tags}
+            onTagAction={onTagAction}
           />
-        ))
-      )}
+        </TagSection>
+        {remotes.length === 0 ? (
+          <p className="px-2 text-xs text-muted-foreground">
+            No remote configured, so there are no remote tags to show.
+          </p>
+        ) : null}
+      </RefreshRegion>
+      {remotes.length === 0
+        ? null
+        : remotes.map((remote) => (
+            <RemoteTagsSection
+              key={remote}
+              collapsed={collapsed.has(remoteTagSection(remote))}
+              localTags={tags}
+              remote={remote}
+              scope={scope}
+              onCollapsedChange={onSectionCollapsedChange}
+            />
+          ))}
     </section>
   );
 });

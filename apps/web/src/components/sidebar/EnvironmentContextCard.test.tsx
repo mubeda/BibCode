@@ -9,6 +9,7 @@ const h = vi.hoisted(() => ({
   environment: null as Record<string, unknown> | null,
   activeEnvironmentId: null as string | null,
   navigate: vi.fn(),
+  mobile: { isMobile: false, setOpenMobile: vi.fn() },
   commandCalls: [] as Array<{ label?: string; input: unknown }>,
   menuItems: [] as Array<Record<string, unknown>>,
   compatVerdict: null as unknown,
@@ -41,8 +42,13 @@ vi.mock("../../connection/environmentCompat", () => ({
   resolveEnvironmentCompatVerdict: () => h.compatVerdict,
   selectRemoteUpdateControlCapability: (serverConfig: unknown) => serverConfig !== null,
 }));
+vi.mock("~/components/ui/sidebar", () => ({ useSidebar: () => h.mobile }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => h.navigate,
+  useRouter: () => ({
+    buildLocation: () => ({ pathname: "/environment/target/terminal" }),
+    state: { location: { pathname: "/" } },
+  }),
 }));
 vi.mock("../ui/menu", () => ({
   Menu: ({ children }: { children?: ReactNode }) => <>{children}</>,
@@ -112,6 +118,14 @@ function mountCard(): HTMLDivElement {
   root = createRoot(container);
   act(() => root!.render(<EnvironmentContextCard />));
   return container;
+}
+
+/** Tooltip texts other than the server command buttons' own (#378). */
+function statusTooltipTexts(host: ParentNode): Array<string | null> {
+  const commandTooltips = new Set(["Open terminal", "Dashboard", "AI-SERVER is not connected."]);
+  return [...host.querySelectorAll("[data-tooltip]")]
+    .map((node) => node.textContent)
+    .filter((text) => !commandTooltips.has(text ?? ""));
 }
 
 /** The innermost element holding the whole status text, outside any tooltip popup. */
@@ -198,7 +212,7 @@ describe("EnvironmentContextCard", () => {
     expect(card).not.toMatch(/\bbg-background\b|\bborder-border\b|\brounded-\[/);
   });
 
-  it("opens the Host dashboard for this environment, before Disconnect", () => {
+  it("opens the Host dashboard center panel for this environment, before Disconnect", () => {
     h.reset();
     h.activeEnvironmentId = ENV_REMOTE;
     h.environment = remoteEnvironment(SERVER_CONFIG);
@@ -212,7 +226,67 @@ describe("EnvironmentContextCard", () => {
     expect(labels.indexOf("Host dashboard")).toBe(labels.indexOf("Disconnect") - 1);
     const item = h.menuItems.find((entry) => entry.children === "Host dashboard");
     (item!.onClick as () => void)();
-    expect(registry.get(hostDashboardRequest)).toEqual({ environmentId: ENV_REMOTE });
+    expect(h.navigate).toHaveBeenCalledExactlyOnceWith({
+      to: "/environment/$environmentId/dashboard",
+      params: { environmentId: ENV_REMOTE },
+    });
+    // One dashboard surface from this card: the sheet is not opened as well (#378).
+    expect(registry.get(hostDashboardRequest)).toBeNull();
+  });
+
+  it("closes the phone sidebar after a server command (#378)", () => {
+    h.reset();
+    h.mobile = { isMobile: true, setOpenMobile: vi.fn() };
+    h.activeEnvironmentId = ENV_REMOTE;
+    h.environment = remoteEnvironment(SERVER_CONFIG);
+    const card = mountCard();
+    act(() =>
+      card.querySelector<HTMLButtonElement>('[aria-label="Dashboard for AI-SERVER"]')!.click(),
+    );
+    expect(h.mobile.setOpenMobile).toHaveBeenCalledExactlyOnceWith(false);
+    h.mobile = { isMobile: false, setOpenMobile: vi.fn() };
+  });
+
+  it("shows Open terminal and Dashboard buttons, disabled with a reason while offline (#378)", () => {
+    h.reset();
+    h.activeEnvironmentId = ENV_REMOTE;
+    h.environment = remoteEnvironment(SERVER_CONFIG);
+    const card = mountCard();
+    const terminal = card.querySelector<HTMLButtonElement>(
+      '[aria-label="Open terminal on AI-SERVER"]',
+    );
+    const dashboard = card.querySelector<HTMLButtonElement>(
+      '[aria-label="Dashboard for AI-SERVER"]',
+    );
+    expect(terminal?.getAttribute("aria-disabled")).toBeNull();
+    act(() => terminal!.click());
+    expect(h.navigate).toHaveBeenLastCalledWith({
+      to: "/environment/$environmentId/terminal",
+      params: { environmentId: ENV_REMOTE },
+      search: { open: expect.any(Number) },
+    });
+    act(() => dashboard!.click());
+    expect(h.navigate).toHaveBeenLastCalledWith({
+      to: "/environment/$environmentId/dashboard",
+      params: { environmentId: ENV_REMOTE },
+    });
+
+    act(() => root?.unmount());
+    container?.remove();
+    h.reset();
+    h.activeEnvironmentId = ENV_REMOTE;
+    h.environment = remoteEnvironment(SERVER_CONFIG, RECONNECTING_NO_DATA);
+    const offline = mountCard();
+    const offlineTerminal = offline.querySelector<HTMLButtonElement>(
+      '[aria-label="Open terminal on AI-SERVER"]',
+    );
+    expect(offlineTerminal?.getAttribute("aria-disabled")).toBe("true");
+    expect(offlineTerminal?.getAttribute("aria-description")).toBe("AI-SERVER is not connected.");
+    act(() => offlineTerminal!.click());
+    expect(h.navigate).not.toHaveBeenCalled();
+    const offlineItem = h.menuItems.findLast((entry) => entry.children === "Host dashboard");
+    expect(offlineItem?.disabled).toBe(true);
+    expect(offlineItem?.title).toBe("AI-SERVER is not connected.");
   });
 
   it("disconnects through the latch and deep-links Manage", () => {
@@ -323,9 +397,7 @@ describe("EnvironmentContextCard", () => {
 
       // Hover (or keyboard focus) opens a tooltip holding the whole reason, and
       // the help cursor says so, as on the project list's reason line.
-      expect([...host.querySelectorAll("[data-tooltip]")].map((node) => node.textContent)).toEqual([
-        statusText,
-      ]);
+      expect(statusTooltipTexts(host)).toEqual([statusText]);
       expect(status.className).toContain("cursor-help");
       // Keyboard users reach the line with Tab, which opens the same tooltip.
       expect(status.tabIndex).toBe(0);
@@ -349,7 +421,7 @@ describe("EnvironmentContextCard", () => {
     // Nothing is hidden, so there is nothing to reveal.
     expect(status.hasAttribute("tabindex")).toBe(false);
     expect(status.className).not.toContain("cursor-help");
-    expect(host.querySelector("[data-tooltip]")).toBeNull();
+    expect(statusTooltipTexts(host)).toEqual([]);
   });
 
   it("shows no reason line for a connected card that still carries a stale error", () => {
@@ -367,7 +439,7 @@ describe("EnvironmentContextCard", () => {
     // the short status with its version and no tooltip or extra tab stop.
     expect(accessibleText(status)).toBe("Connected BiBCode v0.6.2");
     expect(status.hasAttribute("tabindex")).toBe(false);
-    expect(host.querySelector("[data-tooltip]")).toBeNull();
+    expect(statusTooltipTexts(host)).toEqual([]);
     expect(host.textContent).not.toContain("A stale failure from before.");
   });
 

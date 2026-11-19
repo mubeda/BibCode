@@ -15,6 +15,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   type DefaultAgentSelection,
   type EnvironmentId,
+  type ProviderDriverKind,
   ServerSettings,
   type ServerSettingsPatch,
 } from "@bibcode/contracts";
@@ -33,6 +34,7 @@ import { AsyncResult } from "effect/reactivity";
 import { primaryServerSettingsAtom, serverEnvironment } from "~/state/server";
 import { usePrimaryEnvironment } from "~/state/environments";
 import { useAtomCommand } from "~/state/use-atom-command";
+import { appAtomRegistry } from "~/rpc/atomRegistry";
 
 const CLIENT_SETTINGS_PERSISTENCE_ERROR_SCOPE = "[CLIENT_SETTINGS]";
 const decodeClientSettings = Schema.decodeUnknownSync(ClientSettingsSchema);
@@ -263,6 +265,18 @@ export function useEnvironmentSettings<T = UnifiedSettings>(
   return useMergedSettings(serverSettings ?? DEFAULT_SERVER_SETTINGS, selector);
 }
 
+/**
+ * One environment's server settings as they are now, for a write built after an await. A write
+ * of `providerSessionDefaults` also names the providers it owns, so the server keeps a default
+ * another window saved that has not reached this one yet.
+ */
+export function readEnvironmentServerSettings(environmentId: EnvironmentId): ServerSettings {
+  return (
+    appAtomRegistry.get(serverEnvironment.settingsValueAtom(environmentId)) ??
+    DEFAULT_SERVER_SETTINGS
+  );
+}
+
 /** Primary-only settings access for the settings UI and other explicitly global surfaces. */
 export function usePrimarySettings<T = UnifiedSettings>(
   selector?: (settings: UnifiedSettings) => T,
@@ -292,13 +306,18 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
     "server settings update",
   );
   const updateSettings = useCallback(
-    (patch: Partial<UnifiedSettings>) => {
+    (
+      patch: Partial<UnifiedSettings>,
+      // The providers whose saved session defaults this write sets or removes; the server
+      // keeps every other provider's, including one saved in another window meanwhile.
+      options?: { readonly ownedProviderSessionDefaults?: ReadonlyArray<ProviderDriverKind> },
+    ) => {
       const { serverPatch, clientPatch } = splitPatch(patch);
       const serverResult =
         Object.keys(serverPatch).length > 0 && environmentId
           ? persistServerSettings({
               environmentId,
-              input: { patch: serverPatch },
+              input: { patch: serverPatch, ...options },
             })
           : Promise.resolve(AsyncResult.success(undefined));
 

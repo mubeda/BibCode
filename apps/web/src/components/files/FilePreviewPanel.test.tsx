@@ -374,10 +374,14 @@ vi.mock("~/components/ChatMarkdown", () => ({
 
 // The editor chunk loads once per test file, so a later test cannot see its loading fallback
 // unless it asks for it: while `loading` is set, the view shows its fallback as it does then.
-const richMarkdownView = vi.hoisted(() => ({ loading: false }));
+const richMarkdownView = vi.hoisted(() => ({
+  loading: false,
+  preload: vi.fn(() => Promise.resolve()),
+}));
 vi.mock("./RichMarkdownView", async (importOriginal) => {
   const original = await importOriginal<typeof import("./RichMarkdownView")>();
   return {
+    preloadRichMarkdownSurface: richMarkdownView.preload,
     RichMarkdownView: (props: Parameters<typeof original.RichMarkdownView>[0]) =>
       richMarkdownView.loading ? props.fallback : <original.RichMarkdownView {...props} />,
   };
@@ -2214,6 +2218,14 @@ describe("effects wiring", () => {
     };
     const cleanups = harness.runEffects();
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "end" });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("starts loading the rendered Markdown editor when the panel opens, before a Markdown file", () => {
+    renderWithEffects();
+    richMarkdownView.preload.mockClear();
+    const cleanups = harness.runEffects();
+    expect(richMarkdownView.preload).toHaveBeenCalledOnce();
     for (const cleanup of cleanups) cleanup();
   });
 

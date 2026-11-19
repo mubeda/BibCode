@@ -67,6 +67,23 @@ function isSessionRunningRefusal(result: { readonly cause: unknown }): boolean {
   return isWorktreeRemovalError(error) && error.reason === "session-running";
 }
 
+/** A removal that finished first: `thread-not-found` flagged `alreadyRemoved`. */
+function isAlreadyRemovedFailure(result: { readonly cause: unknown }): boolean {
+  const error = squashAtomCommandFailure(result as never);
+  return (
+    isWorktreeRemovalError(error) &&
+    error.reason === "thread-not-found" &&
+    error.alreadyRemoved === true
+  );
+}
+
+const ALREADY_REMOVED_RESULT: WorktreeRemovalResult = {
+  threadRemoved: true,
+  gitOutcome: "not-requested",
+  orphanCleanupPending: false,
+  detail: "This worktree was already removed.",
+};
+
 function failureMessage(result: { readonly cause: unknown }): string {
   const error = squashAtomCommandFailure(result as never);
   if (isWorktreeRemovalError(error) && error.reason === "session-running") {
@@ -171,6 +188,18 @@ export function WorktreeRemovalDialog({
     setServerRefusedRunning(false);
   }
 
+  const finishRemoval = useCallback(
+    (
+      requestTarget: WorktreeRemovalTarget,
+      result: WorktreeRemovalResult,
+      showCompletion: boolean,
+    ) => {
+      if (showCompletion) setCompleted(result);
+      onRemoved(requestTarget, result);
+    },
+    [onRemoved],
+  );
+
   // Callers mark the plan as loading before the request starts.
   const loadPlanForTarget = useCallback(
     (requestTarget: WorktreeRemovalTarget, epoch: number) =>
@@ -181,12 +210,17 @@ export function WorktreeRemovalDialog({
         if (epoch !== asyncEpochRef.current) return;
         setIsLoadingPlan(false);
         if (result._tag === "Failure") {
+          // A removal that finished while the plan loaded is an outcome, not an error.
+          if (isAlreadyRemovedFailure(result)) {
+            finishRemoval(requestTarget, ALREADY_REMOVED_RESULT, true);
+            return;
+          }
           setError(failureMessage(result));
           return;
         }
         setPlan(result.value);
       }),
-    [getRemovalPlan],
+    [finishRemoval, getRemovalPlan],
   );
 
   // Opening, closing, or retargeting starts over from the choices.
@@ -226,18 +260,6 @@ export function WorktreeRemovalDialog({
     void loadPlanForTarget(target, epoch);
   }, [loadPlanForTarget, target]);
 
-  const finishRemoval = useCallback(
-    (
-      requestTarget: WorktreeRemovalTarget,
-      result: WorktreeRemovalResult,
-      showCompletion: boolean,
-    ) => {
-      if (showCompletion) setCompleted(result);
-      onRemoved(requestTarget, result);
-    },
-    [onRemoved],
-  );
-
   const detach = useCallback(async () => {
     if (!target || isRemoving) return;
     const requestTarget = target;
@@ -257,6 +279,11 @@ export function WorktreeRemovalDialog({
     const isCurrent = epoch === asyncEpochRef.current;
     if (isCurrent) setIsRemoving(false);
     if (result._tag === "Failure") {
+      // Another client's removal can land first; the target is gone either way.
+      if (isAlreadyRemovedFailure(result)) {
+        finishRemoval(requestTarget, ALREADY_REMOVED_RESULT, isCurrent);
+        return;
+      }
       if (isCurrent) setError(failureMessage(result));
       return;
     }
@@ -292,6 +319,11 @@ export function WorktreeRemovalDialog({
       const isCurrent = epoch === asyncEpochRef.current;
       if (isCurrent) setIsRemoving(false);
       if (result._tag === "Failure") {
+        // The refresh after a stale plan can find the target already removed.
+        if (isAlreadyRemovedFailure(result)) {
+          finishRemoval(requestTarget, ALREADY_REMOVED_RESULT, isCurrent);
+          return;
+        }
         if (isCurrent) {
           if (isSessionRunningRefusal(result)) {
             setServerRefusedRunning(true);

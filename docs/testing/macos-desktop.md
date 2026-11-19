@@ -259,6 +259,15 @@ test -d "$BIBCODE_E2E_APP_PATH"
 vp run test:ui:desktop
 ```
 
+Keep the test window visible for the whole run. Unlock the screen and do not
+cover the window with another app, including a Parallels guest window. With
+the window hidden, WebKit fires no animation frames, and the specs that sample
+painted frames fail. The specs resize the window to exact viewport sizes. A
+viewport that fits the screen's free area (the screen less the menu bar and
+the Dock) only without the window's title bar cannot be reached, and the
+harness times out with `The webview did not reach the requested <size>
+viewport`.
+
 The Mermaid keyboard case sends a trusted PageUp through `osascript` and System
 Events. Run it in a logged-in desktop session that allows the process invoking
 `vp` to control System Events in macOS Privacy & Security settings. The case

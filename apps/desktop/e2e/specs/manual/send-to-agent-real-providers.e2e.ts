@@ -1,8 +1,11 @@
 // @effect-diagnostics nodeBuiltinImport:off - Manual real-provider run writes an evidence file and screenshots.
 // @effect-diagnostics globalDate:off - Waits for real provider CLIs against wall-clock deadlines.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
+import { DESKTOP_UI_BUNDLE_IDENTIFIER } from "../../support/app-lifecycle.ts";
+import { captureStuckConnectionState } from "../../support/connection-state.ts";
 import { ensureMainSidebarOpen, mockDesktopUiFolderPicker } from "../../support/ui-state.ts";
 
 /**
@@ -39,6 +42,31 @@ function note(line: string): void {
   NodeFS.appendFileSync(evidencePath, `${line}\n`);
 }
 
+/**
+ * Submits what was typed into the focused terminal. Codex's input reads the packaged driver's
+ * Enter and Return as a new line, so macOS sends a trusted Return through System Events, which
+ * needs the process that runs the suite to be allowed to control System Events. The other
+ * platforms keep the driver's key.
+ */
+async function submitTerminalInput(): Promise<void> {
+  if (process.env.BIBCODE_E2E_PLATFORM !== "mac") {
+    await browser.keys("Return");
+    return;
+  }
+  NodeChildProcess.execFileSync("osascript", [
+    "-e",
+    [
+      'tell application "System Events"',
+      `  tell (first application process whose bundle identifier is "${DESKTOP_UI_BUNDLE_IDENTIFIER}")`,
+      "    set frontmost to true",
+      "  end tell",
+      "  delay 0.5",
+      "  key code 36",
+      "end tell",
+    ].join("\n"),
+  ]);
+}
+
 async function shot(name: string): Promise<void> {
   await browser.saveScreenshot(NodePath.join(artifactDirectory!, `real-${provider}-${name}.png`));
 }
@@ -63,7 +91,14 @@ async function importProject(): Promise<void> {
   const loading = browser.$("//*[normalize-space()='Project data is still loading']");
   await browser.pause(1_000);
   if (await loading.isExisting()) {
-    await loading.waitForDisplayed({ reverse: true, timeout: 60_000 });
+    try {
+      await loading.waitForDisplayed({ reverse: true, timeout: 60_000 });
+    } catch (error) {
+      // #381: keep what the client held, for the next diagnosis.
+      const state = await captureStuckConnectionState().catch((reason: unknown) => String(reason));
+      note(`project data never loaded; client state: ${JSON.stringify(state)}`);
+      throw error;
+    }
   }
   const addProject = browser.$('[data-testid="sidebar-add-project-trigger"]');
   await addProject.waitForDisplayed();
@@ -251,8 +286,7 @@ describe(`real ${provider}`, function () {
     // A fresh agent is not ready for a pointer before its first end-of-turn signal, so the person
     // gives it one tiny prompt first.
     await browser.$(`${visibleSurface} .xterm-helper-textarea`).addValue("Reply with the word ok.");
-    // Codex's input takes the driver's Enter as a new line; Return submits in every CLI.
-    await browser.keys("Return");
+    await submitTerminalInput();
     await browser.pause(provider === "claude" ? 60_000 : 45_000);
     await shot("first-turn");
     note(

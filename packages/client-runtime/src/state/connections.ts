@@ -18,11 +18,19 @@ import {
 export interface EnvironmentCatalogState {
   readonly isReady: boolean;
   readonly entries: ReadonlyMap<EnvironmentIdType, ConnectionCatalogEntry>;
+  /** The connection runtime failed to build, so the catalog never becomes ready. */
+  readonly failed?: true;
 }
 
 export const EMPTY_ENVIRONMENT_CATALOG_STATE: EnvironmentCatalogState = Object.freeze({
   isReady: false,
   entries: new Map(),
+});
+
+const FAILED_ENVIRONMENT_CATALOG_STATE: EnvironmentCatalogState = Object.freeze({
+  isReady: false,
+  entries: new Map(),
+  failed: true,
 });
 
 export function createEnvironmentCatalogAtoms<R, E>(
@@ -46,9 +54,12 @@ export function createEnvironmentCatalogAtoms<R, E>(
     { initialValue: EMPTY_ENVIRONMENT_CATALOG_STATE },
   );
 
-  const catalogValueAtom = Atom.make((get) =>
-    Option.getOrElse(AsyncResult.value(get(catalogAtom)), () => EMPTY_ENVIRONMENT_CATALOG_STATE),
-  ).pipe(Atom.withLabel("environment-catalog-value"));
+  const catalogValueAtom = Atom.make((get): EnvironmentCatalogState => {
+    const catalog = get(catalogAtom);
+    // Checked first: a failure can still carry an earlier value, which would read as loading.
+    if (AsyncResult.isFailure(catalog)) return FAILED_ENVIRONMENT_CATALOG_STATE;
+    return Option.getOrElse(AsyncResult.value(catalog), () => EMPTY_ENVIRONMENT_CATALOG_STATE);
+  }).pipe(Atom.withLabel("environment-catalog-value"));
 
   const networkStatusAtom = runtime.atom(
     Stream.unwrap(

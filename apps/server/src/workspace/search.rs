@@ -4,6 +4,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,21 @@ pub struct SearchResult {
     pub truncated: bool,
 }
 
+/// One page of a paged list (#390): `next_cursor` names the next page of the same snapshot and is
+/// absent on the last page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPage {
+    pub entries: Vec<WorkspaceEntry>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// A page cursor that names another snapshot than the current one, or no snapshot at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleCursor;
+
 #[derive(Debug, Clone, Copy)]
 pub struct SearchLimits {
     pub max_entries: usize,
@@ -104,6 +120,8 @@ impl Default for SearchLimits {
 
 #[derive(Default)]
 struct SearchSnapshot {
+    /// Zero until the first build; a page cursor names it.
+    generation: u64,
     entries: Vec<WorkspaceEntry>,
     memory_bytes: usize,
     truncated: bool,
@@ -210,6 +228,12 @@ pub struct WorkspaceSearchIndex {
     root: PathBuf,
     limits: SearchLimits,
     snapshot: Arc<RwLock<SearchSnapshot>>,
+    /// Every build of this index gets the next generation, so a cursor can tell when the list it
+    /// pages moved.
+    generations: Arc<AtomicU64>,
+    /// A random value per index, in every cursor, so a cursor from another index (one a server ran
+    /// before it restarted, whose generations also start at 1) is refused.
+    instance: u64,
     #[cfg(test)]
     phase_sink: Option<WorkspaceIndexPhaseSink>,
 }
@@ -220,6 +244,11 @@ impl WorkspaceSearchIndex {
             root,
             limits,
             snapshot: Arc::new(RwLock::new(SearchSnapshot::default())),
+            generations: Arc::new(AtomicU64::new(1)),
+            instance: std::hash::BuildHasher::hash_one(
+                &std::collections::hash_map::RandomState::new(),
+                (),
+            ),
             #[cfg(test)]
             phase_sink: None,
         }
@@ -282,6 +311,8 @@ impl WorkspaceSearchIndex {
         if cancellation.is_cancelled() {
             return Err(WorkspaceError::Cancelled);
         }
+        let mut scanned = scanned;
+        scanned.generation = self.generations.fetch_add(1, Ordering::Relaxed);
         *self.snapshot.write().await = scanned;
         Ok(())
     }
@@ -298,6 +329,53 @@ impl WorkspaceSearchIndex {
                 .cloned()
                 .collect(),
         }
+    }
+
+    /// One page of the snapshot that encodes to at most `budget` bytes, and always at least one
+    /// entry (#390). `cursor` is `None` for the first page, otherwise the previous page's
+    /// `next_cursor`; a cursor from another snapshot is refused, so pages are never mixed.
+    pub async fn page(&self, cursor: Option<&str>, budget: usize) -> Result<ListPage, StaleCursor> {
+        let snapshot = self.snapshot.read().await;
+        let offset = match cursor {
+            None => 0,
+            Some(cursor) => {
+                let mut parts = cursor.split('.');
+                let (Some(instance), Some(generation), Some(offset), None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                else {
+                    return Err(StaleCursor);
+                };
+                let instance = u64::from_str_radix(instance, 16).map_err(|_| StaleCursor)?;
+                let generation = generation.parse::<u64>().map_err(|_| StaleCursor)?;
+                let offset = offset.parse::<usize>().map_err(|_| StaleCursor)?;
+                if instance != self.instance
+                    || generation != snapshot.generation
+                    || offset > snapshot.entries.len()
+                {
+                    return Err(StaleCursor);
+                }
+                offset
+            }
+        };
+        // `{"entries":[],"truncated":false,"nextCursor":"<hex u64>.<u64>.<usize>"}` at its longest.
+        let mut total = 112_usize;
+        let mut end = offset;
+        for entry in &snapshot.entries[offset..] {
+            let bytes = crate::json_size::encoded_json_len(entry)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
+            if end > offset && total.saturating_add(bytes) > budget {
+                break;
+            }
+            total = total.saturating_add(bytes);
+            end += 1;
+        }
+        Ok(ListPage {
+            entries: snapshot.entries[offset..end].to_vec(),
+            truncated: snapshot.truncated,
+            next_cursor: (end < snapshot.entries.len())
+                .then(|| format!("{:x}.{}.{end}", self.instance, snapshot.generation)),
+        })
     }
 
     /// Whether `other` lists exactly what this index lists: the same entries in the same order, and
@@ -899,6 +977,7 @@ impl BoundedEntries {
         });
         directories.extend(self.listed_directories);
         SearchSnapshot {
+            generation: 0,
             entries: self.entries.into_values().collect(),
             memory_bytes,
             truncated: self.truncated,
@@ -1910,6 +1989,59 @@ mod tests {
         let snapshot_truncated = snapshot_limited.list(Some(200)).await;
         assert_eq!(snapshot_truncated.entries.len(), 2);
         assert!(snapshot_truncated.truncated);
+    }
+
+    /// Pages fit their budget, concatenate to the full list, and refuse a cursor from another
+    /// snapshot or a malformed one (#390).
+    #[tokio::test]
+    async fn pages_fit_the_budget_concatenate_to_the_list_and_refuse_a_stale_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..40 {
+            std::fs::write(root.path().join(format!("file-{index:02}.txt")), "").unwrap();
+        }
+        let index = WorkspaceSearchIndex::new(root.path().to_path_buf(), SearchLimits::default());
+        index.refresh(CancellationToken::new()).await.unwrap();
+        let full = index.list(None).await;
+        let (mut paged, mut cursor, mut pages) = (Vec::new(), None::<String>, 0);
+        loop {
+            let page = index.page(cursor.as_deref(), 300).await.unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= 300);
+            assert!(!page.entries.is_empty());
+            pages += 1;
+            paged.extend(page.entries);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert!(pages > 1);
+        assert_eq!(paged, full.entries);
+        // One entry larger than the budget still makes progress.
+        assert_eq!(index.page(None, 1).await.unwrap().entries.len(), 1);
+
+        let second = index.page(None, 300).await.unwrap().next_cursor.unwrap();
+        index.refresh(CancellationToken::new()).await.unwrap();
+        assert_eq!(index.page(Some(&second), 300).await, Err(StaleCursor));
+        for malformed in ["", "x", "1", "1.x", "x.1"] {
+            assert_eq!(index.page(Some(malformed), 300).await, Err(StaleCursor));
+        }
+    }
+
+    /// A cursor from another index, such as the one a server ran before it restarted, is refused
+    /// even when that index reached the same generation (#390 review).
+    #[tokio::test]
+    async fn a_cursor_from_another_index_with_the_same_generation_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..40 {
+            std::fs::write(root.path().join(format!("file-{index:02}.txt")), "").unwrap();
+        }
+        let before = WorkspaceSearchIndex::new(root.path().to_path_buf(), SearchLimits::default());
+        before.refresh(CancellationToken::new()).await.unwrap();
+        let cursor = before.page(None, 300).await.unwrap().next_cursor.unwrap();
+        let after = WorkspaceSearchIndex::new(root.path().to_path_buf(), SearchLimits::default());
+        after.refresh(CancellationToken::new()).await.unwrap();
+        assert_eq!(after.page(Some(&cursor), 300).await, Err(StaleCursor));
+        assert!(before.page(Some(&cursor), 300).await.is_ok());
     }
 
     /// No `.git` (a nested repository's included, in any letter case) is listed or searched;

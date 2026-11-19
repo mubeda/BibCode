@@ -28,7 +28,12 @@ import {
   type HandoffLoader,
 } from "./handoff.logic";
 import { buildReviewContent, buildReviewScopeOptions } from "./review.logic";
-import { sendChoiceKey, type SendChoice, type SendToAgentSource } from "./sendToAgent.logic";
+import {
+  sendChoiceKey,
+  sendToAgentControlLabel,
+  type SendChoice,
+  type SendToAgentSource,
+} from "./sendToAgent.logic";
 
 const ENVIRONMENT = EnvironmentId.make("environment-a");
 const PROJECT = ProjectId.make("project-a");
@@ -140,6 +145,7 @@ const flush = () => act(() => new Promise((resolve) => setTimeout(resolve, 0)));
 const triggers = () => [
   ...container.querySelectorAll<HTMLButtonElement>('[aria-label="Send to agent"]'),
 ];
+const labelled = () => container.querySelector<HTMLButtonElement>('[aria-label^="Send to agent"]')!;
 const find = (selector: string, text: string) =>
   [...document.body.querySelectorAll<HTMLElement>(selector)].find((element) =>
     element.textContent?.includes(text),
@@ -292,6 +298,24 @@ describe("SendToAgentButton", () => {
     render(baseProps({ openSignal: 2 }));
     await flush();
     expect(menu()).not.toBeNull();
+  });
+
+  it("a prominent control takes the primary colors and its waiting dot contrasts with them", () => {
+    render(baseProps({ prominent: true, waitingAnswers: 2 }));
+    const trigger = labelled();
+    expect(trigger.className).toContain("bg-primary");
+    expect(trigger.className).toContain("text-primary-foreground");
+    expect(trigger.getAttribute("aria-label")).toBe(sendToAgentControlLabel(2));
+    const dot = trigger.querySelector("[data-waiting-answers]")!;
+    expect(dot.className).toContain("bg-primary-foreground");
+    expect(dot.className).not.toMatch(/(^|\s)bg-primary(\s|$)/);
+  });
+
+  it("the default control stays ghost with its primary waiting dot", () => {
+    render(baseProps({ waitingAnswers: 1 }));
+    const trigger = labelled();
+    expect(trigger.className).not.toContain("bg-primary");
+    expect(trigger.querySelector("[data-waiting-answers]")!.className).toContain("bg-primary");
   });
 
   it("the control is disabled with the update reason when the environment lacks sendRequests", () => {

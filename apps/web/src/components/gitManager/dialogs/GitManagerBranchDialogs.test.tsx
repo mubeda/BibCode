@@ -50,7 +50,11 @@ const LOCAL_REFS = [branch("main", { current: true }), branch("feature")];
 const REMOTE_REFS = [branch("origin/main"), branch("origin/release")];
 
 async function renderCreate(
-  base: { readonly baseBranch: string | null; readonly baseCommit: string | null },
+  base: {
+    readonly baseBranch: string | null;
+    readonly baseCommit: string | null;
+    readonly unborn?: boolean;
+  },
   refs: ReadonlyArray<GitManagerRefEntry> = LOCAL_REFS,
 ) {
   const submissions: GitManagerBranchDialogSubmission[] = [];
@@ -169,7 +173,7 @@ describe("GitManagerBranchDialogs", () => {
 
     expect(document.body.textContent).toContain(message);
     expect(buttonWithText("Rename").disabled).toBe(true);
-    expect(buttonWithText("Rename").title).toBe(message);
+    expect(buttonWithText("Rename").parentElement?.title).toBe(message);
   });
 
   it("creates and checks out from the active branch by default", async () => {
@@ -241,6 +245,46 @@ describe("GitManagerBranchDialogs", () => {
 
     expect(submissions).toEqual([
       { kind: "create", name: "rescue", startPoint: null, checkout: false },
+    ]);
+  });
+
+  it("on an unborn HEAD, lets a branch from an existing start point skip checkout", async () => {
+    // An orphan checkout beside a committed `main`: Git creates from `main` without switching.
+    const submissions = await renderCreate({ baseBranch: null, baseCommit: null, unborn: true }, [
+      branch("main"),
+    ]);
+    await chooseSource("main");
+    await toggleCheckout();
+    expect(checkoutBox().checked).toBe(false);
+    await typeName("topic");
+    await act(async () => buttonWithText("Create branch").click());
+
+    expect(submissions).toEqual([
+      { kind: "create", name: "topic", startPoint: "refs/heads/main", checkout: false },
+    ]);
+  });
+
+  it("before the first commit, switches to the new branch from the current HEAD", async () => {
+    // Git can only start a branch on an unborn HEAD by switching to it.
+    const submissions = await renderCreate(
+      { baseBranch: null, baseCommit: null, unborn: true },
+      [],
+    );
+
+    expect(sourceInput().value).toBe("Current HEAD");
+    expect(checkoutBox().checked).toBe(true);
+    expect(
+      checkoutBox().getAttribute("aria-disabled") ??
+        String(checkoutBox().hasAttribute("data-disabled")),
+    ).toBe("true");
+    expect(document.body.textContent).toContain("No commit exists yet");
+    await toggleCheckout();
+    expect(checkoutBox().checked).toBe(true);
+    await typeName("topic");
+    await act(async () => buttonWithText("Create and check out").click());
+
+    expect(submissions).toEqual([
+      { kind: "create", name: "topic", startPoint: null, checkout: true },
     ]);
   });
 

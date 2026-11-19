@@ -209,3 +209,18 @@ fn a_stopped_notification_before_the_task_mapping_applies_once_the_mapping_arriv
     outputs.extend(launch_mapped_subagent(&mut runtime));
     assert_eq!(last_status(&outputs), Some(ActivityLifecycle::Cancelled));
 }
+
+/// A subagent started in an answer Claude gives with no turn open (Claude Code 2.1.326 answering
+/// a finished background task) closes at that answer's result as it would at a turn's end.
+#[test]
+fn a_subagent_absent_at_an_idle_answer_result_closes_there() {
+    let mut runtime = runtime();
+    runtime.handle_raw_value(&result(), 500);
+    let mut outputs = launch_mapped_subagent(&mut runtime);
+    assert_eq!(last_status(&outputs), Some(ActivityLifecycle::Running));
+    outputs.push(runtime.handle_raw_value(&tasks_changed(json!([])), 2_000));
+    let mut idle_result = result();
+    idle_result["origin"] = json!({"kind": "task-notification"});
+    outputs.push(runtime.handle_raw_value(&idle_result, 2_001));
+    assert_eq!(last_status(&outputs), Some(ActivityLifecycle::Interrupted));
+}

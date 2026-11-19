@@ -872,15 +872,22 @@ impl GitRepository {
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
-        self.git_manager_bounded_read(
-            "GitManager.getRefs.headRef",
-            cwd,
-            &strings(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
-            true,
-            64 * 1024,
-            cancellation,
-        )
-        .await
+        // `--short` would say `heads/main` when a tag `main` exists: read the full ref and
+        // drop the branch prefix, so the name always matches the branch's own entry.
+        let mut output = self
+            .git_manager_bounded_read(
+                "GitManager.getRefs.headRef",
+                cwd,
+                &strings(&["symbolic-ref", "--quiet", "HEAD"]),
+                true,
+                64 * 1024,
+                cancellation,
+            )
+            .await?;
+        if let Some(branch) = output.stdout.trim().strip_prefix("refs/heads/") {
+            output.stdout = format!("{branch}\n");
+        }
+        Ok(output)
     }
 
     pub(crate) async fn git_manager_head_sha(

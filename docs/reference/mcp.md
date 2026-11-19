@@ -1977,7 +1977,7 @@ Returns what removing a worktree would do: tracked and untracked change counts (
 
 - `McpNotAWorktreeError`: the thread works in its project's folder, not in a worktree; or it works in a worktree that another thread hosts (the message names that host's id); or it does not host its worktree (use `hostThreadId` from `list_worktrees`).
 - `McpThreadNotFoundError`.
-- `WorktreeRemovalError` with `reason` (see `remove_worktree` for the values; for a plan commonly `thread-not-found`, `stale-generation` when the worktree kept changing while the plan loaded, `replacement-conflict`, `repository-mismatch`, `git-failed`, `internal`).
+- `WorktreeRemovalError` with `reason` (see `remove_worktree` for the values; for a plan commonly `thread-not-found` (with `alreadyRemoved: true` when a removal finished while the plan loaded), `stale-generation` when the worktree kept changing while the plan loaded, `replacement-conflict`, `repository-mismatch`, `git-failed`, `internal`).
 - `WorktreeCatalogError`, `WorktreeOperationError`.
 
 #### `remove_worktree`
@@ -4914,7 +4914,7 @@ BiBCode never types a message into an AI Terminal. It stores the message in that
 mailbox, bound to the terminal's current process. When the terminal's agent waits for a prompt
 and nobody typed into the terminal since the agent last started a turn, BiBCode pastes one fixed
 line followed by Enter: "BiBCode: you have new messages. Run `bibcode agent inbox` to read
-them." The line names no message, title or sender. The agent then runs the command to read its
+them, and answer each one that asks for a reply." The line names no message, title or sender. The agent then runs the command to read its
 mail. Mail of an earlier process of the terminal is failed with `recipient_gone` and never given
 to a later one. The rules for "waits for a prompt" are in
 [Activity observation](../architecture/activity-observation.md#prompt-readiness) and the

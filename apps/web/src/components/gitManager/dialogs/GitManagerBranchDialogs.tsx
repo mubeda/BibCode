@@ -23,6 +23,7 @@ import {
   DialogTitle,
 } from "~/components/ui/dialog";
 import { Input } from "~/components/ui/input";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 
 export type GitManagerBranchDialog =
   | {
@@ -31,6 +32,8 @@ export type GitManagerBranchDialog =
       readonly baseBranch: string | null;
       /** A commit chosen in History; it becomes the default source. */
       readonly baseCommit: string | null;
+      /** HEAD names a branch with no commit yet, so Git can create a branch only by switching. */
+      readonly unborn?: boolean;
     }
   | { readonly kind: "rename"; readonly branch: GitManagerRefEntry }
   | {
@@ -127,6 +130,7 @@ function initialBranchSource(baseBranch: string | null, baseCommit: string | nul
 function CreateBranchDialog({
   baseBranch,
   baseCommit,
+  unborn,
   refs,
   remoteRefs,
   busy,
@@ -137,11 +141,15 @@ function CreateBranchDialog({
 }: SharedDialogProps & {
   readonly baseBranch: string | null;
   readonly baseCommit: string | null;
+  readonly unborn: boolean;
   readonly remoteRefs: ReadonlyArray<GitManagerRefEntry>;
 }) {
   const [name, setName] = useState("");
   const [source, setSource] = useState(() => initialBranchSource(baseBranch, baseCommit));
-  const [checkout, setCheckout] = useState(true);
+  const [checkoutChoice, setCheckout] = useState(true);
+  // Only the unborn HEAD itself has no ref to start from, so only it must be switched to.
+  const checkoutForced = unborn && source.startPoint === null;
+  const checkout = checkoutForced || checkoutChoice;
   const [debouncedRulesMessage, setDebouncedRulesMessage] = useState<string | null>(null);
   const checkoutHintId = useId();
   const trimmedName = name.trim();
@@ -257,17 +265,19 @@ function CreateBranchDialog({
                 aria-describedby={checkoutHintId}
                 checked={checkout}
                 data-testid="git-manager-create-branch-checkout"
-                disabled={busy}
+                disabled={busy || checkoutForced}
                 onCheckedChange={setCheckout}
               />
               Check out after creating
             </label>
             <p className="ps-6 text-xs text-muted-foreground" id={checkoutHintId}>
-              {checkout
-                ? "Switches this checkout to the new branch."
-                : currentBranch === null
-                  ? "You stay on the current commit."
-                  : `You stay on ${currentBranch}.`}
+              {checkoutForced
+                ? "No commit exists yet, so the new branch can only start by switching to it."
+                : checkout
+                  ? "Switches this checkout to the new branch."
+                  : currentBranch === null
+                    ? "You stay on the current commit."
+                    : `You stay on ${currentBranch}.`}
             </p>
           </div>
           <DialogError message={errorMessage} />
@@ -276,14 +286,15 @@ function CreateBranchDialog({
           <Button disabled={busy} variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button
-            aria-describedby={disabledReasonId}
+          <GitManagerDisabledReasonButton
+            // The component describes a capability reason itself; a name problem is described here.
+            aria-describedby={capabilityDisabledReason === null ? disabledReasonId : undefined}
             disabled={busy || disabledReason !== null}
-            title={capabilityDisabledReason ?? undefined}
+            disabledReason={capabilityDisabledReason}
             onClick={submit}
           >
             {checkout ? "Create and check out" : "Create branch"}
-          </Button>
+          </GitManagerDisabledReasonButton>
         </DialogFooter>
       </DialogPopup>
     </Dialog>
@@ -355,14 +366,16 @@ function RenameBranchDialog({
           <Button disabled={busy} variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button
-            aria-describedby={descriptionId}
+          <GitManagerDisabledReasonButton
+            aria-describedby={
+              capabilityDisabledReason === null && serverBlock === null ? descriptionId : undefined
+            }
             disabled={busy || disabledReason !== null || trimmedName === branch.name}
-            title={capabilityDisabledReason ?? serverBlock?.message}
+            disabledReason={capabilityDisabledReason ?? serverBlock?.message ?? null}
             onClick={submit}
           >
             Rename
-          </Button>
+          </GitManagerDisabledReasonButton>
         </DialogFooter>
       </DialogPopup>
     </Dialog>
@@ -385,8 +398,6 @@ function DeleteBranchDialog({
   const [deleteRemote, setDeleteRemote] = useState(false);
   const serverBlock = branch.blocked.find((reason) => reason.operation === "branch-delete") ?? null;
   const disabledReason = capabilityDisabledReason ?? serverBlock?.message ?? null;
-  const descriptionId =
-    disabledReason === null ? undefined : "git-manager-delete-branch-disabled-reason";
   const submit = useCallback(() => {
     if (!confirmed || disabledReason !== null) return;
     void onSubmit({ kind: "delete", name: branch.name, deleteRemote });
@@ -403,11 +414,7 @@ function DeleteBranchDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3 px-6 pb-4 text-sm">
-          {disabledReason === null ? null : (
-            <p className="text-destructive" id={descriptionId}>
-              {disabledReason}
-            </p>
-          )}
+          {disabledReason === null ? null : <p className="text-destructive">{disabledReason}</p>}
           <label className="flex items-start gap-2">
             <input
               checked={confirmed}
@@ -436,15 +443,14 @@ function DeleteBranchDialog({
           <Button disabled={busy} variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button
-            aria-describedby={descriptionId}
-            disabled={busy || !confirmed || disabledReason !== null}
-            title={disabledReason ?? undefined}
+          <GitManagerDisabledReasonButton
+            disabled={busy || !confirmed}
+            disabledReason={disabledReason}
             variant="destructive"
             onClick={submit}
           >
             Delete branch
-          </Button>
+          </GitManagerDisabledReasonButton>
         </DialogFooter>
       </DialogPopup>
     </Dialog>
@@ -471,6 +477,7 @@ export const GitManagerBranchDialogs = memo(function GitManagerBranchDialogs({
           {...shared}
           baseBranch={dialog.baseBranch}
           baseCommit={dialog.baseCommit}
+          unborn={dialog.unborn === true}
           remoteRefs={remoteRefs}
         />
       );

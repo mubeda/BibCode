@@ -331,6 +331,21 @@ describe("small composer surfaces", () => {
     expect(mounted.container.textContent).toContain("Command approval requested");
     expect(mounted.container.textContent).not.toContain("1/1");
 
+    // The collapsed composer has no editor to show what is being approved, so the panel does.
+    const command = {
+      requestId: ApprovalRequestId.make("approval-command"),
+      requestKind: "command" as const,
+      createdAt: "2026-07-16T00:00:00.000Z",
+      detail: "touch made.txt",
+    };
+    await rerender(mounted, <ComposerPendingApprovalPanel approval={command} pendingCount={1} />);
+    expect(mounted.container.textContent).not.toContain("touch made.txt");
+    await rerender(
+      mounted,
+      <ComposerPendingApprovalPanel approval={command} pendingCount={1} showDetail />,
+    );
+    expect(mounted.container.textContent).toContain("touch made.txt");
+
     for (const [requestKind, summary] of [
       ["file-read", "File-read approval requested"],
       ["file-change", "File-change approval requested"],

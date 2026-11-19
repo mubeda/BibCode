@@ -208,7 +208,13 @@ machine. `scripts/tauri-hardening.test.ts` pins both halves of that policy.
 The same policy gives `media-src` and `object-src` only `blob:` (plus `'self'`
 for media), adds `blob:` to `frame-src` because Chromium, and so WebView2 on
 Windows, loads a PDF `<embed>` in a frame that `frame-src` governs, and
-`img-src` never admits an environment origin. A `blob:` URL can only be made by
+`img-src` never admits an environment origin. `connect-src` admits `blob:` too:
+WebKit's PDF viewer on macOS reads an `<embed>`'s `blob:` URL as a
+`connect-src` load, and without it the PDF area stays blank while the policy
+reports `connect-src blob:` violations. That lets page script `fetch` a
+`blob:` URL, which reads bytes the page already holds and reaches no host. It
+opens no origin, and `script-src`, `img-src` and `media-src` are unchanged.
+A `blob:` URL can only be made by
 script already running in the page, so this admits no new origin. The Files panel
 previews an environment's images, PDFs and audio by fetching them through the
 signed asset URL (a `connect-src` request, so LAN, tailnet and relay hosts work)

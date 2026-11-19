@@ -291,10 +291,19 @@ const UNREADABLE_MESSAGE =
 const HEDGED_MESSAGE =
   "Git can't read this folder as a repository. Run git init to create one, or check its .git folder if it already is one.";
 
+const NATIVE_BUTTONS: ReadonlySet<string> = new Set(["Choose branch", "Sync unavailable"]);
+
 function expectDisabled(label: string, message: string): void {
   const action = button(label);
   expect(action.disabled).toBe(true);
-  expect(action.title).toBe(message);
+  if (NATIVE_BUTTONS.has(label)) {
+    // Plain `<button>`s keep pointer events when disabled, so their own title shows.
+    expect(action.title).toBe(message);
+  } else {
+    // The shared Button has pointer-events-none when disabled; the reason sits on its wrapper.
+    expect(action.title).toBe("");
+    expect(action.parentElement?.title).toBe(message);
+  }
   const description = action.getAttribute("aria-describedby");
   expect(description).not.toBeNull();
   expect(document.getElementById(description!)?.textContent).toBe(message);

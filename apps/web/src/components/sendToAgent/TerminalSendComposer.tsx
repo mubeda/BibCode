@@ -388,6 +388,7 @@ function TerminalSendComposerBody(props: {
         {...(viewportFocus === undefined ? {} : { finalFocus: viewportFocus })}
         revealPanel={services.revealPanel}
         waitingAnswers={waitingAnswers}
+        prominent
         openSignal={openSignal}
       />
       <TerminalSendRequests

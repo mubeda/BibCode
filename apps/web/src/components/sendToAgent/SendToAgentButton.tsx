@@ -88,6 +88,8 @@ export interface SendToAgentButtonProps {
   finalFocus?: RefObject<HTMLElement | null>;
   /** Answers to this source's requests that wait for the person, named on the control. */
   waitingAnswers?: number;
+  /** Paints the trigger in the primary button color, for a host where it is the main action. */
+  prominent?: boolean;
   /** Opens the menu each time it grows, so a host can bring the person to the control. */
   openSignal?: number;
   newId?: () => string;
@@ -107,12 +109,13 @@ function TriggerButton(
   props: ComponentProps<typeof Button> & {
     readonly unavailable?: boolean;
     readonly waitingAnswers?: number;
+    readonly prominent?: boolean;
   },
 ): ReactElement {
-  const { unavailable, waitingAnswers = 0, ...rest } = props;
+  const { unavailable, waitingAnswers = 0, prominent = false, ...rest } = props;
   return (
     <Button
-      variant="ghost"
+      variant={prominent ? "default" : "ghost"}
       size="icon-sm"
       type="button"
       aria-label={sendToAgentControlLabel(waitingAnswers)}
@@ -125,7 +128,9 @@ function TriggerButton(
         <span
           aria-hidden="true"
           data-waiting-answers={waitingAnswers}
-          className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-primary"
+          className={`absolute -top-0.5 -right-0.5 size-2 rounded-full ${
+            prominent ? "bg-primary-foreground ring-1 ring-primary" : "bg-primary"
+          }`}
         />
       ) : null}
     </Button>
@@ -164,7 +169,9 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
   if (!serverSupported) {
     return (
       <Tooltip>
-        <TooltipTrigger render={<TriggerButton unavailable />} />
+        <TooltipTrigger
+          render={<TriggerButton unavailable prominent={props.prominent ?? false} />}
+        />
         <TooltipPopup side="top">{SEND_TO_AGENT_SERVER_UPDATE_REASON}</TooltipPopup>
       </Tooltip>
     );
@@ -177,7 +184,11 @@ export const SendToAgentButton = memo(function SendToAgentButton(props: SendToAg
             render={
               <MenuTrigger
                 render={
-                  <TriggerButton ref={triggerRef} waitingAnswers={props.waitingAnswers ?? 0} />
+                  <TriggerButton
+                    ref={triggerRef}
+                    waitingAnswers={props.waitingAnswers ?? 0}
+                    prominent={props.prominent ?? false}
+                  />
                 }
               />
             }

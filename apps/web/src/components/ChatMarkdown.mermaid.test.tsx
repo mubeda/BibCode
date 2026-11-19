@@ -17,6 +17,7 @@ import {
   projectFindSource,
 } from "./chat/threadFind/threadFindText";
 import {
+  __holdMermaidDrawsForTests,
   __resetMermaidDiagramsForTests,
   __setMermaidRendererLoaderForTests,
 } from "./markdown/MarkdownMermaidBlock";
@@ -118,9 +119,16 @@ async function flushMicrotasks(): Promise<void> {
   });
 }
 
+/**
+ * Waits by the clock, not by a number of polls: the first diagram waits for the renderer and a
+ * diagram chunk to be imported, which takes seconds when the whole suite loads the machine.
+ */
+const WAIT_FOR_MS = 20_000;
+
 async function waitFor(condition: () => boolean, message: string): Promise<void> {
-  for (let attempt = 0; !condition(); attempt += 1) {
-    if (attempt > 400) throw new Error(message);
+  const deadline = performance.now() + WAIT_FOR_MS;
+  while (!condition()) {
+    if (performance.now() > deadline) throw new Error(message);
     await settle(1);
   }
 }
@@ -234,6 +242,38 @@ describe("Mermaid diagrams in chat Markdown", () => {
       await waitFor(() => hasDiagram(view.container), "the fence never drew");
       // Every form draws from the same normalized source.
       expect(renderedSources).toEqual([FLOWCHART]);
+    });
+
+    it("keeps a cold diagram's source while draws are held, and draws it on release", async () => {
+      const release = __holdMermaidDrawsForTests();
+      const view = await mount(fence(FLOWCHART));
+      // Long enough for the renderer import and the queue to run were the draw not held.
+      await waitFor(() => rendererLoads > 0, "the renderer never loaded");
+      await settle(20);
+      expect(hasDiagram(view.container)).toBe(false);
+      expect(view.container.querySelector("pre")?.textContent).toContain("Write --> Draw");
+      expect(renderedSources).toEqual([]);
+
+      act(() => release());
+      await waitFor(() => hasDiagram(view.container), "the released diagram never drew");
+      expect(renderedSources).toEqual([FLOWCHART]);
+    });
+
+    it("exposes no draw hold to the page outside the packaged UI build", () => {
+      expect("__bibcodeHoldMermaidDraws" in window).toBe(false);
+    });
+
+    it("holds no draw when called outside unit tests and the packaged UI build", async () => {
+      // An ordinary development build, where any page script can import the module.
+      vi.stubEnv("MODE", "development");
+      try {
+        const release = __holdMermaidDrawsForTests();
+        const view = await mount(fence(FLOWCHART));
+        await waitFor(() => hasDiagram(view.container), "the held diagram never drew");
+        release();
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
 
     it("keeps raw-HTML language-mermaid as source", async () => {

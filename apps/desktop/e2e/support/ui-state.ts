@@ -1,3 +1,4 @@
+import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../../../web/src/rightPanelLayout.ts";
 import { correctDesktopUiOuterSize } from "./window-size.ts";
 
 /**
@@ -64,6 +65,15 @@ export async function setDesktopUiWindowSize(width: number, height: number): Pro
     },
     { timeoutMsg: `The webview did not reach the requested ${width}x${height} viewport.` },
   );
+}
+
+/** Fails unless the window is wide enough for the right panel to sit beside the chat. */
+export async function expectRightPanelBesideChat(): Promise<void> {
+  const sheet = await browser.execute(
+    (query: string) => window.matchMedia(query).matches,
+    RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
+  );
+  expect(sheet).toBe(false);
 }
 
 export async function ensureMainSidebarOpen(): Promise<void> {

@@ -585,6 +585,44 @@ describe("SidebarThreadRow browser interactions", () => {
     },
   );
 
+  it("hides the open chat's card when its project is collapsed and shows it again (#382)", async () => {
+    baseScenario();
+    h.state.routeParams = { environmentId: ENV_MAIN, threadId: "thread-default" };
+    const key = derivePhysicalProjectKey(projectA);
+    h.uiStore.setState({ projectExpandedById: { [key]: true } });
+    const { container, root } = await mount(<Sidebar />);
+    const header = () =>
+      container.querySelector<HTMLElement>('[data-mock="SidebarMenuButton"][aria-expanded]')!;
+    const cards = () =>
+      container.querySelectorAll('[data-testid^="primary-card-"], [data-testid^="thread-row-"]');
+    // The harness store does not notify subscribers, so the new state needs a render.
+    const setExpanded = (expanded: boolean) =>
+      React.act(async () => {
+        h.uiStore.setState({ projectExpandedById: { [key]: expanded } });
+        root.render(<Sidebar />);
+      });
+    try {
+      await React.act(async () => flush());
+      expect(header().getAttribute("aria-expanded")).toBe("true");
+      expect(cards().length).toBeGreaterThan(1);
+
+      await dispatch(header(), new MouseEvent("click", { bubbles: true }));
+      expect(h.spies.setProjectExpanded).toHaveBeenCalledWith(expect.anything(), false);
+      await setExpanded(false);
+      expect(header().getAttribute("aria-expanded")).toBe("false");
+      expect(cards()).toHaveLength(0);
+      // The open chat is hidden, so the collapsed header says it holds the current page.
+      expect(header().getAttribute("aria-current")).toBe("true");
+
+      await setExpanded(true);
+      expect(header().getAttribute("aria-expanded")).toBe("true");
+      expect(header().getAttribute("aria-current")).toBeNull();
+      expect(cards().length).toBeGreaterThan(1);
+    } finally {
+      await unmount(root, container);
+    }
+  });
+
   it.each([
     { expanded: true, label: "Show Hidden Worktrees (1)" },
     { expanded: false, label: "Show Hidden Worktrees" },

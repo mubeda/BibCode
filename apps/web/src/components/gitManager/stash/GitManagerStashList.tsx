@@ -10,6 +10,7 @@ import { ArchiveRestoreIcon, PackageOpenIcon, Trash2Icon } from "lucide-react";
 import { memo, useCallback, useMemo, useState } from "react";
 
 import { Button } from "~/components/ui/button";
+import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
 import {
   Dialog,
   DialogDescription,
@@ -110,9 +111,6 @@ const GitManagerStashRowView = memo(function GitManagerStashRowView({
   onRequestDrop,
 }: GitManagerStashRowViewProps) {
   const selector = `stash@{${row.index}}`;
-  const actionDisabledReason = disabledReason ?? row.blocked?.message ?? null;
-  const descriptionId =
-    actionDisabledReason === null ? undefined : `git-manager-stash-${row.sha}-blocked`;
   const actions = resolveStashActionState(row, { operationInFlight });
   const select = useCallback(() => onSelectStash(row.sha), [onSelectStash, row.sha]);
   const apply = useCallback(() => void onApply(row.sha), [onApply, row.sha]);
@@ -143,45 +141,40 @@ const GitManagerStashRowView = memo(function GitManagerStashRowView({
           {row.files.length} {row.files.length === 1 ? "file" : "files"}
         </span>
       </Button>
-      <Button
-        aria-describedby={descriptionId}
+      <GitManagerDisabledReasonButton
         aria-label={`Apply ${selector}`}
-        disabled={disabledReason !== null || !actions.apply.enabled}
+        disabled={!actions.apply.enabled}
+        disabledReason={disabledReason ?? actions.apply.reason}
+        enabledTitle={`Apply ${selector}`}
         size="icon-xs"
-        title={disabledReason ?? actions.apply.reason ?? `Apply ${selector}`}
         variant="ghost"
         onClick={apply}
       >
         <ArchiveRestoreIcon aria-hidden="true" />
-      </Button>
-      <Button
-        aria-describedby={descriptionId}
+      </GitManagerDisabledReasonButton>
+      <GitManagerDisabledReasonButton
         aria-label={`Pop ${selector}`}
-        disabled={disabledReason !== null || !actions.pop.enabled}
+        disabled={!actions.pop.enabled}
+        disabledReason={disabledReason ?? actions.pop.reason}
+        enabledTitle={`Pop ${selector}`}
         size="icon-xs"
-        title={disabledReason ?? actions.pop.reason ?? `Pop ${selector}`}
         variant="ghost"
         onClick={pop}
       >
         <PackageOpenIcon aria-hidden="true" />
-      </Button>
-      <Button
-        aria-describedby={descriptionId}
+      </GitManagerDisabledReasonButton>
+      <GitManagerDisabledReasonButton
         aria-label={`Drop ${selector}`}
         className="text-destructive"
-        disabled={disabledReason !== null || !actions.drop.enabled}
+        disabled={!actions.drop.enabled}
+        disabledReason={disabledReason ?? actions.drop.reason}
+        enabledTitle={`Drop ${selector}`}
         size="icon-xs"
-        title={disabledReason ?? actions.drop.reason ?? `Drop ${selector}`}
         variant="ghost"
         onClick={requestDrop}
       >
         <Trash2Icon aria-hidden="true" />
-      </Button>
-      {actionDisabledReason === null ? null : (
-        <span className="sr-only" id={descriptionId}>
-          {actionDisabledReason}
-        </span>
-      )}
+      </GitManagerDisabledReasonButton>
     </div>
   );
 }, stashRowViewPropsEqual);
