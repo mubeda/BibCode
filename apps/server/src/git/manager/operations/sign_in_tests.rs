@@ -57,7 +57,7 @@ fn is_network(request: &ProcessRequest) -> bool {
     !request.operation.starts_with("GitManager.signIn")
         && arguments(request)
             .iter()
-            .any(|arg| matches!(arg.as_str(), "fetch" | "pull" | "push"))
+            .any(|arg| matches!(arg.as_str(), "fetch" | "pull" | "push" | "ls-remote"))
 }
 
 impl GitProcessRunner for RemoteRunner {
@@ -209,6 +209,50 @@ async fn each_eligible_operation_reports_sign_in_required_once_without_retrying(
         }
         // The resume request decodes as an ordinary request.
         serde_json::from_value::<GitManagerOperationRequest>(sign_in.resume).expect("resume");
+    }
+}
+
+/// #397: a remote delete reads the remote with `ls-remote` before it pushes. A sign-in that
+/// refusal needs is offered from that read, and nothing is deleted locally or remotely.
+#[tokio::test]
+async fn a_remote_delete_offers_sign_in_from_its_ls_remote_check() {
+    for request in [
+        request(json!({"_tag": "remote-branch-delete", "remote": "origin", "branch": "topic"})),
+        request(json!({
+            "_tag": "branch-delete", "name": "topic", "force": false, "deleteRemote": true
+        })),
+    ] {
+        let runner = RemoteRunner::new(DESTINATION, GCM_STDERR);
+        let error = run(&runner, &request, CredentialPrompt::OfferSignIn)
+            .await
+            .expect_err("GCM refused");
+        let operation = request.operation();
+        assert_eq!(error.code, "sign-in-required", "{operation}");
+        let spawned = runner
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(arguments)
+            .collect::<Vec<_>>();
+        let network = spawned
+            .iter()
+            .filter(|args| {
+                args.iter()
+                    .any(|arg| matches!(arg.as_str(), "ls-remote" | "push"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(network.len(), 1, "{operation}: {spawned:?}");
+        assert!(
+            network[0].iter().any(|arg| arg == "ls-remote"),
+            "{operation}"
+        );
+        assert!(
+            !spawned
+                .iter()
+                .any(|args| args.iter().any(|arg| arg == "-d" || arg == "-D")),
+            "{operation}: the local branch is not deleted before the check passes"
+        );
     }
 }
 

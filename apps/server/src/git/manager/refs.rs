@@ -188,6 +188,8 @@ struct RawRef {
     upstream: Option<String>,
     worktree_path: Option<String>,
     current: bool,
+    /// The target of a symbolic ref, such as `refs/remotes/origin/HEAD`.
+    symref: Option<String>,
 }
 
 pub async fn build_refs_snapshot(
@@ -297,6 +299,14 @@ pub async fn build_refs_snapshot(
         .map(str::to_owned)
         .collect::<Vec<_>>();
 
+    // Each `<remote>/HEAD` names that remote's default branch (#397).
+    let remote_defaults = raw_refs
+        .iter()
+        .filter(|reference| {
+            reference.kind == RawRefKind::RemoteBranch && reference.name.ends_with("/HEAD")
+        })
+        .filter_map(|reference| reference.symref.clone())
+        .collect::<HashSet<_>>();
     let mut local_branches = Vec::new();
     let mut remote_branches = Vec::new();
     let mut tags = Vec::new();
@@ -312,8 +322,11 @@ pub async fn build_refs_snapshot(
         if !is_tag && !is_remote && reference.worktree_path.is_none() {
             reference.worktree_path = worktree_occupancy.get(&reference.name).cloned();
         }
-        let is_default =
-            !is_tag && !is_remote && default_branch.as_deref() == Some(reference.name.as_str());
+        let is_default = if is_remote {
+            remote_defaults.contains(&reference.name)
+        } else {
+            !is_tag && default_branch.as_deref() == Some(reference.name.as_str())
+        };
         let mut entry = GitManagerRefEntry {
             name: reference.name,
             tip_sha: reference.tip_sha,
@@ -385,7 +398,7 @@ fn parse_refs(output: &str) -> Result<Vec<RawRef>, GitManagerRefsError> {
         .lines()
         .map(|line| {
             let fields = line.split('\t').collect::<Vec<_>>();
-            let [name, tip_sha, upstream, worktree_path, head] = fields.as_slice() else {
+            let [name, tip_sha, upstream, worktree_path, head, symref] = fields.as_slice() else {
                 return Err(GitManagerRefsError::MalformedRefs);
             };
             let (kind, name) = parse_ref_name(name).ok_or(GitManagerRefsError::MalformedRefs)?;
@@ -400,6 +413,7 @@ fn parse_refs(output: &str) -> Result<Vec<RawRef>, GitManagerRefsError> {
                 worktree_path: (!worktree_path.is_empty())
                     .then(|| display_path(Path::new(worktree_path))),
                 current: head.trim() == "*",
+                symref: (!symref.is_empty()).then(|| short_ref_name(symref).to_owned()),
             })
         })
         .collect()
@@ -784,7 +798,10 @@ mod tests {
             "upstream/trunk",
             "fork/main",
         ] {
-            git(path, &["update-ref", &format!("refs/remotes/{name}"), &head]);
+            git(
+                path,
+                &["update-ref", &format!("refs/remotes/{name}"), &head],
+            );
         }
         for (remote, target) in [("origin", "main"), ("upstream", "trunk")] {
             git(

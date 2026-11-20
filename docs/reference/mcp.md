@@ -2661,7 +2661,7 @@ Switches the thread's folder to a local branch, or to a new local branch trackin
 
 #### `git_delete_branch`
 
-Destructive: deletes a local branch, and with `deleteRemote` its upstream branch on the remote too, in that order. The upstream is resolved before anything is deleted. If the remote deletion fails, or stops before it reports, the local branch is already gone and the result is `McpPartialOutcomeError`.
+Destructive: deletes a local branch, and with `deleteRemote` its upstream branch on the remote too, in that order. The upstream is resolved before anything is deleted. If the remote deletion fails, or stops before it reports, the local branch is already gone and the result is `McpPartialOutcomeError`. The remote step refuses the remote's default branch, an unreachable remote and a branch that changed since the last fetch, as `git_delete_remote_branch` does.
 
 - **Set / scope:** Source control · `orchestration:operate`
 - **Access:** operate (hidden at read-only)
@@ -2709,6 +2709,9 @@ Destructive: deletes a branch on a remote, leaving any local branch alone. It al
 
 - `McpInvalidArgumentError` — `remote` or `branch` is malformed or missing.
 - `GitOperationFailedError` — the remote is not one the repository has (`code` `invalid-request`) or the deletion failed.
+- `GitOperationFailedError` — nothing was deleted, because one `git ls-remote --symref <remote> HEAD refs/heads/<branch>` could not reach the remote (`code` `remote-default-unknown`), or found that the remote's `HEAD` names the branch (`code` `default-branch`), that a local `refs/remotes/<remote>/<branch>` points to a different commit than the remote branch (`code` `remote-branch-changed`), or that the remote has no such branch (`code` `remote-branch-not-found`). Run `git_fetch` before retrying the last two. A branch with no local tracking ref is not compared, and a remote whose `HEAD` is unborn has no default branch to protect.
+
+The push names `refs/heads/<branch>`, so a tag of the same name is never deleted.
 
 #### `git_discard`
 

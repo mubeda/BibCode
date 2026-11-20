@@ -1576,6 +1576,18 @@ async fn execute_operation_steps(
             } else {
                 None
             };
+            if let Some((remote, remote_branch)) = remote_target {
+                check_remote_branch_delete(
+                    repository,
+                    snapshot,
+                    operation,
+                    cwd,
+                    remote,
+                    remote_branch,
+                    cancellation,
+                )
+                .await?;
+            }
             let mut outputs = one_output(
                 operation,
                 repository
@@ -1612,6 +1624,16 @@ async fn execute_operation_steps(
                     "The remote branch name is not a valid branch name.",
                 ));
             }
+            check_remote_branch_delete(
+                repository,
+                snapshot,
+                operation,
+                cwd,
+                remote,
+                branch,
+                cancellation,
+            )
+            .await?;
             one_output(
                 operation,
                 repository
@@ -2225,6 +2247,85 @@ fn remote_delete_target<'a>(
         .upstream
         .as_deref()?
         .split_once('/')
+}
+
+/// R7 (#397, #404): the server decides every remote branch delete. One `ls-remote` through the
+/// network runner, so a sign-in can be offered and a resumed request checks again, reads the
+/// remote's default branch and the branch's commit. Before anything is deleted it refuses when
+/// the remote cannot be asked, when its `HEAD` names the branch, when the branch is missing, and
+/// when a local tracking ref names another commit (a branch never fetched is not compared). A
+/// remote that answers with no `HEAD` (unborn or dangling) has no default branch to protect.
+async fn check_remote_branch_delete(
+    repository: &GitRepository,
+    snapshot: &GitManagerRefsSnapshot,
+    operation: &str,
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+    cancellation: &CancellationToken,
+) -> Result<(), GitManagerOperationError> {
+    let outputs = one_output(
+        operation,
+        repository
+            .git_manager_remote_heads(cwd, remote, branch, cancellation)
+            .await,
+    )
+    .map_err(|mut error| {
+        // The stderr stays in `outputs`, so a sign-in refusal still becomes `sign-in-required`.
+        if error.code != GitManagerFailureCode::Cancelled.as_str() {
+            "remote-default-unknown".clone_into(&mut error.code);
+            "The remote's default branch could not be checked.".clone_into(&mut error.message);
+        }
+        error
+    })?;
+    let branch_ref = format!("refs/heads/{branch}");
+    let mut default_ref = None;
+    let mut remote_tip = None;
+    for line in outputs.iter().flat_map(|output| output.stdout.lines()) {
+        if let Some((target, name)) = line
+            .strip_prefix("ref: ")
+            .and_then(|rest| rest.split_once('\t'))
+        {
+            if name == "HEAD" {
+                default_ref = Some(target);
+            }
+        } else if let Some((sha, name)) = line.split_once('\t')
+            && name == branch_ref
+        {
+            remote_tip = Some(sha);
+        }
+    }
+    let refusal = match default_ref {
+        Some(target) if target == branch_ref => Some((
+            "default-branch",
+            "Delete is blocked: this is the remote's default branch.",
+        )),
+        _ => {
+            let tracking = format!("{remote}/{branch}");
+            snapshot
+                .remote_branches
+                .iter()
+                .find(|reference| reference.name == tracking)
+                .filter(|reference| remote_tip != Some(reference.tip_sha.as_str()))
+                .map(|_| {
+                    (
+                        "remote-branch-changed",
+                        "This branch changed on the remote since the last fetch. Fetch, then delete it.",
+                    )
+                })
+                // Git reports a delete of a missing ref as a success, so say it here.
+                .or_else(|| {
+                    remote_tip.is_none().then_some((
+                        "remote-branch-not-found",
+                        "This branch no longer exists on the remote. Fetch to update the branch list.",
+                    ))
+                })
+        }
+    };
+    match refusal {
+        Some((code, message)) => Err(operation_error(operation, code, message)),
+        None => Ok(()),
+    }
 }
 
 fn one_output(
@@ -6200,7 +6301,9 @@ mod tests {
         git(remote, &["for-each-ref", "--format=%(refname)"])
     }
 
-    /// R7: the push names `refs/heads/`, so a same-named tag survives a branch that is gone.
+    /// R7: a same-named tag survives a branch that is gone. The pre-check refuses the missing
+    /// branch, because Git reports a delete of a missing `refs/heads/` ref as a success, and the
+    /// push itself names `refs/heads/` (pinned by the repository argument test).
     #[tokio::test]
     async fn remote_branch_delete_never_deletes_a_same_named_tag() {
         let (remote, fixture) = remote_delete_fixture();
@@ -6211,11 +6314,7 @@ mod tests {
             .await
             .expect_err("no branch named gone exists on the remote");
 
-        assert_ne!(failure.code, "invalid-request");
-        assert!(
-            failure.outputs.last().is_some_and(|output| output.exit_code != 0),
-            "the Git error is reported: {failure:?}"
-        );
+        assert_eq!(failure.code, "remote-branch-not-found");
         assert_eq!(
             remote_refs(remote.path()),
             "refs/heads/feature\nrefs/heads/main\nrefs/tags/gone"
@@ -6241,27 +6340,70 @@ mod tests {
         );
     }
 
-    /// R7: a remote whose default branch cannot be read deletes nothing.
+    /// R7: a remote that cannot be asked for its default branch deletes nothing.
     #[tokio::test]
-    async fn remote_branch_delete_refuses_when_the_default_cannot_be_read() {
+    async fn remote_branch_delete_refuses_when_the_remote_cannot_be_asked() {
+        let (remote, fixture) = remote_delete_fixture();
+        git(
+            fixture.path(),
+            &["branch", "--track", "topic", "origin/feature"],
+        );
+        let unreachable = remote.path().join("missing");
+        git(
+            fixture.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &unreachable.to_string_lossy(),
+            ],
+        );
+
+        for request in [
+            remote_delete(fixture.path(), "feature"),
+            GitManagerOperationRequest::BranchDelete {
+                cwd: fixture.path().to_path_buf(),
+                project_id: "p".into(),
+                name: "topic".into(),
+                force: true,
+                delete_remote: true,
+            },
+        ] {
+            let failure = delete_on_remote(fixture.path(), &request)
+                .await
+                .expect_err("an unreachable remote is refused");
+            assert_eq!(failure.code, "remote-default-unknown");
+            assert_eq!(
+                failure.message,
+                "The remote's default branch could not be checked."
+            );
+        }
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main"
+        );
+        assert_eq!(
+            git(fixture.path(), &["branch", "--format=%(refname:short)"]),
+            "feature\nmain\ntopic",
+            "the local branch stays"
+        );
+    }
+
+    /// Ruling on P10: a remote that answers with no `HEAD` (unborn, as after `git init --bare`
+    /// with another default branch, or dangling) has no default to protect, so the delete runs.
+    #[tokio::test]
+    async fn remote_branch_delete_proceeds_when_the_remote_has_no_head() {
         let (remote, fixture) = remote_delete_fixture();
         git(
             remote.path(),
             &["symbolic-ref", "HEAD", "refs/heads/missing"],
         );
 
-        let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "feature"))
+        delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "feature"))
             .await
-            .expect_err("an unknown default is refused");
+            .expect("a remote without a default branch allows the delete");
 
-        assert_eq!(
-            failure.message,
-            "The remote's default branch could not be checked."
-        );
-        assert_eq!(
-            remote_refs(remote.path()),
-            "refs/heads/feature\nrefs/heads/main"
-        );
+        assert_eq!(remote_refs(remote.path()), "refs/heads/main");
     }
 
     /// R7: a branch that moved on the remote since the last fetch is refused, and so is a
@@ -6313,7 +6455,10 @@ mod tests {
     #[tokio::test]
     async fn local_delete_with_remote_refuses_the_remotes_default_before_deleting() {
         let (remote, fixture) = remote_delete_fixture();
-        git(fixture.path(), &["branch", "--track", "mainline", "origin/main"]);
+        git(
+            fixture.path(),
+            &["branch", "--track", "mainline", "origin/main"],
+        );
 
         let failure = delete_on_remote(
             fixture.path(),
@@ -6349,7 +6494,10 @@ mod tests {
     fn remote_branch_delete_is_allowed_during_every_in_progress_operation() {
         let fixture = tempfile::tempdir().expect("repository");
         git(fixture.path(), &["init", "-q", "-b", "main"]);
-        git(fixture.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(
+            fixture.path(),
+            &["commit", "-q", "--allow-empty", "-m", "base"],
+        );
         for kind in [
             GitManagerInProgressKind::Merge,
             GitManagerInProgressKind::Rebase,
@@ -6369,7 +6517,14 @@ mod tests {
                 None,
                 "{kind:?}"
             );
-            assert!(
+            // A control: the guards block fetch for these three, and nothing for revert or squash.
+            let blocks_fetch = matches!(
+                kind,
+                GitManagerInProgressKind::Merge
+                    | GitManagerInProgressKind::Rebase
+                    | GitManagerInProgressKind::CherryPick
+            );
+            assert_eq!(
                 blocked_reason_for_operation(
                     &snapshot,
                     &GitManagerOperationRequest::Fetch {
@@ -6380,7 +6535,8 @@ mod tests {
                     }
                 )
                 .is_some(),
-                "{kind:?} blocks a mutating operation"
+                blocks_fetch,
+                "{kind:?}"
             );
         }
     }
@@ -6416,6 +6572,8 @@ mod transfer_gate_tests {
         started: Notify,
         release: Semaphore,
         outcome: Mutex<Option<ProcessError>>,
+        /// What the remote advertises to the remote delete's `ls-remote` pre-check, unheld.
+        ls_remote: String,
     }
 
     impl GitProcessRunner for HeldNetworkRunner {
@@ -6428,6 +6586,18 @@ mod transfer_gate_tests {
                 .args
                 .iter()
                 .any(|arg| matches!(arg.to_str(), Some("fetch" | "pull" | "push")));
+            if request.args.iter().any(|arg| arg == "ls-remote") {
+                let stdout = self.ls_remote.clone();
+                return Box::pin(async move {
+                    Ok(ProcessOutput {
+                        exit_code: 0,
+                        stdout,
+                        stderr: String::new(),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    })
+                });
+            }
             if !network {
                 return Box::pin(ProcessRunner.run(request, cancellation));
             }
@@ -6499,10 +6669,19 @@ mod transfer_gate_tests {
         ] {
             git(&cwd, args);
         }
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&cwd)
+            .output()
+            .expect("git rev-parse starts");
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
         let runner = Arc::new(HeldNetworkRunner {
             started: Notify::new(),
             release: Semaphore::new(0),
             outcome: Mutex::new(None),
+            ls_remote: format!(
+                "ref: refs/heads/main\tHEAD\n{head}\tHEAD\n{head}\trefs/heads/topic\n"
+            ),
         });
         let repository = Arc::new(GitRepository::with_runner_for_test(runner.clone()));
         let database = Database::open_in_memory().await.expect("database");

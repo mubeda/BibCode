@@ -814,7 +814,7 @@ impl GitRepository {
             cwd,
             &strings(&[
                 "for-each-ref",
-                "--format=%(refname)%09%(objectname)%09%(upstream)%09%(worktreepath)%09%(HEAD)",
+                "--format=%(refname)%09%(objectname)%09%(upstream)%09%(worktreepath)%09%(HEAD)%09%(symref)",
                 "refs/heads",
                 "refs/remotes",
                 "refs/tags",
@@ -4568,7 +4568,34 @@ impl GitRepository {
             .execute(
                 "GitManager.remoteBranchDelete",
                 cwd,
-                &["push".into(), remote.into(), format!(":{name}")],
+                // A qualified destination: an unqualified one can resolve to a same-named tag.
+                &["push".into(), remote.into(), format!(":refs/heads/{name}")],
+                true,
+                cancellation,
+            )
+            .await
+    }
+
+    /// Reads the remote's `HEAD` target and one branch's commit with
+    /// `git ls-remote --symref <remote> HEAD refs/heads/<name>`, before a remote branch delete.
+    pub(crate) async fn git_manager_remote_heads(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.for_network_transfer()
+            .execute(
+                "GitManager.remoteBranchDeleteCheck",
+                cwd,
+                &[
+                    "ls-remote".into(),
+                    "--symref".into(),
+                    remote.into(),
+                    "HEAD".into(),
+                    format!("refs/heads/{name}"),
+                ],
                 true,
                 cancellation,
             )
@@ -9695,6 +9722,10 @@ mod tests {
                     "GitManager.remoteBranchDelete".into(),
                     process_output("remote deleted\n"),
                 ),
+                (
+                    "GitManager.remoteBranchDeleteCheck".into(),
+                    process_output("ref: refs/heads/main\tHEAD\n"),
+                ),
             ]),
             requests: Mutex::new(Vec::new()),
         });
@@ -9713,6 +9744,15 @@ mod tests {
             )
             .await
             .expect("remote delete succeeds");
+        repository
+            .git_manager_remote_heads(
+                Path::new("/repo"),
+                "origin",
+                "topic",
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("remote check succeeds");
 
         let requests = runner.requests();
         assert_eq!(
@@ -9723,7 +9763,18 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_default_budget(&requests[0]);
-        assert_network_transfer(&requests[1], &["push", "origin", ":topic"]);
+        // A qualified destination never resolves to a same-named tag (#403).
+        assert_network_transfer(&requests[1], &["push", "origin", ":refs/heads/topic"]);
+        assert_network_transfer(
+            &requests[2],
+            &[
+                "ls-remote",
+                "--symref",
+                "origin",
+                "HEAD",
+                "refs/heads/topic",
+            ],
+        );
     }
 
     #[tokio::test]
