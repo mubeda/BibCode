@@ -1233,8 +1233,9 @@ fn refuse_option_like_operands(
 }
 
 /// The remote a network operation contacts, its direction, and the request that resumes it
-/// after a sign-in (#325). A branch delete resumes as a delete of its remote branch only,
-/// because its local branch is already gone when the remote step fails.
+/// after a sign-in (#325). A branch delete resumes as a delete of its remote branch only. Its
+/// local branch is gone when the push fails, but stays when the `ls-remote` check before it
+/// needed the sign-in; that resume then leaves the local branch for the person to delete.
 fn network_step(
     snapshot: &GitManagerRefsSnapshot,
     request: &GitManagerOperationRequest,
@@ -2280,6 +2281,7 @@ async fn check_remote_branch_delete(
     })?;
     let branch_ref = format!("refs/heads/{branch}");
     let mut default_ref = None;
+    let mut head_advertised = false;
     let mut remote_tip = None;
     for line in outputs.iter().flat_map(|output| output.stdout.lines()) {
         if let Some((target, name)) = line
@@ -2289,16 +2291,29 @@ async fn check_remote_branch_delete(
             if name == "HEAD" {
                 default_ref = Some(target);
             }
-        } else if let Some((sha, name)) = line.split_once('\t')
-            && name == branch_ref
-        {
-            remote_tip = Some(sha);
+        } else if let Some((sha, name)) = line.split_once('\t') {
+            if name == "HEAD" {
+                head_advertised = true;
+            } else if name == branch_ref {
+                remote_tip = Some(sha);
+            }
         }
     }
+    // Fetching cannot help a local delete whose remote branch is gone; unticking its option can.
+    let missing_message = if operation == "branch-delete" {
+        "The branch no longer exists on the remote. Clear \"Also delete the branch from its remote\" to delete only the local branch."
+    } else {
+        "This branch no longer exists on the remote. Fetch to update the branch list."
+    };
     let refusal = match default_ref {
         Some(target) if target == branch_ref => Some((
             "default-branch",
             "Delete is blocked: this is the remote's default branch.",
+        )),
+        // A HEAD with no branch name (detached) is a default that cannot be checked.
+        None if head_advertised => Some((
+            "remote-default-unknown",
+            "The remote's default branch could not be checked.",
         )),
         _ => {
             let tracking = format!("{remote}/{branch}");
@@ -2315,10 +2330,9 @@ async fn check_remote_branch_delete(
                 })
                 // Git reports a delete of a missing ref as a success, so say it here.
                 .or_else(|| {
-                    remote_tip.is_none().then_some((
-                        "remote-branch-not-found",
-                        "This branch no longer exists on the remote. Fetch to update the branch list.",
-                    ))
+                    remote_tip
+                        .is_none()
+                        .then_some(("remote-branch-not-found", missing_message))
                 })
         }
     };
@@ -6386,6 +6400,25 @@ mod tests {
             git(fixture.path(), &["branch", "--format=%(refname:short)"]),
             "feature\nmain\ntopic",
             "the local branch stays"
+        );
+    }
+
+    /// R7: a remote that advertises `HEAD` without naming its branch (a detached `HEAD`) has a
+    /// default that cannot be checked, so nothing is deleted.
+    #[tokio::test]
+    async fn remote_branch_delete_refuses_a_head_that_names_no_branch() {
+        let (remote, fixture) = remote_delete_fixture();
+        let main = git(remote.path(), &["rev-parse", "refs/heads/main"]);
+        git(remote.path(), &["update-ref", "--no-deref", "HEAD", &main]);
+
+        let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "feature"))
+            .await
+            .expect_err("a detached remote HEAD is refused");
+
+        assert_eq!(failure.code, "remote-default-unknown");
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main"
         );
     }
 

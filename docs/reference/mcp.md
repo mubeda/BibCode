@@ -2342,7 +2342,7 @@ The repository's refs in the thread's folder: the current branch or detached sha
 - `headRef` (string or null): the current branch; null when HEAD is detached. `detachedSha` (string or null): the sha when detached.
 - `isDirty` (boolean); `defaultBranch` (string or null).
 - `remotes` (array of remote names).
-- `localBranches`, `remoteBranches`, `tags` (arrays), each entry `{ name, tipSha, upstream, ahead, behind, current, isDefault, worktreePath }`: `upstream` (string or null, such as `origin/main`), `ahead` and `behind` (numbers), `current` (boolean), `isDefault` (boolean), `worktreePath` (string or null: the path of another worktree that has the branch checked out). Remote branch names include the remote, as in `origin/main`.
+- `localBranches`, `remoteBranches`, `tags` (arrays), each entry `{ name, tipSha, upstream, ahead, behind, current, isDefault, worktreePath }`: `upstream` (string or null, such as `origin/main`), `ahead` and `behind` (numbers), `current` (boolean), `isDefault` (boolean: on a local branch, the repository's default branch; on a remote branch, the branch its remote's `<remote>/HEAD` names), `worktreePath` (string or null: the path of another worktree that has the branch checked out). Remote branch names include the remote, as in `origin/main`.
 - `stashes` (array): `{ index, sha, message, committedAtMs, files }`, where each file is `{ path, status, insertions, deletions }` and `status` is `modified`, `added`, `deleted`, `renamed`, `copied`, `untracked` or `unmerged`.
 - `inProgressOperation` (object or null): `{ kind, current, total }` with `kind` one of `merge`, `rebase`, `cherry-pick`, `revert`, `squash`; `current` and `total` are numbers or null.
 - `conflictedPaths` (array of path strings).
