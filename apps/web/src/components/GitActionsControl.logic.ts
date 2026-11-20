@@ -2,6 +2,7 @@ import { VcsActionRemoteFailureError } from "@bibcode/client-runtime/state/vcs";
 import type {
   GitRunStackedActionResult,
   GitStackedAction,
+  SourceControlProviderKind,
   VcsStatusResult,
 } from "@bibcode/contracts";
 import { isTemporaryWorktreeBranch } from "@bibcode/shared/git";
@@ -11,6 +12,7 @@ import {
   getChangeRequestTerminology,
   type ChangeRequestTerminology,
 } from "../sourceControlPresentation";
+import { canOpenPullRequestInPanel } from "./pullRequests/pullRequestsAvailability";
 
 export type GitActionIconName = "commit" | "push" | "pr";
 
@@ -322,6 +324,45 @@ export function resolveQuickAction(
     kind: "show_hint",
     hint: "Branch is up to date. No action needed.",
   };
+}
+
+/**
+ * Whether a request can be shown in the thread's right panel: the setting is on, the host has
+ * request details, and the server reads pull requests. A disconnect is not lack of support.
+ */
+export function canShowPullRequestInPanel(input: {
+  readonly enabled: boolean;
+  readonly pullRequestsReads: boolean;
+  readonly providerKind: SourceControlProviderKind;
+}): boolean {
+  return (
+    input.pullRequestsReads &&
+    canOpenPullRequestInPanel({ enabled: input.enabled, providerKind: input.providerKind })
+  );
+}
+
+const REQUEST_PATH_MARKER = /\/(?:-\/)?(?:pull|merge_requests)\/\d+/;
+
+/**
+ * True when a request URL names a repository other than `repository` (the checkout's origin,
+ * as the panel addresses it). Source Control finds a branch's request through the host CLI's
+ * default repository, which can be the parent of a copy. An unknown repository or an
+ * unrecognised URL is "cannot tell", reported as false.
+ */
+export function isPullRequestInOtherRepository(
+  requestUrl: string,
+  repository: string | null,
+): boolean {
+  if (repository === null) return false;
+  let pathname: string;
+  try {
+    pathname = new URL(requestUrl).pathname;
+  } catch {
+    return false;
+  }
+  const marker = REQUEST_PATH_MARKER.exec(pathname);
+  if (marker === null) return false;
+  return pathname.slice(1, marker.index).toLowerCase() !== repository.toLowerCase();
 }
 
 const isRemoteFailure = Schema.is(VcsActionRemoteFailureError);

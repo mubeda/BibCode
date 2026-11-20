@@ -1036,24 +1036,27 @@ describe("SourceControlPanel", () => {
     ["the host is Bitbucket", true, "bitbucket", true],
     ["the host is Azure DevOps", true, "azure-devops", true],
     ["the server cannot read pull requests", true, "gitlab", false],
-  ] as const)("does not open the created request on Done when %s", async (_name, enabled, kind, reads) => {
-    testState.pullRequestsEnabled = enabled;
-    testState.pullRequestsReads = reads;
-    testState.statusQuery.data = status({
-      refName: "feature/test",
-      hasUpstream: false,
-      aheadCount: 1,
-      sourceControlProvider: { kind, name: "Host", baseUrl: "https://host.test" },
-    });
-    const props = buildProps();
-    render(props);
-    buttonsByText("Push & create")[0]?.onClick?.();
-    await flushPromises();
-    render(props);
-    expect(captured.createPullRequest).toMatchObject({ open: true });
-    captured.createPullRequest?.onDone?.({ number: 89, provider: kind });
-    expect(testState.openPullRequest).not.toHaveBeenCalled();
-  });
+  ] as const)(
+    "does not open the created request on Done when %s",
+    async (_name, enabled, kind, reads) => {
+      testState.pullRequestsEnabled = enabled;
+      testState.pullRequestsReads = reads;
+      testState.statusQuery.data = status({
+        refName: "feature/test",
+        hasUpstream: false,
+        aheadCount: 1,
+        sourceControlProvider: { kind, name: "Host", baseUrl: "https://host.test" },
+      });
+      const props = buildProps();
+      render(props);
+      buttonsByText("Push & create")[0]?.onClick?.();
+      await flushPromises();
+      render(props);
+      expect(captured.createPullRequest).toMatchObject({ open: true });
+      captured.createPullRequest?.onDone?.({ number: 89, provider: kind });
+      expect(testState.openPullRequest).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     ["a tracked branch", { hasUpstream: true, aheadCount: 1 }, true],

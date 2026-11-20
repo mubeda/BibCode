@@ -100,6 +100,8 @@ import { DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
 import { joinWorkspacePath } from "./files/FileTreeContextMenu.logic";
 import {
   buildMenuItems,
+  canShowPullRequestInPanel,
+  isPullRequestInOtherRepository,
   type DefaultBranchConfirmableAction,
   requiresDefaultBranchConfirmation,
   resolveDefaultBranchActionDialogCopy,
@@ -139,7 +141,7 @@ import { GIT_MANAGER_STASH_MERGE_DISABLED_REASON } from "./gitManager/gitManager
 import { GitManagerInProgressStrip } from "./gitManager/GitManagerInProgressStrip";
 import { GitManagerMergeDialog } from "./gitManager/merge/GitManagerMergeDialog";
 import { GitManagerOperationBanner } from "./gitManager/toolbar/GitManagerOperationBanner";
-import { canOpenPullRequestInPanel } from "./pullRequests/pullRequestsAvailability";
+import { usePullRequestsContextQuery } from "./pullRequests/usePullRequestsContextQuery";
 import { SourceControlMergeChanges } from "./SourceControlMergeChanges";
 import { CodeReviewInstructionsDialog } from "./sourceControl/CodeReviewInstructionsDialog";
 import { CodeReviewProjectPromptDialog } from "./sourceControl/CodeReviewProjectPromptDialog";
@@ -423,12 +425,24 @@ export default function SourceControlPanel({
 
   // The panel can show the request only on a host that has it, with the setting on and a server
   // that reads pull requests. Otherwise View PR opens the browser.
+  const openPrUrl = status?.pr?.state === "open" ? status.pr.url : null;
+  const panelSupported = canShowPullRequestInPanel({
+    enabled: pullRequestsEnabled,
+    pullRequestsReads: capabilities?.pullRequestsReads === true,
+    providerKind: status?.sourceControlProvider?.kind ?? "unknown",
+  });
+  // The panel addresses the checkout's origin, while the request lookup may have used another
+  // repository. Until the context is known, the panel opens and explains itself.
+  const { query: pullRequestsContext } = usePullRequestsContextQuery({
+    environmentId,
+    cwd: gitCwd,
+    enabled: panelSupported && openPrUrl !== null,
+  });
+  const panelRepository =
+    pullRequestsContext.data?.status === "available" ? pullRequestsContext.data.repository : null;
   const canOpenInPanel =
-    capabilities?.pullRequestsReads === true &&
-    canOpenPullRequestInPanel({
-      enabled: pullRequestsEnabled,
-      providerKind: status?.sourceControlProvider?.kind ?? "unknown",
-    });
+    panelSupported &&
+    !(openPrUrl !== null && isPullRequestInOtherRepository(openPrUrl, panelRepository));
   // Legacy servers (no staging areas) keep the chat-header cascade
   // (commit_push-first, commit-by-filePaths). The primary button and dropdown
   // below fork on `hasAreas`: this pair drives the legacy branch unchanged.
@@ -1782,8 +1796,9 @@ export default function SourceControlPanel({
           }}
           onDone={(request) => {
             if (
-              canOpenPullRequestInPanel({
+              canShowPullRequestInPanel({
                 enabled: pullRequestsEnabled,
+                pullRequestsReads: capabilities?.pullRequestsReads === true,
                 providerKind: request.provider,
               })
             )
