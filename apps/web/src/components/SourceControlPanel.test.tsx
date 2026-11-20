@@ -136,6 +136,7 @@ const testState = vi.hoisted(() => ({
   openPullRequest: vi.fn(),
   pullRequestsEnabled: true,
   pullRequestsReads: true,
+  pullRequestsContext: undefined as { status: string; repository?: string } | undefined,
   selectGitScope: vi.fn(),
   toast: { add: vi.fn(), update: vi.fn(), close: vi.fn() },
   groupByFolder: true,
@@ -423,6 +424,10 @@ vi.mock("~/sourceControlDraft", () => ({
 vi.mock("~/hooks/useSettings", () => ({
   usePrimarySettings: (selector: (settings: { pullRequestsEnabled: boolean }) => unknown) =>
     selector({ pullRequestsEnabled: testState.pullRequestsEnabled }),
+}));
+
+vi.mock("./pullRequests/usePullRequestsContextQuery", () => ({
+  usePullRequestsContextQuery: () => ({ query: { data: testState.pullRequestsContext } }),
 }));
 
 vi.mock("~/rightPanelStore", () => ({
@@ -781,6 +786,7 @@ beforeEach(() => {
   testState.openPullRequest.mockReset();
   testState.pullRequestsEnabled = true;
   testState.pullRequestsReads = true;
+  testState.pullRequestsContext = undefined;
   testState.selectGitScope.mockReset();
   testState.toast.add.mockReset();
   testState.toast.add.mockReturnValue("toast-1");
@@ -923,29 +929,87 @@ describe("SourceControlPanel", () => {
     });
   });
 
-  it.each([
-    ["Pull Requests is turned off", false, "gitlab"],
-    ["the host is Bitbucket", true, "bitbucket"],
-    ["the host is Azure DevOps", true, "azure-devops"],
-  ] as const)("does not offer the in-panel action when %s", (_name, enabled, kind) => {
-    testState.pullRequestsEnabled = enabled;
-    for (const data of [
-      status({
-        sourceControlProvider: { kind, name: "Host", baseUrl: "https://host.test" },
-        pr: OPEN_MR,
-      }),
-      legacyStatus({
-        sourceControlProvider: { kind, name: "Host", baseUrl: "https://host.test" },
-        pr: OPEN_MR,
-      }),
-    ]) {
-      testState.statusQuery.data = data;
-      render(buildProps());
-      expect(captured.menuItems.map((item) => flattenText(item.children))).not.toContainEqual(
-        expect.stringContaining("in panel"),
-      );
-      expect(menuItemByText("View")).toBeDefined();
+  it("opens a GitHub pull request from View PR in the panel, in both ladders", () => {
+    for (const build of CLEAN_LADDERS) {
+      testState.openPullRequest.mockClear();
+      testState.statusQuery.data = build({
+        sourceControlProvider: { kind: "github", name: "GitHub", baseUrl: "https://github.test" },
+        pr: { ...OPEN_MR, url: "https://github.test/team/repo/pull/89" },
+      });
+      const props = buildProps();
+      render(props);
+      (buttonsByText("View PR")[0] ?? menuItemByText("View PR"))?.onClick?.();
+      expect(testState.openPullRequest).toHaveBeenCalledWith(props.threadRef, {
+        number: 89,
+        provider: "github",
+      });
+      expect(testState.openPullRequestLink).not.toHaveBeenCalled();
     }
+  });
+
+  it.each([
+    ["Pull Requests is turned off", false, true, "gitlab"],
+    ["the host is Bitbucket", true, true, "bitbucket"],
+    ["the host is Azure DevOps", true, true, "azure-devops"],
+    ["the server cannot read pull requests", true, false, "gitlab"],
+  ] as const)(
+    "opens View in the browser and offers no browser item when %s",
+    async (_name, enabled, reads, kind) => {
+      testState.pullRequestsEnabled = enabled;
+      testState.pullRequestsReads = reads;
+      for (const build of CLEAN_LADDERS) {
+        testState.openPullRequestLink.mockClear();
+        testState.statusQuery.data = build({
+          sourceControlProvider: { kind, name: "Host", baseUrl: "https://host.test" },
+          pr: OPEN_MR,
+        });
+        render(buildProps());
+        expect(menuItemByText("in browser")).toBeUndefined();
+        (buttonsByText("View ")[0] ?? menuItemByText("View "))?.onClick?.();
+        await flushPromises();
+        expect(testState.openPullRequestLink).toHaveBeenCalledWith(
+          (testState.localApi as { shell: unknown }).shell,
+          OPEN_MR.url,
+        );
+        expect(testState.openPullRequest).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("still opens the panel when the connection is down and the repository is unknown", () => {
+    testState.pullRequestsContext = undefined;
+    testState.statusQuery.data = status({ pr: OPEN_MR });
+    render(buildProps());
+    (buttonsByText("View PR")[0] ?? menuItemByText("View PR"))?.onClick?.();
+    expect(testState.openPullRequest).toHaveBeenCalledTimes(1);
+    expect(testState.openPullRequestLink).not.toHaveBeenCalled();
+  });
+
+  it("opens View PR in the browser when the pull request belongs to another repository", async () => {
+    // origin is a fork; the status lookup found the parent's pull request.
+    testState.pullRequestsContext = { status: "available", repository: "fork/repo" };
+    for (const build of CLEAN_LADDERS) {
+      testState.openPullRequestLink.mockClear();
+      testState.statusQuery.data = build({
+        pr: { ...OPEN_MR, url: "https://host.test/team/repo/pull/89" },
+      });
+      render(buildProps());
+      expect(menuItemByText("Open PR in browser")).toBeUndefined();
+      (buttonsByText("View PR")[0] ?? menuItemByText("View PR"))?.onClick?.();
+      await flushPromises();
+      expect(testState.openPullRequestLink).toHaveBeenCalledTimes(1);
+      expect(testState.openPullRequest).not.toHaveBeenCalled();
+    }
+  });
+
+  it("opens View PR in the panel when the pull request belongs to the addressed repository", () => {
+    testState.pullRequestsContext = { status: "available", repository: "team/repo" };
+    testState.statusQuery.data = status({
+      pr: { ...OPEN_MR, url: "https://host.test/team/repo/pull/89" },
+    });
+    render(buildProps());
+    (buttonsByText("View PR")[0] ?? menuItemByText("View PR"))?.onClick?.();
+    expect(testState.openPullRequest).toHaveBeenCalledTimes(1);
   });
 
   it("opens the created merge request beside the thread on Done", async () => {
@@ -968,11 +1032,13 @@ describe("SourceControlPanel", () => {
   });
 
   it.each([
-    ["Pull Requests is turned off", false, "gitlab"],
-    ["the host is Bitbucket", true, "bitbucket"],
-    ["the host is Azure DevOps", true, "azure-devops"],
-  ] as const)("does not open the created request on Done when %s", async (_name, enabled, kind) => {
+    ["Pull Requests is turned off", false, "gitlab", true],
+    ["the host is Bitbucket", true, "bitbucket", true],
+    ["the host is Azure DevOps", true, "azure-devops", true],
+    ["the server cannot read pull requests", true, "gitlab", false],
+  ] as const)("does not open the created request on Done when %s", async (_name, enabled, kind, reads) => {
     testState.pullRequestsEnabled = enabled;
+    testState.pullRequestsReads = reads;
     testState.statusQuery.data = status({
       refName: "feature/test",
       hasUpstream: false,

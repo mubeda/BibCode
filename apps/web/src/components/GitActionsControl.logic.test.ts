@@ -4,6 +4,8 @@ import { assert, describe, it } from "vite-plus/test";
 import {
   buildGitActionProgressStages,
   buildMenuItems,
+  canShowPullRequestInPanel,
+  isPullRequestInOtherRepository,
   requiresDefaultBranchConfirmation,
   resolveAutoFeatureBranchName,
   resolveDefaultBranchActionDialogCopy,
@@ -1275,5 +1277,48 @@ describe("resolveAutoFeatureBranchName", () => {
   it("falls back to feature/update when no preferred name is provided", () => {
     const ref = resolveAutoFeatureBranchName(["main"]);
     assert.equal(ref, "feature/update");
+  });
+});
+
+describe("canShowPullRequestInPanel", () => {
+  it("needs the setting, a supported host and the server's pullRequestsReads", () => {
+    const base = { enabled: true, pullRequestsReads: true, providerKind: "github" } as const;
+    assert.isTrue(canShowPullRequestInPanel(base));
+    assert.isFalse(canShowPullRequestInPanel({ ...base, enabled: false }));
+    assert.isFalse(canShowPullRequestInPanel({ ...base, pullRequestsReads: false }));
+    assert.isFalse(canShowPullRequestInPanel({ ...base, providerKind: "bitbucket" }));
+    assert.isFalse(canShowPullRequestInPanel({ ...base, providerKind: "azure-devops" }));
+  });
+});
+
+describe("isPullRequestInOtherRepository", () => {
+  it("is true only when the pull request URL names a different repository", () => {
+    assert.isFalse(
+      isPullRequestInOtherRepository("https://github.test/team/repo/pull/9", "team/repo"),
+    );
+    assert.isFalse(
+      isPullRequestInOtherRepository("https://github.test/Team/Repo/pull/9", "team/repo"),
+    );
+    assert.isTrue(
+      isPullRequestInOtherRepository("https://github.test/upstream/repo/pull/9", "fork/repo"),
+    );
+    assert.isFalse(
+      isPullRequestInOtherRepository(
+        "https://gitlab.test/group/sub/proj/-/merge_requests/4",
+        "group/sub/proj",
+      ),
+    );
+    assert.isTrue(
+      isPullRequestInOtherRepository(
+        "https://gitlab.test/group/other/-/merge_requests/4",
+        "group/sub/proj",
+      ),
+    );
+  });
+
+  it("cannot tell, and says false, for an unknown repository or an unrecognised URL", () => {
+    assert.isFalse(isPullRequestInOtherRepository("https://github.test/team/repo/pull/9", null));
+    assert.isFalse(isPullRequestInOtherRepository("not a url", "team/repo"));
+    assert.isFalse(isPullRequestInOtherRepository("https://host.test/x/y", "team/repo"));
   });
 });
