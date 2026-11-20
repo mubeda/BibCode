@@ -523,9 +523,15 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     },
     [executeOperation, projectId, selectedWorktreeCwd, stashMergeDisabledReason],
   );
+  const signInPhase = signIn.state?.phase ?? null;
+  const { cancel: cancelSignIn, decline: declineSignIn } = signIn;
   const closeBranchDialog = useCallback(() => {
-    if (!isOperationRunning) setBranchDialog(null);
-  }, [isOperationRunning]);
+    if (isOperationRunning) return;
+    // A sign-in offered for the dialog's request ends with it, so nothing resumes unconfirmed.
+    if (signInPhase === "waiting") cancelSignIn();
+    else if (signInPhase === "approval") declineSignIn();
+    setBranchDialog(null);
+  }, [cancelSignIn, declineSignIn, isOperationRunning, signInPhase]);
   const submitBranchDialog = useCallback(
     async (submission: GitManagerBranchDialogSubmission) => {
       if (branchSyncDisabledReason !== null) {
