@@ -68,6 +68,13 @@ impl GitProcessRunner for RemoteRunner {
     ) -> BoxGitProcessFuture<'a> {
         let (exit_code, stdout, stderr) = if request.operation == "GitManager.signIn.remoteUrls" {
             (0, self.urls.clone(), String::new())
+        } else if request.operation == "GitManager.branchUpstream" {
+            // `topic` tracks `topic` on `origin`, as Git's upstream fields report it.
+            (
+                0,
+                "refs/heads/topic\torigin\trefs/heads/topic\n".to_owned(),
+                String::new(),
+            )
         } else if is_network(&request) {
             (128, String::new(), self.stderr.clone())
         } else {
@@ -253,6 +260,13 @@ async fn a_remote_delete_offers_sign_in_from_its_ls_remote_check() {
                 .any(|args| args.iter().any(|arg| arg == "-d" || arg == "-D")),
             "{operation}: the local branch is not deleted before the check passes"
         );
+
+        // Without an offer the check keeps Git's own classification (#397 review finding 9).
+        let runner = RemoteRunner::new(DESTINATION, GCM_STDERR);
+        let error = run(&runner, &request, CredentialPrompt::Never)
+            .await
+            .expect_err("GCM refused");
+        assert_eq!(error.code, "authentication", "{operation}");
     }
 }
 

@@ -4562,14 +4562,21 @@ impl GitRepository {
         cwd: &Path,
         remote: &str,
         name: &str,
+        expected_oid: &str,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
         self.for_network_transfer()
             .execute(
                 "GitManager.remoteBranchDelete",
                 cwd,
-                // A qualified destination: an unqualified one can resolve to a same-named tag.
-                &["push".into(), remote.into(), format!(":refs/heads/{name}")],
+                // A qualified destination, since an unqualified one can resolve to a same-named
+                // tag, and a lease on the checked commit, so a branch that moved is kept.
+                &[
+                    "push".into(),
+                    format!("--force-with-lease=refs/heads/{name}:{expected_oid}"),
+                    remote.into(),
+                    format!(":refs/heads/{name}"),
+                ],
                 true,
                 cancellation,
             )
@@ -9740,6 +9747,7 @@ mod tests {
                 Path::new("/repo"),
                 "origin",
                 "topic",
+                "abc123",
                 &CancellationToken::new(),
             )
             .await
@@ -9764,7 +9772,16 @@ mod tests {
         );
         assert_default_budget(&requests[0]);
         // A qualified destination never resolves to a same-named tag (#403).
-        assert_network_transfer(&requests[1], &["push", "origin", ":refs/heads/topic"]);
+        // The checked commit rides along as a lease, so a branch that moved is kept.
+        assert_network_transfer(
+            &requests[1],
+            &[
+                "push",
+                "--force-with-lease=refs/heads/topic:abc123",
+                "origin",
+                ":refs/heads/topic",
+            ],
+        );
         assert_network_transfer(
             &requests[2],
             &[

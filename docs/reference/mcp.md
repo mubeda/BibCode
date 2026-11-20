@@ -2661,7 +2661,7 @@ Switches the thread's folder to a local branch, or to a new local branch trackin
 
 #### `git_delete_branch`
 
-Destructive: deletes a local branch, and with `deleteRemote` its upstream branch on the remote too, in that order. The upstream is resolved before anything is deleted. If the remote deletion fails, or stops before it reports, the local branch is already gone and the result is `McpPartialOutcomeError`. The remote step refuses the remote's default branch, an unreachable remote and a branch that changed since the last fetch, as `git_delete_remote_branch` does.
+Destructive: deletes a local branch, and with `deleteRemote` its upstream branch on the remote too, in one Git operation. With `deleteRemote`, the server first reads the upstream from Git and checks the remote branch as `git_delete_remote_branch` does; a refusal there deletes nothing. It then deletes the local branch and pushes the remote delete. If that push fails, or stops before it reports, the local branch is already gone and the result is `McpPartialOutcomeError`.
 
 - **Set / scope:** Source control · `orchestration:operate`
 - **Access:** operate (hidden at read-only)
@@ -2682,7 +2682,7 @@ Destructive: deletes a local branch, and with `deleteRemote` its upstream branch
 **Errors:**
 
 - `McpPartialOutcomeError` — the local branch was deleted but the remote step did not succeed. Fields: `message` (says what to do), `local` (`deleted`), `remote` (`failed` when the remote refused, `unknown` when the remote step stopped before it reported), `remoteName`, `remoteBranch` (what to delete), `reason` (the failing step's `code` or `reason`, or null), and `recovery`: `{ tool: "git_delete_remote_branch", arguments: { remote, branch } }` (add `threadId` yourself, and a new `clientRequestId`). When `remote` is `unknown` the error also has `outcome: "unknown"` and is stored as an unknown outcome; run `git_fetch`, and if `<remoteName>/<remoteBranch>` is still listed, call `recovery`.
-- `GitOperationFailedError` — nothing was deleted: the local deletion failed (not merged without `force`, checked out), or `deleteRemote` was set and the branch has no upstream (`code` `no-upstream`).
+- `GitOperationFailedError` — nothing was deleted: the local deletion failed (not merged without `force`, checked out), `deleteRemote` was set and the branch has no upstream (`code` `no-upstream`), or the remote check refused it (the codes under `git_delete_remote_branch`).
 - `McpInvalidArgumentError` — `name` is malformed, or `deleteRemote` was set and the repository has no local branch of that name.
 - `GitManagerOperationError` — the refs could not be read first.
 
@@ -2709,9 +2709,9 @@ Destructive: deletes a branch on a remote, leaving any local branch alone. It al
 
 - `McpInvalidArgumentError` — `remote` or `branch` is malformed or missing.
 - `GitOperationFailedError` — the remote is not one the repository has (`code` `invalid-request`) or the deletion failed.
-- `GitOperationFailedError` — nothing was deleted, because one `git ls-remote --symref <remote> HEAD refs/heads/<branch>` could not reach the remote (`code` `remote-default-unknown`), or found that the remote's `HEAD` names the branch (`code` `default-branch`), that a local `refs/remotes/<remote>/<branch>` points to a different commit than the remote branch (`code` `remote-branch-changed`), or that the remote has no such branch (`code` `remote-branch-not-found`). Run `git_fetch` before retrying the last two. A branch with no local tracking ref is not compared, and a remote whose `HEAD` is unborn has no default branch to protect.
+- `GitOperationFailedError` — nothing was deleted, because the check before the push refused it. The remote pushes to another URL than it fetches from (`code` `remote-push-url-differs`). One `git ls-remote --symref <remote> HEAD refs/heads/<branch>` could not reach the remote (`remote-default-unknown`, or Git's own code such as `authentication`), or found that the remote's `HEAD` names the branch (`default-branch`) or names no branch (`remote-default-unknown`), or that the remote has no such branch (`remote-branch-not-found`). The local `refs/remotes/<remote>/<branch>` is filled from another remote branch by a custom fetch mapping (`remote-tracking-mapped`), or points to a different commit than the remote branch (`remote-branch-changed`; run `git_fetch`, then retry). A branch with no local tracking ref is not compared, and a remote whose `HEAD` is unborn has no default branch to protect.
 
-The push names `refs/heads/<branch>`, so a tag of the same name is never deleted.
+The push names `refs/heads/<branch>`, so a tag of the same name is never deleted, and leases the commit the check read, so a branch that moved after the check is kept.
 
 #### `git_discard`
 

@@ -634,6 +634,24 @@ async fn delete_branch_with_delete_remote_removes_both_branches() {
     fixture.harness.shutdown().await;
 }
 
+/// #406: the remote check runs before the local delete, so a refused remote default leaves the
+/// local branch in place.
+#[tokio::test]
+async fn delete_branch_with_delete_remote_checks_the_remote_before_deleting_locally() {
+    let fixture = fixture().await;
+    fixture.git(&["branch", "--track", "mainline", "origin/main"]);
+    let refused = fixture
+        .call(
+            "git_delete_branch",
+            json!({ "name": "mainline", "deleteRemote": true }),
+        )
+        .await;
+    assert_eq!(error(&refused)["code"], "default-branch", "{refused}");
+    assert_eq!(branches(&fixture.repo), "main\nmainline");
+    assert_eq!(branches(&fixture.remote), "main");
+    fixture.harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_refused_remote_delete_is_a_partial_outcome_that_replays_and_recovers() {
     let fixture = fixture().await;

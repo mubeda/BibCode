@@ -956,35 +956,40 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
             } else {
                 None
             };
-            operate(
+            // One operation: the server checks the remote before it deletes the local branch, and
+            // pushes the remote delete after it (#406).
+            let deleted = operate(
                 &owned,
                 json!({
                     "_tag": "branch-delete", "cwd": cwd, "projectId": project_id,
-                    "name": name, "force": force, "deleteRemote": false,
+                    "name": name, "force": force, "deleteRemote": target.is_some(),
                 }),
             )
-            .await?;
+            .await;
+            let after = refs(&owned, &cwd).await.ok();
+            let local_gone = after.as_ref().is_some_and(|refs| {
+                !refs["localBranches"].as_array().is_some_and(|branches| {
+                    branches
+                        .iter()
+                        .any(|entry| entry["name"].as_str() == Some(name.as_str()))
+                })
+            });
             // A label must not name the branch this call deleted: it takes the folder's own.
-            if let Ok(thread_target) = owned.target(&thread).await
+            if local_gone
+                && let Ok(thread_target) = owned.target(&thread).await
                 && thread_target.thread.branch.as_deref() == Some(name.as_str())
-                && let Ok(refs) = refs(&owned, &cwd).await
-                && let Some(head) = refs["headRef"].as_str()
+                && let Some(head) = after.as_ref().and_then(|refs| refs["headRef"].as_str())
             {
                 follow_checkout(&owned, &thread, &cwd, &[head]).await;
             }
             let Some((remote, remote_branch)) = target else {
+                deleted?;
                 return Ok(json!({ "branch": name, "local": "deleted", "remote": "not-requested" }));
             };
-            let deleted = operate(
-                &owned,
-                json!({
-                    "_tag": "remote-branch-delete", "cwd": cwd, "projectId": project_id,
-                    "remote": remote, "branch": remote_branch,
-                }),
-            )
-            .await;
             match deleted {
                 Ok(_) => Ok(json!({ "branch": name, "local": "deleted", "remote": "deleted" })),
+                // Nothing was deleted: the remote check or the local delete refused it.
+                Err(failure) if !local_gone => Err(failure),
                 // Whether a stream that stopped reporting reached the remote is unknown, and is
                 // recorded so, with the known local deletion and the remote target.
                 Err(failure)
