@@ -806,8 +806,8 @@ async function measureTextField(
 }
 
 /**
- * Records what a real undo chord does in a focused terminal. It asserts nothing about the shell:
- * on Windows and Linux, Ctrl+Z is the shell's suspend key, which the terminal must keep.
+ * A real undo chord in a focused terminal. On Windows and Linux, Ctrl+Z is the shell's suspend
+ * key, which the terminal must keep, so the page must not run an undo of its own.
  */
 async function recordTerminalChord(): Promise<void> {
   await openFixtureWorkspace();
@@ -818,15 +818,50 @@ async function recordTerminalChord(): Promise<void> {
     document.querySelector<HTMLElement>(".xterm-helper-textarea")?.focus(),
   );
   await startProbe();
+  // Counts the page's native undo and redo, and reads whether the chord was cancelled once its
+  // dispatch ended: xterm cancels the keys it sends to the shell.
+  await browser.execute(() => {
+    const probe = window as unknown as { __terminalChord?: { exec: number; cancelled: boolean } };
+    const state = { exec: 0, cancelled: false };
+    probe.__terminalChord = state;
+    const exec = document.execCommand.bind(document);
+    document.execCommand = (command: string, ...rest: unknown[]) => {
+      if (command === "undo" || command === "redo") state.exec += 1;
+      return exec(command, ...(rest as [boolean?, string?]));
+    };
+    window.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key.toLowerCase() === "z") {
+          setTimeout(() => {
+            state.cancelled = event.defaultPrevented;
+          });
+        }
+      },
+      true,
+    );
+  });
   sendNativeChord("primary+z");
   await new Promise((resolve) => setTimeout(resolve, 600));
   const events = await readProbe();
+  const chord = await browser.execute(
+    () =>
+      (window as unknown as { __terminalChord: { exec: number; cancelled: boolean } })
+        .__terminalChord,
+  );
+  const reached = chordKeydownReachedPage(events);
   recordEvidence({
     cell: "terminal-undo-keystroke",
-    chordKeydownReachedPage: chordKeydownReachedPage(events),
+    chordKeydownReachedPage: reached,
     focus: await focusedElement(),
+    chord,
     events,
   });
+  // The page never runs its own undo for the terminal. On Windows and Linux the shell gets
+  // Ctrl+Z (xterm cancels the keydown it sends); on macOS Cmd+Z never reaches the page.
+  expect(chord.exec).toBe(0);
+  if (platform === "mac") expect(reached).toBe(false);
+  else expect({ reached, cancelled: chord.cancelled }).toEqual({ reached: true, cancelled: true });
 }
 
 describe("packaged Files undo and redo (#398)", () => {
@@ -932,7 +967,7 @@ describe("packaged Files undo and redo (#398)", () => {
       }
     }
 
-    it("keystroke: records what the undo chord does in a terminal", async () => {
+    it("keystroke: the terminal keeps the undo chord", async () => {
       await recordTerminalChord();
     });
   });

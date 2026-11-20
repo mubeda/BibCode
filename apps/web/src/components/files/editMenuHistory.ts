@@ -1,5 +1,7 @@
 import { type RefObject, useEffect } from "react";
 
+import { isLinuxPlatform } from "../../lib/utils";
+
 /** The undo and redo the Files toolbar buttons run. */
 export interface FilesEditHistory {
   undo(): void;
@@ -63,6 +65,27 @@ export function runEditMenuAction(
   doc.execCommand(action === "edit-undo" ? "undo" : "redo");
 }
 
+/**
+ * The native history command for an uncancelled Ctrl+Z, Shift+Ctrl+Z or Ctrl+Y in an `input` or
+ * `textarea`. WebKitGTK gives those fields no undo key of its own (#408); editors and the
+ * terminal cancel their chords before this runs, and editable text is left to its editor.
+ */
+export function textFieldHistoryChord(event: KeyboardEvent): "undo" | "redo" | null {
+  if (event.defaultPrevented || !event.ctrlKey || event.altKey || event.metaKey) return null;
+  const target = event.composedPath()[0];
+  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return null;
+  const key = event.key.toLowerCase();
+  if (key === "z") return event.shiftKey ? "redo" : "undo";
+  return key === "y" && !event.shiftKey ? "redo" : null;
+}
+
+function runTextFieldHistoryChord(event: KeyboardEvent): void {
+  const command = textFieldHistoryChord(event);
+  if (!command) return;
+  event.preventDefault();
+  document.execCommand(command);
+}
+
 /** Listens for the desktop Edit menu actions on every route of the app. */
 export function useEditMenuActions(): void {
   useEffect(() => {
@@ -77,12 +100,16 @@ export function useEditMenuActions(): void {
     };
     document.addEventListener("compositionstart", start, true);
     document.addEventListener("compositionend", end, true);
+    // The Linux desktop has no Edit menu Undo to bind the text fields' chords.
+    const linux = isLinuxPlatform(navigator.platform);
+    if (linux) document.addEventListener("keydown", runTextFieldHistoryChord);
     const unsubscribe = onMenuAction((action) => {
       if (isEditMenuAction(action)) runEditMenuAction(action, composing);
     });
     return () => {
       document.removeEventListener("compositionstart", start, true);
       document.removeEventListener("compositionend", end, true);
+      if (linux) document.removeEventListener("keydown", runTextFieldHistoryChord);
       unsubscribe?.();
     };
   }, []);
