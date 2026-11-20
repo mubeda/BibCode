@@ -1,6 +1,7 @@
 import { Code2, Eye, LoaderCircle, Redo2, Save, Undo2 } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 
+import { isMacPlatform } from "../../lib/platform";
 import { Button } from "../ui/button";
 import { Toggle } from "../ui/toggle";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -10,6 +11,11 @@ import type { FileSavePhase } from "./fileSaveCoordinator";
 const SAVED_INDICATOR_DURATION_MS = 1_500;
 
 /** A file shown either rendered (Markdown, SVG image) or as the source text in the editor. */
+/** The Redo tooltip: every redo chord that works on the platform (Ctrl+Y only off macOS). */
+export function redoShortcutLabel(isMac: boolean): string {
+  return isMac ? "Redo (Shift+Cmd+Z)" : "Redo (Shift+Ctrl+Z or Ctrl+Y)";
+}
+
 export interface FileEditorMarkdownView {
   readonly rendered: boolean;
   readonly onRenderedChange: (rendered: boolean) => void;
@@ -179,7 +185,7 @@ export function FileEditorToolbar({
         }
         disabled={!canRedo}
         label="Redo"
-        tooltip="Redo (Shift+Ctrl/Cmd+Z)"
+        tooltip={redoShortcutLabel(isMacPlatform(navigator.platform))}
         onClick={onRedo}
       >
         <Redo2 className="text-current" />
