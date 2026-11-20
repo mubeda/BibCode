@@ -633,7 +633,7 @@ async function measureTextField(kind: "composer" | "textarea", path: InputPath):
     if (kind === "composer") await browser.$(composerSelector).addValue("cmpq");
     else await browser.$(`#${probeTextareaId}`).addValue("cmpq");
   } else typeNative("cmpq");
-  await browser.waitUntil(async () => (await fieldText(kind)).includes("cmpq"), {
+  await browser.waitUntil(async () => (await fieldText(kind)).toLowerCase().includes("cmpq"), {
     timeoutMsg: `The typed text never reached the ${kind}.`,
   });
   await new Promise((resolve) => setTimeout(resolve, 800));
@@ -644,7 +644,7 @@ async function measureTextField(kind: "composer" | "textarea", path: InputPath):
   const events = await readProbe();
   recordEvidence({
     cell: `${kind}-undo-${path}`,
-    passed: !text.includes("cmpq"),
+    passed: !text.toLowerCase().includes("cmpq"),
     chordKeydownReachedPage: chordKeydownReachedPage(events),
     text,
     sent,
@@ -653,7 +653,8 @@ async function measureTextField(kind: "composer" | "textarea", path: InputPath):
   if (kind === "textarea") {
     await browser.execute((id: string) => document.getElementById(id)?.remove(), probeTextareaId);
   }
-  expect(text).not.toContain("cmpq");
+  // macOS may capitalize the typed word as a replacement step, which is not an undo.
+  expect(text.toLowerCase()).not.toContain("cmpq");
 }
 
 /**
