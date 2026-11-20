@@ -2172,7 +2172,7 @@ describe("disk watching wiring", () => {
     renderPanel(baseProps());
     const session = testState.session as unknown as DiskSession;
     const surface = fakeSurface();
-    harness.refs[1]!.current = surface.element;
+    harness.refs[2]!.current = surface.element;
     stubVisibleWindow();
     const cleanups = harness.runEffects();
 
@@ -2242,7 +2242,7 @@ describe("effects wiring", () => {
   it("installs the editor dismissal handler on the surface", () => {
     renderWithEffects();
     const surface = fakeSurface();
-    harness.refs[1]!.current = surface.element;
+    harness.refs[2]!.current = surface.element;
     harness.runEffects();
     expect(testState.installFileEditorDismissal).toHaveBeenCalledTimes(1);
     const input = testState.installFileEditorDismissal.mock.calls[0]![0] as {
@@ -2260,7 +2260,7 @@ describe("effects wiring", () => {
   it("saves explicitly on the scoped mod+s chord", () => {
     renderWithEffects();
     const surface = fakeSurface();
-    harness.refs[1]!.current = surface.element;
+    harness.refs[2]!.current = surface.element;
     const cleanups = harness.runEffects();
     const handler = surface.listeners.get("keydown");
     expect(handler).toBeDefined();

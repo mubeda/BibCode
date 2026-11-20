@@ -1,0 +1,101 @@
+import { type RefObject, useEffect } from "react";
+
+/** The undo and redo the Files toolbar buttons run. */
+export interface FilesEditHistory {
+  undo(): void;
+  redo(): void;
+}
+
+/** Menu actions the macOS desktop host sends for Edit > Undo and Edit > Redo. */
+export type EditMenuAction = "edit-undo" | "edit-redo";
+
+export function isEditMenuAction(action: string): action is EditMenuAction {
+  return action === "edit-undo" || action === "edit-redo";
+}
+
+const regions = new Map<Element, FilesEditHistory>();
+
+/** Registers a Files editing region with its history; the returned function removes it. */
+export function registerFilesEditRegion(region: Element, history: FilesEditHistory): () => void {
+  regions.set(region, history);
+  return () => {
+    if (regions.get(region) === history) regions.delete(region);
+  };
+}
+
+function deepActiveElement(doc: Document): Element | null {
+  let active = doc.activeElement;
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+  return active;
+}
+
+/**
+ * The history of the Files region holding focus, when focus is on editable text: the source
+ * editor's content element or the rendered editor, across shadow roots. A text field inside the
+ * region, such as the inline comment textarea, is not editable text and keeps its own undo.
+ */
+export function focusedFilesEditHistory(doc: Document = document): FilesEditHistory | null {
+  const active = deepActiveElement(doc);
+  if (!(active instanceof HTMLElement) || !active.isContentEditable) return null;
+  for (let node: Node | null = active; node;) {
+    const history = node instanceof Element ? regions.get(node) : undefined;
+    if (history) return history;
+    node = node.parentNode instanceof ShadowRoot ? node.parentNode.host : node.parentNode;
+  }
+  return null;
+}
+
+/**
+ * Runs Edit > Undo or Redo: the focused Files history, or else the browser's own undo, which is
+ * what the predefined menu item ran. During a composition the input method keeps the native path.
+ */
+export function runEditMenuAction(
+  action: EditMenuAction,
+  composing: boolean,
+  doc: Document = document,
+): void {
+  const history = composing ? null : focusedFilesEditHistory(doc);
+  if (history) {
+    if (action === "edit-undo") history.undo();
+    else history.redo();
+    return;
+  }
+  doc.execCommand(action === "edit-undo" ? "undo" : "redo");
+}
+
+/** Listens for the desktop Edit menu actions on every route of the app. */
+export function useEditMenuActions(): void {
+  useEffect(() => {
+    const onMenuAction = window.desktopBridge?.onMenuAction;
+    if (typeof onMenuAction !== "function") return;
+    let composing = false;
+    const start = () => {
+      composing = true;
+    };
+    const end = () => {
+      composing = false;
+    };
+    document.addEventListener("compositionstart", start, true);
+    document.addEventListener("compositionend", end, true);
+    const unsubscribe = onMenuAction((action) => {
+      if (isEditMenuAction(action)) runEditMenuAction(action, composing);
+    });
+    return () => {
+      document.removeEventListener("compositionstart", start, true);
+      document.removeEventListener("compositionend", end, true);
+      unsubscribe?.();
+    };
+  }, []);
+}
+
+/** Registers `regionRef`'s element as a Files editing region while `history` exists. */
+export function useFilesEditRegion(
+  regionRef: RefObject<HTMLElement | null>,
+  history: FilesEditHistory | null,
+): void {
+  useEffect(() => {
+    const region = regionRef.current;
+    if (!region || !history) return;
+    return registerFilesEditRegion(region, history);
+  }, [regionRef, history]);
+}

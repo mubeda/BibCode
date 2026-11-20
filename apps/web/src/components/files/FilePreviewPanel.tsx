@@ -83,6 +83,7 @@ import { useInsertImage } from "./richMarkdown/useInsertImage";
 import type { RichMarkdownEditor } from "./richMarkdown/richMarkdownExtensions";
 import { FileMediaPreview } from "./FileMediaPreview";
 import { preloadRichMarkdownSurface, RichMarkdownView } from "./RichMarkdownView";
+import { type FilesEditHistory, useFilesEditRegion } from "./editMenuHistory";
 import { explainUndeliveredEdit, saveFile, useFileSaveShortcut } from "./useFileSaveShortcut";
 import {
   filePreviewKind,
@@ -897,6 +898,15 @@ export default function FilePreviewPanel({
   const richEditable = richMode?.editable === true && richEditor !== null;
   const activeRichEditor = renderMarkdown && richEditable ? (richEditor ?? null) : null;
   const [linkDialogOpen, setLinkDialogOpen] = useState(false);
+  // One history for the toolbar buttons and the desktop Edit menu.
+  const editHistory = useMemo<FilesEditHistory | null>(() => {
+    if (activeRichEditor) {
+      return { undo: () => activeRichEditor.undo(), redo: () => activeRichEditor.redo() };
+    }
+    return session ? { undo: () => session.undo(), redo: () => session.redo() } : null;
+  }, [activeRichEditor, session]);
+  const editRegionRef = useRef<HTMLDivElement>(null);
+  useFilesEditRegion(editRegionRef, editHistory);
   const richMarkdownWorkspace = useMemo(
     () => ({
       environmentId,
@@ -1122,8 +1132,8 @@ export default function FilePreviewPanel({
           onSave={() => {
             if (session) saveFile(session);
           }}
-          onUndo={() => (activeRichEditor ? activeRichEditor.undo() : session?.undo())}
-          onRedo={() => (activeRichEditor ? activeRichEditor.redo() : session?.redo())}
+          onUndo={() => editHistory?.undo()}
+          onRedo={() => editHistory?.redo()}
         />
       ) : null}
       {activeRichEditor && linkDialogOpen ? (
@@ -1153,6 +1163,7 @@ export default function FilePreviewPanel({
       ) : null}
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <div
+          ref={editRegionRef}
           className={cn(
             "min-w-0 flex-1 flex-col overflow-hidden",
             relativePath ? "flex" : "hidden",
