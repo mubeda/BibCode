@@ -157,22 +157,28 @@ from the thread's runtime mode. In `full-access` it selects the `allow_once`
 option, not `allow_always`, so a later switch to approval-required takes effect
 on the next request; the shared `acp_mode::auto_approved_option_id` prefers
 `allow_always`, so the Antigravity runtime picks the option itself. If no
-`allow_once` option is offered, the request goes to the user. Other modes
-always ask the user. A flag on `agy acp` would fix the policy for the process
+`allow_once` option is offered, the request goes to the user. Outside full
+access BiBCode never answers a permission request by itself, whatever the mode
+(plan interaction mode included, because whether `plan` runs tools without
+asking is unverified). A flag on `agy acp` would fix the policy for the process
 and ignore a thread switched to approval-required later. Cancelling a turn
 abandons pending requests (ACP page), so the runtime drops its pending
-approvals on cancel.
+approvals on cancel, and an answer that arrives after cancel is discarded.
 
 Modes. The CLI advertises `default` (ask before edits and commands),
-`accept-edits`, `auto` and `plan` (measured). The runtime maps them by id, not
-through the alias search in `acp_mode::resolve_requested_mode_id`:
-`approval-required` to `default`, `auto-accept-edits` to `accept-edits`,
-`full-access` to `auto`, and plan interaction mode to `plan`, each sent with
-`session/set_mode`. If the mode a thread needs is not advertised, the start is
-refused, failing closed as `runtime_mode` does for an unknown mode (issue 376;
-owner ruling, 2026-11-20). BiBCode never auto-answers a permission request in
-`approval-required`, which a C1 test pins. Actions the user's own Antigravity
-rules allow still never prompt (ACP page); the provider guide states it.
+`accept-edits`, `auto` and `plan`, both as `modes.availableModes` and as the
+`mode` config option (measured). The runtime sets modes through the `mode`
+config option by id and never through `acp_mode::resolve_requested_mode_id`,
+whose fallback to the current or first non-plan mode would weaken approval:
+`approval-required` sets `default`, `auto-accept-edits` sets `accept-edits`,
+`full-access` sets `auto`, and plan interaction mode sets `plan`. For
+approval-required the runtime waits for the acknowledgement of `default`
+before the first prompt; a missing or rejected `default` refuses the start,
+failing closed as `runtime_mode` does for an unknown mode (issue 376; owner
+ruling, 2026-11-20). `session/set_config_option` answers with the full
+`configOptions` list and emits `config_option_update` and
+`current_mode_update` (measured). Actions the user's own Antigravity rules
+allow still never prompt (ACP page); the provider guide states it.
 
 Why not the flag for full access. `agy acp --help` lists
 `--dangerously-skip-permissions` (measured), and the coordinator asked whether
@@ -234,20 +240,24 @@ first real chat session. No path exists for a driver to publish models back
 into the inventory (`PublishedProviderInventory` is read by the factory, not
 written by drivers), so the model picker would stay empty.
 
-Chat. The catalog keeps the option id and value ids exactly as the session
-advertised them, and the chat sends them back unchanged through
-`session/set_config_option` with the advertised `configId`. Cursor's parser
-recognizes a thinking level by category while its setter expects fixed wire ids
-(`cursor/model.rs`), so the Antigravity runtime does not reuse the Cursor
-setter. If only the ACP `models` shape is advertised, the model goes through
-`session/set_model`, which no live run has exercised. An option the session does
+Model and effort contract (shared by the runtime, the inventory and the
+terminal). The existing ACP option parser publishes the `thought_level`
+category under the BiBCode option id `reasoning` (`provider/cursor/model.rs`
+near line 505), so `reasoning` is the BiBCode id for the thinking level, and
+the runtime writes it back with `configId` `thought_level`. The model is
+written with `configId` `model` and the unsuffixed value the catalog
+advertised. Every write is `session/set_config_option` with
+`{ sessionId, configId, value }`; an unknown value fails with `-32602`
+(measured). When only `models.availableModels` exists, the suffixed model ids
+are sent unchanged through `session/set_model`, which no live run has
+exercised. The Cursor setter, which expects fixed wire ids, is not reused. An option the session does
 not advertise is rejected with the existing "unsupported option" error, and
 one failed option does not undo the others. The shared `auto` model sentinel
 is stripped before any send, as the server already does for other drivers.
 
 Terminal. `--model` and `--effort` come only from the raw
-`settings.providerSessionDefaults.antigravity` value: `model`, and the first
-option whose id is in `PROVIDER_EFFORT_OPTION_IDS`. The resolver's fallback
+`settings.providerSessionDefaults.antigravity` value: `model`, and the
+option with id `reasoning` (one of `PROVIDER_EFFORT_OPTION_IDS`). The resolver's fallback
 never adds them. R12 passes the flags only when session defaults supply them,
 and that holds with a catalog too. Without a configured default, the TUI starts
 on its own default model.
@@ -320,7 +330,10 @@ from an interactive `agy` or `agy acp --login` is used. An error with code
 `ProviderRuntimeError::Provider` with the message "Antigravity is not signed
 in. Open an Antigravity Terminal and run `agy`, or run `agy acp --login`, then
 send the message again." Code `-32000` is a generic JSON-RPC server error, so
-any other `-32000` message passes through unchanged.
+any other `-32000` message passes through unchanged. The sign-in error and the
+D-A4 version error are final for that start: the durable launch path must not
+retry them, they appear in the thread once, no prompt is written, and the
+terminal stays available.
 
 Lost: offering `terminal-login` or `oauth-personal` through `authenticate`. Both
 start a sign-in BiBCode would have to drive.
@@ -343,17 +356,22 @@ replay history as `session/update` notifications, so the runtime drops every
 update that arrives before the reopen call returns, and every update whose
 `sessionId` is not the open session's. BiBCode's own projected transcript stays
 the record the user sees; the agent keeps its server-side context. If neither
-capability is advertised, the driver starts `session/new`. If the reopen fails
-permanently, the driver
-starts `session/new` and returns the new id. The runtime already treats a
+capability is advertised, the driver starts `session/new`.
+
+Load cannot detect a lost conversation: `session/load` of an unknown id
+succeeds and returns a session with that id (measured on 1.5.13). Resume is
+therefore tried first, and its `-32603` "Failed to read session" answer is the
+missing-session signal (measured); `session/resume` of a closed session from a
+new process succeeds with no replayed update (measured). On that signal the
+driver starts `session/new` and returns the new id. The runtime treats a
 returned id that differs from the requested one as a lost resume
-(`resume_lost` in `provider_runtime.rs`, near line 9830) and sets the context
-handoff for the next turn, or fails a frozen delivery with
-`FrozenConversationLost`. "Permanently" needs its own rule:
-`session_load_is_permanently_gone` matches Cursor's message text, so the
-Antigravity runtime matches "not found" and the `-32603` "trajectory not found"
-the research reports, and treats any other error as transient (the saved id is
-kept). The exact `agy` missing-session error is unverified. C1 tests pin
+(`resume_lost` in `provider_runtime.rs`, near line 9830). For an ordinary turn
+that sets the context handoff for the next turn. `FrozenConversationLost` is
+raised only when the launch asks to abort on a lost resume
+(`abort_on_lost_resume`) for a frozen delivery; other frozen deliveries are
+released by `release_frozen_delivery`. Any other reopen error is transient and
+keeps the saved id. Load is used only when resume is not advertised, and then
+a lost conversation is not detectable. C1 tests pin
 resume, load, neither capability, a replayed update, a stale-session update, a
 transient failure, a sign-in failure, and a missing session; C2 tests a missing
 session with an ordinary and a frozen delivery.
@@ -540,12 +558,10 @@ Sites the command does not find, found by reading the callers:
   enabled entry when the saved instance is disabled, and Antigravity has no
   `DEFAULT_GIT_TEXT_GENERATION_MODEL_BY_PROVIDER` entry. With a catalog it
   takes the first catalog model; without one it creates a selection with an
-  empty model. The server routing for git text generation was not traced for
-  this note; it is inferred to run through the same chat drivers as Cursor's,
-  so Antigravity gets no exclusion; the C4 task adds a test that
-  an empty-catalog fallback does not pick Antigravity over a built-in with a
-  model, or, if that test shows the existing behaviour already picks an empty
-  model for other drivers, records it as a follow-up.
+  empty model. Plan review 3 found that the commit-message RPC does not route
+  through the chat drivers, so nothing is added there. The web task (3.9)
+  makes the fallback skip an enabled, ready Antigravity entry with an empty
+  catalog when a usable provider follows, with a test in `modelSelection.ts`.
 - Inventory, settings and launch disagree on an instance without `enabled`.
   The inventory inherits the legacy driver value (`false` for Antigravity),
   while `ProviderInstanceState` decodes a missing value as `true`
