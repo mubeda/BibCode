@@ -191,6 +191,47 @@ describe("useEditMenuActions and useFilesEditRegion", () => {
     send("edit-undo");
     expect(files.undo).toHaveBeenCalledTimes(1);
   });
+
+  it("forgets a composition whose editor went away before it ended", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const execCommand = vi.fn<(command: string) => boolean>(() => true);
+    document.execCommand = execCommand as unknown as Document["execCommand"];
+    let listener: ((action: string) => void) | null = null;
+    Object.assign(window, {
+      desktopBridge: {
+        onMenuAction: (next: (action: string) => void) => {
+          listener = next;
+          return () => {};
+        },
+      },
+    });
+    function Listener() {
+      useEditMenuActions();
+      return null;
+    }
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<Listener />));
+    const files = history();
+    const regionElement = document.createElement("div");
+    document.body.append(regionElement);
+    const unregister = registerFilesEditRegion(regionElement, files);
+    const first = editable(regionElement);
+    first.focus();
+    first.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true, composed: true }),
+    );
+    first.remove();
+    editable(regionElement).focus();
+
+    (listener as ((action: string) => void) | null)?.("edit-undo");
+
+    expect(files.undo).toHaveBeenCalledTimes(1);
+    expect(execCommand).not.toHaveBeenCalled();
+    unregister();
+    await act(async () => root.unmount());
+  });
 });
 
 describe("Linux text-field undo chords (#408)", () => {
