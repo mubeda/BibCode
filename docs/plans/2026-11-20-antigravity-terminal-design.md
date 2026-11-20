@@ -1,6 +1,8 @@
 # Antigravity terminal and chat: design (issue 399)
 
-Status: reviewed by Codex and the advisor; see "Review record".
+Status: reviewed 2026-11-20 by Codex (verdict "Needs rework") and the
+advisor. All findings were processed (see "Review record"); the fixes were
+checked by the advisor and not reviewed again by Codex.
 
 Scope. Issue 399 asks for an Antigravity AI Terminal that starts the `agy` TUI.
 On 2026-11-20 the owner decided that the same pull request also builds an
@@ -20,28 +22,30 @@ the labs.
 Each fact was read on 2026-11-20 through a summarizing fetch, not by running
 the CLI.
 
-| Fact                                                                                                                                                                                                                | Source                                  | Status                |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- | --------------------- |
-| `--model` selects the session model (see `agy models`).                                                                                                                                                             | CLI reference, command-line flags table | Read                  |
-| `--effort` sets reasoning effort, `low` through `max` depending on the model.                                                                                                                                       | CLI reference                           | Read                  |
-| `--dangerously-skip-permissions` auto-approves all tool permission requests.                                                                                                                                        | CLI reference                           | Read                  |
-| `-c` and `--continue` continue the latest conversation; `--conversation` resumes one by id.                                                                                                                         | CLI reference                           | Read                  |
-| The reference does not list `--version`.                                                                                                                                                                            | CLI reference                           | Read                  |
-| `agy --version` verifies the installation.                                                                                                                                                                          | Getting started page, CLI tab           | Read                  |
-| Plain `agy` launches the interactive TUI in the current directory.                                                                                                                                                  | Getting started page, commands table    | Read                  |
-| The first launch asks for a colour scheme, Alt-Screen or Inline mode, and workspace trust.                                                                                                                          | Getting started page                    | Read                  |
-| Every editor client registers command `agy` with the single argument `acp`.                                                                                                                                         | Docs, IDE extensions, ACP page          | Read                  |
-| Flags after `acp` include `--add-dir`, `--agent`, `--sandbox`, `--dangerously-skip-permissions`, `--process-per-session` (required for HTTP MCP servers the editor configures), `--login` and `--log-file`.         | Docs, IDE extensions, ACP page          | Read                  |
-| Auth method ids are `oauth-personal`, `oauth-business`, `gemini-api-key`, `agent-platform` and `terminal-login`; unauthenticated requests fail with `Authentication required` (code `-32000`).                      | Docs, IDE extensions, ACP page          | Read                  |
-| `agy acp` reuses the credentials cached by an interactive `agy` session or `agy acp --login`.                                                                                                                       | Docs, CLI ACP page                      | Read                  |
-| The server supports loading, resuming, listing and closing sessions; resuming does not replay history.                                                                                                              | Docs, IDE extensions, ACP page          | Read                  |
-| The server exposes two session options shown as pickers: the account's models and a thinking level (`Low`, `Medium`, `High`, `Extra`, `Max`). Method names and option ids are not stated.                           | Docs, IDE extensions, ACP page          | Read; ids unconfirmed |
-| Questions use ACP elicitation forms in clients that support them; no extension method is named.                                                                                                                     | Docs, IDE extensions, ACP page          | Read                  |
-| Permission requests offer Allow and Deny; actions the user's own rules allow or deny do not prompt; cancelling a turn abandons pending permission requests.                                                         | Docs, IDE extensions, ACP page          | Read                  |
-| Neither ACP page states a minimum CLI version; both say to run `agy acp --help` to confirm support.                                                                                                                 | Docs, both ACP pages                    | Read                  |
-| Provider failures end `session/prompt` with `stopReason: end_turn` and the error only as message text.                                                                                                              | Research report, upstream issue 1570    | Research, not re-read |
-| `agy acp` shipped in 1.5.0 (third-party tracker); Orca gates host ACP at 1.5.2 (Orca source).                                                                                                                       | Research report and its addendum        | Third-party           |
-| The FAQ says wrapping `agy` in third-party tools is not supported on consumer plans; a forum reply on Google's behalf says the unmodified official ACP server is supported for single-user interactive development. | Research report, terms section          | Research, conflicting |
+| Fact                                                                                                                                                                                                                                                                                                                                                           | Source                                              | Status                |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | --------------------- |
+| `--model` selects the session model (see `agy models`).                                                                                                                                                                                                                                                                                                        | CLI reference, command-line flags table             | Read                  |
+| `--effort` sets reasoning effort, `low` through `max` depending on the model.                                                                                                                                                                                                                                                                                  | CLI reference                                       | Read                  |
+| `--dangerously-skip-permissions` auto-approves all tool permission requests.                                                                                                                                                                                                                                                                                   | CLI reference                                       | Read                  |
+| `-c` and `--continue` continue the latest conversation; `--conversation` resumes one by id.                                                                                                                                                                                                                                                                    | CLI reference                                       | Read                  |
+| The reference does not list `--version`.                                                                                                                                                                                                                                                                                                                       | CLI reference                                       | Read                  |
+| `agy --version` verifies the installation.                                                                                                                                                                                                                                                                                                                     | Getting started page, CLI tab                       | Read                  |
+| Plain `agy` launches the interactive TUI in the current directory.                                                                                                                                                                                                                                                                                             | Getting started page, commands table                | Read                  |
+| The first launch asks for a colour scheme, Alt-Screen or Inline mode, and workspace trust.                                                                                                                                                                                                                                                                     | Getting started page                                | Read                  |
+| Every editor client registers command `agy` with the single argument `acp`.                                                                                                                                                                                                                                                                                    | Docs, IDE extensions, ACP page                      | Read                  |
+| Flags after `acp` include `--add-dir`, `--agent`, `--sandbox`, `--dangerously-skip-permissions`, `--process-per-session` (required for HTTP MCP servers the editor configures), `--login` and `--log-file`.                                                                                                                                                    | Docs, IDE extensions, ACP page                      | Read                  |
+| Auth method ids are `oauth-personal`, `oauth-business`, `gemini-api-key`, `agent-platform` and `terminal-login`; unauthenticated requests fail with `Authentication required` (code `-32000`).                                                                                                                                                                 | Docs, IDE extensions, ACP page                      | Read                  |
+| `agy acp` reuses the credentials cached by an interactive `agy` session or `agy acp --login`.                                                                                                                                                                                                                                                                  | Docs, CLI ACP page                                  | Read                  |
+| The server supports loading, resuming, listing and closing sessions; resuming does not replay history.                                                                                                                                                                                                                                                         | Docs, IDE extensions, ACP page                      | Read                  |
+| The server exposes two session options shown as pickers: the account's models and a thinking level (`Low`, `Medium`, `High`, `Extra`, `Max`). Method names and option ids are not stated.                                                                                                                                                                      | Docs, IDE extensions, ACP page                      | Read; ids unconfirmed |
+| Questions use ACP elicitation forms in clients that support them; no extension method is named.                                                                                                                                                                                                                                                                | Docs, IDE extensions, ACP page                      | Read                  |
+| Permission requests offer Allow and Deny; actions the user's own rules allow or deny do not prompt; cancelling a turn abandons pending permission requests.                                                                                                                                                                                                    | Docs, IDE extensions, ACP page                      | Read                  |
+| Neither ACP page states a minimum CLI version; both say to run `agy acp --help` to confirm support.                                                                                                                                                                                                                                                            | Docs, both ACP pages                                | Read                  |
+| Provider failures end `session/prompt` with `stopReason: end_turn` and the error only as message text.                                                                                                                                                                                                                                                         | Research report, upstream issue 1570                | Research, not re-read |
+| `agy acp` was added in 1.5.0; 1.5.1 fixed session close, reload and resume during a prompt; 1.5.4 fixed turns hanging on a second permission approval and modes dropping on reload or resume.                                                                                                                                                                  | Google CLI changelog                                | Read                  |
+| Orca gates host ACP at 1.5.2.                                                                                                                                                                                                                                                                                                                                  | Research addendum (Orca source)                     | Research, not re-read |
+| ACP spec: `session/load` takes `sessionId`, `cwd` and `mcpServers`, and the agent MUST replay the conversation as `session/update` notifications; `session/resume` and `session/close` are advertised by `agentCapabilities.sessionCapabilities.resume` and `.close`; on a protocol version mismatch the client SHOULD close the connection and tell the user. | ACP spec v1, initialization and session-setup pages | Read                  |
+| The FAQ says wrapping `agy` in third-party tools is not supported on consumer plans; a forum reply on Google's behalf says the unmodified official ACP server is supported for single-user interactive development.                                                                                                                                            | Research report, terms section                      | Research, conflicting |
 
 ## Decisions
 
@@ -160,7 +164,11 @@ CLI's default agent mode changed to Auto in 1.5.7 (research). If the session
 advertises modes, `acp_mode::resolve_requested_mode_id` picks an "ask" mode as
 for Cursor; if it advertises none, BiBCode sends no `session/set_mode` and the
 CLI's own rules decide. The provider guide states this, because
-approval-required cannot be stricter than the user's Antigravity rules.
+approval-required cannot be stricter than the user's Antigravity rules. This
+departs from the repository's fail-closed rule for an unknown runtime mode
+(`runtime_mode` in `provider_runtime.rs`, issue 376): failing closed here would
+mean refusing an approval-required chat whenever no "ask" mode is advertised.
+That trade-off is an open question for the owner.
 
 Lost for the terminal: no flag, so the TUI prompts (the research's first
 advice). Lost for the chat: Orca's flag on `agy acp`. Lost for both: a
@@ -186,10 +194,18 @@ returns the D-A8 sign-in error. The quick probe is unchanged: like every driver
 except OpenCode, it reads ready once the executable resolves.
 
 Retention. `merge_provider_snapshot` in `control.rs` already keeps the last
-models when a refresh is not a rich one. C3 extends it to keep the last `auth`
-the same way when the refreshed snapshot's auth is `unknown`, and a refresh
-whose binary path changed starts clean (the existing identity check). A
-successful full probe after sign-in replaces it.
+models when a refresh is not a rich one, for the same instance id and driver
+(`provider_snapshot_identity`; the binary path is not part of the identity). C3
+extends it, for the `antigravity` driver only, to keep the last `auth` the same
+way when the refreshed snapshot's auth is `unknown`. Other drivers keep their
+current behaviour. A changed binary path is not detected by the merge, so the
+old auth shows until the next full probe replaces it; a successful full probe
+after sign-in replaces it too.
+
+Frequency. A full probe runs on a client subscription, on a settings change and
+on the background check (`FullProviderRefreshTrigger` in `control.rs`). Each
+full probe of an enabled Antigravity instance creates and closes one session in
+the user's account.
 
 This is new behaviour. The Cursor probe asks `cursor/list_available_models`
 and creates no session. The Antigravity probe creates and closes one empty
@@ -301,8 +317,9 @@ start a sign-in BiBCode would have to drive.
 The ACP `sessionId` is the resume token, stored in the turn's resume cursor as
 for Cursor (`provider_runtime.rs` `cursor_field` `"sessionId"`). After a server
 restart the driver reopens the saved session. It prefers `session/resume` when
-the initialize result advertises it (Google's 1.5.0 changelog describes resume
-without replay). Otherwise, when `loadSession` is advertised, it calls
+the initialize result advertises it under
+`agentCapabilities.sessionCapabilities.resume` (ACP spec; the Antigravity ACP
+page says resuming does not replay history). Otherwise, when `loadSession` is advertised, it calls
 `session/load` with `sessionId`, the checkout `cwd` and the empty `mcpServers`
 the ACP spec requires (Cursor sends only `sessionId`). The ACP spec lets load
 replay history as `session/update` notifications, so the runtime drops every
@@ -368,6 +385,9 @@ Not supported in the first version:
   `exits::report_exit(Watch::Failures, ...)` with `kind: "provider"` in the
   shared session pump (near line 12227), which every driver feeds through
   `exited_process`, so it becomes a `subprocess.crash`.
+- The D-A4 `<binary> --version` check runs as a short-lived child through the
+  `ProcessRunner` path the inventory's `run_command` uses for `--version`,
+  with `PROBE_TIMEOUT` and an output limit, so it is bounded and reaped.
 - A start that fails during the version check, `initialize` or the session
   open goes through the existing startup-failure shutdown, which kills and
   reaps the child; `report_exit` covers exits after the session pump starts,
@@ -505,8 +525,9 @@ Sites the command does not find, found by reading the callers:
   enabled entry when the saved instance is disabled, and Antigravity has no
   `DEFAULT_GIT_TEXT_GENERATION_MODEL_BY_PROVIDER` entry. With a catalog it
   takes the first catalog model; without one it creates a selection with an
-  empty model. Text generation through an ACP chat driver is the same path
-  Cursor uses, so Antigravity gets no exclusion; the C4 task adds a test that
+  empty model. The server routing for git text generation was not traced for
+  this note; it is inferred to run through the same chat drivers as Cursor's,
+  so Antigravity gets no exclusion; the C4 task adds a test that
   an empty-catalog fallback does not pick Antigravity over a built-in with a
   model, or, if that test shows the existing behaviour already picks an empty
   model for other drivers, records it as a follow-up.
@@ -553,7 +574,7 @@ the phase, the plan and the integration phase's inputs.
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
 | C1. ACP session runtime       | create `apps/server/src/provider/antigravity/{mod.rs,runtime.rs}`; modify `apps/server/src/provider/mod.rs`                                        | A fixture ACP peer over in-memory pipes, like the `grok/runtime.rs` tests: `initialize` with protocol 1 and no `authenticate`; a peer answering another protocol version is refused; `session/new` with cwd and empty `mcpServers`; resume, load and neither capability (D-A9); replayed and stale-session updates dropped; transient, missing-session and `-32000` failures; `allow_once` in full-access, a missing option, approval-required, a mode change, cancel with a pending approval; an unanswered cancel and an empty `end_turn`; secret markers stay out of logs. | `cargo test -p bibcode-server antigravity`                                                                                                                | 3.2         |
 | C2. Runtime dispatch          | modify `apps/server/src/production/provider_runtime.rs`                                                                                            | Through the existing scripted executable `ACP_FIXTURE` and `literal_delivery_acp`: a chat start for the default and a custom `antigravity` instance spawns `<binary> acp` with the checkout as cwd and no bypass flag; the 1.5.4 launch check (1.5.3 refused with its message, 1.5.4 and an unparsable line allowed); an inert child that exits during `initialize`; delivery outcomes (not sent, rejected, ambiguous, accepted); a missing session with an ordinary and a frozen delivery; the adapter key and line-too-long tables; error labels.                           | `cargo test -p bibcode-server provider_runtime` and `cargo test -p bibcode-server turn_delivery`                                                          | C1          |
-| C3. Inventory auth and models | modify `apps/server/src/production/provider_inventory.rs`, `apps/server/src/production/control.rs`                                                 | With a scripted executable written like the existing version fixtures: the slow probe sends `initialize`, `session/new` and `session/close` and yields models and thinking levels in both the `configOptions` and the `models` shape; `-32000` `Authentication required` reads unauthenticated with status `ready`; any other error keeps custom models; the quick probe starts no ACP process and keeps the last auth and models; a changed binary path starts clean; a disabled instance is not probed.                                                                     | `cargo test -p bibcode-server provider_inventory` and `cargo test -p bibcode-server control`                                                              | 3.2         |
+| C3. Inventory auth and models | modify `apps/server/src/production/provider_inventory.rs`, `apps/server/src/production/control.rs`                                                 | With a scripted executable written like the existing version fixtures: the slow probe sends `initialize`, `session/new` and `session/close` and yields models and thinking levels in both the `configOptions` and the `models` shape; `-32000` `Authentication required` reads unauthenticated with status `ready`; any other error keeps custom models; the quick probe starts no ACP process and keeps the last auth and models for `antigravity` only; a disabled instance is not probed.                                                                                  | `cargo test -p bibcode-server provider_inventory` and `cargo test -p bibcode-server control`                                                              | 3.2         |
 | C4. Web terminal and chat     | modify `providerTerminalActions.ts`, `providerDriverMeta.ts`, `providerIconUtils.ts`, `session-logic.ts`, the Settings card files, and their tests | Terminal argv cases of Task 3.4 step 1 with the raw-default and lower-case effort rules; the menu lists Antigravity chat and terminal for a ready instance; the Settings card has binary path `agy`, writes `enabled` explicitly and shows the session-defaults control; the saved default reaches argv; one production-shaped test from an inventory snapshot through the menu to the terminal-open request in `ChatView`; the text-generation fallback case.                                                                                                                | `cd apps/web && node ../../scripts/run-local-vp.mjs test run --project unit src/components/chat src/components/settings src/components/ChatView.test.tsx` | 3.2, C2, C3 |
 | C5. Provider guide            | create `docs/providers/antigravity.md`; modify `docs/providers/README.md`, `docs/architecture/providers.md`, `docs/README.md`                      | None (documentation). The guide covers the points in D-A3, D-A5, D-A6, D-A8, D-A10, D-A14 and D-A15, and the AI Terminal notes in `docs/user/workspace-ui.md` link to it (integration phase).                                                                                                                                                                                                                                                                                                                                                                                 | `vp run check:markdown-links` and `vp check`                                                                                                              | C1 to C4    |
 
@@ -599,13 +620,20 @@ machine, which this plan cannot automate.
    chat ships publicly (research recommendation)?
 3. Keep one stored model and effort default for chat and terminal (R12 as
    written, D-A6), or add a CLI-only terminal default, which changes R12?
+4. In approval-required mode with no "ask" mode advertised, let the CLI's own
+   rules decide (D-A5), or refuse the chat start to fail closed as issue 376
+   does for unknown modes?
 
 ## Review record
 
 Codex `gpt-6.2-sol` at effort `high`, read-only, reviewed the note at commit
 `9baf86244` on 2026-11-20. Verdict: Needs rework. The advisor (the executing
 session's reviewer model) reviewed the same draft. Each finding was checked
-against the code or the docs before it was applied. Rejected findings: none.
+against the code or the docs before it was applied; the ACP spec's
+initialization and session-setup pages and Google's CLI changelog were read
+on 2026-11-20 for findings 1 and 2. No finding was rejected outright. Two were
+fixed only in part (7 and 9) and one advisor point was declined in part
+(fail-closed approval mode, below); each is listed.
 
 | Source            | Finding                                                                                                                       | Outcome                                                                                                                                                                                                     |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -625,5 +653,18 @@ against the code or the docs before it was applied. Rejected findings: none.
 | Advisor           | Text generation can pick Antigravity as a fallback.                                                                           | Fixed. A bullet after the table assigns a C4 test.                                                                                                                                                          |
 | Advisor           | `vp check` on one file did not run the linter.                                                                                | Fixed. Full `vp check` run; result in the lane report.                                                                                                                                                      |
 
-The approval of this note (spec D6) needs the advisor's confirmation of these
-fixes; the coordinator adds its own advisor review afterwards.
+Second advisor round, on the revised note:
+
+| Source  | Finding                                                                                      | Outcome                                                                                                             |
+| ------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Advisor | ACP spec claims came from Codex's text, unread.                                              | Fixed. Read the spec's initialization and session-setup pages; the facts table cites them.                          |
+| Advisor | The resume citation pointed at a changelog entry that does not mention resume.               | Fixed. D-A9 cites the ACP spec and the Antigravity ACP page; the changelog row is corrected.                        |
+| Advisor | `merge_provider_snapshot` identity does not include the binary path; auth retention widened. | Fixed. Read `provider_snapshot_identity`; retention is scoped to `antigravity` and the binary-path limit is stated. |
+| Advisor | Probe frequency and the version-check child's supervision were unstated.                     | Fixed. D-A6 states the triggers; D-A11 covers the `ProcessRunner` child.                                            |
+| Advisor | Approval-required with no advertised modes is not fail-closed (issue 376).                   | Declined in part. The design keeps the CLI's own rules for that case and lists the trade-off as open question 4.    |
+| Advisor | Text-generation routing was untraced.                                                        | Fixed. Labelled inferred.                                                                                           |
+| Advisor | The status line hid Codex's verdict.                                                         | Fixed.                                                                                                              |
+
+Tally. Codex: 13 findings, 11 fixed, 2 fixed in part, 0 rejected. Advisor:
+14 points, 13 fixed, 1 declined in part. The coordinator adds its own advisor
+review afterwards.
