@@ -17,6 +17,7 @@ import {
   composerProviderProfiles,
   completeDesktopUiSlowTurn,
   deferDesktopUiTestContextCleanupUntilExit,
+  fixtureToolProbeProblem,
   prepareDesktopUiTestContext,
   type DesktopUiDirectoryRemover,
   type DesktopUiExitRegistrar,
@@ -147,6 +148,25 @@ describe.each([
     expect(environment.BIBCODE_E2E_SHIM_DIRECTORY).toBe(context.shimDirectory);
   });
 
+  it("isolates maintained tools: a fixture codegraph first on PATH and no latest-version lookups", () => {
+    const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: platform };
+    const context = prepareDesktopUiTestContext(environment);
+    contexts.push(context);
+    const settings = JSON.parse(
+      NodeFS.readFileSync(NodePath.join(context.stateRoot, "userdata", "settings.json"), "utf8"),
+    ) as { readonly enableProviderUpdateChecks?: boolean };
+
+    expect(settings.enableProviderUpdateChecks).toBe(false);
+    expect(
+      NodeFS.existsSync(NodePath.join(context.shimDirectory, `codegraph${executableSuffix}`)),
+    ).toBe(true);
+    expect(environment.BIBCODE_E2E_TOOL_PROBE_LOG).toBe(context.toolProbeLogPath);
+    expect(NodeFS.readFileSync(context.toolProbeLogPath, "utf8")).toBe("");
+    expect(fixtureToolProbeProblem(context.toolProbeLogPath)).toMatch(/real codegraph/);
+    NodeFS.writeFileSync(context.toolProbeLogPath, "codegraph --version\n");
+    expect(fixtureToolProbeProblem(context.toolProbeLogPath)).toBeNull();
+  });
+
   it("seeds the Profiler only when BIBCODE_E2E_PROFILER is 1", () => {
     const read = (environment: NodeJS.ProcessEnv): { readonly enableProfiler?: boolean } => {
       const context = prepareDesktopUiTestContext(environment);
@@ -273,6 +293,24 @@ describe.each([
     }
   });
 });
+
+it.runIf(!isNativeWindowsHost)(
+  "logs every fixture codegraph start and answers its version probe",
+  () => {
+    const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: "linux" };
+    const context = prepareDesktopUiTestContext(environment);
+    contexts.push(context);
+    const probe = NodeChildProcess.spawnSync(
+      NodePath.join(context.shimDirectory, "codegraph"),
+      ["--version"],
+      { env: { ...process.env, ...environment }, encoding: "utf8" },
+    );
+
+    expect(probe.status, probe.stderr).toBe(0);
+    expect(probe.stdout.trim()).toBe("0.0.0");
+    expect(NodeFS.readFileSync(context.toolProbeLogPath, "utf8")).toBe("codegraph --version\n");
+  },
+);
 
 it.runIf(isNativeWindowsHost)(
   "executes the Cursor action shim through the native Windows command processor",
@@ -910,6 +948,7 @@ describe("archiveAndCleanupDesktopUiTestContext", () => {
       fixtureUserHomePath: NodePath.join(runRoot, "fixture-user-home"),
       nativeActionLogPath: NodePath.join(artifactDirectory, "native-actions.jsonl"),
       providerInputLogPath: NodePath.join(runRoot, "provider-input.jsonl"),
+      toolProbeLogPath: NodePath.join(artifactDirectory, "tool-probes.log"),
     };
     let removalOptions: Parameters<DesktopUiDirectoryRemover>[1] | undefined;
     const removeDirectory: DesktopUiDirectoryRemover = (path, options) => {
