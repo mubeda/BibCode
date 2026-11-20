@@ -5,6 +5,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import { desktopUiPlatform } from "../support/app-lifecycle.ts";
+import { openCenterTerminal } from "../support/terminal-input.ts";
 import { desktopUiFixture } from "../support/test-project.ts";
 import {
   ensureMainSidebarOpen,
@@ -559,6 +560,7 @@ async function measureCell(cell: Cell): Promise<void> {
     cell: cellName(cell),
     ...cell,
     passed,
+    chordKeydownReachedPage: chordKeydownReachedPage(events),
     focus,
     before,
     after,
@@ -576,22 +578,93 @@ const views: readonly View[] = ["source", "rendered"];
 const redoChords: readonly Chord[] =
   platform === "mac" ? ["primary+shift+z"] : ["primary+shift+z", "ctrl+y"];
 
-async function composerUndoCase(path: "driver" | "keystroke"): Promise<void> {
+const probeTextareaId = "undo-probe-textarea";
+
+/** Whether any recorded `keydown` was the Z or Y of a chord, that is, whether the chord reached the page. */
+function chordKeydownReachedPage(events: readonly ProbeEvent[]): boolean {
+  return events.some(
+    (event) => event.type.startsWith("keydown") && /^[zy] /i.test(event.key ?? ""),
+  );
+}
+
+async function fieldText(kind: "composer" | "textarea"): Promise<string> {
+  if (kind === "composer") return browser.$(composerSelector).getText();
+  return browser.execute(
+    (id: string) => (document.getElementById(id) as HTMLTextAreaElement | null)?.value ?? "",
+    probeTextareaId,
+  );
+}
+
+/**
+ * Undo outside Files: the chat composer (Lexical) or a plain `textarea` added to the page. One
+ * typed step, then the chord or Edit > Undo, and the typed text must be gone.
+ */
+async function measureTextField(kind: "composer" | "textarea", path: InputPath): Promise<void> {
   await openFixtureWorkspace();
-  const composer = browser.$(composerSelector);
-  await composer.waitForDisplayed();
-  await composer.click();
-  if (path === "driver") await composer.addValue("cmpq");
-  else typeNative("cmpq");
-  await expect(composer).toHaveText(expect.stringContaining("cmpq"));
+  if (kind === "composer") {
+    const composer = browser.$(composerSelector);
+    await composer.waitForDisplayed();
+    await composer.click();
+  } else {
+    await browser.execute((id: string) => {
+      const area = document.createElement("textarea");
+      area.id = id;
+      area.setAttribute("aria-label", "Undo probe");
+      area.style.cssText =
+        "position:fixed;top:8px;left:8px;z-index:2147483647;width:240px;height:48px";
+      document.body.append(area);
+      area.focus();
+    }, probeTextareaId);
+  }
+  if (path === "driver") {
+    if (kind === "composer") await browser.$(composerSelector).addValue("cmpq");
+    else await browser.$(`#${probeTextareaId}`).addValue("cmpq");
+  } else typeNative("cmpq");
+  await browser.waitUntil(async () => (await fieldText(kind)).includes("cmpq"), {
+    timeoutMsg: `The typed text never reached the ${kind}.`,
+  });
   await new Promise((resolve) => setTimeout(resolve, 800));
   await startProbe();
-  if (path === "driver") await dispatchPageChord("primary+z");
-  else sendNativeChord("primary+z");
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  const text = await composer.getText();
-  recordEvidence({ cell: `composer-undo-${path}`, text, events: await readProbe() });
+  const sent = await sendChord(path, "primary+z", "undo");
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const text = await fieldText(kind);
+  const events = await readProbe();
+  recordEvidence({
+    cell: `${kind}-undo-${path}`,
+    passed: !text.includes("cmpq"),
+    chordKeydownReachedPage: chordKeydownReachedPage(events),
+    text,
+    sent,
+    events,
+  });
+  if (kind === "textarea") {
+    await browser.execute((id: string) => document.getElementById(id)?.remove(), probeTextareaId);
+  }
   expect(text).not.toContain("cmpq");
+}
+
+/**
+ * Records what a real undo chord does in a focused terminal. It asserts nothing about the shell:
+ * on Windows and Linux, Ctrl+Z is the shell's suspend key, which the terminal must keep.
+ */
+async function recordTerminalChord(): Promise<void> {
+  await openFixtureWorkspace();
+  await openCenterTerminal();
+  const input = await browser.$(".xterm-helper-textarea");
+  await input.waitForExist();
+  await browser.execute(() =>
+    document.querySelector<HTMLElement>(".xterm-helper-textarea")?.focus(),
+  );
+  await startProbe();
+  sendNativeChord("primary+z");
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const events = await readProbe();
+  recordEvidence({
+    cell: "terminal-undo-keystroke",
+    chordKeydownReachedPage: chordKeydownReachedPage(events),
+    focus: await focusedElement(),
+    events,
+  });
 }
 
 describe("packaged Files undo and redo (#398)", () => {
@@ -628,7 +701,7 @@ describe("packaged Files undo and redo (#398)", () => {
   });
 
   it("driver: the undo chord still undoes in the chat composer", async () => {
-    await composerUndoCase("driver");
+    await measureTextField("composer", "driver");
   });
 
   describe("native input (BIBCODE_E2E_NATIVE_INPUT=1)", function () {
@@ -668,8 +741,17 @@ describe("packaged Files undo and redo (#398)", () => {
       });
     }
 
-    it("keystroke: the undo chord still undoes in the chat composer", async () => {
-      await composerUndoCase("keystroke");
+    for (const kind of ["composer", "textarea"] as const) {
+      for (const path of ["keystroke", "menu"] as const) {
+        it(`${path}: undo still undoes in a ${kind === "composer" ? "chat composer" : "plain textarea"}`, async function () {
+          if (path === "menu" && platform === "linux") this.skip();
+          await measureTextField(kind, path);
+        });
+      }
+    }
+
+    it("keystroke: records what the undo chord does in a terminal", async () => {
+      await recordTerminalChord();
     });
   });
 });
