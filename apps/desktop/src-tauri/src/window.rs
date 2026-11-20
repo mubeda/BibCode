@@ -878,6 +878,28 @@ mod tests {
         assert!(recorded.asked.lock().unwrap().is_empty());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_edit_undo_and_redo_are_routed_items_on_macos() {
+        assert_eq!(
+            menu_action_for_id(MENU_ID_EDIT_UNDO),
+            Some(ApplicationMenuAction::Edit(MENU_ACTION_EDIT_UNDO))
+        );
+        assert_eq!(
+            menu_action_for_id(MENU_ID_EDIT_REDO),
+            Some(ApplicationMenuAction::Edit(MENU_ACTION_EDIT_REDO))
+        );
+        assert_eq!(
+            EDIT_MENU_ITEMS,
+            [
+                (MENU_ID_EDIT_UNDO, "Undo", "CmdOrCtrl+Z"),
+                (MENU_ID_EDIT_REDO, "Redo", "CmdOrCtrl+Shift+Z"),
+            ]
+        );
+        assert_eq!(MENU_ACTION_EDIT_UNDO, "edit-undo");
+        assert_eq!(MENU_ACTION_EDIT_REDO, "edit-redo");
+    }
+
     #[test]
     fn close_request_quit_menu_item_replaces_the_predefined_quit() {
         assert_eq!(
