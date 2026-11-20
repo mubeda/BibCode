@@ -61,7 +61,7 @@ Source: https://github.com/mubeda/BibCode/issues/397, https://github.com/mubeda/
 
 ### R10. Antigravity design note
 
-- A design note in `docs/plans/` settles: the driver slug, how a terminal-only instance appears in Settings, the permission flag, the model and effort source, every registration site, the chat provider over ACP, and the editor-catalog overlap. Review by Codex and the advisor counts as its approval (D6).
+- A design note in `docs/plans/` settles: the driver slug, how the instance appears in Settings, the permission flag, the model and effort source, every registration site, the chat provider over ACP, and the editor-catalog overlap. Review by Codex and the advisor counts as its approval (D6).
 
 ### R11. Antigravity provider instance
 
@@ -102,7 +102,7 @@ Source: https://github.com/mubeda/BibCode/issues/397, https://github.com/mubeda/
 
 ## Non-goals
 
-- A chat-panel driver for Antigravity (`agy acp`): a later issue.
+- ACP elicitation forms (agent questions), MCP servers passed to the Antigravity chat, and signing the user in from BiBCode: later issues.
 - A terminal observer, resume flags, or retargeting "Open in Antigravity" to `agy-ide`.
 - Pull-request detection before a remote delete.
 - Deleting the local branch from the remote-delete dialog.

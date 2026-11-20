@@ -1,7 +1,7 @@
 # Files undo shortcuts, remote branch delete, Antigravity terminal
 
 Status: Approved 2026-11-20 (owner's standing rule: reviewed by Codex and the advisor. Codex's last verdict was "Needs rework"; all its findings were applied and the round 2 fixes were not reviewed again)
-Spec: spec.md (Status line: Approved 2026-11-20, sha256 86de6f9db78b)
+Spec: spec.md (Status line: Approved 2026-11-20, sha256 3f5d29373cba)
 Repository: this repository
 Base: main
 
@@ -9,7 +9,7 @@ Base: main
 
 1. Ctrl/Cmd+Z, Shift+Ctrl/Cmd+Z and Ctrl+Y move the Files editor history, in the source and rendered views and in the packaged desktop app (#398).
 2. A remote branch row in Git Manager can be deleted after a confirmation, and server block reasons show in the branch dialogs (#397).
-3. An enabled Antigravity instance offers an Antigravity Terminal that starts `agy`, and never offers a chat (#399).
+3. An enabled Antigravity instance offers an Antigravity Terminal that starts `agy` and an Antigravity chat over `agy acp`, marked Preview (#399).
 4. View PR in Source Control opens the PR/MR panel, with a browser entry in the menu (#400).
 
 ## Global constraints
@@ -36,7 +36,7 @@ Base: main
 
 ## Out of scope
 
-- Antigravity chat-panel driver over `agy acp`: a later issue (spec Non-goals). The research report records the transport, minimum version and risks for it.
+- ACP elicitation forms, MCP servers for the Antigravity chat and in-app sign-in: later issues (spec Non-goals).
 - Terminal observer, resume flags, retargeting the editor command to `agy-ide` (spec Non-goals).
 - Pull-request detection before a remote delete (D4).
 - Deleting the local branch from the remote-delete dialog (D2).
@@ -144,7 +144,7 @@ All six run on the commit that is pushed, and its SHA is logged with the results
 - Windows and Linux native paths need the labs; a locked Mac screen hides the E2E webview -> platforms not measured are named in the report, never assumed.
 - The Antigravity driver has many registration sites -> Task 3.1 classifies every hit of one `rg` command, and review finding 8's list is the floor.
 - No `agy` binary in CI or the labs -> launch is proven by command construction with fixtures, as #399's acceptance criteria ask; a live TUI start is not claimed.
-- Google's terms discourage third-party tools on consumer plans -> the terminal only runs the user's own unmodified CLI, and the provider guide states the position; the later chat provider is out of scope.
+- Google's terms discourage third-party tools on consumer plans -> BiBCode only runs the user's own unmodified CLI (the TUI, or `agy acp`), the instance is disabled by default, the chat is marked Preview, and the provider guide states the position.
 - The research could not confirm every flag spelling from the primary page -> Task 3.1 step 1 re-reads the CLI reference before code depends on them.
 
 ## Decisions
@@ -156,7 +156,7 @@ All six run on the commit that is pushed, and its SHA is logged with the results
 - P5. Skills: every task has an installed skill; no gap, no install.
 - P6. Execution continues on the branch this plan was written on, recorded in `progress.md`, not on a new branch cut from `main`. Decided by: agent's call.
 - P7. Spec decisions D1, D5, D7 and D9 are the planning agent's calls where the issues left a choice, as are P10 and D12, and D8 follows issue #399's recommendation. The research report advised against a silent permission bypass, but Orca passes the same flag to `agy` by default (research addendum), as BiBCode's other terminals do, so D8 stands; a per-agent permission setting would be a separate issue. The pull request lists all five for the owner.
-- P12. Tasks 3.3 to 3.5 were replaced by Tasks 3.6 to 3.10 on 2026-11-20, after the owner ruled that the chat provider is built in this pull request and a live `agy` 1.5.13 handshake on the development machine confirmed the ACP shapes the design relies on. Decided by: user ("Build it now"); task split from the design note's breakdown.
+- P12. Tasks 3.3 to 3.5 were replaced by Tasks 3.6 to 3.10 on 2026-11-20, after the owner ruled that the chat provider is built in this pull request and a live `agy` 1.5.13 handshake on the development machine confirmed the ACP shapes the design relies on. Decided by: user ("Build it now"); task split from the design note's breakdown. Plan review 3 (Codex, Needs rework, 11 findings) was folded into the tasks' rules; its proposal to split Tasks 3.6, 3.7 and 3.9 was taken only as an allowed early commit of the terminal part of 3.9, because one lane runs 3.6 and 3.7 in sequence and each is reviewed at its own commit.
 - P9. The Antigravity chat provider uses ACP (`agy acp`), because no SDK fits. Decided by: user, 2026-11-20 ("use ACP if not available"), in line with the research and with Orca.
 - P8. The client marks a remote default from each remote's local `HEAD` ref as an early reason only, an ambiguous remote name blocks Delete, and the server decides (P10). Alternatives: a contract change carrying remote and branch separately (larger, touches fixtures phase 3 owns). Decided by: agent's call.
 - P10. The server is the authority for every remote branch delete (the new UI, the MCP tool, and local delete with "also delete from its remote"): it names `refs/heads/` explicitly, and one `ls-remote --symref` call before the push refuses the remote's default branch, an unreadable default, and a branch that differs from the local tracking ref. Alternatives: client-side checks only (plan review 2 showed they can target the wrong ref or miss a stale default); refusing any non-standard fetch mapping (it would refuse single-branch clones). This changes the behavior of an existing operation and of the MCP tool, not its contract. Decided by: agent's call, prompted by plan review 2 findings 1 and 3; listed for the owner.

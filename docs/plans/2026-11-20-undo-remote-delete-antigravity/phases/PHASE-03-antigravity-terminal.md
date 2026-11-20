@@ -13,7 +13,7 @@ Phase rules:
 
 - The design note `docs/plans/2026-11-20-antigravity-terminal-design.md` is binding for Tasks 3.6 to 3.10 (decisions D-A1 to D-A15 and its registration table). Tasks 3.3 to 3.5 of the first draft (chat refusal and exclusion) were removed on 2026-11-20 when the owner ruled that the chat is built; their terminal and documentation work moved into Tasks 3.9 and 3.10.
 - No unit or integration test spawns a real `agy`. Fixtures are written from the live handshake measured on 2026-11-20 (design note, facts table), with every account value replaced by a placeholder.
-- This phase also owns `apps/server/src/provider/antigravity/**`, `apps/server/src/provider/mod.rs`, `README.md`, `docs/getting-started/provider-setup.md` and `docs/reference/encyclopedia.md`.
+- This phase also owns `apps/server/src/provider/antigravity/**`, `apps/server/src/provider/mod.rs`, `apps/server/tests/turn_delivery_recovery.rs`, `apps/web/src/modelSelection.ts`, `README.md`, `docs/getting-started/provider-setup.md` and `docs/reference/encyclopedia.md`.
 - Each `cargo test` invocation takes one filter. Every `cargo` command runs under the executor's shared build lock.
 - `ProviderDriverKind` is an open branded string (`packages/contracts/src/providerInstance.ts:16-32`), so no closed union gains a member.
 
@@ -24,7 +24,7 @@ Phase rules:
 - Satisfies: R10
 - Depends on: none
 - Files: create `docs/plans/2026-11-20-antigravity-terminal-design.md`
-- Interfaces: consumes `research-antigravity.md`; produces the classified registration table, the chat-eligibility rule and the model and effort rule that Tasks 3.2 to 3.5 implement
+- Interfaces: consumes `research-antigravity.md`; produces the classified registration table, the chat-eligibility rule and the model and effort rule that Tasks 3.2 and 3.6 to 3.10 implement
 - Skills: mstack-research (re-check any flag the research marks unconfirmed)
 - Read first: `apps/web/src/components/chat/providerTerminalActions.ts:33-236`; `apps/web/src/components/chat/providerAgentActions.ts`; `apps/web/src/components/chat/ChatHeaderPanelMenu.logic.ts`; `apps/web/src/providerModels.ts:92-105`; `apps/server/src/production/provider_inventory.rs:181-191,215-314,2012-2064`; `apps/server/src/production/provider_runtime.rs:2468-2473,2532-2543,6730-6737,6975-6985`; `apps/server/src/production/control.rs:2817-2841,2976-3013`; `packages/contracts/src/settings.ts:425-470,571-578,650-670,762-830`; `packages/shared/src/providerSessionDefaults.ts:89-137,242-254,303-337`; an existing note, `docs/plans/2026-11-18-server-commands-design.md` (the shape)
 - Tier: most capable
@@ -73,6 +73,13 @@ Steps
 - TDD: red-green
 - Done when: `cargo test -p bibcode-server antigravity` exits 0
 
+Rules for this task (plan review 3):
+
+- Approval safety. Approval-required uses the advertised `mode` config option: set `default` and wait for its acknowledgement before the first prompt; a missing or rejected `default` refuses the start. Do not reuse the Cursor helper's fallback to the current or first non-plan mode. Plan interaction mode sets `plan` and wins over the approval setting; full access follows the design note. Test a switch from full access to approval-required, a stale approval answer after cancel, and `allow_once` chosen when both allow choices are offered.
+- Model and effort contract, shared with Task 3.8 and written into the design note before either task codes it: the BiBCode option id for the thinking level is the one the shared effort controls already read (`reasoningEffort`), mapped to ACP `configId` `thought_level`; the model is written through `configId` `model` with the unsuffixed value; when only `models.availableModels` exists the suffixed ids are sent unchanged. Test picker value to saved default to the exact ACP write.
+- A scripted turn must project assistant text, tool activity and one approval, and carry the user's answer back to the peer; an empty completion alone does not satisfy the task.
+- Log hygiene is asserted with synthetic markers in errors, stderr, `_meta` and option values.
+
 Steps
 
 1. [ ] Write the failing tests against a fixture ACP peer over in-memory pipes: `initialize` with protocol 1 and no `authenticate`; another protocol version refused; the CLI version read from `agentInfo.version`; `session/new` with cwd and empty `mcpServers`; resume, load and neither capability; replayed and stale-session updates dropped; transient, missing-session and `-32000` failures; permission answers in full access and approval-required; a mode change; cancel with a pending approval; an unanswered cancel; an empty `end_turn`; secret markers stay out of logs. Run `cargo test -p bibcode-server antigravity`. Expected: FAIL (the new tests fail to compile or fail).
@@ -83,7 +90,7 @@ Steps
 
 - Satisfies: R13
 - Depends on: 3.6
-- Files: modify `apps/server/src/production/provider_runtime.rs`
+- Files: modify `apps/server/src/production/provider_runtime.rs`; modify `apps/server/tests/turn_delivery_recovery.rs`
 - Interfaces: consumes `AntigravitySessionRuntime` (Task 3.6) and the registration of Task 3.2; produces `AntigravityDriver`, adapter key `antigravity-acp`, and the `sessionId` resume cursor
 - Skills: rust-best-practices (delivery outcome mapping); tdd
 - Read first: design note D-A4, D-A8, D-A11, D-A12; `GrokDriver` and `CursorDriver::deliver` in `provider_runtime.rs`; the `ACP_FIXTURE` scripted executable
@@ -91,11 +98,18 @@ Steps
 - TDD: red-green
 - Done when: `cargo test -p bibcode-server provider_runtime` exits 0 and `cargo test -p bibcode-server turn_delivery` exits 0
 
+Rules for this task (plan review 3):
+
+- Also owns `apps/server/tests/turn_delivery_recovery.rs`: extend the crash fixture to prove that an already written prompt stays at one send after a restart, its row becomes `uncertain`, and the next new turn reopens the saved session; pin separately an unsent frozen turn whose conversation is gone; the receipt test covers zero-byte, partial-write and lost-acknowledgement cases. Correct D-A9 where it overstates `FrozenConversationLost`.
+- Errors the user must act on: the sign-in message and the version message appear in the thread exactly once, are not retried by the durable launch path, cause zero prompt writes, and leave the terminal available. The version rule reads `agentInfo.version` from `initialize`; a separate `--version` child is used only if the design note keeps it, and an unparsable version is checked against `agentInfo.version`.
+- Process coverage: the chat child and any launch-time version child are supervised, attributed, bounded at startup and cleaned up when the start is cancelled. A child that dies during `initialize` is reported as an unrequested exit even though the shared exit reporter starts after `driver.start()`; fixtures distinguish it from a requested stop.
+- The shared option-reconciliation logger must not record Antigravity option values; assert it in the production path with synthetic markers.
+
 Steps
 
 1. [ ] Write the failing tests through the scripted executable: a chat start for the default and a custom `antigravity` instance spawns `<binary> acp` with the checkout as cwd; the version rule (1.5.3 refused with its message, 1.5.4 allowed); a child that exits during `initialize`; delivery outcomes (not sent, rejected, ambiguous, accepted); a missing session; the adapter-key and line-too-long tables; error labels. Run `cargo test -p bibcode-server provider_runtime`. Expected: FAIL (the new tests fail).
 2. [ ] Implement the driver and its dispatch. Run both Done when commands. Expected: PASS (exit 0).
-3. [ ] Confirm the child spawns through `spawn_child` so it is supervised and attributed (AGENTS.md, Profiler coverage). Expected: the supervision test of step 1 passes.
+3. [ ] Add the supervision tests named in the rules above (unrequested exit during `initialize`, cancelled start, attribution) and make them pass. Expected: PASS for `cargo test -p bibcode-server provider_runtime`.
 
 ### Task 3.8: Probe Antigravity sign-in state and models in the inventory
 
@@ -109,6 +123,13 @@ Steps
 - TDD: red-green
 - Done when: `cargo test -p bibcode-server provider_inventory` exits 0 and `cargo test -p bibcode-server control` exits 0
 
+Rules for this task (plan review 3):
+
+- Uses the model and effort contract fixed in the design note (Task 3.6 rules). If it needs code from Task 3.6, it runs after it; otherwise the two run in parallel on disjoint files.
+- The version shown in the snapshot never takes a line of stderr; assert it with a synthetic marker in stderr and in version output.
+- The probe child is supervised and registered for attribution, which needs the registry passed to the inventory in `control.rs`; a refresh that drops the probe future still stops and reaps the child.
+- `control.rs` gets its own failing test first: a quick refresh keeps the last auth state and models for `antigravity`, and a slow probe after sign-in replaces them.
+
 Steps
 
 1. [ ] Write the failing tests with a scripted executable: the slow probe sends `initialize`, `session/new` and `session/close` and yields models and thinking levels from `configOptions`, and from `models` when `configOptions` is absent; `-32000` "Authentication required" reads unauthenticated with status `ready`; any other error keeps custom models; the quick probe starts no ACP process and keeps the last auth and models; a disabled instance is not probed; no account or plan value from `_meta` reaches the snapshot. Run `cargo test -p bibcode-server provider_inventory`. Expected: FAIL (the new tests fail).
@@ -118,13 +139,20 @@ Steps
 
 - Satisfies: R11, R12, R13
 - Depends on: 3.2, 3.7, 3.8
-- Files: modify `apps/web/src/components/chat/providerTerminalActions.ts` and its test; modify `apps/web/src/components/settings/providerDriverMeta.ts`; modify `apps/web/src/components/chat/providerIconUtils.ts`; modify `apps/web/src/session-logic.ts`; modify the Settings card files and their tests; modify `apps/web/src/components/ChatView.test.tsx`
+- Files: modify `apps/web/src/components/chat/providerTerminalActions.ts` and its test; modify `apps/web/src/components/settings/providerDriverMeta.ts`; modify `apps/web/src/components/chat/providerIconUtils.ts`; modify `apps/web/src/session-logic.ts`; modify `apps/web/src/modelSelection.ts` and its test; modify the Settings card files and their tests; modify `apps/web/src/components/ChatView.test.tsx`
 - Interfaces: consumes the `"antigravity"` driver kind and `AntigravitySettings` (Task 3.2), the snapshot models and auth state (Task 3.8), `ProviderSessionDefault`, and `AntigravityIcon`; produces nothing another task uses
 - Skills: vercel-react-best-practices (required review); better-ui (Preview badge and the sign-in hint explain themselves); tdd
 - Read first: design note D-A2, D-A5, D-A6, D-A13, D-A14 and the registration table; `apps/web/src/components/chat/providerTerminalActions.ts`; `UI.md`
 - Tier: most capable
 - TDD: red-green
 - Done when: `cd apps/web && node ../../scripts/run-local-vp.mjs test run --project unit src/components/chat src/components/settings src/components/ChatView.test.tsx` exits 0 and `vp run typecheck` exits 0
+
+Rules for this task (plan review 3):
+
+- Also owns `apps/web/src/modelSelection.ts` and its test: an enabled, ready Antigravity entry with an empty catalog placed ahead of a usable provider is not picked for text generation. Include that test in the Done when command. The commit-message RPC does not route through chat, so nothing is added there; quota usage is scoped to Claude and Codex and needs no entry.
+- Settings: the test adds a custom Antigravity instance, not only the default one. Terminal: the test asserts the request's checkout, the selected instance id, the binary override and that no observer is attached.
+- Chat: assert the advertised model and thinking level in the picker, the composer's plan-mode control, and Antigravity as a chat reviewer with its existing guard text.
+- The terminal and Settings part depends only on Task 3.2 and may be committed first; the chat part waits for Tasks 3.7 and 3.8.
 
 Steps
 
@@ -136,7 +164,7 @@ Steps
 
 - Satisfies: R14
 - Depends on: 3.6, 3.7, 3.8, 3.9
-- Files: create `docs/providers/antigravity.md`; modify `docs/providers/README.md`; modify `docs/architecture/providers.md`; modify `docs/architecture/overview.md`; modify `docs/README.md`; modify `README.md`; modify `docs/getting-started/provider-setup.md`; modify `docs/reference/encyclopedia.md`
+- Files: create `docs/providers/antigravity.md`; modify `docs/providers/README.md`; modify `docs/architecture/providers.md`; modify `docs/README.md`; modify `README.md`; modify `docs/getting-started/provider-setup.md`; modify `docs/reference/encyclopedia.md`
 - Interfaces: consumes the shipped behavior of Tasks 3.2 and 3.6 to 3.9; produces the guide that phase 4 links from `docs/user/workspace-ui.md`, the testing runbooks and `CHANGELOG.md`
 - Skills: better-writing (plain provider guide wording)
 - Read first: `docs/providers/cursor.md` (the guide shape); the design note; `research-antigravity.md` in this plan folder
@@ -144,8 +172,13 @@ Steps
 - TDD: exempt (documentation with no behavior to test)
 - Done when: `vp run check:markdown-links` exits 0 and `vp check` exits 0
 
+Rules for this task (plan review 3):
+
+- `docs/architecture/overview.md` belongs to phase 1 in round 1, and `CHANGELOG.md`, `docs/user/workspace-ui.md` and the testing runbooks to Task 4.1; this task does not edit them. Task 4.1 adds Antigravity to each.
+- The guide states what the live handshake did and did not prove: prompt, permission and resume behavior and the TUI's acceptance of chat model values as `--model` are observed by fixtures only unless the integration smoke run covers them.
+
 Steps
 
 1. [ ] Write `docs/providers/antigravity.md`: what is supported (AI Terminal, and chat as Preview over ACP), install check `agy --version` and the 1.5.4 minimum for chat, sign-in (`agy`, or `agy acp --login` without a browser), the first-run prompts, the launch commands and what `--dangerously-skip-permissions` means, the chat modes and approvals, the binary path setting, how a model and thinking-level default reaches the terminal and the chat, known limits, the PATH clash between the `agy` CLI and an IDE launcher of the same name, and Google's stated position on third-party hosts for consumer plans with a link to its terms. Versions and command names only; no account, host or local path. Expected: the guide exists with each of those sections.
-2. [ ] Name Antigravity in `README.md` (the intro sentence and the provider setup list, marked Preview), `docs/README.md`, `docs/providers/README.md`, `docs/getting-started/provider-setup.md`, `docs/architecture/providers.md`, `docs/architecture/overview.md` and `docs/reference/encyclopedia.md`, wherever each lists the providers. Expected: `rg -n "OpenCode" README.md docs/README.md docs/getting-started docs/architecture/providers.md docs/reference/encyclopedia.md` shows no provider list that lacks Antigravity.
+2. [ ] Name Antigravity in `README.md` (the intro sentence and the provider setup list, marked Preview), `docs/README.md`, `docs/providers/README.md`, `docs/getting-started/provider-setup.md`, `docs/architecture/providers.md` and `docs/reference/encyclopedia.md`, wherever each lists the providers. Expected: `rg -n "OpenCode" README.md docs/README.md docs/getting-started docs/architecture/providers.md docs/reference/encyclopedia.md` shows no provider list that lacks Antigravity.
 3. [ ] Run `vp run check:markdown-links` and `vp check`. Expected: exit 0 for both.

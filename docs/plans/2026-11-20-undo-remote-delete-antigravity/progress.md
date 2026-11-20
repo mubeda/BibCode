@@ -1,7 +1,7 @@
 # Progress: Files undo shortcuts, remote branch delete, Antigravity terminal
 
 Plan: plan.md
-Spec: spec.md (sha256 86de6f9db78b)
+Spec: spec.md (sha256 3f5d29373cba)
 Plan status: Approved 2026-11-20
 Plan review: Codex gpt-6.2-sol at high, round 2, Needs rework; all 25 findings of both rounds handled (reviews/), no third round
 Executor: mstack-codex-review-workflow
@@ -39,3 +39,4 @@ Branch: claude/backlog-triage-planning-pr-b5ee7f
 - 2026-11-20 09:16 Owner's instruction: every living document that lists the supported providers must name Antigravity. The replanned documentation task covers at least README.md (intro line and the provider setup list), docs/README.md, docs/providers/README.md plus a new docs/providers/antigravity.md, docs/getting-started/provider-setup.md, docs/architecture/providers.md and overview.md, docs/user/workspace-ui.md, docs/reference/encyclopedia.md, the docs/testing runbooks that state provider visibility, and CHANGELOG.md. Dated plans, reports and docs/superpowers are history and stay as they are.
 - 2026-11-20 09:50 Replanned phase 3 for the chat over ACP: Tasks 3.3 to 3.5 removed, Tasks 3.6 to 3.10 added from the lane D design note (plan.md P12; spec R13, R14 and D9 rewritten). A live `agy` 1.5.13 `initialize` and `session/new` on the development machine (no prompt sent) confirmed protocol 1, resume and load, the option ids `model`, `thought_level` and `mode`, and the modes `default`, `accept-edits`, `auto` and `plan`.
 - 2026-11-20 09:50 1.1 macOS measured: disposition B (the predefined Edit items take the chord before the page). Design note `docs/plans/2026-11-20-edit-menu-undo-design.md` is in Codex and advisor review; Windows and Linux measurements running. Lane branch worktree-agent-a24bd2b8983f9f3fe.
+- 2026-11-20 10:00 Plan review 3 (Codex, Needs rework, 11 findings) processed with an advisor review pending; findings folded into the rules of Tasks 3.6 to 3.10 (reviews/plan-review-3.md). The fixes were not reviewed again.
