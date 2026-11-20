@@ -342,10 +342,33 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   const executeOperationRef = useRef<
     ((input: GitManagerOperationRequest) => Promise<boolean>) | null
   >(null);
+  // The local branch a delete-with-remote submission asked to delete, and the newest refs.
+  const pendingLocalDeleteRef = useRef<string | null>(null);
+  const localBranchesRef = useRef(localBranches);
+  useEffect(() => {
+    localBranchesRef.current = localBranches;
+  }, [localBranches]);
   const { flow: signIn, present: presentOperationEvent } = useGitManagerSignIn(environmentId, {
-    // A resumed request that succeeds closes the dialog that sent the original one.
+    // A resumed request that succeeds closes the dialog that sent the original one. The resume
+    // of a delete-with-remote deletes the remote branch only; when the sign-in came from the
+    // check before the local delete, the local branch is still listed and is deleted next.
     resume: async (request) => {
-      if (await executeOperationRef.current?.(request)) setBranchDialog(null);
+      const execute = executeOperationRef.current;
+      if (execute === null || !(await execute(request))) return;
+      const local = pendingLocalDeleteRef.current;
+      pendingLocalDeleteRef.current = null;
+      if (local !== null && localBranchesRef.current.some((branch) => branch.name === local)) {
+        const deleted = await execute({
+          _tag: "branch-delete",
+          cwd: request.cwd,
+          projectId: request.projectId,
+          name: local,
+          force: true,
+          deleteRemote: false,
+        });
+        if (!deleted) return;
+      }
+      setBranchDialog(null);
     },
     onEnded: (failure) => {
       setOperationEvent(failure);
@@ -524,6 +547,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     [executeOperation, projectId, selectedWorktreeCwd, stashMergeDisabledReason],
   );
   const signInPhase = signIn.state?.phase ?? null;
+  const signInPending = signInPhase !== null;
   const { cancel: cancelSignIn, decline: declineSignIn } = signIn;
   const closeBranchDialog = useCallback(() => {
     if (isOperationRunning) return;
@@ -538,6 +562,10 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         setOperationError(branchSyncDisabledReason);
         return;
       }
+      // An offer belongs to the submission that raised it; a second one waits for its end.
+      if (signInPending) return;
+      pendingLocalDeleteRef.current =
+        submission.kind === "delete" && submission.deleteRemote ? submission.name : null;
       let request: GitManagerOperationRequest;
       switch (submission.kind) {
         case "create":
@@ -581,7 +609,7 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       }
       if (await executeOperation(request)) setBranchDialog(null);
     },
-    [branchSyncDisabledReason, executeOperation, projectId, selectedWorktreeCwd],
+    [branchSyncDisabledReason, executeOperation, projectId, selectedWorktreeCwd, signInPending],
   );
   const resolveSwitchWithChanges = useCallback(
     async ({ strategy }: { readonly strategy: "stash" | "bring" }) => {
@@ -889,7 +917,9 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       <GitManagerBranchDialogs
         busy={isOperationRunning}
         dialog={branchDialog}
-        disabledReason={branchSyncDisabledReason}
+        disabledReason={
+          branchSyncDisabledReason ?? (signInPending ? "Finish or cancel the sign-in first." : null)
+        }
         errorMessage={operationError}
         signInPrompt={signInPrompt}
         refs={localBranches}
