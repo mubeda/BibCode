@@ -936,6 +936,30 @@ describe("GitManagerToolbar", () => {
       }
     });
 
+    it("ends a pending sign-in when the dialog is cancelled, so nothing resumes", async () => {
+      h.snapshot = { ...refsSnapshot(), remoteBranches: [ref("origin/develop")] };
+      h.events = { "remote-branch-delete": [signInFailure] };
+      await mount();
+      try {
+        await act(async () =>
+          container
+            .querySelector<HTMLButtonElement>('[aria-label="Delete remote branch origin/develop"]')!
+            .click(),
+        );
+        await submit({ kind: "delete-remote", remote: "origin", branch: "develop" });
+        await act(async () => (lastDialogProps().onClose as () => void)());
+
+        expect(lastDialogProps().dialog).toBeNull();
+        expect([...document.querySelectorAll("button")].map((b) => b.textContent)).not.toContain(
+          "Sign in",
+        );
+        expect(h.runSignIn).not.toHaveBeenCalled();
+        expect(sentInputs()).toHaveLength(1);
+      } finally {
+        await unmount();
+      }
+    });
+
     it("shows the remote's rejection text and keeps the dialog open", async () => {
       const rejection = " ! [remote rejected] develop (protected branch hook declined)";
       h.snapshot = { ...refsSnapshot(), remoteBranches: [ref("origin/develop")] };
