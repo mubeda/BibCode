@@ -1,7 +1,7 @@
 # Files undo shortcuts, remote branch delete, Antigravity terminal
 
 Status: Approved 2026-11-20 (owner's standing rule: reviewed by Codex and the advisor. Codex's last verdict was "Needs rework"; all its findings were applied and the round 2 fixes were not reviewed again)
-Spec: spec.md (Status line: Approved 2026-11-20, sha256 9d9513bbe595)
+Spec: spec.md (Status line: Approved 2026-11-20, sha256 86de6f9db78b)
 Repository: this repository
 Base: main
 
@@ -17,7 +17,7 @@ Base: main
 - One pull request against `main`; every follow-up found is ticketed and fixed in it (R15, D11).
 - Antigravity executable default is `agy`, driver slug `antigravity`, permission flag `--dangerously-skip-permissions`, install probe `agy --version` (R11, R12, D8).
 - `--continue` and `--conversation` are never passed on launch (R12).
-- "Open in Antigravity" (`packages/contracts/src/editor.ts`, `apps/server/src/production/editor_launch.rs`) is not changed (R13).
+- "Open in Antigravity" (`packages/contracts/src/editor.ts`, `apps/server/src/production/editor_launch.rs`) is not changed.
 - Ctrl+Y redoes on Windows and Linux only (D1).
 - Remote delete sends the existing `remote-branch-delete` operation; no new server operation (R6).
 - BiBCode never edits the user's Antigravity settings, hooks or MCP files and never reads Google credentials (research report, recommendations).
@@ -31,7 +31,7 @@ Base: main
 1. The undo chord works in a browser but not in the packaged app, because the native Edit menu handles it differently on each platform. Pinned by Tasks 1.1 and 1.2.
 2. A fix for Files undo breaks undo somewhere else (the inline comment textarea, the chat composer). Pinned by Tasks 1.2 and 1.3.
 3. Remote Delete enabled on a remote's default branch, or resolved to the wrong remote when one remote's name prefixes another. Pinned by Tasks 2.2 and 2.3.
-4. Antigravity chosen as a chat through a fallback path instead of the menu (saved default, first enabled provider, server routing). Pinned by Tasks 3.3 and 3.4.
+4. An Antigravity chat that replays a sent prompt after a restart, leaks an account value or provider text into logs or fixtures, or runs without approvals in approval-required mode. Pinned by Tasks 3.6 to 3.8.
 5. A settings file written before this change fails to decode, or enables the driver. Pinned by Task 3.2.
 
 ## Out of scope
@@ -107,24 +107,24 @@ Parallel conflicts: none between round 1 phases, which own disjoint files: phase
 
 ## Traceability
 
-| Requirement | Tasks         |
-| ----------- | ------------- |
-| R1          | 1.2, 1.3      |
-| R2          | 1.2, 1.3      |
-| R3          | 1.3           |
-| R4          | 1.3           |
-| R5          | 1.1, 1.2      |
-| R6          | 2.3           |
-| R7          | 2.2, 2.3      |
-| R8          | 2.3           |
-| R9          | 2.1           |
-| R10         | 3.1           |
-| R11         | 3.2, 3.4      |
-| R12         | 3.4           |
-| R13         | 3.3, 3.4      |
-| R14         | 3.2, 3.5      |
-| R15         | 2.1, 4.1, 4.2 |
-| R16         | 5.1           |
+| Requirement | Tasks              |
+| ----------- | ------------------ |
+| R1          | 1.2, 1.3           |
+| R2          | 1.2, 1.3           |
+| R3          | 1.3                |
+| R4          | 1.3                |
+| R5          | 1.1, 1.2           |
+| R6          | 2.3                |
+| R7          | 2.2, 2.3           |
+| R8          | 2.3                |
+| R9          | 2.1                |
+| R10         | 3.1                |
+| R11         | 3.2, 3.8, 3.9      |
+| R12         | 3.9                |
+| R13         | 3.6, 3.7, 3.8, 3.9 |
+| R14         | 3.2, 3.10, 4.1     |
+| R15         | 2.1, 4.1, 4.2      |
+| R16         | 5.1                |
 
 ## End-to-end verification
 
@@ -156,7 +156,8 @@ All six run on the commit that is pushed, and its SHA is logged with the results
 - P5. Skills: every task has an installed skill; no gap, no install.
 - P6. Execution continues on the branch this plan was written on, recorded in `progress.md`, not on a new branch cut from `main`. Decided by: agent's call.
 - P7. Spec decisions D1, D5, D7 and D9 are the planning agent's calls where the issues left a choice, as are P10 and D12, and D8 follows issue #399's recommendation. The research report advised against a silent permission bypass, but Orca passes the same flag to `agy` by default (research addendum), as BiBCode's other terminals do, so D8 stands; a per-agent permission setting would be a separate issue. The pull request lists all five for the owner.
-- P9. A later Antigravity chat provider uses ACP (`agy acp`), because no SDK fits. Decided by: user, 2026-11-20 ("use ACP if not available"), in line with the research and with Orca.
+- P12. Tasks 3.3 to 3.5 were replaced by Tasks 3.6 to 3.10 on 2026-11-20, after the owner ruled that the chat provider is built in this pull request and a live `agy` 1.5.13 handshake on the development machine confirmed the ACP shapes the design relies on. Decided by: user ("Build it now"); task split from the design note's breakdown.
+- P9. The Antigravity chat provider uses ACP (`agy acp`), because no SDK fits. Decided by: user, 2026-11-20 ("use ACP if not available"), in line with the research and with Orca.
 - P8. The client marks a remote default from each remote's local `HEAD` ref as an early reason only, an ambiguous remote name blocks Delete, and the server decides (P10). Alternatives: a contract change carrying remote and branch separately (larger, touches fixtures phase 3 owns). Decided by: agent's call.
 - P10. The server is the authority for every remote branch delete (the new UI, the MCP tool, and local delete with "also delete from its remote"): it names `refs/heads/` explicitly, and one `ls-remote --symref` call before the push refuses the remote's default branch, an unreadable default, and a branch that differs from the local tracking ref. Alternatives: client-side checks only (plan review 2 showed they can target the wrong ref or miss a stale default); refusing any non-standard fetch mapping (it would refuse single-branch clones). This changes the behavior of an existing operation and of the MCP tool, not its contract. Decided by: agent's call, prompted by plan review 2 findings 1 and 3; listed for the owner.
 - P11. A workflow lane starts from the plan's branch after the plan folder is committed, and a dependent task's lane starts from its predecessor's commits.
@@ -167,6 +168,6 @@ All six run on the commit that is pushed, and its SHA is logged with the results
 - 2026-11-20 Evidence: `@pierre/diffs/dist/editor/command.js` binds `cmdOrCtrl+z`, `cmdOrCtrl+shift+z`, `ctrl+y` / Decision: P3; Task 1.1 diagnoses first.
 - 2026-11-20 Evidence: `apps/server/src/git/manager/refs.rs:315-346` sets `is_default` for local refs only / Decision: Task 2.2.
 - 2026-11-20 Evidence: `GitManagerPanel.tsx:498-523` owns the sign-in offer; the toolbar runner has none / Decision: Task 2.3 shares one hook.
-- 2026-11-20 Evidence: `provider_runtime.rs:6975-6985` already rejects an unknown driver with a generic message / Decision: Task 3.3 adds a specific refusal before it.
+- 2026-11-20 Evidence: `provider_runtime.rs:6975-6985` already rejects an unknown driver with a generic message / Decision: superseded by P12; the driver is dispatched instead.
 - 2026-11-20 Evidence: `research-antigravity.md` / Decision: no SDK; terminal now, `agy acp` later; terms stated in the guide (R14).
 - 2026-11-20 Q: where, which spec, external sources, reviewer model / Recommended: this folder, the three issues, the issue links, Codex `gpt-6.2-sol` at `high` / Decision: recommended defaults taken without asking, per the owner's autopilot rule.

@@ -61,7 +61,7 @@ Source: https://github.com/mubeda/BibCode/issues/397, https://github.com/mubeda/
 
 ### R10. Antigravity design note
 
-- A design note in `docs/plans/` settles: the driver slug, how a terminal-only instance appears in Settings, the permission flag, the model and effort source, every registration site, how chat is excluded on client and server, and the editor-catalog overlap. Review by Codex and the advisor counts as its approval (D6).
+- A design note in `docs/plans/` settles: the driver slug, how a terminal-only instance appears in Settings, the permission flag, the model and effort source, every registration site, the chat provider over ACP, and the editor-catalog overlap. Review by Codex and the advisor counts as its approval (D6).
 
 ### R11. Antigravity provider instance
 
@@ -73,16 +73,21 @@ Source: https://github.com/mubeda/BibCode/issues/397, https://github.com/mubeda/
 - GIVEN an enabled instance and `agy` installed, WHEN the user picks Antigravity Terminal in the AI Terminal menu, THEN the TUI starts in the thread checkout as `<binary> --dangerously-skip-permissions`, plus `--model <m>` and `--effort <e>` only when session defaults supply them, with `activity: { driverKind, providerInstanceId }` (D8).
 - A configured binary path overrides `agy`. `--continue` and `--conversation` are never passed.
 
-### R13. Antigravity never looks chat-ready
+### R13. Antigravity chat over ACP
 
-- GIVEN an Antigravity instance, THEN no chat action for it appears in the panel menu, the Default Agent picker, the code reviewer list or the worktree dialog, and it is never chosen as a fallback chat (D9).
-- GIVEN a chat start that names an Antigravity instance, THEN the server refuses it with a clear error.
-- "Open in Antigravity" (`agy --goto`) is unchanged.
+- GIVEN an enabled Antigravity instance with `agy` 1.5.4 or later, WHEN the user starts an Antigravity chat, THEN the server spawns `<binary> acp` in the thread checkout, speaks ACP v1 over stdio, and the chat streams replies, tool activity and approval requests like the other chat providers (D9).
+- GIVEN an older `agy` or a peer that answers another protocol version, THEN the chat start fails with a message that names the required version, and the terminal stays available.
+- GIVEN the CLI is not signed in (error `-32000`, "Authentication required"), THEN the thread shows how to sign in (`agy`, or `agy acp --login`); BiBCode never signs the user in and never reads Google credentials.
+- GIVEN a thread with a saved session, WHEN the server restarts, THEN the driver reopens it with `session/resume`, else `session/load`, else a new session, and never replays an already sent prompt.
+- GIVEN approval-required mode, THEN the session runs in the advertised `default` mode and tool requests reach the user; when `default` is not advertised the chat start is refused. Full access and plan mode follow the design note.
+- The models and thinking levels offered come from the session's advertised options, never from a hard-coded list.
+- The Settings card marks the chat as Preview. "Open in Antigravity" (`agy --goto`) is unchanged.
 
 ### R14. Antigravity cannot be spawned by unit tests, and is documented
 
 - `agy` is in the hermetic guard list.
-- `docs/providers/antigravity.md` covers install (`agy --version`), sign-in (`agy`, or `agy acp --login` without a browser), the permission flag, the `agy` CLI versus IDE launcher PATH clash, and Google's stated position on third-party hosts for consumer plans; the provider index and AI Terminal notes link it.
+- `docs/providers/antigravity.md` covers install (`agy --version`), sign-in (`agy`, or `agy acp --login` without a browser), the permission flag, the `agy` CLI versus IDE launcher PATH clash, and Google's stated position on third-party hosts for consumer plans; the provider index and AI Terminal notes link it. It also covers the chat (version, sign-in, modes, known limits).
+- Every living document that lists the supported providers names Antigravity: `README.md`, `docs/README.md`, `docs/getting-started/provider-setup.md`, `docs/architecture/providers.md` and `overview.md`, `docs/user/workspace-ui.md`, `docs/reference/encyclopedia.md`, the `docs/testing` runbooks that state provider visibility, and `CHANGELOG.md`.
 
 ### R15. Follow-ups and gates
 
@@ -112,7 +117,7 @@ Source: https://github.com/mubeda/BibCode/issues/397, https://github.com/mubeda/
 - D6. The design note is required and is approved by Codex and advisor review. Source: #399 question 1, recommended yes; the owner's standing rule that reviewed designs count as approved.
 - D7. A new Antigravity instance is disabled by default. Source: #399 proposed behavior offers this or enabled-but-unready; the planning agent's call, listed for the owner.
 - D8. The permission flag is `--dangerously-skip-permissions`. Source: #399 question 2, recommended.
-- D9. The chat action is omitted, not shown disabled. Source: #399 question 4 allows either; the planning agent's call, listed for the owner; the design note may change this to "disabled with a reason" only with evidence that omission is not possible.
+- D9. The Antigravity chat provider is built in this pull request over ACP (`agy acp`), with no SDK, and ships as Preview on an instance that is disabled by default. Source: the owner, 2026-11-20 ("use ACP if not available", "Build it now"); this reverses the first draft, which offered no chat.
 - D10. Edit menu Undo and Redo drive the Files history when that surface has focus. Source: #398 question 3, recommended yes.
 - D11. One pull request, base `main`.
 - D12. View PR falls back to the browser where no panel can host the pull request. Source: issue #400, the planning agent's call, listed for the owner.

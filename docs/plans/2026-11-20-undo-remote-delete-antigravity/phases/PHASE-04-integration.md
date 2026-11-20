@@ -14,7 +14,7 @@
 ### Task 4.1: Integrate, review and fix follow-ups
 
 - Satisfies: R15
-- Depends on: 1.2, 1.3, 2.3, 3.5, 5.1
+- Depends on: 1.2, 1.3, 2.3, 3.10, 5.1
 - Files: modify `docs/user/workspace-ui.md`; modify `docs/plans/README.md`; modify the testing runbooks under `docs/testing/` that the change affects; modify any file a follow-up fix needs
 - Interfaces: consumes the three phase branches and their task reports; produces one candidate commit on the plan's branch
 - Skills: mstack-receive-review (processes the Codex and advisor reviews); better-writing (the user guide text)
