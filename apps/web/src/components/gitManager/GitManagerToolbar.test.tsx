@@ -27,10 +27,14 @@ const h = vi.hoisted(() => ({
   failureMessage: null as string | null,
   /** Failures for one operation tag only; `failureMessage` fails every operation. */
   failures: {} as Record<string, { readonly code: string; readonly message: string }>,
+  /** Full event sequences for one operation tag, emitted in order; the last one settles it. */
+  events: {} as Record<string, ReadonlyArray<GitManagerOperationEvent>>,
+  runSignIn: vi.fn(),
 }));
 
 vi.mock("../../state/gitManager", () => ({
   runGitManagerOperation: h.runOperation,
+  runGitSignIn: h.runSignIn,
   gitManagerEnvironment: {
     getRefs: h.refsAtom,
     signalWithDegradedFocusRefresh: h.signalAtom,
@@ -143,7 +147,12 @@ vi.mock("./tags/GitManagerTagDialog", () => ({
 vi.mock("./dialogs/GitManagerBranchDialogs", () => ({
   GitManagerBranchDialogs: (props: Record<string, unknown>) => {
     h.branchDialogProps.push(props);
-    return null;
+    return props.dialog === null ? null : (
+      <div role="dialog">
+        {props.errorMessage as React.ReactNode}
+        {props.signInPrompt as React.ReactNode}
+      </div>
+    );
   },
 }));
 
@@ -222,7 +231,22 @@ beforeEach(() => {
   h.runOperation.mockReset();
   h.failureMessage = null;
   h.failures = {};
+  h.events = {};
+  h.runSignIn.mockReset();
+  h.runSignIn.mockImplementation(() => ({
+    cancel: vi.fn(),
+    result: Promise.resolve({ _tag: "Success", value: { outcome: "signedIn", message: "" } }),
+  }));
   h.runOperation.mockImplementation((_registry, { input }, onEvent) => {
+    const sequence = h.events[input._tag];
+    if (sequence !== undefined) {
+      delete h.events[input._tag];
+      for (const event of sequence) onEvent(event);
+      return {
+        cancel: vi.fn(),
+        result: Promise.resolve({ _tag: "Success", value: sequence.at(-1) }),
+      };
+    }
     const failure =
       h.failures[input._tag] ??
       (h.failureMessage === null ? null : { code: "branch-exists", message: h.failureMessage });
@@ -728,6 +752,259 @@ describe("GitManagerToolbar", () => {
     for (const markup of [disabled, empty]) expect(markup).not.toMatch(/text-\[\d+px\]/);
     expect(disabled).toContain(`<span class="text-xs text-muted-foreground">${reason}</span>`);
     expect(empty).toContain('<span class="text-xs text-muted-foreground">No local tags.</span>');
+  });
+
+  describe("remote branch delete (#397)", () => {
+    const offer = {
+      remote: "origin",
+      destination: "https://gitlab.example.test/example-group/sample-project.git",
+      host: "gitlab.example.test",
+      direction: "push" as const,
+    };
+    const resume = {
+      _tag: "remote-branch-delete" as const,
+      cwd: "/opaque/main",
+      projectId: "project-current" as never,
+      remote: "origin",
+      branch: "develop",
+      expectedDestination: offer.destination,
+    };
+    const signInFailure: GitManagerOperationEvent = {
+      _tag: "failed",
+      operation: "remote-branch-delete",
+      code: "sign-in-required",
+      message: "Sign in to continue.",
+      blocked: null,
+      signIn: { ...offer, resume },
+    };
+    let container: HTMLDivElement;
+    let root: ReturnType<typeof createRoot>;
+
+    async function mount() {
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+      container = document.createElement("div");
+      document.body.append(container);
+      root = createRoot(container);
+      await rerender();
+    }
+
+    async function rerender() {
+      await act(async () =>
+        root.render(
+          <GitManagerToolbar
+            projectRef={currentProject}
+            mainCheckoutCwd="/opaque/main"
+            selectedWorktreeCwd="/opaque/main"
+            worktrees={worktrees}
+            catalogPending={false}
+            catalogError={null}
+            repositoryUnavailable={null}
+            branchSyncDisabledReason={null}
+            stashMergeDisabledReason={null}
+            tagDisabledReason={null}
+            onSelectedWorktreeChange={() => undefined}
+          />,
+        ),
+      );
+    }
+
+    async function unmount() {
+      await act(async () => root.unmount());
+      container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+
+    const lastDialogProps = () => h.branchDialogProps.at(-1)!;
+    const clickButton = async (text: string) => {
+      const button = [...document.querySelectorAll("button")].find(
+        (entry) => entry.textContent === text,
+      );
+      expect(button).toBeDefined();
+      await act(async () => button!.click());
+    };
+    const submit = async (submission: Record<string, unknown>) => {
+      const onSubmit = lastDialogProps().onSubmit as (value: unknown) => Promise<void>;
+      await act(async () => onSubmit(submission));
+    };
+    const sentInputs = () => h.runOperation.mock.calls.map((call) => call[1].input);
+
+    it.each([
+      ["with a local branch of the same name", true],
+      ["for a remote-only branch", false],
+    ])("deletes the remote row %s, then the row is gone", async (_, withLocal) => {
+      const local = withLocal ? [ref("develop")] : [];
+      h.snapshot = {
+        ...refsSnapshot(),
+        localBranches: [...refsSnapshot().localBranches, ...local],
+        remoteBranches: [ref("origin/main", { isDefault: true }), ref("origin/develop")],
+      };
+      await mount();
+      try {
+        const deleteButton = container.querySelector<HTMLButtonElement>(
+          '[aria-label="Delete remote branch origin/develop"]',
+        );
+        await act(async () => deleteButton!.click());
+        expect(lastDialogProps().dialog).toMatchObject({
+          kind: "delete-remote",
+          remote: "origin",
+          remoteBranch: "develop",
+        });
+
+        await submit({ kind: "delete-remote", remote: "origin", branch: "develop" });
+
+        expect(sentInputs()).toEqual([
+          {
+            _tag: "remote-branch-delete",
+            cwd: "/opaque/main",
+            projectId: "project-current",
+            remote: "origin",
+            branch: "develop",
+          },
+        ]);
+        expect(lastDialogProps().dialog).toBeNull();
+        expect(h.refreshRefs).toHaveBeenCalled();
+
+        h.snapshot = { ...h.snapshot, remoteBranches: [ref("origin/main", { isDefault: true })] };
+        await act(async () =>
+          useGitManagerStore.getState().setOpenDropdown(currentProject, "branch"),
+        );
+        await rerender();
+        expect(
+          container.querySelector('[aria-label="Delete remote branch origin/develop"]'),
+        ).toBeNull();
+        expect(container.querySelector('[aria-label="Delete develop"]') !== null).toBe(withLocal);
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("offers sign-in inside the dialog and resumes the offer's request unchanged", async () => {
+      h.snapshot = { ...refsSnapshot(), remoteBranches: [ref("origin/develop")] };
+      h.events = { "remote-branch-delete": [signInFailure] };
+      await mount();
+      try {
+        await act(async () =>
+          container
+            .querySelector<HTMLButtonElement>('[aria-label="Delete remote branch origin/develop"]')!
+            .click(),
+        );
+        await submit({ kind: "delete-remote", remote: "origin", branch: "develop" });
+        expect(lastDialogProps().dialog).not.toBeNull();
+        expect(container.querySelector('[role="dialog"]')?.textContent).toContain(
+          "gitlab.example.test",
+        );
+
+        await clickButton("Sign in");
+
+        expect(h.runSignIn).toHaveBeenCalledTimes(1);
+        expect(sentInputs()).toEqual([
+          {
+            _tag: "remote-branch-delete",
+            cwd: "/opaque/main",
+            projectId: "project-current",
+            remote: "origin",
+            branch: "develop",
+          },
+          resume,
+        ]);
+        expect(lastDialogProps().dialog).toBeNull();
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("keeps the dialog open with the failure when sign-in is declined", async () => {
+      h.snapshot = { ...refsSnapshot(), remoteBranches: [ref("origin/develop")] };
+      h.events = { "remote-branch-delete": [signInFailure] };
+      await mount();
+      try {
+        await act(async () =>
+          container
+            .querySelector<HTMLButtonElement>('[aria-label="Delete remote branch origin/develop"]')!
+            .click(),
+        );
+        await submit({ kind: "delete-remote", remote: "origin", branch: "develop" });
+        await clickButton("Not now");
+
+        expect(sentInputs()).toHaveLength(1);
+        expect(lastDialogProps().dialog).not.toBeNull();
+        expect(lastDialogProps().errorMessage).toBe(
+          "Authentication failed. Check the configured credentials and try again.",
+        );
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("shows the remote's rejection text and keeps the dialog open", async () => {
+      const rejection = " ! [remote rejected] develop (protected branch hook declined)";
+      h.snapshot = { ...refsSnapshot(), remoteBranches: [ref("origin/develop")] };
+      h.events = {
+        "remote-branch-delete": [
+          { _tag: "started", operation: "remote-branch-delete" },
+          { _tag: "output", operation: "remote-branch-delete", stream: "stderr", text: rejection },
+          {
+            _tag: "failed",
+            operation: "remote-branch-delete",
+            code: "git-command-failed",
+            message: "The Git command failed.",
+            blocked: null,
+          },
+        ],
+      };
+      await mount();
+      try {
+        await act(async () =>
+          container
+            .querySelector<HTMLButtonElement>('[aria-label="Delete remote branch origin/develop"]')!
+            .click(),
+        );
+        await submit({ kind: "delete-remote", remote: "origin", branch: "develop" });
+
+        expect(lastDialogProps().dialog).not.toBeNull();
+        expect(lastDialogProps().errorMessage).toContain("protected branch hook declined");
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("keeps local delete with its remote and now offers sign-in for it", async () => {
+      h.snapshot = {
+        ...refsSnapshot(),
+        localBranches: [
+          ...refsSnapshot().localBranches,
+          ref("develop", { upstream: "origin/develop" }),
+        ],
+        remoteBranches: [ref("origin/develop")],
+      };
+      h.events = { "branch-delete": [{ ...signInFailure, operation: "branch-delete" }] };
+      await mount();
+      try {
+        await act(async () =>
+          container.querySelector<HTMLButtonElement>('[aria-label="Delete develop"]')!.click(),
+        );
+        expect(lastDialogProps().dialog).toMatchObject({ kind: "delete", existsUpstream: true });
+        await submit({ kind: "delete", name: "develop", deleteRemote: true });
+
+        expect(sentInputs()).toEqual([
+          {
+            _tag: "branch-delete",
+            cwd: "/opaque/main",
+            projectId: "project-current",
+            name: "develop",
+            force: true,
+            deleteRemote: true,
+          },
+        ]);
+        expect(container.querySelector('[role="dialog"]')?.textContent).toContain(
+          "gitlab.example.test",
+        );
+        await clickButton("Sign in");
+        expect(sentInputs().at(-1)).toEqual(resume);
+      } finally {
+        await unmount();
+      }
+    });
   });
 
   it("skips the live signal subscription without disabling explicit repository reads", () => {

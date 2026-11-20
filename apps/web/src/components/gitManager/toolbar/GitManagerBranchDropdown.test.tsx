@@ -297,6 +297,61 @@ describe("GitManagerBranchDropdown", () => {
     expect(container.textContent).not.toContain("Remote branches");
   });
 
+  it("offers Delete and no Rename on a remote row", async () => {
+    const onDeleteRemoteBranch = vi.fn();
+    const remote = branch("origin/feature/a");
+    await renderDropdown([], {
+      remoteRefs: [remote],
+      remotes: ["origin"],
+      onDeleteRemoteBranch,
+    });
+
+    expect(container.querySelector('[aria-label="Rename origin/feature/a"]')).toBeNull();
+    const deleteButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Delete remote branch origin/feature/a"]',
+    );
+    expect(deleteButton?.disabled).toBe(false);
+    await act(async () => deleteButton!.click());
+    expect(onDeleteRemoteBranch).toHaveBeenCalledWith(remote);
+  });
+
+  it.each([
+    [
+      "the remote's default branch",
+      branch("upstream/trunk", { isDefault: true }),
+      ["origin", "upstream"],
+      "Delete is blocked: this is the remote's default branch.",
+    ],
+    [
+      "a name two remotes match",
+      branch("team/fork/x"),
+      ["team", "team/fork"],
+      "Delete is blocked: two remotes match this name. Delete it from a terminal.",
+    ],
+  ])(
+    "disables Delete on %s with a visible, described reason",
+    async (_, remote, remotes, reason) => {
+      const onDeleteRemoteBranch = vi.fn();
+      await renderDropdown([], { remoteRefs: [remote], remotes, onDeleteRemoteBranch });
+
+      const deleteButton = container.querySelector<HTMLButtonElement>(
+        `[aria-label="Delete remote branch ${remote.name}"]`,
+      );
+      expect(deleteButton).toMatchObject({ disabled: true, title: reason });
+      expect(container.textContent).toContain(reason);
+      const describedBy = deleteButton!.getAttribute("aria-describedby")!.split(" ");
+      expect(describedBy.map((id) => document.getElementById(id)?.textContent)).toContain(reason);
+      await act(async () => deleteButton!.click());
+      expect(onDeleteRemoteBranch).not.toHaveBeenCalled();
+      // Checkout of the remote row is a different action and stays available.
+      expect(
+        container.querySelector<HTMLButtonElement>(
+          `[aria-label="Check out remote branch ${remote.name}"]`,
+        )?.disabled,
+      ).toBe(false);
+    },
+  );
+
   const dirty = (operation: string, label: string) => ({
     operation,
     code: "dirty-working-tree" as const,
@@ -306,7 +361,11 @@ describe("GitManagerBranchDropdown", () => {
   it("lets a dirty checkout through to the Stash or Bring choice", async () => {
     const callbacks = await renderDropdown([
       branch("feature", {
-        blocked: [dirty("checkout", "Checkout"), dirty("merge", "Merge"), dirty("rebase", "Rebase")],
+        blocked: [
+          dirty("checkout", "Checkout"),
+          dirty("merge", "Merge"),
+          dirty("rebase", "Rebase"),
+        ],
       }),
     ]);
 

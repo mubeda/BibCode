@@ -415,12 +415,100 @@ describe("GitManagerBranchDialogs", () => {
     expect(renames).toEqual([{ kind: "rename", name: "feature", newName: "feature-two" }]);
   });
 
+  async function renderRemoteDelete(
+    remoteRefs: ReadonlyArray<GitManagerRefEntry>,
+    extra: Partial<React.ComponentProps<typeof GitManagerBranchDialogs>> = {},
+  ) {
+    const submissions: GitManagerBranchDialogSubmission[] = [];
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={{
+            kind: "delete-remote",
+            branch: branch("origin/feature/a"),
+            remote: "origin",
+            remoteBranch: "feature/a",
+          }}
+          errorMessage={null}
+          refs={[]}
+          remoteRefs={remoteRefs}
+          onClose={() => undefined}
+          onSubmit={(submission) => {
+            submissions.push(submission);
+            return Promise.resolve();
+          }}
+          {...extra}
+        />,
+      ),
+    );
+    return submissions;
+  }
+
+  it("confirms a remote branch delete that names the remote and keeps the local branch", async () => {
+    const submissions = await renderRemoteDelete([branch("origin/feature/a")]);
+
+    expect(document.querySelector("h2")?.textContent).toBe("Delete Remote Branch?");
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("feature/a");
+    expect(text).toContain("origin");
+    expect(text).toContain("A local branch with the same name is kept.");
+    expect(text).toContain("The remote may refuse to delete a protected branch.");
+    const deleteButton = buttonWithText("Delete remote branch");
+    expect(deleteButton.disabled).toBe(true);
+    await act(async () => deleteButton.click());
+    expect(submissions).toEqual([]);
+
+    await confirmDelete();
+    expect(deleteButton.disabled).toBe(false);
+    await act(async () => deleteButton.click());
+    expect(submissions).toEqual([{ kind: "delete-remote", remote: "origin", branch: "feature/a" }]);
+  });
+
+  it("sends nothing when the remote branch is gone from a newer snapshot", async () => {
+    const submissions = await renderRemoteDelete([branch("origin/feature/a")]);
+    await confirmDelete();
+    await renderRemoteDelete([branch("origin/other")]);
+
+    await act(async () => buttonWithText("Delete remote branch").click());
+    expect(submissions).toEqual([]);
+    expect(document.body.textContent).toContain("This remote branch no longer exists.");
+  });
+
+  it("blocks a remote branch that became the remote's default while the dialog was open", async () => {
+    const submissions = await renderRemoteDelete([branch("origin/feature/a")]);
+    await confirmDelete();
+    await renderRemoteDelete([branch("origin/feature/a", { isDefault: true })]);
+
+    await act(async () => buttonWithText("Delete remote branch").click());
+    expect(submissions).toEqual([]);
+    expect(document.body.textContent).toContain(
+      "Delete is blocked: this is the remote's default branch.",
+    );
+  });
+
+  it("shows a Git error and a sign-in prompt inside the open dialog", async () => {
+    const error = "remote: error: protected branch hook declined";
+    await renderRemoteDelete([branch("origin/feature/a")], {
+      errorMessage: error,
+      signInPrompt: <p>Sign in to example.test?</p>,
+    });
+
+    expect(document.body.textContent).toContain(error);
+    expect(document.body.textContent).toContain("Sign in to example.test?");
+    expect(buttonWithText("Delete remote branch")).toBeDefined();
+  });
+
   it("shows the server's rename reason and not an unrelated one", async () => {
-    const message = "Rename is blocked: the worktree at /opaque/feature has this branch checked out.";
+    const message =
+      "Rename is blocked: the worktree at /opaque/feature has this branch checked out.";
     await renderBranchDialog({
       kind: "rename",
       branch: branch("feature", {
-        blocked: [MERGE_DIRTY, { operation: "rename-branch", code: "worktree-checked-out", message }],
+        blocked: [
+          MERGE_DIRTY,
+          { operation: "rename-branch", code: "worktree-checked-out", message },
+        ],
       }),
     });
 
