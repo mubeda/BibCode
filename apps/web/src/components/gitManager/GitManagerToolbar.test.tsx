@@ -1024,7 +1024,75 @@ describe("GitManagerToolbar", () => {
           "gitlab.example.test",
         );
         await clickButton("Sign in");
-        expect(sentInputs().at(-1)).toEqual(resume);
+        // The pre-check needed the sign-in, so the local branch is still listed: after the
+        // resumed remote delete, the local one is deleted too, then the dialog closes.
+        expect(sentInputs().slice(1)).toEqual([
+          resume,
+          {
+            _tag: "branch-delete",
+            cwd: "/opaque/main",
+            projectId: "project-current",
+            name: "develop",
+            force: true,
+            deleteRemote: false,
+          },
+        ]);
+        expect(lastDialogProps().dialog).toBeNull();
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("resumes only the remote delete when the local branch is already gone", async () => {
+      const withLocal = {
+        ...refsSnapshot(),
+        localBranches: [
+          ...refsSnapshot().localBranches,
+          ref("develop", { upstream: "origin/develop" }),
+        ],
+        remoteBranches: [ref("origin/develop")],
+      };
+      h.snapshot = withLocal;
+      h.events = { "branch-delete": [{ ...signInFailure, operation: "branch-delete" }] };
+      await mount();
+      try {
+        await act(async () =>
+          container.querySelector<HTMLButtonElement>('[aria-label="Delete develop"]')!.click(),
+        );
+        await submit({ kind: "delete", name: "develop", deleteRemote: true });
+        // The push failed after the local delete, so the refreshed refs no longer list it.
+        h.snapshot = { ...withLocal, localBranches: refsSnapshot().localBranches };
+        await rerender();
+        await clickButton("Sign in");
+
+        expect(sentInputs().slice(1)).toEqual([resume]);
+        expect(lastDialogProps().dialog).toBeNull();
+      } finally {
+        await unmount();
+      }
+    });
+
+    it("blocks a second submission while a sign-in is pending", async () => {
+      h.snapshot = {
+        ...refsSnapshot(),
+        localBranches: [
+          ...refsSnapshot().localBranches,
+          ref("develop", { upstream: "origin/develop" }),
+        ],
+        remoteBranches: [ref("origin/develop")],
+      };
+      h.events = { "branch-delete": [{ ...signInFailure, operation: "branch-delete" }] };
+      await mount();
+      try {
+        await act(async () =>
+          container.querySelector<HTMLButtonElement>('[aria-label="Delete develop"]')!.click(),
+        );
+        await submit({ kind: "delete", name: "develop", deleteRemote: true });
+        expect(lastDialogProps().disabledReason).toBe("Finish or cancel the sign-in first.");
+        await submit({ kind: "delete", name: "develop", deleteRemote: false });
+
+        expect(sentInputs()).toHaveLength(1);
+        expect(lastDialogProps().dialog).not.toBeNull();
       } finally {
         await unmount();
       }
