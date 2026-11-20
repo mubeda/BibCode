@@ -1,0 +1,9 @@
+# Triage, 2026-11-20
+
+| Issue | Title                                                             | Class          | Type    | Recommendation | Route                       | Reason and evidence                                                                      | Acceptance hint                                                                     | Duplicate check                       |
+| ----- | ----------------------------------------------------------------- | -------------- | ------- | -------------- | --------------------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------- |
+| #398  | Files: undo and redo keyboard shortcuts do not work in the editor | Bug with repro | bug     | now            | workflow                    | Complete report; only Ctrl/Cmd+S is bound on the Files surface                           | Chords undo and redo the same history as the buttons in both views                  | 3 searches, none (#342 related)       |
+| #397  | Git Manager: delete a remote branch from the branch list          | Feature        | feature | now            | workflow                    | Server operation exists with no UI caller; guard names differ between server and dialogs | A remote row deletes after confirmation; default branch blocked; refused push shown | 3 searches, none (#139, #325 related) |
+| #399  | AI terminal: support the Antigravity CLI                          | Feature        | feature | now            | workflow, design note first | No `agy` entry in the launch table, inventory or hermetic guard                          | Antigravity Terminal launches the TUI; chat action absent; editor command unchanged | 3 searches, none                      |
+
+Totals: 3 now, 0 next, 0 defer, 0 closing.
