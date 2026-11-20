@@ -21,6 +21,15 @@ describe("ProviderSettingsForm helpers", () => {
     ]);
   });
 
+  it("offers the Antigravity binary path with agy as its placeholder (R11)", () => {
+    const antigravity = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("antigravity")];
+
+    expect(antigravity).toBeDefined();
+    expect(deriveProviderSettingsFields(antigravity!)).toEqual([
+      expect.objectContaining({ key: "binaryPath", placeholder: "agy" }),
+    ]);
+  });
+
   it("sources labels and descriptions from schema annotations", () => {
     const opencode = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("opencode")];
     expect(opencode).toBeDefined();

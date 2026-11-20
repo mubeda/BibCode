@@ -8,6 +8,7 @@ import {
   TERMINAL_LAUNCH_EXECUTABLE_MAX_LENGTH,
   TERMINAL_LAUNCH_LABEL_MAX_LENGTH,
   type ProviderOptionDescriptor,
+  type ProviderSessionDefault,
   type ServerSettings,
   type ServerProviderModel,
 } from "@bibcode/contracts";
@@ -29,6 +30,7 @@ const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 const GROK_DRIVER = ProviderDriverKind.make("grok");
 const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
+const ANTIGRAVITY_DRIVER = ProviderDriverKind.make("antigravity");
 
 function entry(
   driver: string,
@@ -679,6 +681,7 @@ describe("resolveProviderTerminalAction", () => {
   it.each([
     { driver: CURSOR_DRIVER, executable: "cursor-agent" },
     { driver: GROK_DRIVER, executable: "grok" },
+    { driver: ANTIGRAVITY_DRIVER, executable: "agy" },
   ])("names the $driver provider so its status reads unavailable", ({ driver, executable }) => {
     const action = resolveProviderTerminalAction(entry(driver, driver), DEFAULT_SERVER_SETTINGS);
 
@@ -766,6 +769,150 @@ describe("resolveProviderTerminalAction", () => {
     ]) {
       expect(decodeTerminalLaunchCommand(candidate)).toBeNull();
     }
+  });
+});
+
+describe("Antigravity Terminal (R12)", () => {
+  const ANTIGRAVITY_ID = ProviderInstanceId.make("antigravity");
+  const thinkingLevel: ProviderOptionDescriptor = {
+    id: "reasoning",
+    label: "Thinking level",
+    type: "select",
+    options: [
+      { id: "low", label: "Low" },
+      { id: "medium", label: "Medium", isDefault: true },
+      { id: "high", label: "High" },
+    ],
+    currentValue: "medium",
+  };
+  const catalog = [model("model-alpha", [thinkingLevel]), model("model-beta", [thinkingLevel])];
+
+  function withDefault(
+    configuredDefault: ProviderSessionDefault | undefined,
+    overrides: Partial<ServerSettings> = {},
+  ): ServerSettings {
+    return {
+      ...DEFAULT_SERVER_SETTINGS,
+      ...overrides,
+      providerSessionDefaults: configuredDefault ? { [ANTIGRAVITY_DRIVER]: configuredDefault } : {},
+    };
+  }
+
+  function launch(settings: ServerSettings, instanceId = "antigravity", displayName = "Antigravity") {
+    return resolveProviderTerminalAction(
+      entry("antigravity", instanceId, displayName, catalog),
+      settings,
+    );
+  }
+
+  it("starts plain agy with the bypass flag and no model when no default is saved", () => {
+    const action = launch(withDefault(undefined));
+
+    // The resolver would pick model-alpha from the catalog; the terminal must not (D-A6).
+    expect(action?.command).toEqual({
+      executable: "agy",
+      args: ["--dangerously-skip-permissions"],
+      label: "Antigravity Terminal",
+      activity: { driverKind: ANTIGRAVITY_DRIVER, providerInstanceId: ANTIGRAVITY_ID },
+    });
+    expect(action).not.toHaveProperty("fallback");
+  });
+
+  it("passes the saved model alone, without the catalog's default thinking level", () => {
+    expect(launch(withDefault({ model: "model-beta" }))?.command?.args).toEqual([
+      "--dangerously-skip-permissions",
+      "--model",
+      "model-beta",
+    ]);
+  });
+
+  it("passes the saved model and thinking level as stored", () => {
+    expect(
+      launch(withDefault({ model: "model-beta", options: [{ id: "reasoning", value: "high" }] }))
+        ?.command?.args,
+    ).toEqual(["--dangerously-skip-permissions", "--model", "model-beta", "--effort", "high"]);
+  });
+
+  it("passes a saved model the catalog does not list, and no fallback", () => {
+    const action = launch(withDefault({ model: "model-gamma" }));
+
+    expect(action?.command?.args).toEqual([
+      "--dangerously-skip-permissions",
+      "--model",
+      "model-gamma",
+    ]);
+    expect(action).not.toHaveProperty("fallback");
+  });
+
+  it("reads the thinking level only from the reasoning option", () => {
+    expect(
+      launch(withDefault({ model: "model-beta", options: [{ id: "effort", value: "high" }] }))
+        ?.command?.args,
+    ).toEqual(["--dangerously-skip-permissions", "--model", "model-beta"]);
+  });
+
+  it("never resumes a conversation", () => {
+    const args =
+      launch(withDefault({ model: "model-beta", options: [{ id: "reasoning", value: "high" }] }))
+        ?.command?.args ?? [];
+
+    for (const flag of ["--continue", "-c", "--conversation"]) {
+      expect(args).not.toContain(flag);
+    }
+  });
+
+  it("starts a custom instance's binary and names that instance", () => {
+    const customId = ProviderInstanceId.make("antigravity_work");
+    const settings = withDefault(undefined, {
+      providerInstances: {
+        [customId]: {
+          driver: ANTIGRAVITY_DRIVER,
+          displayName: "Work Antigravity",
+          enabled: true,
+          config: { binaryPath: " custom-agy " },
+        },
+      },
+    });
+
+    expect(launch(settings, customId, "Work Antigravity")).toMatchObject({
+      label: "Work Antigravity Terminal",
+      command: {
+        executable: "custom-agy",
+        args: ["--dangerously-skip-permissions"],
+        activity: { driverKind: ANTIGRAVITY_DRIVER, providerInstanceId: customId },
+      },
+    });
+  });
+
+  it("starts the legacy binary path of the default instance", () => {
+    const settings = withDefault(undefined, {
+      providers: {
+        ...DEFAULT_SERVER_SETTINGS.providers,
+        antigravity: { ...DEFAULT_SERVER_SETTINGS.providers.antigravity, binaryPath: "legacy-agy" },
+      },
+    });
+
+    expect(launch(settings)?.command?.executable).toBe("legacy-agy");
+  });
+
+  it("disables the action when the saved model exceeds command bounds", () => {
+    const action = launch(withDefault({ model: "x".repeat(TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH + 1) }));
+
+    expect(action).toMatchObject({
+      command: null,
+      disabledReason:
+        "Provider terminal command exceeds supported limits. Shorten the provider name or configured binary path.",
+    });
+  });
+
+  it("offers no review terminal", () => {
+    expect(
+      resolveProviderReviewTerminalAction(
+        entry("antigravity", "antigravity", "Antigravity", catalog),
+        DEFAULT_SERVER_SETTINGS,
+        { prompt: "Review.", platformOs: "linux", modelSelection: null },
+      ),
+    ).toBeNull();
   });
 });
 

@@ -440,6 +440,16 @@ describe("ProviderSessionDefaultsControls", () => {
     expect(entries("Switch")[0]?.disabled).toBe(true);
   });
 
+  it("names the CLI's own default when Antigravity has no catalog and no saved default", () => {
+    const markup = render(
+      baseProps({ driver: ProviderDriverKind.make("antigravity"), models: [], value: undefined }),
+    );
+
+    expect(markup).toContain("CLI default");
+    expect(markup).not.toContain("Unavailable here");
+    expect(entries("Select")[0]?.disabled).toBe(true);
+  });
+
   it("keeps the full control row mounted when model capabilities change", async () => {
     const mounted = await mount(
       baseProps({ driver: OPENCODE, models: richModels, value: richValue }),

@@ -3,6 +3,7 @@ import {
   ProviderDriverKind,
   TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH,
   type ModelSelection,
+  type ProviderSessionDefault,
   type ServerSettings,
   type TerminalLaunchCommand,
 } from "@bibcode/contracts";
@@ -55,6 +56,10 @@ const DEFINITIONS: Partial<Record<ProviderDriverKind, ProviderTerminalDefinition
   [ProviderDriverKind.make("grok")]: {
     executable: "grok",
     args: ["--permission-mode", "bypassPermissions"],
+  },
+  [ProviderDriverKind.make("antigravity")]: {
+    executable: "agy",
+    args: ["--dangerously-skip-permissions"],
   },
 };
 
@@ -160,6 +165,20 @@ function providerArguments(
   return [];
 }
 
+/**
+ * Antigravity's flags come only from the saved default, never from the resolver's fallback model:
+ * without a saved default the TUI starts on its own model (design note D-A6).
+ */
+function antigravityArguments(configuredDefault: ProviderSessionDefault | null): string[] {
+  if (configuredDefault === null) return [];
+  const effort = configuredDefault.options?.find((option) => option.id === "reasoning")?.value;
+  return [
+    "--model",
+    configuredDefault.model,
+    ...(typeof effort === "string" ? ["--effort", effort] : []),
+  ];
+}
+
 function resolveTerminalLaunch(
   entry: ProviderInstanceEntry,
   settings: ProviderTerminalSettings,
@@ -168,20 +187,25 @@ function resolveTerminalLaunch(
 ) {
   const instance = settings.providerInstances?.[entry.instanceId];
   const legacy = (settings.providers as Readonly<Record<string, unknown>>)[entry.driverKind];
+  const configuredDefault = settings.providerSessionDefaults[entry.driverKind] ?? null;
   const resolution = resolveProviderSessionDefault({
     driver: entry.driverKind,
     instanceId: entry.instanceId,
     models: entry.models,
-    configuredDefault: settings.providerSessionDefaults[entry.driverKind] ?? null,
+    configuredDefault,
     explicitSelection,
   });
+  const rawDefaultOnly = entry.driverKind === ProviderDriverKind.make("antigravity");
   return {
     executable: binaryPath(instance?.config) ?? binaryPath(legacy) ?? definition.executable,
     // Every AI Terminal names its provider: the server observes the ones it can (Codex, Claude,
     // OpenCode on macOS and Linux) and reports the rest as status unavailable (#187).
     activity: { driverKind: entry.driverKind, providerInstanceId: entry.instanceId },
-    resolution,
-    modelArguments: providerArguments(entry.driverKind, resolution, entry.models),
+    // No resolver fallback reaches Antigravity's argv, so none is reported either.
+    resolution: rawDefaultOnly ? { ...resolution, fallback: null } : resolution,
+    modelArguments: rawDefaultOnly
+      ? antigravityArguments(configuredDefault)
+      : providerArguments(entry.driverKind, resolution, entry.models),
   };
 }
 

@@ -24,6 +24,7 @@ import {
   DEFAULT_UNIFIED_SETTINGS,
   type UnifiedSettings,
 } from "@bibcode/contracts/settings";
+import { AntigravityIcon } from "../Icons";
 import * as settingsPanelsLogic from "./SettingsPanels.logic";
 
 type AnyProps = Record<string, unknown>;
@@ -1648,6 +1649,7 @@ describe("ProviderSettingsPanel", () => {
       "cursor",
       "cursor_alt",
       "opencode",
+      "antigravity",
     ]);
 
     const cursorCard = h.instanceCards.find((card) => String(card.instanceId) === "cursor")!;
@@ -1668,6 +1670,69 @@ describe("ProviderSettingsPanel", () => {
     expect(typeof personalCard.onDelete).toBe("function");
     expect(personalCard).not.toHaveProperty("sessionDefaults");
     expect(personalCard).not.toHaveProperty("onSessionDefaultsChange");
+  });
+
+  it("offers a disabled Antigravity card with a chat preview badge and session defaults (R11)", () => {
+    const antigravityDriver = ProviderDriverKind.make("antigravity");
+    const customId = ProviderInstanceId.make("antigravity_work");
+    const settings = baseProviderSettings();
+    h.settings = {
+      ...settings,
+      providerInstances: {
+        ...settings.providerInstances,
+        [customId]: {
+          driver: antigravityDriver,
+          displayName: "Work Antigravity",
+          enabled: true,
+          config: { binaryPath: "custom-agy" },
+        },
+      },
+    };
+
+    render(<ProviderSettingsPanel />);
+
+    const cardIds = h.instanceCards.map((card) => String(card.instanceId));
+    expect(cardIds.slice(-2)).toEqual(["antigravity", "antigravity_work"]);
+    const defaultCard = h.instanceCards.find((card) => String(card.instanceId) === "antigravity")!;
+    const customCard = h.instanceCards.find((card) => String(card.instanceId) === customId)!;
+    expect(defaultCard.instance).toMatchObject({
+      driver: antigravityDriver,
+      enabled: false,
+      config: { enabled: false, binaryPath: "agy" },
+    });
+    for (const card of [defaultCard, customCard]) {
+      expect(card.driverOption).toMatchObject({
+        value: antigravityDriver,
+        label: "Antigravity",
+        icon: AntigravityIcon,
+        badgeLabel: "Chat preview",
+      });
+    }
+    expect(typeof defaultCard.onSessionDefaultsChange).toBe("function");
+    expect(customCard).not.toHaveProperty("onSessionDefaultsChange");
+    expect(typeof customCard.onDelete).toBe("function");
+    expect(customCard.instance).toMatchObject({ enabled: true, config: { binaryPath: "custom-agy" } });
+  });
+
+  it("writes enabled explicitly when the default Antigravity card is switched on", () => {
+    const antigravityId = ProviderInstanceId.make("antigravity");
+    h.settings = baseProviderSettings();
+
+    render(<ProviderSettingsPanel />);
+    const card = h.instanceCards.find((entry) => String(entry.instanceId) === "antigravity")!;
+    (card.onUpdate as (next: ProviderInstanceConfig) => void)({
+      ...(card.instance as ProviderInstanceConfig),
+      enabled: true,
+    });
+
+    const patch = h.updateSettings.mock.calls.at(-1)![0] as {
+      providerInstances: Record<string, ProviderInstanceConfig>;
+    };
+    expect(patch.providerInstances[antigravityId]).toMatchObject({
+      driver: "antigravity",
+      enabled: true,
+      config: { binaryPath: "agy" },
+    });
   });
 
   it("hides default and custom Grok provider rows", () => {
