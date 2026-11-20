@@ -69,6 +69,7 @@ const desktopUiSpecFiles =
         "./specs/mermaid-diagrams.e2e.ts",
         "./specs/files-binary-preview.e2e.ts",
         "./specs/files-rich-markdown.e2e.ts",
+        "./specs/files-undo-shortcuts.e2e.ts",
         "./specs/appearance-themes.e2e.ts",
         "./specs/source-control-review.e2e.ts",
         "./specs/host-dashboard.e2e.ts",
