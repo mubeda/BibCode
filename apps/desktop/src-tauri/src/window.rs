@@ -16,6 +16,21 @@ pub const MENU_ACTION_EVENT: &str = "desktop:menu-action";
 pub const MENU_ACTION_OPEN_SETTINGS: &str = "open-settings";
 pub const MENU_ACTION_CHECK_FOR_UPDATES: &str = "check-for-updates";
 pub const MENU_ACTION_CLOSE_SHORTCUT: &str = "close-shortcut";
+#[cfg(target_os = "macos")]
+pub const MENU_ACTION_EDIT_UNDO: &str = "edit-undo";
+#[cfg(target_os = "macos")]
+pub const MENU_ACTION_EDIT_REDO: &str = "edit-redo";
+#[cfg(target_os = "macos")]
+const MENU_ID_EDIT_UNDO: &str = "bibcode:edit-undo";
+#[cfg(target_os = "macos")]
+const MENU_ID_EDIT_REDO: &str = "bibcode:edit-redo";
+/// Id, label and accelerator of the macOS Edit menu's Undo and Redo, which replace the predefined
+/// items: those send `undo:` to WebKit, whose own undo never holds the Files editors' edits.
+#[cfg(target_os = "macos")]
+const EDIT_MENU_ITEMS: [(&str, &str, &str); 2] = [
+    (MENU_ID_EDIT_UNDO, "Undo", "CmdOrCtrl+Z"),
+    (MENU_ID_EDIT_REDO, "Redo", "CmdOrCtrl+Shift+Z"),
+];
 
 pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 const MENU_ID_OPEN_SETTINGS: &str = "bibcode:open-settings";
@@ -43,12 +58,19 @@ struct MainWindowState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplicationMenuAction {
     Emit(&'static str),
+    /// Edit > Undo or Redo: the page's action when the main webview has focus, else native.
+    #[cfg(target_os = "macos")]
+    Edit(&'static str),
     CloseWindow,
     Quit,
 }
 
 fn menu_action_for_id(id: &str) -> Option<ApplicationMenuAction> {
     match id {
+        #[cfg(target_os = "macos")]
+        MENU_ID_EDIT_UNDO => Some(ApplicationMenuAction::Edit(MENU_ACTION_EDIT_UNDO)),
+        #[cfg(target_os = "macos")]
+        MENU_ID_EDIT_REDO => Some(ApplicationMenuAction::Edit(MENU_ACTION_EDIT_REDO)),
         MENU_ID_OPEN_SETTINGS => Some(ApplicationMenuAction::Emit(MENU_ACTION_OPEN_SETTINGS)),
         MENU_ID_CHECK_FOR_UPDATES => {
             Some(ApplicationMenuAction::Emit(MENU_ACTION_CHECK_FOR_UPDATES))
@@ -79,6 +101,8 @@ pub fn configure_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Resu
                 }
                 let _ = app.emit(MENU_ACTION_EVENT, action);
             }
+            #[cfg(target_os = "macos")]
+            Some(ApplicationMenuAction::Edit(action)) => run_edit_menu_action(app, action),
             Some(ApplicationMenuAction::CloseWindow) => {
                 if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                     let _ = window.close();
@@ -113,15 +137,18 @@ fn build_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<
         .separator()
         .item(&quit)
         .build()?;
-    let edit = SubmenuBuilder::new(app, "Edit")
-        .undo()
-        .redo()
-        .separator()
-        .cut()
-        .copy()
-        .paste()
-        .select_all()
-        .build()?;
+    #[cfg(target_os = "macos")]
+    let edit = {
+        let [undo, redo] = EDIT_MENU_ITEMS.map(|(id, label, accelerator)| {
+            MenuItemBuilder::with_id(id, label)
+                .accelerator(accelerator)
+                .build(app)
+        });
+        SubmenuBuilder::new(app, "Edit").item(&undo?).item(&redo?)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let edit = SubmenuBuilder::new(app, "Edit").undo().redo();
+    let edit = edit.separator().cut().copy().paste().select_all().build()?;
     let view = SubmenuBuilder::new(app, "View").fullscreen().build()?;
     let window = SubmenuBuilder::new(app, "Window")
         .minimize()
@@ -150,6 +177,61 @@ fn quit_menu_item<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<tauri::menu::
     #[cfg(not(any(target_os = "macos", windows)))]
     let item = MenuItemBuilder::with_id(MENU_ID_QUIT, "&Quit");
     item.build(app)
+}
+
+/// Sends Edit > Undo or Redo to the page when the main webview holds the key window's first
+/// responder, and otherwise sends the native `undo:` or `redo:` up the responder chain, as the
+/// predefined item does, so native panels and the preview webview keep their own undo.
+#[cfg(target_os = "macos")]
+fn run_edit_menu_action<R: Runtime>(app: &AppHandle<R>, action: &'static str) {
+    if main_webview_has_first_responder(app) {
+        if let Err(error) = app.emit_to(MAIN_WINDOW_LABEL, MENU_ACTION_EVENT, action) {
+            tracing::warn!("failed to send the Edit menu action to the main webview: {error}");
+        }
+        return;
+    }
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        tracing::warn!("the Edit menu ran off the main thread; its action was dropped");
+        return;
+    };
+    let selector = if action == MENU_ACTION_EDIT_UNDO {
+        objc2::sel!(undo:)
+    } else {
+        objc2::sel!(redo:)
+    };
+    let application = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    // SAFETY: a nil target makes AppKit walk the responder chain, as the predefined item does.
+    unsafe { application.sendAction_to_from(selector, None, None) };
+}
+
+/// Whether the key window is the main window and its first responder is the main `WKWebView` or a
+/// view inside it. The preview's child webview is a sibling of the main one, so it does not count.
+#[cfg(target_os = "macos")]
+fn main_webview_has_first_responder<R: Runtime>(app: &AppHandle<R>) -> bool {
+    use objc2_app_kit::{NSApplication, NSView};
+
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return false;
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<bool>(1);
+    let sent = window.with_webview(move |platform| {
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            let _ = sender.send(false);
+            return;
+        };
+        // SAFETY: on macOS `inner()` is the live main WKWebView, and this closure runs on the
+        // main thread.
+        let webview: &NSView = unsafe { &*platform.inner().cast() };
+        let owns_focus = NSApplication::sharedApplication(mtm)
+            .keyWindow()
+            .filter(|key_window| webview.window().is_some_and(|own| own == *key_window))
+            .and_then(|key_window| key_window.firstResponder())
+            .and_then(|responder| responder.downcast::<NSView>().ok())
+            .is_some_and(|view| view.isDescendantOf(webview));
+        let _ = sender.send(owns_focus);
+    });
+    // The menu handler runs on the main thread, where Tauri runs this closure at once.
+    sent.is_ok() && receiver.try_recv().unwrap_or(false)
 }
 
 fn window_state_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
