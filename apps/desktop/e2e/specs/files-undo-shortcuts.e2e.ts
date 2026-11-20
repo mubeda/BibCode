@@ -317,7 +317,11 @@ function sendNativeChord(chord: Chord): void {
 }
 
 /** Chooses Edit > Undo or Redo in the native menu bar. Returns whether the item existed and was enabled. */
-function chooseNativeEditItem(item: "Undo" | "Redo"): { exists: boolean; enabled: boolean } {
+function chooseNativeEditItem(item: "Undo" | "Redo"): {
+  exists: boolean;
+  enabled: boolean;
+  reply?: string;
+} {
   if (platform === "mac") {
     const reply = macSystemEvents([
       `tell (first application process whose bundle identifier is "${bundleIdentifier}")`,
@@ -340,7 +344,12 @@ function chooseNativeEditItem(item: "Undo" | "Redo"): { exists: boolean; enabled
         `$window = $A::FromHandle((Get-Process -Name "${NodePath.parse(process.env.BIBCODE_E2E_APP_PATH ?? "bibcode-desktop").name}" | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1).MainWindowHandle)`,
         '$named = { param($root, $name) $root.FindAll($S, [System.Windows.Automation.Condition]::TrueCondition) | Where-Object { $_.Current.Name -like "$name*" -and $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::MenuItem } | Select-Object -First 1 }',
         "$edit = & $named $window 'Edit'",
-        "if (-not $edit) { 'missing-edit'; exit }",
+        // The window's own Win32 menu bar, read through user32, decides whether the item exists.
+        'Add-Type -Namespace LabWin -Name User32 -MemberDefinition \'[DllImport("user32.dll")] public static extern System.IntPtr GetMenu(System.IntPtr hWnd); [DllImport("user32.dll")] public static extern int GetMenuItemCount(System.IntPtr hMenu);\'',
+        `$hwnd = (Get-Process -Name "${NodePath.parse(process.env.BIBCODE_E2E_APP_PATH ?? "bibcode-desktop").name}" | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1).MainWindowHandle`,
+        "$menuCount = [LabWin.User32]::GetMenuItemCount([LabWin.User32]::GetMenu($hwnd))",
+        // Without a UI Automation item, open Edit from the keyboard as a person can: F10, Right, Down.
+        `if (-not $edit) { Add-Type -AssemblyName System.Windows.Forms; if ($menuCount -le 0) { "missing-menu count=$menuCount"; exit }; [System.Windows.Forms.SendKeys]::SendWait("{F10}"); Start-Sleep -Milliseconds 300; [System.Windows.Forms.SendKeys]::SendWait("{RIGHT}{DOWN}"); Start-Sleep -Milliseconds 300; [System.Windows.Forms.SendKeys]::SendWait("${item === "Redo" ? "{DOWN}" : ""}{ENTER}"); "keyboard count=$menuCount"; exit }`,
         "$edit.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()",
         "Start-Sleep -Milliseconds 400",
         `$entry = & $named $A::RootElement '${item}'`,
@@ -350,7 +359,11 @@ function chooseNativeEditItem(item: "Undo" | "Redo"): { exists: boolean; enabled
         "'invoked'",
       ].join("; "),
     );
-    return { exists: !reply.startsWith("missing"), enabled: reply === "invoked" };
+    return {
+      exists: !reply.startsWith("missing"),
+      enabled: reply === "invoked" || reply.startsWith("keyboard"),
+      reply,
+    };
   }
   // The pinned menu library creates no predefined Undo or Redo item on GTK.
   return { exists: false, enabled: false };
