@@ -587,6 +587,126 @@ async function measureCell(cell: Cell): Promise<void> {
   }).toEqual({ text: expectMarker, canUndo: expectMarker, canRedo: !expectMarker });
 }
 
+/**
+ * Two typed steps, then one undo: exactly the second step leaves. Catches a menu item that both
+ * runs its action and lets the chord's own `keydown` reach the editor.
+ */
+async function measureTwoSteps(view: View, path: InputPath): Promise<void> {
+  const fileName = await openFreshFile(view, `undo-two-steps-${view}-${path}`);
+  await placeCaretAtEnd(view, fileName);
+  typeNative("kq");
+  await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("kq"));
+  // Past both editors' history grouping delay, so the two edits are two steps.
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  typeNative("wv");
+  await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("kqwv"));
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  await startProbe();
+  const sent = await sendChord(path, "primary+z", "undo");
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const after = await readState(view, fileName);
+  const events = await readProbe();
+  const passed = after.text.includes("kq") && !after.text.includes("kqwv") && after.canUndo;
+  recordEvidence({
+    cell: `${view}-two-steps-undo-${path}`,
+    passed,
+    chordKeydownReachedPage: chordKeydownReachedPage(events),
+    after,
+    sent,
+    events,
+  });
+  expect({ first: after.text.includes("kq"), second: after.text.includes("kqwv") }).toEqual({
+    first: true,
+    second: false,
+  });
+  expect(after.canUndo).toBe(true);
+}
+
+/**
+ * Independent edits in the source view and in its inline comment field: undo with the comment
+ * field focused undoes the comment text and leaves the file's history where it was.
+ */
+async function measureCommentIndependence(path: InputPath, direction: Direction): Promise<void> {
+  const fileName = await openFreshFile("source", `undo-comment-${path}-${direction}`);
+  await placeCaretAtEnd("source", fileName);
+  typeNative("kq");
+  await browser.waitUntil(async () => (await readState("source", fileName)).text.includes("kq"));
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  // A click on the first line number opens a comment form with its textarea focused.
+  await browser.execute((hostQuery: string) => {
+    const host = [...document.querySelectorAll<HTMLElement>(hostQuery)].find(
+      (candidate) => candidate.getBoundingClientRect().height > 0,
+    );
+    const gutter = host?.shadowRoot?.querySelector<HTMLElement>(
+      "[data-gutter] [data-column-number]",
+    );
+    if (!gutter) throw new Error("The source view shows no line number.");
+    const rect = gutter.getBoundingClientRect();
+    const pointer = (type: string, buttons: number) =>
+      gutter.dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          button: 0,
+          buttons,
+          clientX: Math.round(rect.left + rect.width / 2),
+          clientY: Math.round(rect.top + rect.height / 2),
+          composed: true,
+          isPrimary: true,
+          pointerId: 74,
+          pointerType: "mouse",
+        }),
+      );
+    pointer("pointermove", 0);
+    pointer("pointerdown", 1);
+    pointer("pointerup", 0);
+    gutter.click();
+  }, sourceHostSelector);
+  const comment = browser.$('textarea[aria-label^="Comment on lines"]');
+  await comment.waitForDisplayed({ timeoutMsg: "The line number did not open a comment form." });
+  await browser.execute(() =>
+    document.querySelector<HTMLElement>('textarea[aria-label^="Comment on lines"]')?.focus(),
+  );
+  typeNative("cmtq");
+  await browser.waitUntil(async () => (await comment.getValue()).toLowerCase().includes("cmtq"), {
+    timeoutMsg: "The typed text never reached the comment field.",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  if (direction === "redo") {
+    await sendChord(path, "primary+z", "undo");
+    await browser.waitUntil(
+      async () => !(await comment.getValue()).toLowerCase().includes("cmtq"),
+      {
+        timeoutMsg: `Undo by ${path} did not empty the comment field, so its redo is not measured.`,
+      },
+    );
+  }
+  const filesBefore = await readState("source", fileName);
+  await startProbe();
+  const sent = await sendChord(
+    path,
+    direction === "undo" ? "primary+z" : "primary+shift+z",
+    direction,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const commentHoldsText = (await comment.getValue()).toLowerCase().includes("cmtq");
+  const filesAfter = await readState("source", fileName);
+  const events = await readProbe();
+  recordEvidence({
+    cell: `comment-${direction}-${path}`,
+    passed:
+      commentHoldsText === (direction === "redo") &&
+      filesAfter.text === filesBefore.text &&
+      filesAfter.canUndo === filesBefore.canUndo,
+    filesBefore,
+    filesAfter,
+    commentHoldsText,
+    sent,
+    events,
+  });
+  expect(commentHoldsText).toBe(direction === "redo");
+  expect(filesAfter).toEqual(filesBefore);
+}
+
 const views: readonly View[] = ["source", "rendered"];
 const redoChords: readonly Chord[] =
   platform === "mac" ? ["primary+shift+z"] : ["primary+shift+z", "ctrl+y"];
@@ -612,7 +732,11 @@ async function fieldText(kind: "composer" | "textarea"): Promise<string> {
  * Undo outside Files: the chat composer (Lexical) or a plain `textarea` added to the page. One
  * typed step, then the chord or Edit > Undo, and the typed text must be gone.
  */
-async function measureTextField(kind: "composer" | "textarea", path: InputPath): Promise<void> {
+async function measureTextField(
+  kind: "composer" | "textarea",
+  path: InputPath,
+  direction: Direction = "undo",
+): Promise<void> {
   await openFixtureWorkspace();
   if (kind === "composer") {
     const composer = browser.$(composerSelector);
@@ -637,14 +761,26 @@ async function measureTextField(kind: "composer" | "textarea", path: InputPath):
     timeoutMsg: `The typed text never reached the ${kind}.`,
   });
   await new Promise((resolve) => setTimeout(resolve, 800));
+  if (direction === "redo") {
+    await sendChord(path, "primary+z", "undo");
+    await browser.waitUntil(async () => !(await fieldText(kind)).toLowerCase().includes("cmpq"), {
+      timeoutMsg: `Undo by ${path} did not empty the ${kind}, so its redo is not measured.`,
+    });
+  }
   await startProbe();
-  const sent = await sendChord(path, "primary+z", "undo");
+  const sent = await sendChord(
+    path,
+    direction === "undo" ? "primary+z" : "primary+shift+z",
+    direction,
+  );
   await new Promise((resolve) => setTimeout(resolve, 600));
   const text = await fieldText(kind);
   const events = await readProbe();
+  // macOS may capitalize the typed word as a replacement step, which is not an undo.
+  const holdsText = text.toLowerCase().includes("cmpq");
   recordEvidence({
-    cell: `${kind}-undo-${path}`,
-    passed: !text.toLowerCase().includes("cmpq"),
+    cell: `${kind}-${direction}-${path}`,
+    passed: holdsText === (direction === "redo"),
     chordKeydownReachedPage: chordKeydownReachedPage(events),
     text,
     sent,
@@ -653,8 +789,7 @@ async function measureTextField(kind: "composer" | "textarea", path: InputPath):
   if (kind === "textarea") {
     await browser.execute((id: string) => document.getElementById(id)?.remove(), probeTextareaId);
   }
-  // macOS may capitalize the typed word as a replacement step, which is not an undo.
-  expect(text.toLowerCase()).not.toContain("cmpq");
+  expect(holdsText).toBe(direction === "redo");
 }
 
 /**
@@ -724,6 +859,15 @@ describe("packaged Files undo and redo (#398)", () => {
     });
 
     for (const path of ["keystroke", "menu"] as const) {
+      for (const view of views) {
+        it(`${path}: one undo after two steps removes only the second in the ${view} view`, async function () {
+          if (path === "menu" && platform === "linux") this.skip();
+          await measureTwoSteps(view, path);
+        });
+      }
+    }
+
+    for (const path of ["keystroke", "menu"] as const) {
       const skipMenu = (context: Mocha.Context) => {
         // The pinned menu library creates no predefined Undo or Redo item on GTK.
         if (path === "menu" && platform === "linux") context.skip();
@@ -757,9 +901,20 @@ describe("packaged Files undo and redo (#398)", () => {
 
     for (const kind of ["composer", "textarea"] as const) {
       for (const path of ["keystroke", "menu"] as const) {
-        it(`${path}: undo still undoes in a ${kind === "composer" ? "chat composer" : "plain textarea"}`, async function () {
+        for (const direction of ["undo", "redo"] as const) {
+          it(`${path}: ${direction} still works in a ${kind === "composer" ? "chat composer" : "plain textarea"}`, async function () {
+            if (path === "menu" && platform === "linux") this.skip();
+            await measureTextField(kind, path, direction);
+          });
+        }
+      }
+    }
+
+    for (const path of ["keystroke", "menu"] as const) {
+      for (const direction of ["undo", "redo"] as const) {
+        it(`${path}: ${direction} in the inline comment field leaves the file history alone`, async function () {
           if (path === "menu" && platform === "linux") this.skip();
-          await measureTextField(kind, path);
+          await measureCommentIndependence(path, direction);
         });
       }
     }
