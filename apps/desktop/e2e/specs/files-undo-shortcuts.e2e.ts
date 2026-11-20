@@ -37,6 +37,7 @@ type Chord = "primary+z" | "primary+shift+z" | "ctrl+y";
 interface ProbeEvent {
   readonly type: string;
   readonly key: string | null;
+  readonly modifiers: string;
   readonly inputType: string | null;
   readonly cancelable: boolean;
   readonly isTrusted: boolean;
@@ -147,9 +148,22 @@ async function openFreshFile(view: View, name: string): Promise<string> {
     { timeoutMsg: `The Files tree did not list ${fileName}.` },
   );
   await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("Hello"), {
+    // The first file of a session waits for the editor bundle to load.
+    timeout: 30_000,
     timeoutMsg: `${fileName} did not open editable in the ${view} view.`,
   });
   return fileName;
+}
+
+/** The focused element, looking through shadow roots, as `tag[role]`. */
+async function focusedElement(): Promise<string> {
+  return browser.execute(() => {
+    let active = document.activeElement;
+    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    if (!active) return "none";
+    const role = active.getAttribute("role");
+    return `${active.tagName.toLowerCase()}${role ? `[role=${role}]` : ""}`;
+  });
 }
 
 async function readState(view: View, fileName: string): Promise<EditorState> {
@@ -351,18 +365,44 @@ async function startProbe(): Promise<void> {
         ? `${target.tagName.toLowerCase()}${target.getAttribute("role") ? `[role=${target.getAttribute("role")}]` : ""}`
         : String(target);
     };
-    for (const type of ["keydown", "beforeinput"]) {
-      window.addEventListener(type, (event) => {
-        events.push({
-          type,
-          key: event instanceof KeyboardEvent ? event.key : null,
-          inputType: event instanceof InputEvent ? event.inputType : null,
-          cancelable: event.cancelable,
-          isTrusted: event.isTrusted,
-          defaultPrevented: event.defaultPrevented,
-          target: label(event),
-        });
-      });
+    // The focused element inside a shadow root also listens, in case an event does not cross it.
+    let focused = document.activeElement;
+    while (focused?.shadowRoot?.activeElement) focused = focused.shadowRoot.activeElement;
+    const listeners: [EventTarget, string, boolean, string][] = [];
+    for (const [type, capture] of [
+      ["keydown", true],
+      ["keydown", false],
+      ["beforeinput", true],
+      ["beforeinput", false],
+      ["input", false],
+    ] as const) {
+      listeners.push([window, type, capture, capture ? `${type}:capture` : type]);
+    }
+    if (focused && focused.getRootNode() !== document) {
+      for (const type of ["keydown", "beforeinput"]) {
+        listeners.push([focused, type, true, `${type}:focused-in-shadow`]);
+      }
+    }
+    for (const [listenerTarget, type, capture, name] of listeners) {
+      listenerTarget.addEventListener(
+        type,
+        (event) => {
+          events.push({
+            type: name,
+            key: event instanceof KeyboardEvent ? `${event.key} keyCode=${event.keyCode}` : null,
+            modifiers:
+              event instanceof KeyboardEvent
+                ? `${event.metaKey ? "meta+" : ""}${event.ctrlKey ? "ctrl+" : ""}${event.shiftKey ? "shift+" : ""}${event.altKey ? "alt+" : ""}`
+                : "",
+            inputType: event instanceof InputEvent ? event.inputType : null,
+            cancelable: event.cancelable,
+            isTrusted: event.isTrusted,
+            defaultPrevented: event.defaultPrevented,
+            target: label(event),
+          });
+        },
+        capture,
+      );
     }
   });
 }
@@ -379,18 +419,51 @@ async function sendChord(path: InputPath, chord: Chord, direction: Direction) {
   if (path === "menu") {
     return { menu: chooseNativeEditItem(direction === "undo" ? "Undo" : "Redo") };
   }
-  const primary = platform === "mac" ? "Meta" : "Control";
-  const keys =
-    chord === "primary+z"
-      ? [primary, "z"]
-      : chord === "primary+shift+z"
-        ? [primary, "Shift", "z"]
-        : ["Control", "y"];
-  await browser.keys(keys);
+  await dispatchPageChord(chord);
   return { menu: null };
 }
 
-async function clickToolbar(label: "Undo" | "Redo"): Promise<void> {
+/**
+ * Dispatches the chord as a page `keydown` at the focused element, as a browser delivers it. The
+ * embedded driver's own keys land on the shadow host and carry the character code as `keyCode`
+ * (122 for "z"), so neither editor reads them as the chord.
+ */
+async function dispatchPageChord(chord: Chord | "primary+s"): Promise<void> {
+  const primaryIsMeta = platform === "mac";
+  await browser.execute(
+    (name: string, macPrimary: boolean) => {
+      let target = document.activeElement;
+      while (target?.shadowRoot?.activeElement) target = target.shadowRoot.activeElement;
+      const letter = name.endsWith("y") ? "y" : name.endsWith("s") ? "s" : "z";
+      const primary = name.startsWith("primary");
+      const shift = name.includes("shift");
+      (target ?? document.body).dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: shift ? letter.toUpperCase() : letter,
+          code: `Key${letter.toUpperCase()}`,
+          keyCode: letter.toUpperCase().charCodeAt(0),
+          metaKey: primary && macPrimary,
+          ctrlKey: (primary && !macPrimary) || name === "ctrl+y",
+          shiftKey: shift,
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+        }),
+      );
+    },
+    chord,
+    primaryIsMeta,
+  );
+}
+
+async function renderedHtml(): Promise<string> {
+  return browser.execute(
+    (query: string) => document.querySelector(query)?.innerHTML ?? "",
+    richEditorSelector,
+  );
+}
+
+async function clickToolbar(label: "Undo" | "Redo" | "Heading 2"): Promise<void> {
   const button = await browser.$(`[data-file-editor-toolbar] button[aria-label="${label}"]`);
   await button.waitForEnabled();
   await button.click();
@@ -401,10 +474,23 @@ interface Cell {
   readonly direction: Direction;
   readonly path: InputPath;
   readonly chord: Chord;
+  /** How the redo case's step was undone first: by the same path, or by the toolbar button. */
+  readonly redoAfter?: "path" | "toolbar";
+  /** The seeded step: typed text, or a toolbar formatting change (rendered view only). */
+  readonly edit?: "typing" | "format";
 }
 
-function cellName({ view, direction, path, chord }: Cell): string {
-  return `${view}-${direction}-${path}-${chord.replaceAll("+", "-")}`;
+function cellName({ view, direction, path, chord, redoAfter, edit }: Cell): string {
+  return [
+    view,
+    direction,
+    path,
+    chord.replaceAll("+", "-"),
+    redoAfter ? `after-${redoAfter}-undo` : null,
+    edit === "format" ? "format" : null,
+  ]
+    .filter(Boolean)
+    .join("-");
 }
 
 /**
@@ -413,42 +499,74 @@ function cellName({ view, direction, path, chord }: Cell): string {
  */
 async function measureCell(cell: Cell): Promise<void> {
   const name = `undo-${cellName(cell)}`;
-  const marker = cell.view === "source" ? "kq" : "kqv";
   const fileName = await openFreshFile(cell.view, name);
-  if (cell.path === "driver") await seedThroughPage(cell.view, fileName, marker);
+  // A formatting step shows in the text as the heading's own block, so it is read from the HTML.
+  const marker = cell.edit === "format" ? "<h2" : cell.view === "source" ? "kq" : "kqv";
+  const holdsStep = async () =>
+    cell.edit === "format"
+      ? (await renderedHtml()).includes(marker)
+      : (await readState(cell.view, fileName)).text.includes(marker);
+  if (cell.edit === "format") {
+    await placeCaretAtEnd(cell.view, fileName);
+    await clickToolbar("Heading 2");
+    await placeCaretAtEnd(cell.view, fileName);
+  } else if (cell.path === "driver") await seedThroughPage(cell.view, fileName, marker);
   else {
     await placeCaretAtEnd(cell.view, fileName);
     typeNative(marker);
   }
-  await browser.waitUntil(
-    async () => (await readState(cell.view, fileName)).text.includes(marker),
-    {
-      timeoutMsg: `The seeded edit "${marker}" never reached ${fileName}.`,
-    },
-  );
+  await browser.waitUntil(holdsStep, {
+    timeoutMsg: `The seeded ${cell.edit ?? "typing"} step never reached ${fileName}.`,
+  });
   // Past both editors' history grouping delay, so the edit is one closed step.
   await new Promise((resolve) => setTimeout(resolve, 800));
   if (cell.direction === "redo") {
-    await clickToolbar("Undo");
-    await browser.waitUntil(
-      async () => !(await readState(cell.view, fileName)).text.includes(marker),
-      { timeoutMsg: "The toolbar Undo did not remove the seeded edit." },
-    );
+    if (cell.redoAfter === "path") {
+      await sendChord(cell.path, "primary+z", "undo");
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      if (await holdsStep()) {
+        recordEvidence({
+          cell: cellName(cell),
+          ...cell,
+          passed: false,
+          note: "this path did not undo",
+        });
+        throw new Error("This path cannot undo, so its redo is not measured.");
+      }
+    } else {
+      await clickToolbar("Undo");
+      await browser.waitUntil(async () => !(await holdsStep()), {
+        timeoutMsg: "The toolbar Undo did not remove the seeded edit.",
+      });
+      // The click moved focus to the toolbar; a person clicks back into the text before redoing.
+      await placeCaretAtEnd(cell.view, fileName);
+    }
   }
   const before = await readState(cell.view, fileName);
+  const focus = await focusedElement();
   await startProbe();
   const sent = await sendChord(cell.path, cell.chord, cell.direction);
   await new Promise((resolve) => setTimeout(resolve, 800));
   const after = await readState(cell.view, fileName);
   const events = await readProbe();
   const expectMarker = cell.direction === "redo";
+  const stepPresent = await holdsStep();
   const passed =
-    after.text.includes(marker) === expectMarker &&
+    stepPresent === expectMarker &&
     after.canUndo === expectMarker &&
     after.canRedo === !expectMarker;
-  recordEvidence({ cell: cellName(cell), ...cell, passed, before, after, sent, events });
+  recordEvidence({
+    cell: cellName(cell),
+    ...cell,
+    passed,
+    focus,
+    before,
+    after,
+    sent,
+    events,
+  });
   expect({
-    text: after.text.includes(marker),
+    text: stepPresent,
     canUndo: after.canUndo,
     canRedo: after.canRedo,
   }).toEqual({ text: expectMarker, canUndo: expectMarker, canRedo: !expectMarker });
@@ -458,6 +576,24 @@ const views: readonly View[] = ["source", "rendered"];
 const redoChords: readonly Chord[] =
   platform === "mac" ? ["primary+shift+z"] : ["primary+shift+z", "ctrl+y"];
 
+async function composerUndoCase(path: "driver" | "keystroke"): Promise<void> {
+  await openFixtureWorkspace();
+  const composer = browser.$(composerSelector);
+  await composer.waitForDisplayed();
+  await composer.click();
+  if (path === "driver") await composer.addValue("cmpq");
+  else typeNative("cmpq");
+  await expect(composer).toHaveText(expect.stringContaining("cmpq"));
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  await startProbe();
+  if (path === "driver") await dispatchPageChord("primary+z");
+  else sendNativeChord("primary+z");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const text = await composer.getText();
+  recordEvidence({ cell: `composer-undo-${path}`, text, events: await readProbe() });
+  expect(text).not.toContain("cmpq");
+}
+
 describe("packaged Files undo and redo (#398)", () => {
   for (const view of views) {
     it(`driver: the undo chord undoes one step in the ${view} view`, async () => {
@@ -465,15 +601,25 @@ describe("packaged Files undo and redo (#398)", () => {
     });
     for (const chord of redoChords) {
       it(`driver: ${chord} redoes one step in the ${view} view`, async () => {
-        await measureCell({ view, direction: "redo", path: "driver", chord });
+        await measureCell({ view, direction: "redo", path: "driver", chord, redoAfter: "path" });
       });
     }
   }
 
+  it("driver: the undo chord undoes a formatting step in the rendered view", async () => {
+    await measureCell({
+      view: "rendered",
+      direction: "undo",
+      path: "driver",
+      chord: "primary+z",
+      edit: "format",
+    });
+  });
+
   it("driver: the save chord still saves the source view", async () => {
     const fileName = await openFreshFile("source", "undo-save-chord");
     await seedThroughPage("source", fileName, "kq");
-    await browser.keys([platform === "mac" ? "Meta" : "Control", "s"]);
+    await dispatchPageChord("primary+s");
     await browser.waitUntil(
       () =>
         NodeFS.readFileSync(NodePath.join(preparedProjectPath, fileName), "utf8").includes("kq"),
@@ -482,19 +628,7 @@ describe("packaged Files undo and redo (#398)", () => {
   });
 
   it("driver: the undo chord still undoes in the chat composer", async () => {
-    await openFixtureWorkspace();
-    const composer = browser.$(composerSelector);
-    await composer.waitForDisplayed();
-    await composer.click();
-    await composer.addValue("composer undo marker");
-    await expect(composer).toHaveText(expect.stringContaining("composer undo marker"));
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    await startProbe();
-    await browser.keys([platform === "mac" ? "Meta" : "Control", "z"]);
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const text = await composer.getText();
-    recordEvidence({ cell: "composer-undo-driver", text, events: await readProbe() });
-    expect(text).not.toContain("composer undo marker");
+    await composerUndoCase("driver");
   });
 
   describe("native input (BIBCODE_E2E_NATIVE_INPUT=1)", function () {
@@ -503,35 +637,39 @@ describe("packaged Files undo and redo (#398)", () => {
     });
 
     for (const path of ["keystroke", "menu"] as const) {
+      const skipMenu = (context: Mocha.Context) => {
+        // The pinned menu library creates no predefined Undo or Redo item on GTK.
+        if (path === "menu" && platform === "linux") context.skip();
+      };
       for (const view of views) {
         it(`${path}: undo moves the ${view} view one step`, async function () {
-          if (path === "menu" && platform === "linux") this.skip();
+          skipMenu(this);
           await measureCell({ view, direction: "undo", path, chord: "primary+z" });
         });
         const chords: readonly Chord[] = path === "menu" ? ["primary+shift+z"] : redoChords;
         for (const chord of chords) {
-          it(`${path}: ${path === "menu" ? "Redo" : chord} redoes the ${view} view one step`, async function () {
-            if (path === "menu" && platform === "linux") this.skip();
-            await measureCell({ view, direction: "redo", path, chord });
-          });
+          for (const redoAfter of ["path", "toolbar"] as const) {
+            it(`${path}: ${path === "menu" ? "Redo" : chord} redoes the ${view} view after a ${redoAfter} undo`, async function () {
+              skipMenu(this);
+              await measureCell({ view, direction: "redo", path, chord, redoAfter });
+            });
+          }
         }
       }
+      it(`${path}: undo removes a formatting step in the rendered view`, async function () {
+        skipMenu(this);
+        await measureCell({
+          view: "rendered",
+          direction: "undo",
+          path,
+          chord: "primary+z",
+          edit: "format",
+        });
+      });
     }
 
     it("keystroke: the undo chord still undoes in the chat composer", async () => {
-      await openFixtureWorkspace();
-      const composer = browser.$(composerSelector);
-      await composer.waitForDisplayed();
-      await composer.click();
-      typeNative("cmpq");
-      await expect(composer).toHaveText(expect.stringContaining("cmpq"));
-      await new Promise((resolve) => setTimeout(resolve, 800));
-      await startProbe();
-      sendNativeChord("primary+z");
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      const text = await composer.getText();
-      recordEvidence({ cell: "composer-undo-keystroke", text, events: await readProbe() });
-      expect(text).not.toContain("cmpq");
+      await composerUndoCase("keystroke");
     });
   });
 });
