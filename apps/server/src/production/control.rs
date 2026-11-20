@@ -2827,6 +2827,7 @@ fn validate_legacy_provider_settings(providers: &Value) -> Result<(), String> {
             "opencode",
             &["binaryPath", "serverUrl", "serverPassword"][..],
         ),
+        ("antigravity", &["binaryPath"][..]),
     ] {
         let Some(settings) = providers.get(driver) else {
             continue;
@@ -3718,7 +3719,8 @@ mod tests {
                     "claudeAgent": missing_provider,
                     "cursor": missing_provider,
                     "grok": missing_provider,
-                    "opencode": missing_provider
+                    "opencode": missing_provider,
+                    "antigravity": missing_provider
                 },
                 "providerInstances": {
                     "codex": { "driver": "codex", "enabled": true, "config": { "binaryPath": missing_binary } },
@@ -4800,15 +4802,22 @@ done
         apply_settings_defaults(&mut settings);
 
         let missing_binary = missing_provider_executable(&temp);
-        let host_fallbacks = ["codex", "claudeAgent", "cursor", "grok", "opencode", "antigravity"]
-            .into_iter()
-            .filter_map(|driver| {
-                let target = provider_inventory::maintenance_target(&settings, driver, None)
-                    .unwrap_or_else(|| panic!("{driver} has a provider definition"));
-                (target.binary_path != missing_binary)
-                    .then(|| format!("{driver} -> {}", target.binary_path))
-            })
-            .collect::<Vec<_>>();
+        let host_fallbacks = [
+            "codex",
+            "claudeAgent",
+            "cursor",
+            "grok",
+            "opencode",
+            "antigravity",
+        ]
+        .into_iter()
+        .filter_map(|driver| {
+            let target = provider_inventory::maintenance_target(&settings, driver, None)
+                .unwrap_or_else(|| panic!("{driver} has a provider definition"));
+            (target.binary_path != missing_binary)
+                .then(|| format!("{driver} -> {}", target.binary_path))
+        })
+        .collect::<Vec<_>>();
         assert!(
             host_fallbacks.is_empty(),
             "providers must not resolve CLIs from the host PATH: {host_fallbacks:?}"

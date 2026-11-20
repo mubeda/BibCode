@@ -18,6 +18,7 @@ pub(crate) fn built_in_provider_defaults() -> Value {
         "cursor": { "enabled": true, "binaryPath": "cursor-agent", "apiEndpoint": "", "customModels": [] },
         "grok": { "enabled": false, "binaryPath": "grok", "customModels": [] },
         "opencode": { "enabled": true, "binaryPath": "opencode", "serverUrl": "", "serverPassword": "", "customModels": [] },
+        "antigravity": { "enabled": false, "binaryPath": "agy", "customModels": [] },
     })
 }
 
@@ -59,6 +60,7 @@ pub struct ProvidersState {
     pub cursor: ProviderBinarySettingsState,
     pub grok: ProviderBinarySettingsState,
     pub opencode: ProviderBinarySettingsState,
+    pub antigravity: ProviderBinarySettingsState,
 }
 
 impl ProvidersState {
@@ -76,6 +78,7 @@ impl ProvidersState {
             cursor: provider("cursor"),
             grok: provider("grok"),
             opencode: provider("opencode"),
+            antigravity: provider("antigravity"),
         }
     }
 }
@@ -193,6 +196,7 @@ pub struct ProvidersPatch {
     pub cursor: Option<ProviderSettingsPatch>,
     pub grok: Option<ProviderSettingsPatch>,
     pub opencode: Option<ProviderSettingsPatch>,
+    pub antigravity: Option<ProviderSettingsPatch>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -493,6 +497,11 @@ fn apply_patch(
             providers.opencode,
             "opencode",
         );
+        apply_provider_patch(
+            &mut current.providers.antigravity,
+            providers.antigravity,
+            "agy",
+        );
     }
     if let Some(instances) = patch.provider_instances {
         current.provider_instances = instances
@@ -752,6 +761,38 @@ mod tests {
         assert!(reloaded.providers.codex.enabled);
         assert_eq!(reloaded.providers.codex.binary_path, "custom-codex");
         assert_eq!(reloaded, updated);
+    }
+
+    #[tokio::test]
+    async fn antigravity_enable_patch_persists_with_the_agy_binary() {
+        let temp = tempfile::tempdir().expect("settings root");
+        let store = ProviderSettingsStore::new(temp.path());
+        assert!(
+            !store
+                .get()
+                .await
+                .expect("defaults")
+                .providers
+                .antigravity
+                .enabled
+        );
+        store
+            .update(ServerSettingsPatch {
+                providers: Some(ProvidersPatch {
+                    antigravity: Some(ProviderSettingsPatch {
+                        enabled: Some(true),
+                        ..ProviderSettingsPatch::default()
+                    }),
+                    ..ProvidersPatch::default()
+                }),
+                ..ServerSettingsPatch::default()
+            })
+            .await
+            .expect("enable Antigravity");
+
+        let reloaded = store.get().await.expect("reload Antigravity settings");
+        assert!(reloaded.providers.antigravity.enabled);
+        assert_eq!(reloaded.providers.antigravity.binary_path, "agy");
     }
 
     #[test]

@@ -159,6 +159,7 @@ mod tests {
             ("cursor", &runtime_settings.providers.cursor),
             ("grok", &runtime_settings.providers.grok),
             ("opencode", &runtime_settings.providers.opencode),
+            ("antigravity", &runtime_settings.providers.antigravity),
         ] {
             assert_eq!(
                 settings.enabled,
@@ -251,7 +252,7 @@ mod tests {
         assert_eq!(written["enableAssistantStreaming"], true);
         assert_eq!(written["providers"]["codex"], overlay["providers"]["codex"]);
         assert_eq!(written["providerInstances"], overlay["providerInstances"]);
-        for driver in ["claudeAgent", "cursor", "grok", "opencode"] {
+        for driver in ["claudeAgent", "cursor", "grok", "opencode", "antigravity"] {
             assert_eq!(
                 written["providers"][driver]["binaryPath"],
                 state_dir

@@ -17,6 +17,7 @@ const GUARDED_PROGRAMS: &[&str] = &[
     "cursor-agent",
     "agent",
     "grok",
+    "agy",
     "gh",
     "glab",
     "az",

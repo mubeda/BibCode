@@ -183,10 +183,10 @@ fn provider_is_enabled(driver: &str, configured: bool) -> bool {
 }
 
 fn default_provider_binary(driver: &str) -> &str {
-    if driver == "cursor" {
-        "cursor-agent"
-    } else {
-        driver
+    match driver {
+        "cursor" => "cursor-agent",
+        "antigravity" => "agy",
+        other => other,
     }
 }
 
@@ -275,7 +275,15 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
         })
         .unwrap_or_default();
 
-    for driver in ["codex", "claudeAgent", "cursor", "grok", "opencode"] {
+    let built_in_defaults = crate::server_settings::built_in_provider_defaults();
+    for driver in [
+        "codex",
+        "claudeAgent",
+        "cursor",
+        "grok",
+        "opencode",
+        "antigravity",
+    ] {
         if definitions
             .iter()
             .any(|definition| definition.driver == driver)
@@ -293,6 +301,8 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                 driver_settings
                     .and_then(|value| value.get("enabled"))
                     .and_then(Value::as_bool)
+                    // Raw settings carry no defaults; Antigravity must stay off until enabled.
+                    .or_else(|| built_in_defaults[driver]["enabled"].as_bool())
                     .unwrap_or(true),
             ),
             binary_path: string_setting(driver_settings, "binaryPath")
@@ -2059,7 +2069,7 @@ fn snapshot_owned_message(
 fn is_builtin_driver(driver: &str) -> bool {
     matches!(
         driver,
-        "codex" | "claudeAgent" | "cursor" | "grok" | "opencode"
+        "codex" | "claudeAgent" | "cursor" | "grok" | "opencode" | "antigravity"
     )
 }
 
@@ -2964,9 +2974,11 @@ done
             ),
         );
 
-        let snapshot =
-            probe_antigravity(&sandbox, &antigravity_probe_settings(sandbox.root(), &binary, true))
-                .await;
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
 
         assert_eq!(snapshot["driver"], "antigravity");
         assert_eq!(snapshot["displayName"], "Antigravity");
@@ -2998,7 +3010,10 @@ done
 
         assert_eq!(snapshot["driver"], "antigravity");
         assert_eq!(snapshot["enabled"], false);
-        assert!(!ran.exists(), "a disabled instance must not start its binary");
+        assert!(
+            !ran.exists(),
+            "a disabled instance must not start its binary"
+        );
     }
 
     #[cfg(unix)]
@@ -3021,9 +3036,11 @@ done
 
         let inert = sandbox.path("antigravity-cli-inert");
         std::fs::write(&inert, "not executable").expect("inert fixture");
-        let inert_snapshot =
-            probe_antigravity(&sandbox, &antigravity_probe_settings(sandbox.root(), &inert, true))
-                .await;
+        let inert_snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &inert, true),
+        )
+        .await;
         assert_eq!(inert_snapshot["driver"], "antigravity");
         assert_eq!(inert_snapshot["installed"], false);
     }
@@ -3533,7 +3550,8 @@ done
                 "claudeAgent": { "enabled": false, "binaryPath": missing },
                 "cursor": { "enabled": false, "binaryPath": missing },
                 "grok": { "enabled": false, "binaryPath": missing },
-                "opencode": { "enabled": false, "binaryPath": missing }
+                "opencode": { "enabled": false, "binaryPath": missing },
+                "antigravity": { "enabled": false, "binaryPath": missing }
             },
             "providerInstances": {
                 "first": {

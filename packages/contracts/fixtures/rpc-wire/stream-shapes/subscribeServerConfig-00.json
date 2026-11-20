@@ -113,6 +113,11 @@
               "serverPassword": "",
               "exclusiveServer": false,
               "customModels": []
+            },
+            "antigravity": {
+              "enabled": false,
+              "binaryPath": "agy",
+              "customModels": []
             }
           },
           "providerInstances": {},
