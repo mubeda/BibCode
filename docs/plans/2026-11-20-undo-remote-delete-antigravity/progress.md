@@ -45,3 +45,28 @@ Branch: claude/backlog-triage-planning-pr-b5ee7f
 - 2026-11-20 12:40 Lane A: 1.1 measured on macOS (B), Windows (C) and Linux (C; menu N). Design revision 2 accepted after Codex and advisor review; 1.2 and 1.3 committed (macOS packaged spec 38 of 38), Codex review of the diff running; Windows and Linux re-measurement pending. Follow-ups filed: #408 (Linux plain text fields do not undo) and #409 (packaged E2E probes real tools), both assigned to lane A.
 - 2026-11-20 12:40 Lane B: 2.1 to 2.3 committed with follow-ups #401 to #404; Codex review round 1 requested changes (9 findings, all accepted); fixes in progress. Ruling refining P10: a remote that answers with no HEAD has no default to protect and the delete proceeds; an unreachable remote, a HEAD without a symref and the default branch are refused.
 - 2026-11-20 12:40 Lane D ended after 3.1 and 3.2 (context used up). Lanes F (3.6, 3.7), G (3.8) and E (3.9) started from its branch worktree-agent-adec49c6f98e2e169.
+- 2026-11-20 12:50 Run paused at the owner's request (usage limit). All lanes stopped, no build running, build lock free. Nothing is integrated or pushed. Resume from the section below.
+
+## Resume point (2026-11-20 12:50)
+
+Each lane has its own branch; restart a lane from that branch with a fresh agent and this list.
+
+| Lane | Branch                           | Head      | State at pause                                                               |
+| ---- | -------------------------------- | --------- | ---------------------------------------------------------------------------- |
+| C    | worktree-agent-a095c372d3e446d48 | 78046e199 | 5.1 accepted; integrate only                                                 |
+| A    | worktree-agent-a24bd2b8983f9f3fe | aa362a958 | head is a deliberately failing composition test; fixes below not started     |
+| B    | worktree-agent-a7f600c2542d16d45 | 6b03ee8bf | wip commit; 8 of 9 review findings pass, finding 3 has two failing tests     |
+| D    | worktree-agent-adec49c6f98e2e169 | 0754cacbc | 3.1 and 3.2 done; base of lanes E, F and G                                   |
+| E    | worktree-agent-a371e624fc394e24d | d44d89b1e | wip commit: terminal action and Settings card; chat part and review not done |
+| F    | worktree-agent-a22603f291e52a5eb | 0754cacbc | no code; runtime design reviewed by the advisor                              |
+| G    | worktree-agent-a58b411b366942881 | 0754cacbc | no code                                                                      |
+
+Remaining per lane:
+
+- Lane A (1.2, 1.3, #408, #409): make the composition test pass (track composition in the registered Files regions); in `window.rs` release the three retained native objects and fall back to the native undo when the event cannot be sent; correct the macOS terminal cell expectation; merge lane D's branch, pin the Antigravity binary path in the E2E test project and add the hermetic assertion in `backend.rs`; note #408 in the design note and diagnosis; `vp run typecheck`; rebuild and re-measure the matrix on macOS, Windows and Linux, including the native fallback and Link URL cells; runbook text. File a follow-up for the same retain leak in the preview module's webview access. The lab VMs and the Linux lab container still hold builds from before these fixes.
+- Lane B (2.1 to 2.3, #401 to #407): finding 3 fails in `cargo test -p bibcode-server operations` (`local_delete_with_remote_deletes_the_upstream_git_names`, `local_delete_with_remote_refuses_an_option_like_upstream_remote`); first suspect is the new upstream read through `for-each-ref`. Then rerun the Done-when commands, fmt and Clippy, re-prove each new test can fail, write the per-finding table and replace the wip commit message. The lane also edited one caller line in `apps/server/src/git/manager/mod.rs`; review it.
+- Lane F (3.6, 3.7): everything. Decisions already taken: version, sign-in and mode-unavailable errors are separate variants mapped to `IncompatibleProvider`; model, thinking level and mode are re-applied after every open, because a resume resets model and level to the CLI defaults; a mode change is acknowledged when the `set_config_option` response shows the new value; the driver kills the child when a cancel goes unanswered. Measured live: a cancel returns `stopReason: cancelled` at once, also with an approval pending, and a late approval answer is ignored; plan mode writes its plan file outside the workspace without asking. Risk to document: the transport caps a line at 128 KB and the CLI repeats file content in a non-standard field, so a large file write could close the connection.
+- Lane G (3.8, and findings 2, 3, 4 and 6 of the Codex review of 3.2): everything, plus the model list comparison against the CLI.
+- Lane E (3.9): the chat part (waits for 3.7 and 3.8), tests, the React and UI.md reviews, Codex review.
+- 3.10 (documentation): not started, no lane.
+- Coordinator: Codex and advisor review of every lane, then phase 4 as planned.
