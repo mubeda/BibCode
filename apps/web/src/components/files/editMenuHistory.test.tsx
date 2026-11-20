@@ -8,6 +8,7 @@ import {
   type FilesEditHistory,
   registerFilesEditRegion,
   runEditMenuAction,
+  textFieldHistoryChord,
   useEditMenuActions,
   useFilesEditRegion,
 } from "./editMenuHistory";
@@ -189,5 +190,81 @@ describe("useEditMenuActions and useFilesEditRegion", () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1);
     send("edit-undo");
     expect(files.undo).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Linux text-field undo chords (#408)", () => {
+  function keydown(target: EventTarget, init: KeyboardEventInit & { key: string }): KeyboardEvent {
+    const event = new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      ...init,
+    });
+    target.dispatchEvent(event);
+    return event;
+  }
+
+  it("maps Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y in an input or a textarea", () => {
+    const area = document.createElement("textarea");
+    const input = document.createElement("input");
+    document.body.append(area, input);
+    const seen: (string | null)[] = [];
+    const record = (event: Event) => seen.push(textFieldHistoryChord(event as KeyboardEvent));
+    document.addEventListener("keydown", record);
+
+    keydown(area, { key: "z", ctrlKey: true });
+    keydown(area, { key: "Z", ctrlKey: true, shiftKey: true });
+    keydown(input, { key: "y", ctrlKey: true });
+
+    document.removeEventListener("keydown", record);
+    expect(seen).toEqual(["undo", "redo", "redo"]);
+  });
+
+  it("leaves editable text, cancelled chords and other modifiers alone", () => {
+    const area = document.createElement("textarea");
+    const text = document.createElement("div");
+    text.contentEditable = "true";
+    document.body.append(area, text);
+    const seen: (string | null)[] = [];
+    const record = (event: Event) => seen.push(textFieldHistoryChord(event as KeyboardEvent));
+    area.addEventListener("keydown", (event) => {
+      if (event.key === "y") event.preventDefault();
+    });
+    document.addEventListener("keydown", record);
+
+    keydown(text, { key: "z", ctrlKey: true });
+    keydown(area, { key: "y", ctrlKey: true });
+    keydown(area, { key: "z", metaKey: true });
+    keydown(area, { key: "z", ctrlKey: true, altKey: true });
+    keydown(area, { key: "z" });
+
+    document.removeEventListener("keydown", record);
+    expect(seen).toEqual([null, null, null, null, null]);
+  });
+
+  it("runs the native undo for an uncancelled chord on the Linux desktop only", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const execCommand = vi.fn<(command: string) => boolean>(() => true);
+    document.execCommand = execCommand as unknown as Document["execCommand"];
+    Object.assign(window, { desktopBridge: { onMenuAction: () => () => {} } });
+    const platform = vi.spyOn(navigator, "platform", "get");
+    function Probe() {
+      useEditMenuActions();
+      return <textarea data-testid="field" />;
+    }
+    for (const value of ["Linux x86_64", "Win32"]) {
+      platform.mockReturnValue(value);
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => root.render(<Probe />));
+      const event = keydown(container.querySelector("textarea")!, { key: "z", ctrlKey: true });
+      expect(event.defaultPrevented).toBe(value.startsWith("Linux"));
+      await act(async () => root.unmount());
+    }
+    platform.mockRestore();
+
+    expect(execCommand.mock.calls).toEqual([["undo"]]);
   });
 });
