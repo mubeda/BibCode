@@ -295,6 +295,16 @@ function typeNative(letters: string): void {
   } else runNative("xdotool", ["type", "--delay", "40", letters]);
 }
 
+/** Presses Return as a real operating-system key event. */
+function typeNativeReturn(): void {
+  if (platform === "mac") macSystemEvents(["keystroke return"]);
+  else if (platform === "win") {
+    powershell(
+      "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')",
+    );
+  } else runNative("xdotool", ["key", "--clearmodifiers", "Return"]);
+}
+
 function sendNativeChord(chord: Chord): void {
   if (platform === "mac") {
     const using =
@@ -596,17 +606,19 @@ async function measureTwoSteps(view: View, path: InputPath): Promise<void> {
   await placeCaretAtEnd(view, fileName);
   typeNative("kq");
   await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("kq"));
-  // Past both editors' history grouping delay, so the two edits are two steps.
+  // The source editor joins adjacent typing into one step whatever the pause, so a new line
+  // separates its steps; the rendered editor separates them by the pause.
   await new Promise((resolve) => setTimeout(resolve, 1_200));
+  if (view === "source") typeNativeReturn();
   typeNative("wv");
-  await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("kqwv"));
+  await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("wv"));
   await new Promise((resolve) => setTimeout(resolve, 1_200));
   await startProbe();
   const sent = await sendChord(path, "primary+z", "undo");
   await new Promise((resolve) => setTimeout(resolve, 800));
   const after = await readState(view, fileName);
   const events = await readProbe();
-  const passed = after.text.includes("kq") && !after.text.includes("kqwv") && after.canUndo;
+  const passed = after.text.includes("kq") && !after.text.includes("wv") && after.canUndo;
   recordEvidence({
     cell: `${view}-two-steps-undo-${path}`,
     passed,
@@ -615,7 +627,7 @@ async function measureTwoSteps(view: View, path: InputPath): Promise<void> {
     sent,
     events,
   });
-  expect({ first: after.text.includes("kq"), second: after.text.includes("kqwv") }).toEqual({
+  expect({ first: after.text.includes("kq"), second: after.text.includes("wv") }).toEqual({
     first: true,
     second: false,
   });
@@ -666,7 +678,8 @@ async function measureCommentIndependence(path: InputPath, direction: Direction)
   await browser.execute(() =>
     document.querySelector<HTMLElement>('textarea[aria-label^="Comment on lines"]')?.focus(),
   );
-  typeNative("cmtq");
+  // Capitalized, so macOS has no capitalization step of its own to add before the undo.
+  typeNative("Cmtq");
   await browser.waitUntil(async () => (await comment.getValue()).toLowerCase().includes("cmtq"), {
     timeoutMsg: "The typed text never reached the comment field.",
   });
@@ -756,7 +769,7 @@ async function measureTextField(
   if (path === "driver") {
     if (kind === "composer") await browser.$(composerSelector).addValue("cmpq");
     else await browser.$(`#${probeTextareaId}`).addValue("cmpq");
-  } else typeNative("cmpq");
+  } else typeNative("Cmpq");
   await browser.waitUntil(async () => (await fieldText(kind)).toLowerCase().includes("cmpq"), {
     timeoutMsg: `The typed text never reached the ${kind}.`,
   });
