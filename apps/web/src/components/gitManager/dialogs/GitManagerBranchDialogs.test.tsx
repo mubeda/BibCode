@@ -159,7 +159,7 @@ describe("GitManagerBranchDialogs", () => {
           dialog={{
             kind: "rename",
             branch: branch("feature", {
-              blocked: [{ operation: "branch-rename", code: "worktree-checked-out", message }],
+              blocked: [{ operation: "rename-branch", code: "worktree-checked-out", message }],
             }),
           }}
           errorMessage={null}
@@ -318,6 +318,117 @@ describe("GitManagerBranchDialogs", () => {
     await act(async () => deleteButton.click());
 
     expect(submissions).toEqual([{ kind: "delete", name: "old-feature", deleteRemote: false }]);
+  });
+
+  async function renderBranchDialog(
+    dialog: React.ComponentProps<typeof GitManagerBranchDialogs>["dialog"],
+  ) {
+    const submissions: GitManagerBranchDialogSubmission[] = [];
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={dialog}
+          errorMessage={null}
+          refs={[]}
+          remoteRefs={[]}
+          onClose={() => undefined}
+          onSubmit={(submission) => {
+            submissions.push(submission);
+            return Promise.resolve();
+          }}
+        />,
+      ),
+    );
+    return submissions;
+  }
+
+  async function confirmDelete() {
+    const confirmation = document.querySelector<HTMLInputElement>('input[name="confirm-delete"]');
+    if (!confirmation) throw new Error("Missing delete confirmation");
+    await act(async () => confirmation.click());
+  }
+
+  const MERGE_DIRTY = {
+    operation: "merge",
+    code: "dirty-working-tree",
+    message: "Merge is blocked: the working tree has uncommitted changes.",
+  } as const;
+
+  it("shows the server's delete reason among unrelated ones and sends nothing", async () => {
+    const message = "Delete is blocked: this is the default branch.";
+    const submissions = await renderBranchDialog({
+      kind: "delete",
+      branch: branch("main", {
+        blocked: [MERGE_DIRTY, { operation: "delete-branch", code: "default-branch", message }],
+      }),
+      existsUpstream: false,
+    });
+
+    await confirmDelete();
+    const deleteButton = buttonWithText("Delete branch");
+    expect(document.body.textContent).toContain(message);
+    expect(document.body.textContent).not.toContain(MERGE_DIRTY.message);
+    expect(deleteButton.disabled).toBe(true);
+    await act(async () => deleteButton.click());
+    expect(submissions).toEqual([]);
+  });
+
+  it("blocks delete while an operation holds the repository", async () => {
+    const message = "Blocked: a merge is in progress; resolve or abort it first.";
+    await renderBranchDialog({
+      kind: "delete",
+      branch: branch("feature", {
+        // The server emits both spellings for in-progress and lock-held reasons.
+        blocked: [
+          { operation: "branch-delete", code: "merge-in-progress", message },
+          { operation: "delete-branch", code: "merge-in-progress", message },
+        ],
+      }),
+      existsUpstream: false,
+    });
+
+    await confirmDelete();
+    expect(buttonWithText("Delete branch").disabled).toBe(true);
+    expect(document.body.textContent).toContain(message);
+  });
+
+  it("deletes and renames a branch that is blocked only for merge", async () => {
+    const blocked = [MERGE_DIRTY];
+    const deletions = await renderBranchDialog({
+      kind: "delete",
+      branch: branch("feature", { blocked }),
+      existsUpstream: false,
+    });
+    await confirmDelete();
+    await act(async () => buttonWithText("Delete branch").click());
+    expect(deletions).toEqual([{ kind: "delete", name: "feature", deleteRemote: false }]);
+
+    const renames = await renderBranchDialog({
+      kind: "rename",
+      branch: branch("feature", { blocked }),
+    });
+    expect(document.body.textContent).not.toContain(MERGE_DIRTY.message);
+    const input = document.querySelector<HTMLInputElement>('input[aria-label="New branch name"]');
+    await setInputValue(input!, "feature-two");
+    await act(async () => buttonWithText("Rename").click());
+    expect(renames).toEqual([{ kind: "rename", name: "feature", newName: "feature-two" }]);
+  });
+
+  it("shows the server's rename reason and not an unrelated one", async () => {
+    const message = "Rename is blocked: the worktree at /opaque/feature has this branch checked out.";
+    await renderBranchDialog({
+      kind: "rename",
+      branch: branch("feature", {
+        blocked: [MERGE_DIRTY, { operation: "rename-branch", code: "worktree-checked-out", message }],
+      }),
+    });
+
+    const input = document.querySelector<HTMLInputElement>('input[aria-label="New branch name"]');
+    await setInputValue(input!, "feature-two");
+    expect(document.body.textContent).toContain(message);
+    expect(document.body.textContent).not.toContain(MERGE_DIRTY.message);
+    expect(buttonWithText("Rename").disabled).toBe(true);
   });
 });
 
