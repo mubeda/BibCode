@@ -6147,6 +6147,243 @@ mod tests {
             "the local branch stays"
         );
     }
+
+    /// A bare remote whose `HEAD` is `main`, with `main` and `feature` pushed from a clone.
+    fn remote_delete_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+        let remote = tempfile::tempdir().expect("bare remote");
+        let fixture = tempfile::tempdir().expect("clone");
+        git(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        git(
+            fixture.path(),
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        );
+        std::fs::write(fixture.path().join("a.txt"), "a\n").expect("file");
+        git(fixture.path(), &["add", "a.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        git(fixture.path(), &["branch", "feature"]);
+        git(fixture.path(), &["push", "-q", "origin", "main", "feature"]);
+        (remote, fixture)
+    }
+
+    async fn delete_on_remote(
+        fixture: &Path,
+        request: &GitManagerOperationRequest,
+    ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+        let snapshot = build_refs_snapshot(&repository, fixture, &token)
+            .await
+            .expect("refs snapshot");
+        execute_branch_or_sync_operation(
+            &repository,
+            &snapshot,
+            request,
+            CredentialPrompt::Never,
+            &ExecutionPlace::default(),
+            &token,
+        )
+        .await
+    }
+
+    fn remote_delete(fixture: &Path, branch: &str) -> GitManagerOperationRequest {
+        GitManagerOperationRequest::RemoteBranchDelete {
+            cwd: fixture.to_path_buf(),
+            project_id: "p".into(),
+            remote: "origin".into(),
+            branch: branch.into(),
+            expected_destination: None,
+        }
+    }
+
+    fn remote_refs(remote: &Path) -> String {
+        git(remote, &["for-each-ref", "--format=%(refname)"])
+    }
+
+    /// R7: the push names `refs/heads/`, so a same-named tag survives a branch that is gone.
+    #[tokio::test]
+    async fn remote_branch_delete_never_deletes_a_same_named_tag() {
+        let (remote, fixture) = remote_delete_fixture();
+        git(fixture.path(), &["tag", "gone"]);
+        git(fixture.path(), &["push", "-q", "origin", "gone"]);
+
+        let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "gone"))
+            .await
+            .expect_err("no branch named gone exists on the remote");
+
+        assert_ne!(failure.code, "invalid-request");
+        assert!(
+            failure.outputs.last().is_some_and(|output| output.exit_code != 0),
+            "the Git error is reported: {failure:?}"
+        );
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main\nrefs/tags/gone"
+        );
+    }
+
+    /// R7: the remote's default branch is refused before anything is pushed.
+    #[tokio::test]
+    async fn remote_branch_delete_refuses_the_remotes_default_branch() {
+        let (remote, fixture) = remote_delete_fixture();
+
+        let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "main"))
+            .await
+            .expect_err("the default branch is refused");
+
+        assert_eq!(
+            failure.message,
+            "Delete is blocked: this is the remote's default branch."
+        );
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main"
+        );
+    }
+
+    /// R7: a remote whose default branch cannot be read deletes nothing.
+    #[tokio::test]
+    async fn remote_branch_delete_refuses_when_the_default_cannot_be_read() {
+        let (remote, fixture) = remote_delete_fixture();
+        git(
+            remote.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/missing"],
+        );
+
+        let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "feature"))
+            .await
+            .expect_err("an unknown default is refused");
+
+        assert_eq!(
+            failure.message,
+            "The remote's default branch could not be checked."
+        );
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main"
+        );
+    }
+
+    /// R7: a branch that moved on the remote since the last fetch is refused, and so is a
+    /// tracking name a custom fetch mapping fills from another remote branch.
+    #[tokio::test]
+    async fn remote_branch_delete_refuses_a_branch_that_differs_from_its_tracking_ref() {
+        let (remote, fixture) = remote_delete_fixture();
+        let other = tempfile::tempdir().expect("second clone");
+        git(
+            other.path(),
+            &[
+                "clone",
+                "-q",
+                &remote.path().to_string_lossy(),
+                &other.path().to_string_lossy(),
+            ],
+        );
+        git(other.path(), &["switch", "-q", "feature"]);
+        std::fs::write(other.path().join("b.txt"), "b\n").expect("file");
+        git(other.path(), &["add", "b.txt"]);
+        git(other.path(), &["commit", "-q", "-m", "moved"]);
+        git(other.path(), &["push", "-q", "origin", "feature"]);
+        git(
+            fixture.path(),
+            &[
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        for branch in ["feature", "topic"] {
+            let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), branch))
+                .await
+                .expect_err("a stale tracking ref is refused");
+            assert_eq!(
+                failure.message,
+                "This branch changed on the remote since the last fetch. Fetch, then delete it.",
+                "{branch}"
+            );
+        }
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main"
+        );
+    }
+
+    /// R7: a local delete that would also delete the remote's default branch deletes nothing.
+    #[tokio::test]
+    async fn local_delete_with_remote_refuses_the_remotes_default_before_deleting() {
+        let (remote, fixture) = remote_delete_fixture();
+        git(fixture.path(), &["branch", "--track", "mainline", "origin/main"]);
+
+        let failure = delete_on_remote(
+            fixture.path(),
+            &GitManagerOperationRequest::BranchDelete {
+                cwd: fixture.path().to_path_buf(),
+                project_id: "p".into(),
+                name: "mainline".into(),
+                force: true,
+                delete_remote: true,
+            },
+        )
+        .await
+        .expect_err("the remote default is refused");
+
+        assert_eq!(
+            failure.message,
+            "Delete is blocked: this is the remote's default branch."
+        );
+        assert_eq!(
+            git(fixture.path(), &["branch", "--format=%(refname:short)"]),
+            "feature\nmain\nmainline",
+            "the local branch stays"
+        );
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main"
+        );
+    }
+
+    /// D5: deleting a remote branch touches neither the index nor the working tree, so no
+    /// in-progress operation blocks it.
+    #[test]
+    fn remote_branch_delete_is_allowed_during_every_in_progress_operation() {
+        let fixture = tempfile::tempdir().expect("repository");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        git(fixture.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        for kind in [
+            GitManagerInProgressKind::Merge,
+            GitManagerInProgressKind::Rebase,
+            GitManagerInProgressKind::CherryPick,
+            GitManagerInProgressKind::Revert,
+            GitManagerInProgressKind::Squash,
+        ] {
+            let mut snapshot = operation_snapshot(fixture.path());
+            snapshot.remotes = vec!["origin".into()];
+            snapshot.in_progress_operation = Some(crate::git::GitManagerInProgressOperation {
+                kind,
+                current: None,
+                total: None,
+            });
+            assert_eq!(
+                blocked_reason_for_operation(&snapshot, &remote_delete(fixture.path(), "feature")),
+                None,
+                "{kind:?}"
+            );
+            assert!(
+                blocked_reason_for_operation(
+                    &snapshot,
+                    &GitManagerOperationRequest::Fetch {
+                        cwd: fixture.path().to_path_buf(),
+                        project_id: "p".into(),
+                        remote: "origin".into(),
+                        expected_destination: None,
+                    }
+                )
+                .is_some(),
+                "{kind:?} blocks a mutating operation"
+            );
+        }
+    }
 }
 
 /// Status reads during a held Git Manager network step (#345, R19, R21).

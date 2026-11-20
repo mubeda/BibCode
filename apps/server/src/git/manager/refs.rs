@@ -764,6 +764,64 @@ mod tests {
         assert_eq!(remote_names, ["origin/main"]);
     }
 
+    /// #397: each remote's `HEAD` marks that remote's default branch, and only that one.
+    #[tokio::test]
+    async fn each_remote_head_marks_its_own_default_branch() {
+        let repository = repository_with_one_commit();
+        let path = repository.path();
+        let url = path.to_str().expect("fixture path should be UTF-8");
+        let head = String::from_utf8(git_output(path, &["rev-parse", "HEAD"]).stdout)
+            .expect("UTF-8 HEAD")
+            .trim()
+            .to_owned();
+        for remote in ["origin", "upstream", "fork"] {
+            git(path, &["remote", "add", remote, url]);
+        }
+        for name in [
+            "origin/main",
+            "origin/feature",
+            "upstream/main",
+            "upstream/trunk",
+            "fork/main",
+        ] {
+            git(path, &["update-ref", &format!("refs/remotes/{name}"), &head]);
+        }
+        for (remote, target) in [("origin", "main"), ("upstream", "trunk")] {
+            git(
+                path,
+                &[
+                    "symbolic-ref",
+                    &format!("refs/remotes/{remote}/HEAD"),
+                    &format!("refs/remotes/{remote}/{target}"),
+                ],
+            );
+        }
+
+        let snapshot = snapshot(&repository).await;
+        let remote_defaults = snapshot
+            .remote_branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.is_default))
+            .collect::<Vec<_>>();
+        let local_defaults = snapshot
+            .local_branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.is_default))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            remote_defaults,
+            [
+                ("fork/main", false),
+                ("origin/feature", false),
+                ("origin/main", true),
+                ("upstream/main", false),
+                ("upstream/trunk", true),
+            ]
+        );
+        assert_eq!(local_defaults, [("main", true)]);
+    }
+
     #[tokio::test]
     async fn missing_remote_tracking_ref_does_not_make_the_snapshot_unavailable() {
         let repository = repository_with_one_commit();
