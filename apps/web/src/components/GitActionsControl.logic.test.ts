@@ -75,7 +75,58 @@ describe("when: ref is clean and has an open PR", () => {
     assert.deepInclude(quick, { kind: "open_pr", label: "View PR", disabled: false });
   });
 
-  it("buildMenuItems offers opening the PR in the thread's panel only when asked", () => {
+  it("resolveQuickAction opens the PR in the panel when the panel can show it", () => {
+    const pr = {
+      number: 10,
+      title: "Open PR",
+      url: "https://example.com/pr/10",
+      baseRef: "main",
+      headRef: "feature/test",
+      state: "open",
+    } as const;
+    assert.deepInclude(resolveQuickAction(status({ pr }), false, false, true, true), {
+      kind: "open_pr_panel",
+      label: "View PR",
+      disabled: false,
+    });
+    assert.deepInclude(resolveQuickAction(status({ pr }), false, false, true, false), {
+      kind: "open_pr",
+      label: "View PR",
+    });
+    const gitlab = status({
+      pr,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    assert.deepInclude(resolveQuickAction(gitlab, false, false, true, true), {
+      kind: "open_pr_panel",
+      label: "View MR",
+    });
+  });
+
+  it("resolveQuickAction opens the PR in the panel when there is no upstream", () => {
+    const pr = {
+      number: 10,
+      title: "Open PR",
+      url: "https://example.com/pr/10",
+      baseRef: "main",
+      headRef: "feature/test",
+      state: "open",
+    } as const;
+    for (const hasPrimaryRemote of [true, false]) {
+      assert.deepInclude(
+        resolveQuickAction(
+          status({ hasUpstream: false, aheadCount: 0, pr }),
+          false,
+          false,
+          hasPrimaryRemote,
+          true,
+        ),
+        { kind: "open_pr_panel", label: "View PR" },
+      );
+    }
+  });
+
+  it("buildMenuItems puts View PR in the panel and keeps a browser item only when asked", () => {
     const withPr = status({
       pr: {
         number: 11,
@@ -86,20 +137,34 @@ describe("when: ref is clean and has an open PR", () => {
         state: "open",
       },
     });
-    assert.notInclude(
-      buildMenuItems(withPr, false).map((item) => item.id),
-      "pr_panel",
+    assert.deepEqual(
+      buildMenuItems(withPr, false)
+        .filter((item) => item.icon === "pr")
+        .map(({ label, kind }) => ({ label, kind })),
+      [{ label: "View PR", kind: "open_pr" }],
     );
-    assert.deepInclude(buildMenuItems(withPr, false, true, true).at(-1), {
-      id: "pr_panel",
-      label: "Open PR in panel",
-      disabled: false,
-      icon: "pr",
-      kind: "open_pr_panel",
-    });
+    assert.deepEqual(
+      buildMenuItems(withPr, false, true, true)
+        .filter((item) => item.icon === "pr")
+        .map(({ label, kind, disabled }) => ({ label, kind, disabled })),
+      [
+        { label: "View PR", kind: "open_pr_panel", disabled: false },
+        { label: "Open PR in browser", kind: "open_pr", disabled: false },
+      ],
+    );
     assert.notInclude(
-      buildMenuItems(status(), false, true, true).map((item) => item.id),
-      "pr_panel",
+      buildMenuItems(status(), false, true, true).map((item) => item.label),
+      "Open PR in browser",
+    );
+    const gitlab = status({
+      pr: withPr.pr,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    assert.deepEqual(
+      buildMenuItems(gitlab, false, true, true)
+        .filter((item) => item.icon === "pr")
+        .map((item) => item.label),
+      ["View MR", "Open MR in browser"],
     );
   });
 

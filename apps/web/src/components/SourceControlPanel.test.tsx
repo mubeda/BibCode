@@ -135,6 +135,7 @@ const testState = vi.hoisted(() => ({
   rightPanelOpen: vi.fn(),
   openPullRequest: vi.fn(),
   pullRequestsEnabled: true,
+  pullRequestsReads: true,
   selectGitScope: vi.fn(),
   toast: { add: vi.fn(), update: vi.fn(), close: vi.fn() },
   groupByFolder: true,
@@ -342,6 +343,7 @@ vi.mock("~/state/entities", () => ({
           gitManagerStashMergeOperations: testState.mergeCapabilities,
           gitManagerBranchSyncOperations: testState.mergeCapabilities,
           codeReviews: testState.codeReviews,
+          pullRequestsReads: testState.pullRequestsReads,
         },
       },
     }),
@@ -778,6 +780,7 @@ beforeEach(() => {
   testState.rightPanelOpen.mockReset();
   testState.openPullRequest.mockReset();
   testState.pullRequestsEnabled = true;
+  testState.pullRequestsReads = true;
   testState.selectGitScope.mockReset();
   testState.toast.add.mockReset();
   testState.toast.add.mockReturnValue("toast-1");
@@ -824,6 +827,14 @@ describe("SourceControlPanel", () => {
     expect(testState.runAction).toHaveBeenCalledTimes(1);
   });
 
+  // A clean tree walks the remote ladder: the staging-area ladder, and the legacy one (files
+  // without an area) with its quick action.
+  const CLEAN_LADDERS = [
+    status,
+    (overrides: Partial<VcsStatusResult>) =>
+      legacyStatus({ hasWorkingTreeChanges: false, ...overrides }),
+  ];
+
   const OPEN_MR = {
     number: 89,
     title: "Fix it",
@@ -840,12 +851,62 @@ describe("SourceControlPanel", () => {
     });
     const props = buildProps();
     render(props);
-    menuItemByText("Open MR in panel")?.onClick?.();
+    menuItemByText("View MR")?.onClick?.();
     expect(testState.openPullRequest).toHaveBeenCalledWith(props.threadRef, {
       number: 89,
       provider: "gitlab",
     });
     expect(testState.openPullRequestLink).not.toHaveBeenCalled();
+  });
+
+  it("opens the open merge request in the panel from the View MR button, in both ladders", () => {
+    for (const build of CLEAN_LADDERS) {
+      testState.openPullRequest.mockClear();
+      testState.statusQuery.data = build({
+        sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+        pr: OPEN_MR,
+      });
+      const props = buildProps();
+      render(props);
+      const viewMr = buttonByExactText("View MR") ?? buttonsByText("View MR")[0];
+      expect(viewMr).toBeDefined();
+      viewMr?.onClick?.();
+      expect(testState.openPullRequest).toHaveBeenCalledWith(props.threadRef, {
+        number: 89,
+        provider: "gitlab",
+      });
+      expect(testState.openPullRequestLink).not.toHaveBeenCalled();
+    }
+  });
+
+  it("opens the PR URL in the browser from the Open PR in browser menu item, in both ladders", async () => {
+    for (const build of CLEAN_LADDERS) {
+      testState.openPullRequestLink.mockClear();
+      testState.openPullRequest.mockClear();
+      testState.statusQuery.data = build({ pr: OPEN_MR });
+      render(buildProps());
+      menuItemByText("Open PR in browser")?.onClick?.();
+      await flushPromises();
+      expect(testState.openPullRequestLink).toHaveBeenCalledWith(
+        (testState.localApi as { shell: unknown }).shell,
+        OPEN_MR.url,
+      );
+      expect(testState.openPullRequest).not.toHaveBeenCalled();
+    }
+  });
+
+  it("opens View PR in the browser when the server cannot read pull requests", async () => {
+    testState.pullRequestsReads = false;
+    for (const build of CLEAN_LADDERS) {
+      testState.openPullRequestLink.mockClear();
+      testState.statusQuery.data = build({ pr: OPEN_MR });
+      render(buildProps());
+      expect(menuItemByText("Open PR in browser")).toBeUndefined();
+      (buttonsByText("View PR")[0] ?? menuItemByText("View PR"))?.onClick?.();
+      await flushPromises();
+      expect(testState.openPullRequestLink).toHaveBeenCalledTimes(1);
+      expect(testState.openPullRequest).not.toHaveBeenCalled();
+    }
   });
 
   it("opens the open merge request in the thread's panel from the legacy menu", () => {
@@ -855,7 +916,7 @@ describe("SourceControlPanel", () => {
     });
     const props = buildProps();
     render(props);
-    menuItemByText("Open MR in panel")?.onClick?.();
+    menuItemByText("View MR")?.onClick?.();
     expect(testState.openPullRequest).toHaveBeenCalledWith(props.threadRef, {
       number: 89,
       provider: "gitlab",
@@ -1933,7 +1994,8 @@ describe("SourceControlPanel", () => {
     expect(testState.runAction.mock.calls[0]?.[0]).not.toHaveProperty("commitStagedIndexAsIs");
   });
 
-  it("opens an existing PR from the legacy quick action", async () => {
+  it("opens an existing PR from the legacy quick action in the browser without pull request reads", async () => {
+    testState.pullRequestsReads = false;
     testState.statusQuery.data = legacyStatus({
       hasWorkingTreeChanges: false,
       workingTree: { files: [], insertions: 0, deletions: 0 },
