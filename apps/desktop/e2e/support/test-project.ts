@@ -119,6 +119,8 @@ export interface DesktopUiTestContext {
   readonly fixtureUserHomePath: string;
   readonly nativeActionLogPath: string;
   readonly providerInputLogPath: string;
+  /** Every start of a fixture tool, one line each, so a run can prove no real tool was reached. */
+  readonly toolProbeLogPath: string;
 }
 
 export type DesktopUiDirectoryRemover = (path: string, options: NodeFS.RmDirOptions) => void;
@@ -1249,6 +1251,31 @@ function createProviderShims(shimDirectory: string, isWindows: boolean): void {
     NodeFS.writeFileSync(NodePath.join(shimDirectory, `${provider}-fixture.mjs`), source);
   }
 
+  // The maintained tool BiBCode probes on PATH: it logs each start and reports a fixture version.
+  if (isWindows) {
+    NodeFS.writeFileSync(
+      NodePath.join(shimDirectory, "codegraph.cmd"),
+      [
+        '@echo codegraph %*>>"%BIBCODE_E2E_TOOL_PROBE_LOG%"',
+        '@if "%~1"=="--version" (echo 0.0.0& exit /b 0)',
+        "@exit /b 1",
+        "",
+      ].join("\r\n"),
+    );
+  } else {
+    writeExecutable(
+      NodePath.join(shimDirectory, "codegraph"),
+      [
+        "#!/bin/sh",
+        'printf "%s\\n" "codegraph $*" >> "$BIBCODE_E2E_TOOL_PROBE_LOG"',
+        'if [ "$1" = "--version" ]; then printf "%s\\n" "0.0.0"; exit 0; fi',
+        "exit 1",
+        "",
+      ].join("\n"),
+      false,
+    );
+  }
+
   if (isWindows) {
     NodeFS.writeFileSync(
       NodePath.join(shimDirectory, "cursor.cmd"),
@@ -1338,6 +1365,8 @@ function writeProviderSettings(
         ...(options.realProviders
           ? { enableTerminalAgentActivity: true, terminal: { webglEnabled: false } }
           : {
+              // No latest-version lookups: the fixture tool and providers are not real releases.
+              enableProviderUpdateChecks: false,
               providers: {
                 codex: { enabled: true, binaryPath: executablePath("codex") },
                 claudeAgent: { enabled: true, binaryPath: executablePath("claude") },
@@ -1482,6 +1511,7 @@ export function prepareDesktopUiTestContext(
   );
   const nativeActionLogPath = NodePath.join(artifactDirectory, "native-actions.jsonl");
   const providerInputLogPath = NodePath.join(runRoot, "provider-input.jsonl");
+  const toolProbeLogPath = NodePath.join(artifactDirectory, "tool-probes.log");
 
   NodeFS.mkdirSync(stateRoot, { recursive: true });
   NodeFS.mkdirSync(shimDirectory, { recursive: true });
@@ -1495,6 +1525,7 @@ export function prepareDesktopUiTestContext(
     NodeFS.writeFileSync(nativeActionLogPath, "");
   }
   NodeFS.writeFileSync(providerInputLogPath, "");
+  NodeFS.writeFileSync(toolProbeLogPath, "");
   initializeGitProject(projectPath);
   writeFixtureFiles(fixtureUserHomePath, cursorInventoryFiles);
   createProviderShims(shimDirectory, isWindows);
@@ -1515,6 +1546,7 @@ export function prepareDesktopUiTestContext(
   environment.BIBCODE_E2E_USER_HOME = fixtureUserHomePath;
   environment.BIBCODE_E2E_NATIVE_ACTION_LOG = nativeActionLogPath;
   environment.BIBCODE_E2E_PROVIDER_INPUT_LOG = providerInputLogPath;
+  environment.BIBCODE_E2E_TOOL_PROBE_LOG = toolProbeLogPath;
   environment.BIBCODE_HOME = stateRoot;
   if (realProviders) {
     // Keep HOME and PATH: the provider CLIs find their own sign-ins there.
@@ -1542,6 +1574,7 @@ export function prepareDesktopUiTestContext(
     fixtureUserHomePath,
     nativeActionLogPath,
     providerInputLogPath,
+    toolProbeLogPath,
   };
 }
 
@@ -1576,6 +1609,19 @@ export function deferDesktopUiTestContextCleanupUntilExit(
   exitRegistrar.once("exit", () => {
     cleanContext(context);
   });
+}
+
+/**
+ * Why the run reached no fixture tool, or null. The app probes codegraph at startup; a log
+ * without the fixture's version probe means a real codegraph on PATH answered it instead.
+ */
+export function fixtureToolProbeProblem(toolProbeLogPath: string): string | null {
+  const log = NodeFS.existsSync(toolProbeLogPath)
+    ? NodeFS.readFileSync(toolProbeLogPath, "utf8")
+    : "";
+  return log.split(/\r?\n/).includes("codegraph --version")
+    ? null
+    : `The packaged app never started the fixture codegraph, so a real codegraph on PATH or none answered its probe (${toolProbeLogPath}).`;
 }
 
 export const desktopUiFixture = {
