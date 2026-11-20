@@ -176,6 +176,39 @@ does today, for every element.
    element as target and `keyCode` 90, every page cell passes. These were
    harness artifacts, not product defects.
 
+2. The Linux Edit menu cells are N against R5 and D10. The pinned menu
+   library creates no predefined Undo or Redo item on GTK, so there is no
+   menu path to route, and the Linux chords already reach the editors.
+
+## After the fix (macOS)
+
+The fix (`apps/desktop/src-tauri/src/window.rs` and
+`apps/web/src/components/files/editMenuHistory.ts`) was rebuilt in the macOS
+lab and the spec run again with real keystrokes and Edit menu clicks: 38 of 38
+cases passed, exit 0 (measured).
+
+| Cell                                                         | Keystroke | Menu |
+| ------------------------------------------------------------ | --------- | ---- |
+| Source undo, and redo after a same-path or toolbar Undo      | C         | C    |
+| Rendered undo of typed text and of a formatting step         | C         | C    |
+| Rendered redo after a same-path or toolbar Undo              | C         | C    |
+| Two steps, one undo, in each view: only the second leaves    | C         | C    |
+| Comment field undo and redo; the file's history is unchanged | C         | C    |
+| Composer undo and redo                                       | C         | C    |
+| Plain textarea undo and redo                                 | C         | C    |
+
+- A real Cmd+Z still produced no page `keydown` in any cell, so a custom item
+  that keeps the accelerator does not also deliver the chord to the editor.
+- The source menu cells can only pass through the new route, so the
+  host's targeted emit reached the page's `DesktopBridge.onMenuAction`
+  listener.
+- The comment field cells pass through `execCommand` (`historyUndo` and
+  `historyRedo` on its `textarea`), and the file's text, Undo and Redo state
+  stay as they were.
+- Windows and Linux were not rebuilt. Their menus are unchanged; the web
+  change there is the shared toolbar history and a listener for actions only
+  the macOS host sends.
+
 ## Profiler
 
 No run on any platform recorded a finding or a crash. On every platform the
@@ -190,7 +223,7 @@ isolation).
 
 | Cells                                                                                                                    | Disposition  | Reason                                                                                                                                                                 |
 | ------------------------------------------------------------------------------------------------------------------------ | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS, keystroke and menu: source undo and redo; rendered undo of a formatting step; rendered redo after a toolbar Undo  | B            | Nothing reaches the webview. The menu takes the chord, and WebKit's undo has no entry for these steps.                                                                 |
+| macOS, keystroke and menu: source undo and redo; rendered undo of a formatting step; rendered redo after a toolbar Undo  | B, fixed     | Nothing reached the webview. The menu took the chord, and WebKit's undo had no entry for these steps. C after the fix (see After the fix).                             |
 | macOS, keystroke and menu: rendered undo of typed text, rendered redo after a same-path Undo, composer and textarea undo | C            | Pass.                                                                                                                                                                  |
 | macOS, page keydown: every cell                                                                                          | C            | Pass.                                                                                                                                                                  |
 | Windows, every cell (keystroke, menu, page)                                                                              | C            | Pass. The menu items inject the same chords.                                                                                                                           |
