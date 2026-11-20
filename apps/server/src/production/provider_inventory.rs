@@ -2892,6 +2892,143 @@ done
     }
 
     #[test]
+    fn fresh_antigravity_inventory_is_disabled_and_runs_agy_not_its_slug() {
+        let fresh = definitions(&json!({}));
+        let antigravity = fresh
+            .iter()
+            .find(|definition| definition.instance_id == "antigravity")
+            .expect("built-in Antigravity definition");
+        assert!(!antigravity.enabled);
+        assert!(antigravity.available);
+        assert_eq!(antigravity.binary_path, "agy");
+        assert_eq!(default_provider_binary("antigravity"), "agy");
+
+        let custom = definitions(&json!({
+            "providerInstances": {
+                "antigravity_work": { "driver": "antigravity", "enabled": true, "config": {} }
+            }
+        }));
+        let custom = custom
+            .iter()
+            .find(|definition| definition.instance_id == "antigravity_work")
+            .expect("custom Antigravity definition");
+        assert!(custom.enabled);
+        assert!(custom.available, "antigravity is a driver this build ships");
+        assert_eq!(custom.binary_path, "agy");
+    }
+
+    /// Settings with one Antigravity instance whose binary is `binary`, every other built-in
+    /// pinned to an absent executable so the probe touches nothing else.
+    #[cfg(unix)]
+    fn antigravity_probe_settings(sandbox: &Path, binary: &Path, enabled: bool) -> Value {
+        let missing = crate::test_support::hermetic_providers::missing_provider_executable(sandbox);
+        let mut settings =
+            crate::test_support::hermetic_providers::hermetic_provider_settings(sandbox);
+        settings["providerInstances"] = json!({
+            "antigravity": {
+                "driver": "antigravity",
+                "enabled": enabled,
+                "config": { "binaryPath": binary }
+            },
+            "codex": { "driver": "codex", "enabled": false, "config": { "binaryPath": missing } }
+        });
+        settings
+    }
+
+    #[cfg(unix)]
+    async fn probe_antigravity(sandbox: &TestSandbox, settings: &Value) -> Value {
+        probe_full(
+            settings,
+            Some("antigravity"),
+            sandbox.root(),
+            &ProviderMaintenance::new(),
+        )
+        .await
+        .into_iter()
+        .next()
+        .expect("the Antigravity snapshot")
+        .snapshot
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_enabled_antigravity_instance_is_probed_with_version_only() {
+        let sandbox = TestSandbox::new("antigravity-probe");
+        let arguments = sandbox.path("arguments");
+        let binary = sandbox.path("antigravity-cli-fixture");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' '1.5.13'\n",
+                arguments.display()
+            ),
+        );
+
+        let snapshot =
+            probe_antigravity(&sandbox, &antigravity_probe_settings(sandbox.root(), &binary, true))
+                .await;
+
+        assert_eq!(snapshot["driver"], "antigravity");
+        assert_eq!(snapshot["displayName"], "Antigravity");
+        assert_eq!(snapshot["installed"], true);
+        assert_eq!(snapshot["status"], "ready");
+        assert_eq!(snapshot["version"], "1.5.13");
+        assert_eq!(
+            std::fs::read_to_string(&arguments).expect("the probe ran the binary"),
+            "--version\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_disabled_antigravity_instance_is_not_probed() {
+        let sandbox = TestSandbox::new("antigravity-disabled");
+        let ran = sandbox.path("ran");
+        let binary = sandbox.path("antigravity-cli-fixture");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+        );
+
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, false),
+        )
+        .await;
+
+        assert_eq!(snapshot["driver"], "antigravity");
+        assert_eq!(snapshot["enabled"], false);
+        assert!(!ran.exists(), "a disabled instance must not start its binary");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_probe_failures_follow_the_inventory_rules() {
+        let sandbox = TestSandbox::new("antigravity-probe-failures");
+        let failing = sandbox.path("antigravity-cli-failing");
+        crate::test_support::executable_fixture::write_executable(
+            &failing,
+            "#!/bin/sh\nprintf '%s\\n' 'not the cli'\nexit 3\n",
+        );
+        let failing_snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &failing, true),
+        )
+        .await;
+        assert_eq!(failing_snapshot["driver"], "antigravity");
+        assert_eq!(failing_snapshot["installed"], true);
+        assert_eq!(failing_snapshot["status"], "warning");
+
+        let inert = sandbox.path("antigravity-cli-inert");
+        std::fs::write(&inert, "not executable").expect("inert fixture");
+        let inert_snapshot =
+            probe_antigravity(&sandbox, &antigravity_probe_settings(sandbox.root(), &inert, true))
+                .await;
+        assert_eq!(inert_snapshot["driver"], "antigravity");
+        assert_eq!(inert_snapshot["installed"], false);
+    }
+
+    #[test]
     fn configured_instances_do_not_hide_enabled_legacy_providers() {
         let settings = json!({
             "providerInstances": {
@@ -2918,7 +3055,14 @@ done
 
         assert_eq!(
             drivers,
-            ["cursor", "codex", "claudeAgent", "grok", "opencode"]
+            [
+                "cursor",
+                "codex",
+                "claudeAgent",
+                "grok",
+                "opencode",
+                "antigravity"
+            ]
         );
         assert_eq!(
             drivers.iter().filter(|driver| **driver == "cursor").count(),

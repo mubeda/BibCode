@@ -640,7 +640,30 @@ mod tests {
         ("cursor", true, "cursor-agent"),
         ("grok", false, "grok"),
         ("opencode", true, "opencode"),
+        ("antigravity", false, "agy"),
     ];
+
+    #[tokio::test]
+    async fn antigravity_explicit_enable_survives_a_reload() {
+        let temp = tempfile::tempdir().expect("settings root");
+        fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "providers": { "antigravity": { "enabled": true } }
+            }))
+            .expect("enabled settings JSON"),
+        )
+        .await
+        .expect("enabled settings file");
+
+        let settings = ProviderSettingsStore::new(temp.path())
+            .get()
+            .await
+            .expect("enabled settings load");
+        let providers = serde_json::to_value(settings.providers).expect("providers JSON");
+        assert_eq!(providers["antigravity"]["enabled"], true);
+        assert_eq!(providers["antigravity"]["binaryPath"], "agy");
+    }
 
     #[tokio::test]
     async fn partial_builtin_provider_objects_preserve_enabled_defaults_and_custom_paths() {

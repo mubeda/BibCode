@@ -391,7 +391,7 @@ mod tests {
         }
         // Every possible built-in is a disposable tripwire. Even a broken guard
         // could not execute a developer-installed provider through this PATH.
-        for name in ["codex", "claude", "cursor-agent", "grok", "opencode"] {
+        for name in ["codex", "claude", "cursor-agent", "grok", "opencode", "agy"] {
             let name = if cfg!(windows) {
                 format!("{name}.cmd")
             } else {
@@ -658,6 +658,11 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(!String::from_utf8_lossy(&output.stderr).contains("hermetic-test-guard: refused"));
+    }
+
+    #[test]
+    fn hermetic_guard_refuses_the_antigravity_cli() {
+        assert!(super::is_guarded_program(Path::new("agy")));
     }
 
     #[cfg(windows)]
