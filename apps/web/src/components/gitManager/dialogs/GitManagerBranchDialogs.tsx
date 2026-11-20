@@ -24,6 +24,7 @@ import {
 } from "~/components/ui/dialog";
 import { Input } from "~/components/ui/input";
 import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
+import { GUARD_DELETE_BRANCH, GUARD_RENAME_BRANCH } from "../gitManagerGuardOperations";
 
 export type GitManagerBranchDialog =
   | {
@@ -313,9 +314,7 @@ function RenameBranchDialog({
   const [name, setName] = useState(branch.name);
   const trimmedName = name.trim();
   const serverBlock =
-    branch.blocked.find((reason) => reason.operation === "branch-rename") ??
-    branch.blocked[0] ??
-    null;
+    branch.blocked.find((reason) => reason.operation === GUARD_RENAME_BRANCH) ?? null;
   const duplicate = refs.some(
     (ref) =>
       ref.name !== branch.name && ref.name.toLocaleLowerCase() === trimmedName.toLocaleLowerCase(),
@@ -396,7 +395,8 @@ function DeleteBranchDialog({
 }) {
   const [confirmed, setConfirmed] = useState(false);
   const [deleteRemote, setDeleteRemote] = useState(false);
-  const serverBlock = branch.blocked.find((reason) => reason.operation === "branch-delete") ?? null;
+  const serverBlock =
+    branch.blocked.find((reason) => reason.operation === GUARD_DELETE_BRANCH) ?? null;
   const disabledReason = capabilityDisabledReason ?? serverBlock?.message ?? null;
   const submit = useCallback(() => {
     if (!confirmed || disabledReason !== null) return;

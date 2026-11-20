@@ -24,6 +24,7 @@ import {
 } from "react";
 
 import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
+import { GUARD_CHECKOUT, GUARD_MERGE } from "../gitManagerGuardOperations";
 import { Input } from "~/components/ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { cn } from "~/lib/utils";
@@ -143,12 +144,16 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
       ? refEntry.worktreePath
       : null;
   const unknownReason = refEntry.blocked.find((reason) => !KNOWN_BLOCKED_CODES.has(reason.code));
-  const checkoutBlock = refEntry.blocked.find(
-    (reason) =>
-      redirectPath === null &&
-      !(reason.operation === "branch-checkout" && reason.code === "dirty-working-tree"),
-  );
-  const blockedReason = unknownReason ?? checkoutBlock ?? null;
+  // Each row action reads its own reason. A dirty checkout is not blocked: the toolbar
+  // offers Stash or Bring for it.
+  const actionBlock = mergeMode
+    ? refEntry.blocked.find((reason) => reason.operation === GUARD_MERGE)
+    : redirectPath === null
+      ? refEntry.blocked.find(
+          (reason) => reason.operation === GUARD_CHECKOUT && reason.code !== "dirty-working-tree",
+        )
+      : undefined;
+  const blockedReason = unknownReason ?? actionBlock ?? null;
   const capabilityDisabledReason = mergeMode
     ? mergeDisabledReason
     : redirectPath === null
@@ -157,11 +162,7 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
   const currentMergeReason =
     mergeMode && refEntry.current ? "Choose a different branch to merge." : null;
   const displayReason =
-    capabilityDisabledReason ??
-    blockedReason?.message ??
-    currentMergeReason ??
-    refEntry.blocked[0]?.message ??
-    null;
+    capabilityDisabledReason ?? blockedReason?.message ?? currentMergeReason ?? null;
   const descriptionId =
     displayReason === null
       ? undefined
