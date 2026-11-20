@@ -17,7 +17,7 @@ export type GitActionIconName = "commit" | "push" | "pr";
 export type GitDialogAction = "commit" | "push" | "create_pr";
 
 export interface GitActionMenuItem {
-  id: "commit" | "push" | "pr" | "pr_panel";
+  id: "commit" | "push" | "pr" | "pr_browser";
   label: string;
   disabled: boolean;
   icon: GitActionIconName;
@@ -28,7 +28,7 @@ export interface GitActionMenuItem {
 export interface GitQuickAction {
   label: string;
   disabled: boolean;
-  kind: "run_action" | "run_pull" | "open_pr" | "open_publish" | "show_hint";
+  kind: "run_action" | "run_pull" | "open_pr" | "open_pr_panel" | "open_publish" | "show_hint";
   action?: GitStackedAction;
   hint?: string;
 }
@@ -154,7 +154,7 @@ export function buildMenuItems(
           label: `View ${terminology.shortLabel}`,
           disabled: !canOpenPr,
           icon: "pr",
-          kind: "open_pr",
+          kind: canOpenInPanel ? "open_pr_panel" : "open_pr",
         }
       : {
           id: "pr",
@@ -167,11 +167,11 @@ export function buildMenuItems(
   ];
   if (canOpenInPanel && hasOpenPr) {
     items.push({
-      id: "pr_panel",
-      label: `Open ${terminology.shortLabel} in panel`,
+      id: "pr_browser",
+      label: `Open ${terminology.shortLabel} in browser`,
       disabled: !canOpenPr,
       icon: "pr",
-      kind: "open_pr_panel",
+      kind: "open_pr",
     });
   }
   return items;
@@ -182,6 +182,7 @@ export function resolveQuickAction(
   isBusy: boolean,
   isDefaultRef = false,
   hasPrimaryRemote = true,
+  canOpenInPanel = false,
 ): GitQuickAction {
   if (isBusy) {
     return { label: "Commit", disabled: true, kind: "show_hint", hint: "Git action in progress." };
@@ -204,6 +205,7 @@ export function resolveQuickAction(
   const isBehind = gitStatus.behindCount > 0;
   const isDiverged = isAhead && isBehind;
   const terminology = resolveChangeRequestTerminology(gitStatus);
+  const viewKind = canOpenInPanel ? "open_pr_panel" : "open_pr";
 
   if (!hasBranch) {
     return {
@@ -232,7 +234,7 @@ export function resolveQuickAction(
   if (!gitStatus.hasUpstream) {
     if (!hasPrimaryRemote) {
       if (hasOpenPr && !isAhead) {
-        return { label: `View ${terminology.shortLabel}`, disabled: false, kind: "open_pr" };
+        return { label: `View ${terminology.shortLabel}`, disabled: false, kind: viewKind };
       }
       return {
         label: "Publish repository",
@@ -242,7 +244,7 @@ export function resolveQuickAction(
     }
     if (!isAhead) {
       if (hasOpenPr) {
-        return { label: `View ${terminology.shortLabel}`, disabled: false, kind: "open_pr" };
+        return { label: `View ${terminology.shortLabel}`, disabled: false, kind: viewKind };
       }
       return {
         label: "Push",
@@ -302,7 +304,7 @@ export function resolveQuickAction(
   }
 
   if (hasOpenPr && gitStatus.hasUpstream) {
-    return { label: `View ${terminology.shortLabel}`, disabled: false, kind: "open_pr" };
+    return { label: `View ${terminology.shortLabel}`, disabled: false, kind: viewKind };
   }
 
   if (hasDefaultBranchDelta && !isDefaultRef) {

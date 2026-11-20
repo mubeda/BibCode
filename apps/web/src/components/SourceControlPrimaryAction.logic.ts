@@ -34,6 +34,7 @@ export type SourceControlPrimaryActionKind =
   | "publish"
   | "create_pr"
   | "open_pr"
+  | "open_pr_panel"
   | "none";
 
 export interface SourceControlPrimaryAction {
@@ -96,7 +97,7 @@ export interface SourceControlPrimaryActionInput {
   stageableCount: number;
   /** The environment runs Git Manager fetch and merge operations for this project. */
   mergeAvailable: boolean;
-  /** The thread's right panel can show this branch's request (setting on, host supported). */
+  /** The thread's right panel can show this branch's request (setting on, host and server support it). */
   canOpenInPanel: boolean;
 }
 
@@ -151,6 +152,7 @@ function resolvePrimaryActionForStatus(
   const terminology = resolveChangeRequestTerminology(gitStatus);
   const changeRequestsEnabled = supportsChangeRequests(gitStatus);
   const pushEnabledForRef = canPushFromCurrentRef(gitStatus);
+  const viewPrKind = input.canOpenInPanel ? "open_pr_panel" : "open_pr";
 
   // Staged content always wins — commit the staged index as-is. Enabled even
   // with an empty message (auto-generate divergence); ordering intentionally
@@ -196,7 +198,7 @@ function resolvePrimaryActionForStatus(
   if (!gitStatus.hasUpstream) {
     if (!hasPrimaryRemote) {
       if (changeRequestsEnabled && hasOpenPr && !isAhead) {
-        return { kind: "open_pr", label: `View ${terminology.shortLabel}`, disabled: false };
+        return { kind: viewPrKind, label: `View ${terminology.shortLabel}`, disabled: false };
       }
       return { kind: "publish", label: "Publish repository", disabled: false };
     }
@@ -265,7 +267,7 @@ function resolvePrimaryActionForStatus(
   }
 
   if (changeRequestsEnabled && hasOpenPr) {
-    return { kind: "open_pr", label: `View ${terminology.shortLabel}`, disabled: false };
+    return { kind: viewPrKind, label: `View ${terminology.shortLabel}`, disabled: false };
   }
 
   if (changeRequestsEnabled && pushEnabledForRef && hasDefaultBranchDelta && !isDefaultRef) {
@@ -386,10 +388,10 @@ export function buildSourceControlMenuItems(
     },
     changeRequestsEnabled && hasOpenPr
       ? {
-          id: "open_pr",
+          id: input.canOpenInPanel ? "open_pr_panel" : "open_pr",
           label: `View ${terminology.shortLabel}`,
           group: "remote",
-          kind: "open_pr",
+          kind: input.canOpenInPanel ? "open_pr_panel" : "open_pr",
           ...gate(undefined),
         }
       : changeRequestsEnabled
@@ -417,10 +419,10 @@ export function buildSourceControlMenuItems(
         : null,
     changeRequestsEnabled && hasOpenPr && input.canOpenInPanel
       ? {
-          id: "open_pr_panel",
-          label: `Open ${terminology.shortLabel} in panel`,
+          id: "open_pr",
+          label: `Open ${terminology.shortLabel} in browser`,
           group: "remote",
-          kind: "open_pr_panel",
+          kind: "open_pr",
           ...gate(undefined),
         }
       : null,

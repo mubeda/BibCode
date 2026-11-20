@@ -421,17 +421,21 @@ export default function SourceControlPanel({
     [codeReviewMenuReviewers, codeReviewScope, status],
   );
 
+  // The panel can show the request only on a host that has it, with the setting on and a server
+  // that reads pull requests. Otherwise View PR opens the browser.
+  const canOpenInPanel =
+    capabilities?.pullRequestsReads === true &&
+    canOpenPullRequestInPanel({
+      enabled: pullRequestsEnabled,
+      providerKind: status?.sourceControlProvider?.kind ?? "unknown",
+    });
   // Legacy servers (no staging areas) keep the chat-header cascade
   // (commit_push-first, commit-by-filePaths). The primary button and dropdown
   // below fork on `hasAreas`: this pair drives the legacy branch unchanged.
   const quickAction = useMemo(
-    () => resolveQuickAction(status, isBusy, isDefaultRef, hasPrimaryRemote),
-    [status, isBusy, isDefaultRef, hasPrimaryRemote],
+    () => resolveQuickAction(status, isBusy, isDefaultRef, hasPrimaryRemote, canOpenInPanel),
+    [status, isBusy, isDefaultRef, hasPrimaryRemote, canOpenInPanel],
   );
-  const canOpenInPanel = canOpenPullRequestInPanel({
-    enabled: pullRequestsEnabled,
-    providerKind: status?.sourceControlProvider?.kind ?? "unknown",
-  });
   const menuItems = useMemo(
     () => buildMenuItems(status, isBusy, hasPrimaryRemote, canOpenInPanel),
     [status, isBusy, hasPrimaryRemote, canOpenInPanel],
@@ -1036,12 +1040,13 @@ export default function SourceControlPanel({
 
   const onPrimaryAction = useCallback(() => {
     if (quickAction.kind === "open_pr") return openPr();
+    if (quickAction.kind === "open_pr_panel") return openPrInPanel();
     if (quickAction.kind === "run_pull") return void runPull();
     if (quickAction.kind === "run_action" && quickAction.action) {
       return void runGitAction(quickAction.action);
     }
     // open_publish / show_hint: no-op here (surfaced as disabled below).
-  }, [openPr, quickAction, runGitAction, runPull]);
+  }, [openPr, openPrInPanel, quickAction, runGitAction, runPull]);
 
   // Commit-first ladder dispatch (staging-area servers). Commit-family actions
   // route through runGitAction, which holds the ledger guard (commit the staged
@@ -1063,9 +1068,12 @@ export default function SourceControlPanel({
       case "open_pr":
         openPr();
         return;
+      case "open_pr_panel":
+        openPrInPanel();
+        return;
       // publish / sync_hint / none: disabled below, no-op here.
     }
-  }, [primaryAction, runGitAction, runStage, runPull, openPr, groups]);
+  }, [primaryAction, runGitAction, runStage, runPull, openPr, openPrInPanel, groups]);
 
   const onScMenuItem = useCallback(
     (item: SourceControlMenuItem) => {

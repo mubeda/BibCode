@@ -168,7 +168,7 @@ describe("when: ref is clean and has an open PR", () => {
     );
   });
 
-  it("buildMenuItems disables opening the PR in the panel while busy", () => {
+  it("buildMenuItems disables both PR items while busy", () => {
     const withPr = status({
       pr: {
         number: 11,
@@ -179,10 +179,11 @@ describe("when: ref is clean and has an open PR", () => {
         state: "open",
       },
     });
-    assert.deepInclude(buildMenuItems(withPr, true, true, true).at(-1), {
-      id: "pr_panel",
-      disabled: true,
-    });
+    const prItems = buildMenuItems(withPr, true, true, true).filter((item) => item.icon === "pr");
+    assert.deepEqual(
+      prItems.map((item) => item.disabled),
+      [true, true],
+    );
   });
 
   it("buildMenuItems disables commit/push and enables open PR", () => {
