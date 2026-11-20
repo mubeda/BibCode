@@ -49,9 +49,11 @@ so for most Files steps nothing arrives.
 3. The web decides at delivery, in one listener mounted on every route of the
    main webview.
    - It finds the focused element, looking through open shadow roots.
-   - If that element is a registered Files editing host (the source editor's
-     content element, or the rendered editor's root) and no composition is in
-     progress on it, it calls that surface's undo or redo: the same operation
+   - If that element is editable text (`isContentEditable`, which the source
+     editor's content element and the rendered editor are, and a `textarea`
+     or `input` is not) inside a registered Files region (containment, across
+     shadow roots), and no composition is in progress, it calls that
+     region's undo or redo: the same operation
      the toolbar buttons call (`FilePreviewPanel.tsx:1125-1126`), shared with
      the toolbar, not copied. With an empty history this changes nothing, like
      the disabled toolbar button.
@@ -72,11 +74,11 @@ existing string-valued menu action carries the two ids.
 | Files source editor                     | That panel's history, one step.                                    | Shares the toolbar operation (measured to move one step).               |
 | Files rendered editor                   | That panel's rich-editor history, one step.                        | Same.                                                                   |
 | Files editor with an active composition | `execCommand`, today's behavior.                                   | Task 1.2 web test with composition events. A real IME is not automated. |
-| Inline comment textarea, Link URL field | `execCommand`, native undo of that field. Files history unchanged. | Not a registered host (a different element). Task 1.2 packaged test.    |
+| Inline comment textarea, Link URL field | `execCommand`, native undo of that field. Files history unchanged. | Not editable text. Measured for the comment field; Link URL not run.    |
 | Chat composer (Lexical)                 | `execCommand`, Lexical handles `historyUndo`.                      | Measured: keystroke and menu cells pass today; `execCommand` probe.     |
 | Plain `input` or `textarea`             | `execCommand`, native undo.                                        | Measured: `execCommand` emptied a typed textarea.                       |
 | Terminal                                | `execCommand` on xterm's textarea, as the predefined item does.    | Measured: today a real Cmd+Z delivers nothing there.                    |
-| Preview webview, native panel, sheet    | Native `undo:` through the responder chain, as today.              | Host check in step 2. Task 1.2 packaged test for the preview.           |
+| Preview webview, native panel, sheet    | Native `undo:` through the responder chain, as today.              | Host check in step 2. Not run in a packaged test.                       |
 | Main webview with no listener mounted   | Not possible: the listener is mounted on every route.              | Step 3 and Files below.                                                 |
 
 Redo follows the same table.
@@ -160,15 +162,21 @@ The AppKit classes the check needs (`NSApplication`, `NSWindow`,
   runs `execCommand` and moves no Files history; an active composition runs
   `execCommand`; an empty history changes nothing and runs no `execCommand`;
   redo mirrors undo.
-- Packaged, macOS lab, for each of keystroke and menu click: two independent
-  seeded steps in each Files view (catches a double step); a formatting step;
-  redo after a toolbar Undo; independent edits in Files and in the inline
-  comment field, and in the rendered view and its Link URL field, proving
-  which history moved; the composer and a plain textarea in both directions;
-  a custom `mod+z` keybinding with a menu click, which must not fire; a held
-  chord over three steps; a typed field in the preview webview.
+- Packaged, macOS lab, for each of keystroke and menu click (run, 38 of 38
+  passed): two independent seeded steps in each Files view (catches a double
+  step); a formatting step; redo after a toolbar Undo; independent edits in
+  Files and in the inline comment field, proving which history moved; the
+  composer and a plain textarea in both directions.
+- Not run: the Link URL field, a held chord, a typed field in the preview
+  webview or a native panel (so the native `undo:` branch never ran in a
+  packaged test), and a custom `mod+z` keybinding. The last cannot fire from
+  the menu by construction, because no keyboard event is dispatched.
 - Not automated: a real input method with marked text (System Events cannot
   drive one reliably); the web test covers the composition guard.
+- When a file is deleted on disk, the toolbar disables Undo and Redo, but the
+  chord already reaches the editor's own binding there on every platform
+  (inferred from the code, not measured). The menu follows the chord, not the
+  button.
 
 ## Risks
 
@@ -191,4 +199,6 @@ as follows.
 | 5. Enabled state, empty history, key repeat                                  | question   | Answered. Items stay enabled as today; an empty Files history changes nothing; each repeat moves one step, as today.                                           | Decision 3, Timing              |
 | 6. Windows and Linux need packaged evidence; Linux menu disposition; tooltip | blocking   | Fixed. Both measured: every Files cell passes, so the design stays macOS-only; Linux menu is N. The Redo tooltip stays in Task 1.3.                            | Status, diagnosis               |
 
-Advisor: pending.
+The coordinator accepted revision 2 on 2026-11-20. The advisor reviewed the
+implementation against it and its remaining points are recorded in the lane
+report.

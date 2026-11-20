@@ -1,11 +1,15 @@
 // @vitest-environment happy-dom
 
+import { act, useRef } from "react";
+import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   type FilesEditHistory,
   registerFilesEditRegion,
   runEditMenuAction,
+  useEditMenuActions,
+  useFilesEditRegion,
 } from "./editMenuHistory";
 
 function history() {
@@ -133,5 +137,57 @@ describe("runEditMenuAction", () => {
 
     expect(files.undo).not.toHaveBeenCalled();
     expect(execCommand).toHaveBeenCalledWith("undo");
+  });
+});
+
+describe("useEditMenuActions and useFilesEditRegion", () => {
+  afterEach(() => {
+    delete (window as { desktopBridge?: unknown }).desktopBridge;
+    document.body.replaceChildren();
+  });
+
+  it("runs the menu actions while mounted, ignores other actions, and stops after unmount", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const execCommand = vi.fn<(command: string) => boolean>(() => true);
+    document.execCommand = execCommand as unknown as Document["execCommand"];
+    let listener: ((action: string) => void) | null = null;
+    const unsubscribe = vi.fn(() => {
+      listener = null;
+    });
+    Object.assign(window, {
+      desktopBridge: {
+        onMenuAction: (next: (action: string) => void) => {
+          listener = next;
+          return unsubscribe;
+        },
+      },
+    });
+    const files = history();
+    function Probe() {
+      useEditMenuActions();
+      const region = useRef<HTMLDivElement>(null);
+      useFilesEditRegion(region, files);
+      return (
+        <div ref={region}>
+          <div contentEditable suppressContentEditableWarning tabIndex={0} data-testid="text" />
+        </div>
+      );
+    }
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<Probe />));
+    container.querySelector<HTMLElement>('[data-testid="text"]')!.focus();
+    const send = (action: string) => (listener as ((action: string) => void) | null)?.(action);
+
+    send("edit-undo");
+    send("open-settings");
+    expect(files.undo).toHaveBeenCalledTimes(1);
+    expect(execCommand).not.toHaveBeenCalled();
+
+    await act(async () => root.unmount());
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    send("edit-undo");
+    expect(files.undo).toHaveBeenCalledTimes(1);
   });
 });
