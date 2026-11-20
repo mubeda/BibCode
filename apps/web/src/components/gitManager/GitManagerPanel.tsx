@@ -95,8 +95,7 @@ import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
 import { GitManagerTagsView, type GitManagerTagRowAction } from "./tags/GitManagerTagsView";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
 import { GitSignInPrompt } from "../gitSignIn/GitSignInPrompt";
-import { SIGN_IN_REPEATED_MESSAGE } from "../gitSignIn/gitSignIn.logic";
-import { useGitSignInFlow } from "../gitSignIn/useGitSignInFlow";
+import { useGitManagerSignIn } from "./useGitManagerSignIn";
 import { useCheckoutStatusRereads } from "./useCheckoutStatusRereads";
 import { GitManagerRepositoryUnavailable } from "./GitManagerRepositoryUnavailable";
 import {
@@ -495,36 +494,13 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
     revalidateRefs();
     if (stashPaneOpen) revalidateStashes();
   }, [revalidateRefs, revalidateStashes, stashPaneOpen]);
-  const signIn = useGitSignInFlow(environmentId);
-  const offerSignIn = signIn.offer;
-  // Set while the request a sign-in resumed runs: a second `sign-in-required` is not offered again.
-  const resumingAfterSignInRef = useRef(false);
   const executeOperationRef = useRef<
     ((input: GitManagerOperationRequest) => Promise<boolean>) | null
   >(null);
-  const presentOperationEvent = useCallback(
-    (event: GitManagerOperationEvent): GitManagerOperationEvent => {
-      if (event._tag !== "failed" || event.signIn === undefined) return event;
-      const { signIn: offer, ...failure } = event;
-      if (resumingAfterSignInRef.current) {
-        return { ...failure, message: SIGN_IN_REPEATED_MESSAGE };
-      }
-      offerSignIn({
-        offer,
-        cwd: offer.resume.cwd,
-        projectId: offer.resume.projectId,
-        onSignedIn: () => {
-          resumingAfterSignInRef.current = true;
-          void executeOperationRef.current?.(offer.resume).finally(() => {
-            resumingAfterSignInRef.current = false;
-          });
-        },
-        onEnded: (code, message) => setOperationEvent({ ...failure, code, message, blocked: null }),
-      });
-      return failure;
-    },
-    [offerSignIn],
-  );
+  const { flow: signIn, present: presentOperationEvent } = useGitManagerSignIn(environmentId, {
+    resume: (request) => executeOperationRef.current?.(request) ?? Promise.resolve(false),
+    onEnded: setOperationEvent,
+  });
   const executeOperation = useCallback(
     async (
       input: GitManagerOperationRequest,

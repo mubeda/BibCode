@@ -28,9 +28,11 @@ import {
   type GitManagerBranchDialogSubmission,
 } from "./dialogs/GitManagerBranchDialogs";
 import { GitManagerSwitchWithChangesDialog } from "./dialogs/GitManagerSwitchWithChangesDialog";
+import { GitSignInPrompt } from "../gitSignIn/GitSignInPrompt";
 import { newBranchDialog } from "./toolbar/branchCreateBase";
 import { GitManagerBranchDropdown } from "./toolbar/GitManagerBranchDropdown";
 import { GitManagerOperationBanner } from "./toolbar/GitManagerOperationBanner";
+import { splitRemoteBranchRef } from "./toolbar/remoteBranchRef";
 import {
   GitManagerSyncButton,
   type SyncOperationKind,
@@ -39,6 +41,7 @@ import {
 import { resolveSyncState, type SyncState } from "./toolbar/syncButton.logic";
 import { GitManagerTagDialog } from "./tags/GitManagerTagDialog";
 import type { RepositoryUnavailable } from "./gitManagerRepositoryAvailability";
+import { useGitManagerSignIn } from "./useGitManagerSignIn";
 import {
   Menu,
   MenuItem,
@@ -131,6 +134,7 @@ function leaveChangesSwitchFailure(
 
 const EMPTY_BRANCHES: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
 const EMPTY_TAG_NAMES: ReadonlyArray<string> = Object.freeze([]);
+const EMPTY_REMOTES: ReadonlyArray<string> = Object.freeze([]);
 const LOADING_SYNC_STATE: SyncState = Object.freeze({
   kind: "running",
   label: "Loading repository state…",
@@ -335,6 +339,19 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     [],
   );
 
+  const executeOperationRef = useRef<
+    ((input: GitManagerOperationRequest) => Promise<boolean>) | null
+  >(null);
+  const { flow: signIn, present: presentOperationEvent } = useGitManagerSignIn(environmentId, {
+    // A resumed request that succeeds closes the dialog that sent the original one.
+    resume: async (request) => {
+      if (await executeOperationRef.current?.(request)) setBranchDialog(null);
+    },
+    onEnded: (failure) => {
+      setOperationEvent(failure);
+      setOperationError(failure.message);
+    },
+  });
   const executeOperation = useCallback(
     async (input: GitManagerOperationRequest): Promise<boolean> => {
       lastFailureCodeRef.current = null;
@@ -342,11 +359,20 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       setOperationError(null);
       setIsOperationRunning(true);
       setOperationEvent({ _tag: "started", operation: input._tag });
-      const handle = runGitManagerOperation(registry, { environmentId, input }, (event) => {
+      // Git's own refusal (a protected branch, a rejected push) arrives on stderr before the
+      // failure summary; the dialog shows both.
+      let stderr = "";
+      const handle = runGitManagerOperation(registry, { environmentId, input }, (received) => {
+        if (received._tag === "output" && received.stream === "stderr") stderr += received.text;
+        const event = presentOperationEvent(received);
         setOperationEvent(event);
         if (event._tag === "failed") {
           lastFailureCodeRef.current = event.code;
-          setOperationError(event.blocked?.message ?? event.message);
+          const gitError = stderr.trim();
+          setOperationError(
+            event.blocked?.message ??
+              (gitError === "" ? event.message : `${event.message}\n${gitError}`),
+          );
         }
       });
       activeOperationRef.current = handle;
@@ -370,8 +396,11 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       }
       return result.value._tag === "finished";
     },
-    [environmentId, revalidateRefs, registry],
+    [environmentId, presentOperationEvent, revalidateRefs, registry],
   );
+  useEffect(() => {
+    executeOperationRef.current = executeOperation;
+  }, [executeOperation]);
   const cancelOperation = useCallback(() => {
     const active = activeOperationRef.current;
     if (active === null) return;
@@ -463,6 +492,21 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       setBranchDialog({ kind: "delete", branch, existsUpstream: branch.upstream !== null }),
     [],
   );
+  const remotes = snapshot?.remotes ?? EMPTY_REMOTES;
+  const deleteRemoteBranch = useCallback(
+    (branch: GitManagerRefEntry) => {
+      const split = splitRemoteBranchRef(branch.name, remotes);
+      if (split === null || split === "ambiguous") return;
+      setOperationError(null);
+      setBranchDialog({
+        kind: "delete-remote",
+        branch,
+        remote: split.remote,
+        remoteBranch: split.branch,
+      });
+    },
+    [remotes],
+  );
   const mergeIntoCurrent = useCallback(
     (branch: GitManagerRefEntry) => {
       if (stashMergeDisabledReason !== null) {
@@ -517,6 +561,15 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             name: submission.name,
             force: true,
             deleteRemote: submission.deleteRemote,
+          };
+          break;
+        case "delete-remote":
+          request = {
+            _tag: "remote-branch-delete",
+            cwd: selectedWorktreeCwd,
+            projectId,
+            remote: submission.remote,
+            branch: submission.branch,
           };
           break;
       }
@@ -594,6 +647,17 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
     tagMenuDisabledReason ??
     (tagTargetSha === null ? "Create a commit before creating a tag." : null);
   const tagRemote = snapshot?.remotes.includes(remote) === true ? remote : null;
+  // A modal branch dialog covers the toolbar, so the prompt for its request shows inside it.
+  const signInPrompt =
+    signIn.state === null ? null : (
+      <GitSignInPrompt
+        offer={signIn.state.offer}
+        phase={signIn.state.phase}
+        onCancel={signIn.cancel}
+        onNotNow={signIn.decline}
+        onSignIn={signIn.approve}
+      />
+    );
 
   return (
     <div className="min-w-0 shrink-0">
@@ -685,7 +749,9 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
             remoteRefs={snapshot?.remoteBranches ?? EMPTY_BRANCHES}
             selectedWorktreeCwd={selectedWorktreeCwd}
             onCreateBranch={createBranch}
+            remotes={remotes}
             onDeleteBranch={deleteBranch}
+            onDeleteRemoteBranch={deleteRemoteBranch}
             onMergeInto={mergeIntoCurrent}
             onRenameBranch={renameBranch}
             onSelectBranch={selectBranch}
@@ -809,12 +875,17 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
         </div>
       </header>
 
-      <GitManagerOperationBanner operation={operationEvent} onCancel={cancelOperation} />
+      {signInPrompt !== null && branchDialog === null ? (
+        signInPrompt
+      ) : (
+        <GitManagerOperationBanner operation={operationEvent} onCancel={cancelOperation} />
+      )}
       <GitManagerBranchDialogs
         busy={isOperationRunning}
         dialog={branchDialog}
         disabledReason={branchSyncDisabledReason}
         errorMessage={operationError}
+        signInPrompt={signInPrompt}
         refs={localBranches}
         remoteRefs={snapshot?.remoteBranches ?? EMPTY_BRANCHES}
         onClose={closeBranchDialog}
