@@ -4,7 +4,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
-import { desktopUiApplicationPid, desktopUiPlatform } from "../support/app-lifecycle.ts";
+import { desktopUiPlatform } from "../support/app-lifecycle.ts";
 import { desktopUiFixture } from "../support/test-project.ts";
 import {
   ensureMainSidebarOpen,
@@ -330,13 +330,13 @@ function chooseNativeEditItem(item: "Undo" | "Redo"): { exists: boolean; enabled
     return { exists: true, enabled: reply === "true" };
   }
   if (platform === "win") {
-    const pid = desktopUiApplicationPid();
     const reply = powershell(
       [
         "Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes",
         "$A = [System.Windows.Automation.AutomationElement]",
         "$S = [System.Windows.Automation.TreeScope]::Descendants",
-        `$window = $A::FromHandle((Get-Process -Id ${pid}).MainWindowHandle)`,
+        // The packaged app is the one process of that executable with a main window.
+        `$window = $A::FromHandle((Get-Process -Name "${NodePath.parse(process.env.BIBCODE_E2E_APP_PATH ?? "bibcode-desktop").name}" | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1).MainWindowHandle)`,
         '$named = { param($root, $name) $root.FindAll($S, [System.Windows.Automation.Condition]::TrueCondition) | Where-Object { $_.Current.Name -like "$name*" -and $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::MenuItem } | Select-Object -First 1 }',
         "$edit = & $named $window 'Edit'",
         "if (-not $edit) { 'missing-edit'; exit }",
