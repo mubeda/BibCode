@@ -1,6 +1,6 @@
 # Diagnosis: Files undo and redo shortcuts (#398)
 
-Status: macOS measured 2026-11-20. Windows and Linux pending.
+Status: macOS, Windows and Linux measured 2026-11-20.
 
 ## Question
 
@@ -57,20 +57,64 @@ C means the history moved one step and the toolbar agreed. F means it did not.
 | Rendered | Undo      | toolbar Heading 2        | F, nothing                          | F, nothing                          | C            |
 | Rendered | Redo      | after same-path Undo     | C, trusted cancelable `historyRedo` | C, trusted cancelable `historyRedo` | C            |
 | Rendered | Redo      | after toolbar Undo       | F, nothing                          | F, nothing                          | C            |
-| Composer | Undo      | typed text               | C, trusted cancelable `historyUndo` | not run                             | C            |
+| Composer | Undo      | typed text               | C, trusted cancelable `historyUndo` | C, trusted cancelable `historyUndo` | C            |
+| Textarea | Undo      | typed text               | C, native undo                      | C, native undo                      | not run      |
+| Terminal | Undo      | focused, no step         | nothing reached the page            | not run                             | not run      |
 
 Ctrl/Cmd+S saved the source view on the page path. A real Cmd+Z or
 Shift+Cmd+Z never produced a `keydown` in any cell.
 
-### Windows
+### Windows (packaged app, Windows 11 arm64, WebView2 157)
 
-Pending. It needs a packaged build in the Windows lab.
+Every cell passed (32 of 32 cases, measured). A real Ctrl+Z, Shift+Ctrl+Z
+and Ctrl+Y each reached the page as a trusted `keydown` that the focused
+editor cancelled.
 
-### Linux
+| View     | Direction | Seed or undo before redo | Keystroke                                                                                                                      | Menu                            | Page keydown |
+| -------- | --------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------- | ------------ |
+| Source   | Undo      | typed text               | C, `keydown` Ctrl+Z                                                                                                            | C, injected Ctrl+Z `keydown`    | C            |
+| Source   | Redo      | after same-path Undo     | C, Shift+Ctrl+Z and Ctrl+Y                                                                                                     | C, injected Ctrl+Y `keydown`    | C            |
+| Source   | Redo      | after toolbar Undo       | C, Shift+Ctrl+Z and Ctrl+Y                                                                                                     | C, injected Ctrl+Y `keydown`    | C            |
+| Rendered | Undo      | typed text               | C                                                                                                                              | C, injected Ctrl+Z              | C            |
+| Rendered | Undo      | toolbar Heading 2        | C                                                                                                                              | C, injected Ctrl+Z              | C            |
+| Rendered | Redo      | after same-path Undo     | C, Shift+Ctrl+Z and Ctrl+Y                                                                                                     | C, injected Ctrl+Y              | C            |
+| Rendered | Redo      | after toolbar Undo       | C, Shift+Ctrl+Z and Ctrl+Y                                                                                                     | C, injected Ctrl+Y              | C            |
+| Composer | Undo      | typed text               | C, `keydown` cancelled                                                                                                         | C, injected Ctrl+Z              | C            |
+| Textarea | Undo      | typed text               | C, native `historyUndo`                                                                                                        | C, injected Ctrl+Z, native undo | not run      |
+| Terminal | Undo      | focused, no step         | `keydown` seen in capture only; xterm stopped it (it sends Ctrl+Z to the shell, inferred from xterm 6.0 `Keyboard.ts:308-310`) | not run                         | not run      |
 
-Pending. It needs a packaged build in the Linux lab. The pinned menu library
+The menu column chose Edit > Undo or Redo from the keyboard (F10, Right,
+Down, Enter). UI Automation lists no menu bar for the packaged window,
+although `GetMenuItemCount(GetMenu(hwnd))` reports its five menus. Each menu
+choice then delivered the chord `muda` 0.19.3 injects with `SendInput`
+(`src/platform_impl/windows/mod.rs:1264-1292`): Ctrl+Z for Undo and Ctrl+Y
+for Redo. So the Windows menu path is the chord path, measured.
+
+### Linux (packaged AppImage, Ubuntu 22.04 arm64 under Xvfb, WebKitGTK 2.50.4)
+
+A real Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y each reached the page as a trusted
+`keydown`, and every Files cell passed (measured). The pinned menu library
 (`muda` 0.19.3, `src/platform_impl/gtk/mod.rs:30-43`) creates no predefined
-Undo or Redo item on GTK, so the menu column is N there.
+Undo or Redo item on GTK, so the menu column is N.
+
+| View     | Direction | Seed or undo before redo | Keystroke                                        | Menu | Page keydown |
+| -------- | --------- | ------------------------ | ------------------------------------------------ | ---- | ------------ |
+| Source   | Undo      | typed text               | C, `keydown` Ctrl+Z cancelled                    | N    | C            |
+| Source   | Redo      | after same-path Undo     | C, Shift+Ctrl+Z and Ctrl+Y                       | N    | C            |
+| Source   | Redo      | after toolbar Undo       | C, Shift+Ctrl+Z and Ctrl+Y                       | N    | C            |
+| Rendered | Undo      | typed text               | C                                                | N    | C            |
+| Rendered | Undo      | toolbar Heading 2        | C                                                | N    | C            |
+| Rendered | Redo      | after same-path Undo     | C, Shift+Ctrl+Z and Ctrl+Y                       | N    | C            |
+| Rendered | Redo      | after toolbar Undo       | C, Shift+Ctrl+Z and Ctrl+Y                       | N    | C            |
+| Composer | Undo      | typed text               | C, `keydown` cancelled                           | N    | C            |
+| Textarea | Undo      | typed text               | F, `keydown` not cancelled, no undo              | N    | not run      |
+| Terminal | Undo      | focused, no step         | `keydown` seen in capture only; xterm stopped it | N    | not run      |
+
+The textarea cell failed in 2 of 2 runs. In the same app,
+`document.execCommand("undo")` emptied the same kind of textarea and the
+composer, so WebKitGTK holds the undo entry but has no Ctrl+Z binding for it,
+and the GTK menu has no Undo item to supply one (inferred from both
+measurements). This is outside the Files editor and older than this change.
 
 ## Cause on macOS
 
@@ -96,6 +140,11 @@ Undo or Redo item on GTK, so the menu column is N there.
 
 The editors themselves are correct. Every page-keydown cell passes, including
 redo with Shift and the formatting step.
+
+Windows and Linux do not have this failure. There the real chord reaches the
+page as a `keydown`, and the focused editor cancels it (measured in every
+keystroke cell). The Windows menu items inject the same chords. So #398
+reproduces only in the macOS desktop app.
 
 Root-cause tier: Confirmed for steps 1, 3 and 4 by the measured cells.
 Step 2 is Supported. It fits every cell, and `document.execCommand("undo")`
@@ -129,17 +178,23 @@ does today, for every element.
 
 ## Profiler
 
-The macOS runs recorded no findings and no crashes. The only repeated event,
-`rpc.disconnect` with `client-closed` and close code 1001, comes once per case
-from the harness reloading the page between cases.
+No run on any platform recorded a finding or a crash. On every platform the
+only repeated event, `rpc.disconnect` with `client-closed` and close code
+1001, comes once per case from the harness reloading the page between cases.
+The Windows run also logged 22 `rpc.timing` events at the warn tier (1.0 s to
+2.8 s, first items of subscriptions and `server.discoverSourceControl`) while
+a Linux build loaded the same host (inferred as host load, not measured in
+isolation).
 
 ## Dispositions
 
-| Cells                                                                                                                   | Disposition | Reason                                                                                                 |
-| ----------------------------------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------ |
-| macOS, keystroke and menu: source undo and redo; rendered undo of a formatting step; rendered redo after a toolbar Undo | B           | Nothing reaches the webview. The menu takes the chord, and WebKit's undo has no entry for these steps. |
-| macOS, keystroke and menu: rendered undo of typed text, rendered redo after a same-path Undo, composer undo             | C           | Pass.                                                                                                  |
-| macOS, page keydown: every cell                                                                                         | C           | Pass.                                                                                                  |
-| Windows, every cell                                                                                                     | pending     | Not yet measured.                                                                                      |
-| Linux, keystroke and page cells                                                                                         | pending     | Not yet measured.                                                                                      |
-| Linux, menu cells                                                                                                       | N           | `muda` 0.19.3 creates no predefined Undo or Redo item on GTK.                                          |
+| Cells                                                                                                                    | Disposition  | Reason                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------ | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS, keystroke and menu: source undo and redo; rendered undo of a formatting step; rendered redo after a toolbar Undo  | B            | Nothing reaches the webview. The menu takes the chord, and WebKit's undo has no entry for these steps.                                                                 |
+| macOS, keystroke and menu: rendered undo of typed text, rendered redo after a same-path Undo, composer and textarea undo | C            | Pass.                                                                                                                                                                  |
+| macOS, page keydown: every cell                                                                                          | C            | Pass.                                                                                                                                                                  |
+| Windows, every cell (keystroke, menu, page)                                                                              | C            | Pass. The menu items inject the same chords.                                                                                                                           |
+| Linux, keystroke and page cells in Files and the composer                                                                | C            | Pass.                                                                                                                                                                  |
+| Linux, menu cells                                                                                                        | N            | `muda` 0.19.3 creates no predefined Undo or Redo item on GTK.                                                                                                          |
+| Linux, plain textarea keystroke undo                                                                                     | outside #398 | Fails today, outside Files. WebKitGTK gets the `keydown` and has no undo binding. Proposed as a follow-up issue. R4 only requires that this change leaves it as it is. |
+| Terminal, every platform                                                                                                 | recorded     | No undo history. On macOS the chord reaches nothing. On Windows and Linux xterm takes Ctrl+Z, which a change reaching those platforms must not intercept.              |
