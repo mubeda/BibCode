@@ -106,7 +106,7 @@ Source: https://github.com/mubeda/BibCode/issues/397, https://github.com/mubeda/
 - GIVEN the setting off (the default), THEN neither variable is set by BiBCode, and a value the user exported is left as it is.
 - The setting is reachable without a working window (an environment variable or a file the user can edit), and from Settings on Linux; Settings says a restart is needed.
 - macOS and Windows are unchanged.
-- Not proven by this pull request: that the GPU hang of issue #411 stops on the affected machine. That needs 20 launches and a 24 hour run there, so #411 stays open until the owner reports it.
+- The pull request closes #411 (owner's ruling, 2026-11-21). The pull request proves that the variables are set and that the app renders in the Linux lab; the 20 launches and the 24 hour run on the affected machine named in the issue are not run, and the pull request says so.
 
 ## Non-goals
 

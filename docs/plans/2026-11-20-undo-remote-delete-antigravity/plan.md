@@ -1,7 +1,7 @@
 # Files undo shortcuts, remote branch delete, Antigravity terminal
 
 Status: Approved 2026-11-20 (owner's standing rule: reviewed by Codex and the advisor. Codex's last verdict was "Needs rework"; all its findings were applied and the round 2 fixes were not reviewed again. The phase 3 revision for the chat got plan review 3, also "Needs rework", and an advisor review; their findings are in the task rules and were not reviewed again)
-Spec: spec.md (Status line: Approved 2026-11-20, sha256 f67ba6219586)
+Spec: spec.md (Status line: Approved 2026-11-20, sha256 f51be8b89ea5)
 Repository: this repository
 Base: main
 
