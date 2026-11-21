@@ -1,6 +1,6 @@
 # Antigravity in the agent usage status bar: design (task 3.11, requirement R18)
 
-Status: draft written 2026-11-21, not yet reviewed by Codex or the advisor.
+Status: round 1 of the Codex review (13 findings) processed on 2026-11-21 under the coordinator's rulings; see "Review record". The revision is not reviewed again.
 
 Scope. The status bar shows account usage for Claude and Codex only. This note
 decides how Antigravity (CLI `agy`) joins them, and which hardcoded two-provider
@@ -41,9 +41,9 @@ scratch folder). Both exited 0 with `num_turns` 0 and zero tokens. The run took
 
 - Contract: `ServerProviderUsageProvider = Literals(["claude","codex"])`
   (`packages/contracts/src/providerUsage.ts:6`). A snapshot has one `session`,
-  one `weekly`, and one extra `fableWeekly` slot (`:30-33`). A window stores the
+  one `weekly`, and one extra `fableWeekly` slot (`:36-40`). A window stores the
   USED percent, the window length in minutes, `resetsAt` and a free
-  `resetDescription` (`:15-20`).
+  `resetDescription` (`:18-23`).
 - Server: `enum ProviderUsageProvider { Claude, Codex }`
   (`apps/server/src/provider_usage/mod.rs:48-51`); `providers()` lists both
   (`:1130-1132`); `production_fetchers()` returns the two fetchers (`:493-495`).
@@ -55,10 +55,10 @@ scratch folder). Both exited 0 with `num_turns` 0 and zero tokens. The run took
   refresh to one per 30 s for all providers together, not per provider
   (`mod.rs:30`, `:345-356`). The Refresh button sends `force: true`.
 - The Codex fetcher spawns `codex app-server` with `kill_on_drop` and its own
-  timeout, not through `process::supervised` (`mod.rs:830-914`). That path is
+  timeout, not through `process::supervised` (`mod.rs:824-914`; it resolves and prepares its executable at `:824-831`). That path is
   the older one; AGENTS.md asks new child processes to use
   `process::supervised`. OpenCode's probe is the pattern to copy
-  (`provider_terminal/opencode.rs:2350-2375`: `run_supervised` with
+  (`provider_terminal/opencode.rs:2353-2365`: `run_supervised` with
   `SupervisedRunRequest`, a byte cap and `StopPolicy::Force`).
 - Last good data survives a failed fetch (`retain_last_good_usage`,
   `mod.rs:1187-1203`); a successful snapshot older than 30 min reads as
@@ -71,234 +71,206 @@ scratch folder). Both exited 0 with `num_turns` 0 and zero tokens. The run took
   in `production/runtime.rs:690`, after the `ProviderSettingsStore` exists
   (`:480`).
 
-## Decision A: wire shape for several quota groups
+## Decisions
 
-Options.
+### A. Wire shape (several quota groups)
 
-1. Show one group only (Gemini) in `session` and `weekly`. No contract change
-   beyond the provider literal. Cost: the Claude and GPT models, which the CLI
-   also serves, silently have no limit shown, and a user on those models sees
-   an empty-looking bar while blocked. This hides measured data.
-2. Add flat slots in the style of `fableWeekly` (`thirdPartySession`,
-   `thirdPartyWeekly`). Mechanical, but names one provider's marketing split in
-   the shared contract and adds two more nullable slots every consumer must
-   list (the presentation already enumerates slots in
-   `providerUsagePresentation.ts:64-70`).
-3. Add an optional `windowGroups` array to the snapshot: each `{id, label,
-   session, weekly}` using the existing window type, decoded with a default of
-   `[]` like `planType`. Antigravity fills it and leaves `session`/`weekly`
-   null. Claude and Codex are unchanged. A future provider with groups needs no
-   contract change.
-4. Two pseudo-providers (`antigravity-gemini`, `antigravity-3p`). Two spawns or
-   a shared cache, two bar items, and a provider list that no longer maps to
-   drivers. Rejected.
+Options: one group only (hides measured data); flat `fableWeekly`-style slots
+(names one vendor's split in the shared contract); two pseudo-providers (two
+spawns, items that no longer map to drivers); an optional `windowGroups` array.
+Recommendation: `windowGroups`, default `[]` (Effect's decoding default makes it
+compatible with old servers; old clients ignore the extra field). Each group is
+`{id, label, session, weekly}` over the existing window type; `session` and
+`weekly` stay null for Antigravity.
 
-Recommendation: option 3. It is additive (old clients decode the field away;
-the default makes new clients read old servers), keeps `ProviderUsageWindow`
-as is, and is the only option that shows all measured data without growing the
-slot list again.
+Privacy (finding 4). The CLI's group `name`, `description`, `response` and every
+other free-text field are never read, stored, sent or logged. The group id and
+label come from the bucket id prefix only: `gemini-` gives "Gemini models",
+`3p-` gives "Claude and GPT models", anything else gives "Other models". The
+parser decodes only `command.name`, `num_turns`, `status`, and per bucket `id`,
+`window`, `remaining_fraction`, `reset_time`. `plan_type` stays `None`.
 
-Conversion. The CLI reports remaining, the contract stores used.
-`usedPercent = round((1 - remaining_fraction) * 100)`, clamped to 0..100 after
-dropping non-finite values, so 0.986 reads 1 % used (the existing `map_window`
-rounds the same way, `mod.rs:1049-1069`). `windowMinutes` is 300 for `5h` and
-10080 for `weekly`; any other `window` value drops that bucket. `resetsAt` is
-`reset_time` parsed as RFC 3339 (`parse_reset`, `:1103`); an unparsable time
-becomes null, not an error. `resetDescription` is null. Group `id` is a stable
-slug (`gemini`, `third-party`) derived from the bucket id prefix, `label` is the
-group `name` the CLI reports, capped to 40 characters. A group with no usable
-bucket is dropped; no group at all gives `unavailable`, not `ok`.
-Edge: 0.996 remaining rounds to 0 % used and 0.004 remaining to 100 % used while
-a sliver is left; the out-of-usage hint (Decision D) therefore tests
-`remaining_fraction <= 0` through `usedPercent === 100` only after rounding, the
-same behavior Claude and Codex have today. Accepted.
+Conversion. `usedPercent = round((1 - remaining_fraction) * 100)` clamped to
+0..100 after dropping non-finite values. `windowMinutes` is 300 for `5h` and
+10080 for `weekly`; another `window` drops the bucket. `reset_time` is parsed
+strictly as RFC 3339 (the existing `parse_reset`, `mod.rs:1103`, also accepts
+numeric epochs and is not used); an invalid time becomes null. A group with no
+usable bucket is dropped; no group gives `unavailable`. Boundary cases
+(fraction 0, 1, 0.004, 0.996, 0.5, negative, above 1, NaN, a numeric reset) are
+tests.
 
-Server-side, `ProviderUsageSnapshot` gains `window_groups: Vec<ProviderUsageWindowGroup>`;
-`has_usable_usage` (`mod.rs:1205-1211`) counts it, so the last good groups
-survive a failed fetch. The plan name is never stored: `plan_type` stays `None`.
+### B. Item and detail
 
-## Decision B: status bar item and detail
+- The item shows the tightest window across groups (compact and summary; the
+  icon-only badge shows a dot when any window exists, as for the others,
+  `ProviderUsageControl.tsx:22-40`). The popover shows one section per group
+  with its 5-hour and weekly meter and reset time; no plan, no credits.
+- Opt-in (finding 5). A new optional client setting `showAntigravityUsage`,
+  default false. The `StatusBarItem` array is NOT extended: an older client
+  decodes the whole array to the defaults when it meets an unknown literal
+  (`settings.ts:217-220`) and writes the whole document back
+  (`useSettings.ts:347`), which would lose the user's other choices. A separate
+  boolean an old client does not know is ignored by it.
+- The item is built from the settings flag and the query state, not from the
+  presence of a snapshot, so it renders before the first answer and keeps the
+  manual refresh control reachable when it is the only usage item (the filter
+  `visible && viewModel !== undefined` at `AppStatusBar.tsx:126-129` is replaced
+  for it by a placeholder view model). Provider labels and icons become lookup
+  tables with no default branch; an unknown provider renders nothing.
+- Visibility selector, equality check and presentation cache
+  (`AppStatusBar.tsx:84-91`, `:314`) include the new flag, and
+  `providerUsageRelativeLabelKey` (`providerUsagePresentation.ts:180`) includes
+  group windows, so a countdown cannot stay stale when only group windows exist
+  (finding 10).
+- For a non-ok state with no usable data the popover shows only the sentence;
+  retained last-good meters plus "Showing last available usage" appear only for
+  an `error` snapshot that still has data.
 
-- Item. A third usage item with the Antigravity (Gemini mark) icon and the label
-  "Antigravity". `ProviderUsageBadge` and `ProviderUsageSummary` show the
-  tightest window across all groups in compact mode, the existing rule
-  (`providerUsagePresentation.ts:147-152`). In detailed mode the summary shows
-  that same tightest window, because four meters do not fit in a status bar
-  item.
-- Popover. One section per group under its label ("Gemini Models", "Claude and
-  GPT models"), each with its 5-hour and weekly meter (reusing
-  `ProviderUsageWindowMeter`) and the reset time. The existing "used" or
-  "remaining" display setting applies. A footer line says "Read from the
-  Antigravity CLI". No plan, no credits.
-- Why no data. The item always renders when switched on and the server has a
-  snapshot. For `unavailable` or `error` the popover shows one sentence from the
-  server and no meters:
-  - provider disabled: "Antigravity is turned off. Turn it on in Settings,
-    Providers."
-  - CLI missing: "The Antigravity CLI was not found at the configured path."
-  - CLI older than 1.1.11: "Antigravity CLI 1.1.11 or newer is needed to show
-    usage."
-  - exit code 2: "This sign-in uses an API key, which has no account quota."
-  - signed out or any other non-zero exit: "Antigravity could not read your
-    quota. Run agy to sign in." The CLI's stderr is not shown: it can name the
-    account.
-  - unrecognized output (guard fails or shape unknown): "Antigravity reported
-    usage in a format this version of BiBCode does not read."
-- Settings. A third checkbox, off by default, in `StatusBarSettingsSection`.
-  Off by default because Antigravity itself is disabled by default (spec D7) and
-  the item would show nothing for most users.
-- Unknown providers. Every `provider === "claude" ? ... : Codex` becomes a
-  lookup table keyed by provider, with no default branch that names a vendor: an
-  unknown provider renders nothing (and TypeScript's exhaustive record fails the
-  build when a new literal is added). This satisfies R18 bullet 3.
+No-data states (finding 8), one sentence each, no sign-in instruction without
+evidence of sign-out:
 
-## Decision C: the fetch
+| State                                                                                                                    | Sentence                                                                                    |
+| ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| Before the first answer                                                                                                  | "Reading Antigravity usage..."                                                              |
+| Server cannot serve it (refresh rejected, or the answer has no Antigravity entry)                                        | "This BiBCode server is too old to show Antigravity usage."                                 |
+| Provider turned off                                                                                                      | "Antigravity is turned off. Turn it on in Settings, Providers."                             |
+| CLI missing or cannot start                                                                                              | "The Antigravity CLI could not be started."                                                 |
+| Version probe failed, truncated or unparsable; or below 1.1.11                                                           | "Antigravity usage needs CLI 1.1.11 or newer, and its version could not be confirmed."      |
+| Exit code 2 (documented in the changelog for the versions that print it; older versions are already refused by the gate) | "This Antigravity sign-in uses an API key, which has no account quota."                     |
+| Signed out                                                                                                               | Not shown: no output of a signed-out CLI was measured, so it falls under transient failure. |
+| Timeout, other non-zero exit, spawn failure                                                                              | "Antigravity usage could not be read. It will be tried again."                              |
+| Guard fails, bad JSON, truncated stdout, empty groups                                                                    | "Antigravity reported usage in a format this version of BiBCode does not read."             |
+| Snapshot older than 30 minutes                                                                                           | "Antigravity usage is out of date. It will be tried again."                                 |
 
-Command. `<binary> -p "/usage" --output-format json`, no other flags, never
-`--dangerously-skip-permissions`. `--print-timeout` is not passed: the
-supervisor's own timeout is the single clock and does not depend on a flag an
-older CLI may lack.
+Out-of-usage hint (finding 9, coordinator ruling overriding the plan).
+Antigravity gets no hint in this pull request: several groups make "out of
+usage" ambiguous (display rounding versus exact exhaustion, a dropped group, a
+custom instance sharing the driver, different reset times). `usageProviderOf`
+stays `null` for it and a test pins that. Claude and Codex background refresh is
+unchanged when their items are hidden (Send to Agent reads those snapshots,
+`ChatSendToAgentControl.tsx:41`).
 
-Spawn. `run_supervised` with `SupervisedRunRequest`: `timeout` 15 s (the
-measured run is 3.7 s, mostly one network call; the service-level 10 s
-`USAGE_TIMEOUT` is raised for this provider to match), `cleanup_timeout` 2 s,
-`max_output_bytes` 64 KiB with `SupervisedOverflow::Truncate` treated as
-unrecognized output, `StopPolicy::Force`, stdin closed, stdout and stderr piped,
-`sanitize_provider_subprocess_environment` applied, a neutral working directory
-(the server's state directory, never a project, so nothing in a repository is
-loaded). The binary is resolved with `resolve_provider_executable`
-(`production/provider_runtime.rs:15038`) and launched with
-`prepare_provider_launch` (`:15107`), as Codex does (`mod.rs:822-833`).
+### C. Fetch
 
-Which binary and instance. The built-in `antigravity` instance's `binaryPath`,
-read from `ProviderSettingsStore` at fetch time, and only when its `enabled` is
-true; otherwise the snapshot is `unavailable` (reason above) and nothing is
-spawned. Alternatives: the first enabled instance with driver `antigravity`
-(custom instances may carry their own environment, so a different account would
-be reported under the one label; rejected for now), or one item per instance
-(needs a per-instance snapshot key; out of scope). Custom Antigravity instances
-are therefore not covered; the settings row says so in one line. The
-`ProviderSettingsStore` is passed into `production_fetchers(...)` from
-`runtime.rs:690`.
+Command: `<absolute executable> -p "/usage" --output-format json`, never
+`--dangerously-skip-permissions`, stdin closed,
+`sanitize_provider_subprocess_environment`, the instance's environment applied.
 
-Version gate (the safety property). A CLI before 1.1.11 would treat `/usage` as
-a prompt and spend quota on every poll, and the result guard below only looks
-after the spend. So the fetcher first runs `<binary> --version` under the same
-supervisor (5 s timeout), accepts only output that is exactly one
-`major.minor.patch` token, and fetches only when it is at least 1.1.11. The
-token rule is the only defense against the IDE launcher that shares the name
-`agy`; what that launcher prints for `--version` was not measured, so the
-rule narrows the risk and does not close it (the result guard still applies). The version is
-cached per resolved binary path for the life of the process: the common path
-then costs one spawn per refresh, and an upgrade never lowers a version. A
-failed or unparsable probe is not cached, so a fixed install is picked up on
-the next refresh. If the provider inventory (owned by another lane) later
-exposes a probed version, the fetcher should read that instead; this note does
-not depend on it.
+Instance (finding 3). The effective default instance is resolved as the
+inventory does: the explicit `providerInstances.antigravity` first, the legacy
+`providers.antigravity` entry as fallback, through the existing
+`maintenance_target(settings, "antigravity", Some("antigravity"))`
+(`provider_inventory.rs:452`), which returns the binary path and environment.
+That helper does not return `enabled`, so the fetcher reads it from the same
+document with the same precedence (explicit instance, else legacy, default
+false). A disabled instance spawns nothing. Saving the default card writes the
+explicit instance and resets the legacy entry (`SettingsPanels.logic.ts:185`);
+the test goes through that saved shape. Custom Antigravity instances are not
+covered.
 
-Result guard. The JSON is accepted only when `command.name == "usage"` and
-`num_turns == 0` (an integer zero; a missing field fails). Anything else,
-including `status` other than `SUCCESS`, is "unrecognized output" and the
-snapshot is `unavailable`. Exit code 2 is checked before the output is parsed
-and maps to the API-key message. Any other non-zero exit, a timeout, or a spawn
-error is an `error` snapshot (last good data kept, as for the other providers).
-A parse never panics and logs only the failure class through `tracing::warn!`,
-never the CLI's text.
+Trust (finding 1). The configured binary path is trusted the way the chat
+provider trusts it; a hostile same-name binary is out of scope. What is guarded
+is accidental quota spend: `agy --version` runs first under the same supervisor
+and the fetch proceeds only when it exits 0, its stdout is complete (not
+truncated) and is exactly one `major.minor.patch` token, at least 1.1.11. The
+result is cached keyed by (resolved absolute path, modified time, size) and the
+probe re-runs when any of them changes, so a replaced or retargeted executable
+is re-checked. A failed probe is not cached.
 
-Poll cost. The bar asks every 30 s and the server throttles only globally. A
-`usage` spawn every 30 s costs a process, a Google API call (the changelog says
-`/usage` forces a real-time quota reload) and 3.7 s of a sequential refresh that
-Claude and Codex also wait on. Options:
+Deadline and spawn (findings 7, 12). One combined deadline of 20 s covers the
+probe (at most 5 s) and the fetch; the service's timeout for this provider is
+25 s, above the inner deadline plus both cleanup windows, so the outer timeout
+never drops a supervised future before its cleanup runs. `run_supervised` with a
+64 KiB cap and `StopPolicy::Force`; a truncated stdout (observed bytes above kept
+bytes) is "format not read". The working directory is a fresh temporary
+directory removed afterwards (not the data root, which may sit inside a
+checkout). Both children are registered with the `ProcessAttributionRegistry`
+(`AttributionKind::Helper`, `AttributionScope::External`, the pattern at
+`tool_maintenance.rs:946`), passed into `production_fetchers`. An unrequested
+signal death is already reported as `subprocess.crash` by the supervisor's
+signal watch; no new event.
 
-1. Refresh on every poll. 120 spawns an hour; rejected.
-2. A cache inside the Antigravity fetcher. Hides the policy inside one closure,
-   and a forced refresh would need a second path to bypass it.
-3. A `min_interval: Option<Duration>` on `ProviderUsageFetcher`, applied by the
-   service: a throttled refresh skips a provider whose last attempt is younger
-   than the interval and serves the cached snapshot; a forced refresh (the
-   Refresh button, which the user pressed to see fresh numbers) always runs.
-   Claude and Codex keep `None`.
-4. Exclude Antigravity from the polled provider list and refresh it only when
-   its popover opens. Needs new client state and gives stale numbers in the bar.
+Admission (finding 6). Each fetcher may carry a minimum interval (Antigravity: 5
+minutes), measured on a monotonic clock per provider and guarded by an async
+lock per provider: no second CLI process runs at once. A throttled refresh
+inside the interval serves the cache. A forced refresh bypasses the cooldown but,
+if an attempt finished after it arrived, joins that attempt's result instead of
+spawning. The global 30 s throttle applies only to providers without an
+interval, so a Claude/Codex poll cannot starve Antigravity, and an
+Antigravity-only request does not consume the global slot. The "12 an hour"
+figure counts automatic usage attempts only. Tests: staggered polls,
+simultaneous forced refreshes, caller cancellation.
 
-Recommendation: option 3 with `min_interval` of 5 minutes. The windows are 5 hours
-and a week, so 5 minutes is invisible, it gives at most 12 spawns an hour, and
-the 30-minute staleness threshold (`mod.rs:31`) stays well clear. Failed fetches
-count as attempts, so a broken CLI is also retried at most every 5 minutes. The
-web client requests `antigravity` only while its item is on, so a user who never
-enables it never spawns anything. Fetchers also run last in the list so a slow
-CLI does not delay Claude and Codex.
+Isolation (findings 2, 7). The web sends Antigravity in its own request
+(`providers: ["antigravity"]`) and its own read, so it can never delay or fail
+the Claude and Codex request. Server rule: Antigravity appears in a response only
+when the request names it. `server.getProviderUsage` gains an optional
+`providers` input; the two refresh RPCs already have one; the nested usage in the
+Codex reset response and any request that omits `providers` keep the legacy list
+(Claude, Codex). Support detection: capability flags are advertised from
+`production/control.rs`, which this lane may not edit, so support is detected
+from the exchange itself: an old server rejects the literal (invalid request) or
+answers without an Antigravity entry, and the web shows the "too old" sentence
+for that environment. A capability flag is a recorded follow-up. Tests cover
+both directions across the read, refresh and reset RPCs.
 
-Version skew. A server that returns an unknown `provider` literal in the
-`providers` array makes an older client fail to decode the whole result, which
-would blank Claude and Codex too (remote servers can be newer than the client).
-`read()` therefore lists Claude and Codex always and any other provider only once
-it has been refreshed at least once (it then has a snapshot in state). An older
-client never asks for it, so it never receives it. A newer client reading an
-older server sees no Antigravity entry and renders no item. The same hazard
-exists for `StatusBarItem`: `Schema.Array(StatusBarItem)` with `catchDecoding`
-resets the whole list to the default when it holds a literal the reader does not
-know (`packages/contracts/src/settings.ts:217-220`), so an older client reading
-settings that hold `"antigravity"` resets to the defaults. That is a downgrade
-cost only, no data is lost, and is accepted and noted in the changelog entry.
+### D. Spots to change
 
-## Decision D: every two-provider spot
+As in the first draft, with these corrections: `settings.ts` gets the optional
+`showAntigravityUsage` boolean and the `StatusBarItem` literal is left alone;
+`rpc.ts:1013` (read payload) and `client-runtime/state/server.ts:210` follow;
+`outOfTokens.logic.ts` is not changed apart from a pinning test;
+`providerUsagePresentation.ts` flattens groups and its cache key covers them;
+`production/server_terminal.rs` (request match at `:781-783`, wire at `:1849`,
+read input) and `runtime.rs:690` (settings store and attribution registry into
+`production_fetchers`). Also `ProviderModelsSection.tsx:33-38` (custom-model
+placeholder) and `activityPresentation.ts:245-251` (label) with tests.
 
-| Place                                                                  | Today                                                                                       | Change                                                                                                                                                                                                  |
-| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/contracts/src/providerUsage.ts:6`                            | `["claude","codex"]`                                                                        | add `"antigravity"`; add `ServerProviderUsageWindowGroup` and `windowGroups` (default `[]`)                                                                                                             |
-| `packages/contracts/src/settings.ts:29-34`                             | `StatusBarItem` literal and `DEFAULT_STATUS_BAR_ITEMS`                                      | add `"antigravity"` to the literal, not to the default list                                                                                                                                             |
-| `apps/server/src/provider_usage/mod.rs:48-51, 1130-1132, 493-495`      | enum, `providers()`, `production_fetchers()`                                                | add `Antigravity`; `providers()` per the skew rule; add the fetcher, `min_interval`, window groups                                                                                                      |
-| `apps/server/src/production/server_terminal.rs:781-783, 1849`          | request match (`"provider must be claude or codex"`) and response match                     | add `"antigravity"` to both; the error text names all three; add `windowGroups` to the wire; extend the wire test (`:3712-3748`)                                                                        |
-| `apps/server/src/production/runtime.rs:690`                            | `production_fetchers()`                                                                     | pass the settings store                                                                                                                                                                                 |
-| `apps/web/src/components/status-bar/AppStatusBar.tsx:126-129, 239-251` | provider list, `showClaudeUsage ? ... : showCodexUsage`, fixed `["claude","codex"]` request | provider table with a visibility flag each; the request lists only visible providers                                                                                                                    |
-| `ProviderUsageControl.tsx:10-20`                                       | `providerLabel`, `ProviderIcon` (Claude else OpenAI)                                        | lookup tables, no default                                                                                                                                                                               |
-| `ProviderUsageDetail.tsx:60-62, 116, 167, 198, 226`                    | label; Codex-only plan, credits and reset notice blocks                                     | label table; keep Codex-only blocks; add the group sections                                                                                                                                             |
-| `providerUsagePresentation.ts:16-21, 64-70, 134-170`                   | window keys and labels                                                                      | flatten `windowGroups` into windows with a group label; widen `label`                                                                                                                                   |
-| `settings/StatusBarSettingsSection.tsx:7-11, 80-125`                   | `STATUS_BAR_ITEM_ORDER` and two checkboxes                                                  | third row and entry, with the custom-instance note                                                                                                                                                      |
-| `sendToAgent/outOfTokens.logic.ts:32-36, 86-90`                        | `usageProviderOf` maps two drivers; limited windows are `session`, `weekly`, `fableWeekly`  | map `antigravity`; include group windows. Out of usage only when every group has a window at 100 % that has not reset: the thread's model group is unknown, so a limit on one group alone gives no hint |
-| `settings/ProviderModelsSection.tsx:33-38`                             | custom-model placeholder per driver                                                         | add `antigravity` with a model id the CLI lists (read it from `agy models`, not guessed)                                                                                                                |
-| `activity/activityPresentation.ts:245-251`                             | `PROVIDER_LABELS`                                                                           | add `antigravity: "Antigravity"`                                                                                                                                                                        |
+R18's last bullet (provider pickers): review terminals
+(`providerTerminalActions.ts:252`), MCP client registration
+(`mcp_client_registration/mod.rs:34`), session import
+(`agent_sessions_rpc.rs:44`) and native skill discovery
+(`provider_inventory/capabilities.rs:134`) do not offer Antigravity. Each is
+outside this lane's files; the disposition for the pull request text is "not
+offered here" and is recorded for the coordinator, not changed.
 
-Out of scope for this task and confirmed absent from the usage path: the
-hermetic guard and `test_support` mentions of Antigravity concern the CLI's home
-directory, not usage; `provider_inventory.rs`, `provider_runtime.rs` and
-`control.rs` belong to other lanes and need no change here.
+### E. Profiler
 
-## Decision E: profiler, crash and trace coverage
+Both children are attributed (above); signal deaths already become
+`subprocess.crash` through the supervisor; `server.refreshProviderUsage` is
+already long-running (`latency.rs:168`) and `getProviderUsage` is state-only.
+Failures log a failure class with `tracing::warn!`, never CLI text. No new
+service, so shutdown ordering is unchanged. Documentation:
+`docs/providers/antigravity.md` and the RPC documentation
+(`docs/architecture/rpc-and-orchestration.md:5537`) get the changes.
 
-- Child process. Both spawns (`--version`, `/usage`) go through
-  `process::supervised::run_supervised`, which owns timeout, forced stop and
-  reaping. They are short-lived and read-only, like the OpenCode probe, so they
-  are not registered with `ProcessAttributionRegistry`. A spawn that dies
-  unrequested surfaces as a failed fetch, not a `subprocess.crash`: the child is
-  not a long-lived worker.
-- RPC. `server.refreshProviderUsage` is already in `is_long_running`
-  (`latency.rs:168`); the added 15 s ceiling and one more provider do not change
-  that. `server.getProviderUsage` reads state only and stays out.
-- Logging. Failures log through `tracing::warn!` with the failure class, never
-  the CLI's output (it can name the account). No profiler event is added.
-- Shutdown. No new service: the fetch is a request-scoped future, aborted with
-  its caller by the existing refresh supervisor (`mod.rs:379-392`).
-- Documentation. `docs/providers/antigravity.md` (phase 3, task 3.10) gains a
-  "Usage in the status bar" paragraph; `docs/architecture/overview.md` names the
-  new fetcher and the window groups in its provider usage section.
+## Review record
+
+| #   | Finding                                     | Disposition                                                                                                                                   |
+| --- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Version gate, same-path downgrade, impostor | Downgrade accepted (cache key path, mtime, size; untruncated output). Impostor rejected: configured paths are trusted like the chat provider. |
+| 2   | Version skew both directions                | Accepted: named-only responses, separate request. Capability flag deferred (control.rs is another lane's); support read from the exchange.    |
+| 3   | Wrong instance, legacy entry                | Accepted: effective default instance via the inventory helper, explicit first.                                                                |
+| 4   | Group name leak                             | Accepted: fixed labels from the bucket prefix; marker test.                                                                                   |
+| 5   | Settings downgrade                          | Accepted: separate boolean, array untouched.                                                                                                  |
+| 6   | Admission                                   | Accepted: per-provider monotonic interval, join in-flight.                                                                                    |
+| 7   | Timeouts, batching, truncation, cwd         | Accepted: combined deadline, own request, truncation rejected, temp directory.                                                                |
+| 8   | No-data states                              | Accepted: one table.                                                                                                                          |
+| 9   | Out-of-usage hint                           | Overridden by the coordinator: no hint, pinned by a test.                                                                                     |
+| 10  | Reset and visibility paths                  | Accepted: cache key, selector, strict RFC 3339.                                                                                               |
+| 11  | Provider-picker audit                       | Dispositions recorded for the PR; placeholder and label tests kept.                                                                           |
+| 12  | Profiler                                    | Accepted: attribution registered, signal reporting stated.                                                                                    |
+| 13  | Citations                                   | Fixed.                                                                                                                                        |
 
 ## Verification plan for task 3.12
 
-- Parser tests (Rust, fixture anonymized, no plan name): the measured shape maps
-  to four windows in two groups with the right minutes and rounded used
-  percents; `command.name` other than `usage`, `num_turns` other than 0, `status`
-  not `SUCCESS`, an unknown `window`, a non-finite fraction and a missing
-  `groups` each give `unavailable` or a dropped bucket as decided; exit code 2
-  gives the API-key message; a version below 1.1.11 or multi-line version output
-  spawns no `/usage` (a fake binary records its argument list).
-- Service tests: `min_interval` skips a throttled refresh and serves the cache,
-  a forced refresh bypasses it, `read()` omits Antigravity until refreshed.
-- Web tests: the item shows both groups with reset times; each message above
-  renders for its snapshot; an unknown provider literal renders nothing; the
-  out-of-usage hint needs every group limited.
-- Mutation proof as in the task: let the parser accept any command name and see
-  the tests fail.
-- Live comparison against `agy -p "/usage"` at the end, recorded as percentages
-  only.
+Rust tests: parser (measured shape, guard failures, strict time, boundaries,
+marker in every free-text field, stdout and stderr, snapshot, wire, error and
+log capture), version gate with a fake binary (same-path downgrade, truncated,
+multi-token output spawns no usage run), instance resolution through the saved
+settings shape, admission (staggered, simultaneous forced, cancellation), RPC
+named-only responses. Web tests: the item and states table, an unknown provider
+renders nothing, toggling the flag with an unchanged snapshot, a reset crossing
+with a skewed clock, the no-hint pin, the placeholder and label. Mutation proof:
+let the parser accept any command name and see the tests fail. Live comparison
+against `agy -p "/usage"` at the end, percentages only.
