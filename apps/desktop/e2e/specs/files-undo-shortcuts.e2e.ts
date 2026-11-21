@@ -969,7 +969,12 @@ async function measureLinkField(path: InputPath): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 800));
   const filesBefore = await readState("rendered", fileName);
   expect(filesBefore.canUndo).toBe(true);
-  await clickToolbar("Link");
+  // A plain click: the driver's pointer sequence closes the popover again as an outside press.
+  await browser.execute(() =>
+    document
+      .querySelector<HTMLButtonElement>('[data-file-editor-toolbar] button[aria-label="Link"]')
+      ?.click(),
+  );
   const field = browser.$('input[aria-label="Link URL"]');
   await field.waitForDisplayed({ timeoutMsg: "The Link button did not open the Link URL field." });
   await browser.execute(() =>
@@ -1002,17 +1007,15 @@ async function measureLinkField(path: InputPath): Promise<void> {
 }
 
 // A page for the preview webview: it remembers the longest value its field held, and Return
-// reloads it with the field's value, so the tab title (read at each page load) reports both.
+// navigates to a sibling page whose name carries the field's value and that peak, which the
+// preview's address bar shows whether or not that page exists.
 const previewProbePage = `<!doctype html>
-<html><head><meta charset="utf-8"><title>echo:</title>
-<script>
-  const key = "peak:" + location.pathname;
-  document.title = "echo:" + decodeURIComponent(location.hash.slice(1)) + "|peak:" + (sessionStorage.getItem(key) ?? "");
-</script></head>
+<html><head><meta charset="utf-8"><title>Preview probe</title>
+<script>const key = "peak:" + location.pathname;</script></head>
 <body style="margin:0">
 <input aria-label="Preview probe" autofocus style="box-sizing:border-box;width:100vw;height:100vh;border:0;font-size:32px"
   oninput="if (this.value.length > (sessionStorage.getItem(key) ?? '').length) sessionStorage.setItem(key, this.value)"
-  onkeydown="if (event.key === 'Enter') { location.hash = encodeURIComponent(this.value); location.reload(); }">
+  onkeydown="if (event.key === 'Enter') location.href = new URL('echo-' + encodeURIComponent(this.value) + '-peak-' + encodeURIComponent(sessionStorage.getItem(key) ?? '') + '.html', location.href).href">
 </body></html>
 <!-- Hello world -->
 `;
@@ -1036,17 +1039,20 @@ async function measurePreviewFallback(path: InputPath): Promise<void> {
   const open = browser.$('button[aria-label="Open file in preview browser"]');
   await open.waitForDisplayed();
   await open.click();
-  const tabTitle = async () =>
+  // The visible preview's address bar, which shows the page's file name.
+  const address = async () =>
     browser.execute(() => {
-      const close = document.querySelector(
-        '[data-right-panel-tab-list] button[aria-label^="Close echo:"]',
-      );
-      return close?.getAttribute("aria-label")?.slice("Close ".length) ?? null;
+      const input = [
+        ...document.querySelectorAll<HTMLInputElement>('[class*="group/address"] input'),
+      ].find((candidate) => candidate.getBoundingClientRect().height > 0);
+      return input?.value ?? "";
     });
-  await browser.waitUntil(async () => (await tabTitle()) === "echo:|peak:", {
+  await browser.waitUntil(async () => (await address()).includes(fileName), {
     timeout: 30_000,
-    timeoutMsg: "The preview browser did not load the probe page.",
+    timeoutMsg: "The preview browser did not open the probe page.",
   });
+  // Let the page load before it is clicked.
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
   // The preview webview takes focus only from a real click; the field fills the page.
   const slot = await browser.execute(() => {
     const candidates = [
@@ -1064,17 +1070,15 @@ async function measurePreviewFallback(path: InputPath): Promise<void> {
   const sent = await sendChord(path, "primary+z", "undo");
   await new Promise((resolve) => setTimeout(resolve, 800));
   typeNativeReturn();
-  await browser.waitUntil(async () => (await tabTitle()) !== "echo:|peak:", {
+  await browser.waitUntil(async () => (await address()).includes("echo-"), {
     timeout: 15_000,
-    timeoutMsg: "The preview page never reloaded with its field's value: typing did not reach it.",
+    timeoutMsg: "The preview page never navigated on Return: typing did not reach it.",
   });
-  const title = await tabTitle();
-  const close = browser.$('[data-right-panel-tab-list] button[aria-label^="Close echo:"]');
-  await close.click();
+  const title = decodeURIComponent(await address());
   await openFilesSurface();
   const filesAfter = await readState("source", fileName);
-  const typed = title?.toLowerCase().includes("peak:undq") ?? false;
-  const undone = title?.toLowerCase().startsWith("echo:|") ?? false;
+  const typed = title.toLowerCase().includes("-peak-undq");
+  const undone = title.toLowerCase().includes("echo--peak-");
   recordEvidence({
     cell: `preview-undo-${path}`,
     passed: typed && undone && JSON.stringify(filesAfter) === JSON.stringify(filesBefore),
