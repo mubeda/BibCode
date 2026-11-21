@@ -380,9 +380,17 @@ describe("Linux text-field undo chords (#408)", () => {
     keydown(button, { key: "z", ctrlKey: true });
     keydown(readOnly, { key: "z", ctrlKey: true });
     keydown(disabled, { key: "z", ctrlKey: true });
+    // The terminal's own input textarea: xterm leaves Shift+Ctrl+Z uncancelled, for the shell.
+    const terminal = document.createElement("div");
+    terminal.className = "xterm";
+    const terminalInput = document.createElement("textarea");
+    terminalInput.className = "xterm-helper-textarea";
+    terminal.append(terminalInput);
+    document.body.append(terminal);
+    keydown(terminalInput, { key: "Z", ctrlKey: true, shiftKey: true });
 
     document.removeEventListener("keydown", record);
-    expect(seen).toEqual([null, null, "undo", null, null, null, null]);
+    expect(seen).toEqual([null, null, "undo", null, null, null, null, null]);
   });
 
   it("runs the native undo for an uncancelled chord on the Linux desktop only", async () => {

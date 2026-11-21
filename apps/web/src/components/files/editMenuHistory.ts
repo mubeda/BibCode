@@ -88,6 +88,8 @@ export function textFieldHistoryChord(event: KeyboardEvent): "undo" | "redo" | n
 const textInputTypes = new Set(["", "text", "search", "url", "tel", "email", "password", "number"]);
 
 function isEditableTextField(target: EventTarget | undefined): boolean {
+  // The terminal's input textarea passes the chords it leaves alone to the shell.
+  if (target instanceof Element && target.closest(".xterm")) return false;
   if (target instanceof HTMLTextAreaElement) return !target.readOnly && !target.disabled;
   return (
     target instanceof HTMLInputElement &&
