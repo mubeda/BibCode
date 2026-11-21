@@ -298,5 +298,11 @@ export const config = {
     // until process exit so the Tauri service has released Windows filesystem handles first.
     deferDesktopUiTestContextCleanupUntilExit(testContext, process);
     console.log(`Desktop UI artifacts: ${testContext.artifactDirectory}`);
+    // A `before` hook error is only logged, so the run fails here when a real tool answered.
+    const probeProblem =
+      process.env.BIBCODE_E2E_REAL_PROVIDERS === "1"
+        ? null
+        : fixtureToolProbeProblem(testContext.toolProbeLogPath);
+    if (probeProblem !== null) throw new Error(probeProblem);
   },
 };

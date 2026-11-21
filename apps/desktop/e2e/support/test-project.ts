@@ -1530,7 +1530,10 @@ export function prepareDesktopUiTestContext(
     NodeFS.writeFileSync(nativeActionLogPath, "");
   }
   NodeFS.writeFileSync(providerInputLogPath, "");
-  NodeFS.writeFileSync(toolProbeLogPath, "");
+  // A WDIO worker prepares the run again after the app's startup probe; keep what it logged.
+  if (!NodeFS.existsSync(toolProbeLogPath)) {
+    NodeFS.writeFileSync(toolProbeLogPath, "");
+  }
   initializeGitProject(projectPath);
   writeFixtureFiles(fixtureUserHomePath, cursorInventoryFiles);
   createProviderShims(shimDirectory, isWindows);
@@ -1566,6 +1569,7 @@ export function prepareDesktopUiTestContext(
   }
   if (!realProviders) {
     environment.PATH = `${shimDirectory}${NodePath.delimiter}${environment.PATH ?? ""}`;
+    if (!isWindows) pinShimsInLoginShellPath(fixtureUserHomePath, shimDirectory);
   }
   environment.RUST_LOG ??= "bibcode=debug";
   environment.BIBCODE_LOG = `${environment.BIBCODE_LOG ?? environment.RUST_LOG},bibcode::desktop_e2e=info`;
@@ -1620,6 +1624,22 @@ export function deferDesktopUiTestContextCleanupUntilExit(
  * Why the run reached no fixture tool, or null. The app probes codegraph at startup; a log
  * without the fixture's version probe means a real codegraph on PATH answered it instead.
  */
+/**
+ * The packaged app puts its login shell's PATH ahead of the one it inherited, and a system profile
+ * (macOS `path_helper`, a Linux `/etc/profile`) can move real tool directories ahead of the shims.
+ * The fixture HOME's own profiles run last, so they put the shims back in front.
+ */
+function pinShimsInLoginShellPath(home: string, shimDirectory: string): void {
+  const quoted = `'${shimDirectory.replaceAll("'", "'\\''")}'`;
+  const posix = `PATH=${quoted}:"$PATH"; export PATH\n`;
+  for (const profile of [".zshrc", ".bash_profile", ".profile"]) {
+    NodeFS.writeFileSync(NodePath.join(home, profile), posix);
+  }
+  const fish = NodePath.join(home, ".config", "fish");
+  NodeFS.mkdirSync(fish, { recursive: true });
+  NodeFS.writeFileSync(NodePath.join(fish, "config.fish"), `set -gx PATH ${quoted} $PATH\n`);
+}
+
 export function fixtureToolProbeProblem(toolProbeLogPath: string): string | null {
   const log = NodeFS.existsSync(toolProbeLogPath)
     ? NodeFS.readFileSync(toolProbeLogPath, "utf8")

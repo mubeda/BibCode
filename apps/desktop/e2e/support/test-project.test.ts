@@ -331,6 +331,46 @@ it.runIf(!isNativeWindowsHost)(
   },
 );
 
+it("keeps the startup probe evidence when a worker prepares the same run again", () => {
+  const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: "linux" };
+  const context = prepareDesktopUiTestContext(environment);
+  contexts.push(context);
+  NodeFS.writeFileSync(context.toolProbeLogPath, "codegraph --version\n");
+
+  // The WDIO worker loads the config again with the launcher's run root and artifact directory.
+  prepareDesktopUiTestContext(environment);
+
+  expect(fixtureToolProbeProblem(context.toolProbeLogPath)).toBeNull();
+});
+
+// The packaged app puts its login shell's PATH first (`shell_environment::hydrate_posix_path`),
+// and a profile such as macOS `path_helper` moves system directories ahead of inherited ones.
+for (const shell of ["/bin/zsh", "/bin/bash"]) {
+  it.runIf(!isNativeWindowsHost && NodeFS.existsSync(shell))(
+    `keeps the fixture shims first in the PATH a ${NodePath.basename(shell)} login shell reports`,
+    () => {
+      const environment: NodeJS.ProcessEnv = {
+        ...process.env,
+        BIBCODE_E2E_PLATFORM: "linux",
+        BIBCODE_E2E_RUN_ROOT: undefined,
+        BIBCODE_E2E_ARTIFACT_DIR: undefined,
+        BIBCODE_E2E_REAL_PROVIDERS: undefined,
+        PATH: "/usr/bin:/bin",
+      };
+      const context = prepareDesktopUiTestContext(environment);
+      contexts.push(context);
+      const probe = NodeChildProcess.spawnSync(
+        shell,
+        ["-ilc", "printf '%s' __PATH_START__; printf '%s' \"$PATH\"; printf '%s' __PATH_END__"],
+        { env: { ...environment, SHELL: shell }, encoding: "utf8", timeout: 20_000 },
+      );
+      const reported = /__PATH_START__(.*)__PATH_END__/s.exec(probe.stdout)?.[1] ?? "";
+
+      expect(reported.split(":")[0], probe.stderr).toBe(context.shimDirectory);
+    },
+  );
+}
+
 it.runIf(isNativeWindowsHost)(
   "executes the Cursor action shim through the native Windows command processor",
   () => {
