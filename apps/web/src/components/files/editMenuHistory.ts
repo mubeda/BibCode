@@ -105,11 +105,14 @@ function isEditableTextField(target: EventTarget | undefined): boolean {
  * pre-empt, so nothing is lost by waiting.
  */
 function runTextFieldHistoryChord(event: KeyboardEvent): void {
-  if (!textFieldHistoryChord(event)) return;
+  // Read during dispatch: the event's path is empty once its dispatch has ended.
+  const command = textFieldHistoryChord(event);
+  if (!command) return;
   const field = event.composedPath()[0];
   setTimeout(() => {
-    const command = textFieldHistoryChord(event);
-    if (command && deepActiveElement(document) === field) document.execCommand(command);
+    if (!event.defaultPrevented && deepActiveElement(document) === field) {
+      document.execCommand(command);
+    }
   }, 0);
 }
 

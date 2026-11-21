@@ -411,7 +411,9 @@ describe("Linux text-field undo chords (#408)", () => {
       await act(async () => root.render(<Probe />));
       const field = container.querySelector("textarea")!;
       field.focus();
-      keydown(field, { key: "z", ctrlKey: true });
+      const event = keydown(field, { key: "z", ctrlKey: true });
+      // As in a browser, the event's path is empty once its dispatch has ended.
+      event.composedPath = () => [];
       await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
       await act(async () => root.unmount());
     }
