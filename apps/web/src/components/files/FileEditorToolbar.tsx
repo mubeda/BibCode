@@ -10,12 +10,16 @@ import type { FileSavePhase } from "./fileSaveCoordinator";
 
 const SAVED_INDICATOR_DURATION_MS = 1_500;
 
-/** A file shown either rendered (Markdown, SVG image) or as the source text in the editor. */
-/** The Redo tooltip: every redo chord that works on the platform (Ctrl+Y only off macOS). */
-export function redoShortcutLabel(isMac: boolean): string {
-  return isMac ? "Redo (Shift+Cmd+Z)" : "Redo (Shift+Ctrl+Z or Ctrl+Y)";
+/**
+ * The Redo tooltip: every redo chord that works on the platform in the active view. Ctrl+Y works
+ * only off macOS; on macOS the rendered editor also redoes with Cmd+Y and the source editor does not.
+ */
+export function redoShortcutLabel(isMac: boolean, rendered: boolean): string {
+  if (!isMac) return "Redo (Shift+Ctrl+Z or Ctrl+Y)";
+  return rendered ? "Redo (Shift+Cmd+Z or Cmd+Y)" : "Redo (Shift+Cmd+Z)";
 }
 
+/** A file shown either rendered (Markdown, SVG image) or as the source text in the editor. */
 export interface FileEditorMarkdownView {
   readonly rendered: boolean;
   readonly onRenderedChange: (rendered: boolean) => void;
@@ -185,7 +189,10 @@ export function FileEditorToolbar({
         }
         disabled={!canRedo}
         label="Redo"
-        tooltip={redoShortcutLabel(isMacPlatform(navigator.platform))}
+        tooltip={redoShortcutLabel(
+          isMacPlatform(navigator.platform),
+          markdownView?.rendered ?? false,
+        )}
         onClick={onRedo}
       >
         <Redo2 className="text-current" />

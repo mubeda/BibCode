@@ -99,7 +99,8 @@ Each key moves the same history as the toolbar's Undo and Redo buttons, one
 step at a time. In the macOS and Windows desktop app, **Edit → Undo** and
 **Edit → Redo** do the same while the editor has focus. The Linux desktop app
 has no Undo or Redo item in its Edit menu. A text field inside Files, such as a line
-comment, keeps its own undo. On macOS, Ctrl+Y does nothing in the editor.
+comment, keeps its own undo. On macOS, Ctrl+Y does nothing in the editor, and
+the rendered view also redoes with Cmd+Y.
 
 The native server validates overrides in
 [`apps/server/src/production/keybindings.rs`](../../apps/server/src/production/keybindings.rs)
