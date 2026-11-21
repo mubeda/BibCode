@@ -148,6 +148,25 @@ describe.each([
     expect(environment.BIBCODE_E2E_SHIM_DIRECTORY).toBe(context.shimDirectory);
   });
 
+  it("pins the disabled Antigravity instance to an absent absolute executable", () => {
+    const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: platform };
+    const context = prepareDesktopUiTestContext(environment);
+    contexts.push(context);
+    const settings = JSON.parse(
+      NodeFS.readFileSync(NodePath.join(context.stateRoot, "userdata", "settings.json"), "utf8"),
+    ) as {
+      readonly providers: Record<
+        string,
+        { readonly enabled: boolean; readonly binaryPath: string }
+      >;
+    };
+    const antigravity = settings.providers.antigravity;
+
+    expect(antigravity?.enabled).toBe(false);
+    expect(NodePath.isAbsolute(antigravity?.binaryPath ?? "")).toBe(true);
+    expect(NodeFS.existsSync(antigravity?.binaryPath ?? "")).toBe(false);
+  });
+
   it("isolates maintained tools: a fixture codegraph first on PATH and no latest-version lookups", () => {
     const environment: NodeJS.ProcessEnv = { BIBCODE_E2E_PLATFORM: platform };
     const context = prepareDesktopUiTestContext(environment);
