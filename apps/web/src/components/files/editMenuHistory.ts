@@ -39,9 +39,14 @@ function deepActiveElement(doc: Document): Element | null {
 export function focusedFilesEditHistory(doc: Document = document): FilesEditHistory | null {
   const active = deepActiveElement(doc);
   if (!(active instanceof HTMLElement) || !active.isContentEditable) return null;
-  for (let node: Node | null = active; node;) {
-    const history = node instanceof Element ? regions.get(node) : undefined;
-    if (history) return history;
+  const region = filesRegionOf(active);
+  return region ? (regions.get(region) ?? null) : null;
+}
+
+/** The registered Files region holding `start`, a text node included, across shadow roots. */
+function filesRegionOf(start: Node | null): Element | null {
+  for (let node = start; node;) {
+    if (node instanceof Element && regions.has(node)) return node;
     node = node.parentNode instanceof ShadowRoot ? node.parentNode.host : node.parentNode;
   }
   return null;
@@ -72,18 +77,38 @@ export function runEditMenuAction(
  */
 export function textFieldHistoryChord(event: KeyboardEvent): "undo" | "redo" | null {
   if (event.defaultPrevented || !event.ctrlKey || event.altKey || event.metaKey) return null;
-  const target = event.composedPath()[0];
-  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return null;
+  // An input method owns the keys while it composes.
+  if (event.isComposing || event.keyCode === 229) return null;
+  if (!isEditableTextField(event.composedPath()[0])) return null;
   const key = event.key.toLowerCase();
   if (key === "z") return event.shiftKey ? "redo" : "undo";
   return key === "y" && !event.shiftKey ? "redo" : null;
 }
 
+const textInputTypes = new Set(["", "text", "search", "url", "tel", "email", "password", "number"]);
+
+function isEditableTextField(target: EventTarget | undefined): boolean {
+  if (target instanceof HTMLTextAreaElement) return !target.readOnly && !target.disabled;
+  return (
+    target instanceof HTMLInputElement &&
+    textInputTypes.has(target.getAttribute("type")?.toLowerCase() ?? "") &&
+    !target.readOnly &&
+    !target.disabled
+  );
+}
+
+/**
+ * Runs once the keydown has reached every listener, so an app shortcut bound to the chord (the
+ * command palette's window listener, for one) takes it first. The field has no native undo key to
+ * pre-empt, so nothing is lost by waiting.
+ */
 function runTextFieldHistoryChord(event: KeyboardEvent): void {
-  const command = textFieldHistoryChord(event);
-  if (!command) return;
-  event.preventDefault();
-  document.execCommand(command);
+  if (!textFieldHistoryChord(event)) return;
+  const field = event.composedPath()[0];
+  setTimeout(() => {
+    const command = textFieldHistoryChord(event);
+    if (command && deepActiveElement(document) === field) document.execCommand(command);
+  }, 0);
 }
 
 /** Listens for the desktop Edit menu actions on every route of the app. */
@@ -91,20 +116,31 @@ export function useEditMenuActions(): void {
   useEffect(() => {
     const onMenuAction = window.desktopBridge?.onMenuAction;
     if (typeof onMenuAction !== "function") return;
-    // The element a composition started in. It counts only while it is still in the page and
-    // focused: an editor removed mid-composition never delivers compositionend to the document.
+    // The Files region a composition started in, whatever node inside it the input method
+    // targeted. It counts only while that region is in the page and still holds focus: an editor
+    // removed mid-composition never delivers compositionend to the document.
+    // The editing host is kept, not the target: an editor may replace its text nodes meanwhile.
     let composingIn: Element | null = null;
+    let composingHost: Element | null = null;
     const start = (event: Event) => {
       const target = event.composedPath()[0];
-      composingIn = target instanceof Element ? target : null;
+      let host =
+        target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
+      while (host?.parentElement instanceof HTMLElement && host.parentElement.isContentEditable) {
+        host = host.parentElement;
+      }
+      composingHost = host;
+      composingIn = filesRegionOf(host);
     };
     const end = () => {
       composingIn = null;
+      composingHost = null;
     };
     const composing = () =>
       composingIn !== null &&
-      composingIn.isConnected &&
-      deepActiveElement(document) === composingIn;
+      composingHost !== null &&
+      composingHost.isConnected &&
+      filesRegionOf(deepActiveElement(document)) === composingIn;
     document.addEventListener("compositionstart", start, true);
     document.addEventListener("compositionend", end, true);
     // The Linux desktop has no Edit menu Undo to bind the text fields' chords.
