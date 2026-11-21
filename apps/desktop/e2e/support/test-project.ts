@@ -1373,6 +1373,11 @@ function writeProviderSettings(
                 cursor: { enabled: true, binaryPath: executablePath("cursor-agent") },
                 grok: { enabled: true, binaryPath: executablePath("grok") },
                 opencode: { enabled: true, binaryPath: executablePath("opencode") },
+                // Disabled, and pinned to an absent path so no agy on PATH is ever probed.
+                antigravity: {
+                  enabled: false,
+                  binaryPath: NodePath.join(shimDirectory, "absent", isWindows ? "agy.cmd" : "agy"),
+                },
               },
               providerInstances: {
                 cursor: {
