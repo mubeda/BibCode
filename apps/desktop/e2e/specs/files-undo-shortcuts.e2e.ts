@@ -124,9 +124,20 @@ async function openFilesSurface(): Promise<void> {
 }
 
 /** Writes a fresh file for one case and opens it editable in `view`. */
-async function openFreshFile(view: View, name: string): Promise<string> {
-  const fileName = view === "source" ? `${name}.txt` : `${name}.md`;
-  NodeFS.writeFileSync(NodePath.join(preparedProjectPath, fileName), "Hello world\n");
+async function openFreshFile(
+  view: View,
+  name: string,
+  own?: { readonly extension: string; readonly content: string },
+): Promise<string> {
+  const fileName = own
+    ? `${name}.${own.extension}`
+    : view === "source"
+      ? `${name}.txt`
+      : `${name}.md`;
+  NodeFS.writeFileSync(
+    NodePath.join(preparedProjectPath, fileName),
+    own?.content ?? "Hello world\n",
+  );
   await setDesktopUiWindowSize(1_200, 720);
   await openFixtureWorkspace();
   await openFilesSurface();
@@ -198,10 +209,10 @@ async function readState(view: View, fileName: string): Promise<EditorState> {
   );
 }
 
-/** Focuses the editing host and puts the caret at the end of its text. */
-async function placeCaretAtEnd(view: View, fileName: string): Promise<void> {
+/** Focuses the editing host and puts the caret at the end, or the start, of its text. */
+async function placeCaretAtEnd(view: View, fileName: string, atStart = false): Promise<void> {
   const placed = await browser.execute(
-    (sourceView: boolean, hostQuery: string, richQuery: string, label: string) => {
+    (sourceView: boolean, hostQuery: string, richQuery: string, label: string, start: boolean) => {
       let editor: HTMLElement | null = null;
       if (sourceView) {
         const host = [...document.querySelectorAll<HTMLElement>(hostQuery)].find(
@@ -216,18 +227,24 @@ async function placeCaretAtEnd(view: View, fileName: string): Promise<void> {
       if (!editor) return false;
       editor.focus();
       const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+      let first: Text | null = null;
       let last: Text | null = null;
       for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-        if ((node.textContent ?? "").trim().length > 0) last = node as Text;
+        if ((node.textContent ?? "").trim().length > 0) {
+          first ??= node as Text;
+          last = node as Text;
+        }
       }
-      if (!last) return false;
-      window.getSelection()?.setBaseAndExtent(last, last.length, last, last.length);
+      if (!first || !last) return false;
+      if (start) window.getSelection()?.setBaseAndExtent(first, 0, first, 0);
+      else window.getSelection()?.setBaseAndExtent(last, last.length, last, last.length);
       return true;
     },
     view === "source",
     sourceHostSelector,
     richEditorSelector,
     fileName,
+    atStart,
   );
   if (!placed) throw new Error(`Could not place the caret in the ${view} view of ${fileName}.`);
   // Pierre reads the caret on the next selectionchange.
@@ -487,7 +504,7 @@ async function renderedHtml(): Promise<string> {
   );
 }
 
-async function clickToolbar(label: "Undo" | "Redo" | "Heading 2"): Promise<void> {
+async function clickToolbar(label: "Undo" | "Redo" | "Heading 2" | "Link"): Promise<void> {
   const button = await browser.$(`[data-file-editor-toolbar] button[aria-label="${label}"]`);
   await button.waitForEnabled();
   await button.click();
@@ -544,11 +561,31 @@ async function measureCell(cell: Cell): Promise<void> {
   });
   // Past both editors' history grouping delay, so the edit is one closed step.
   await new Promise((resolve) => setTimeout(resolve, 800));
+  // A native redo gets two pending redo entries, so a redo that runs twice shows: the second
+  // step is typed away from the first, which keeps the two steps apart in both editors.
+  const secondMarker = "wv";
+  const twoRedoEntries =
+    cell.direction === "redo" && cell.path !== "driver" && cell.edit !== "format";
+  if (twoRedoEntries) {
+    await placeCaretAtEnd(cell.view, fileName, true);
+    typeNative(secondMarker);
+    await browser.waitUntil(
+      async () => (await readState(cell.view, fileName)).text.includes(secondMarker),
+      { timeoutMsg: `The second seeded step never reached ${fileName}.` },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 800));
+  }
+  const holdsSecond = async () =>
+    (await readState(cell.view, fileName)).text.includes(secondMarker);
   if (cell.direction === "redo") {
     if (cell.redoAfter === "path") {
+      if (twoRedoEntries) {
+        await sendChord(cell.path, "primary+z", "undo");
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
       await sendChord(cell.path, "primary+z", "undo");
       await new Promise((resolve) => setTimeout(resolve, 800));
-      if (await holdsStep()) {
+      if ((await holdsStep()) || (twoRedoEntries && (await holdsSecond()))) {
         recordEvidence({
           cell: cellName(cell),
           ...cell,
@@ -558,6 +595,12 @@ async function measureCell(cell: Cell): Promise<void> {
         throw new Error("This path cannot undo, so its redo is not measured.");
       }
     } else {
+      if (twoRedoEntries) {
+        await clickToolbar("Undo");
+        await browser.waitUntil(async () => !(await holdsSecond()), {
+          timeoutMsg: "The toolbar Undo did not remove the second seeded step.",
+        });
+      }
       await clickToolbar("Undo");
       await browser.waitUntil(async () => !(await holdsStep()), {
         timeoutMsg: "The toolbar Undo did not remove the seeded edit.",
@@ -575,10 +618,14 @@ async function measureCell(cell: Cell): Promise<void> {
   const events = await readProbe();
   const expectMarker = cell.direction === "redo";
   const stepPresent = await holdsStep();
+  // After one redo of two, the second step is still undone and Redo stays enabled.
+  const secondPresent = twoRedoEntries && (await holdsSecond());
+  const expectRedo = twoRedoEntries || !expectMarker;
   const passed =
     stepPresent === expectMarker &&
+    !secondPresent &&
     after.canUndo === expectMarker &&
-    after.canRedo === !expectMarker;
+    after.canRedo === expectRedo;
   recordEvidence({
     cell: cellName(cell),
     ...cell,
@@ -592,24 +639,25 @@ async function measureCell(cell: Cell): Promise<void> {
   });
   expect({
     text: stepPresent,
+    second: secondPresent,
     canUndo: after.canUndo,
     canRedo: after.canRedo,
-  }).toEqual({ text: expectMarker, canUndo: expectMarker, canRedo: !expectMarker });
+  }).toEqual({ text: expectMarker, second: false, canUndo: expectMarker, canRedo: expectRedo });
 }
 
 /**
- * Two typed steps, then one undo: exactly the second step leaves. Catches a menu item that both
- * runs its action and lets the chord's own `keydown` reach the editor.
+ * Two typed steps, then one undo: exactly the second step leaves and the first stays. Catches a
+ * menu item that both runs its action and lets the chord's own `keydown` reach the editor.
  */
 async function measureTwoSteps(view: View, path: InputPath): Promise<void> {
   const fileName = await openFreshFile(view, `undo-two-steps-${view}-${path}`);
   await placeCaretAtEnd(view, fileName);
   typeNative("kq");
   await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("kq"));
-  // The source editor joins adjacent typing into one step whatever the pause, so a new line
-  // separates its steps; the rendered editor separates them by the pause.
+  // The source editor joins adjacent typing into one step whatever the pause, so the second step
+  // is typed at the start of the text; a new line would add a step a double undo hides behind.
   await new Promise((resolve) => setTimeout(resolve, 1_200));
-  if (view === "source") typeNativeReturn();
+  await placeCaretAtEnd(view, fileName, true);
   typeNative("wv");
   await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("wv"));
   await new Promise((resolve) => setTimeout(resolve, 1_200));
@@ -684,6 +732,9 @@ async function measureCommentIndependence(path: InputPath, direction: Direction)
     timeoutMsg: "The typed text never reached the comment field.",
   });
   await new Promise((resolve) => setTimeout(resolve, 800));
+  // Read before any undo, so a setup undo that also moved the file's history is caught.
+  const filesBefore = await readState("source", fileName);
+  expect(filesBefore.text.includes("kq") && filesBefore.canUndo).toBe(true);
   if (direction === "redo") {
     await sendChord(path, "primary+z", "undo");
     await browser.waitUntil(
@@ -693,7 +744,6 @@ async function measureCommentIndependence(path: InputPath, direction: Direction)
       },
     );
   }
-  const filesBefore = await readState("source", fileName);
   await startProbe();
   const sent = await sendChord(
     path,
@@ -809,7 +859,7 @@ async function measureTextField(
  * A real undo chord in a focused terminal. On Windows and Linux, Ctrl+Z is the shell's suspend
  * key, which the terminal must keep, so the page must not run an undo of its own.
  */
-async function recordTerminalChord(): Promise<void> {
+async function recordTerminalChord(sent: Chord = "primary+z"): Promise<void> {
   await openFixtureWorkspace();
   await openCenterTerminal();
   const input = await browser.$(".xterm-helper-textarea");
@@ -832,7 +882,7 @@ async function recordTerminalChord(): Promise<void> {
     window.addEventListener(
       "keydown",
       (event) => {
-        if (event.key.toLowerCase() === "z") {
+        if (/^[zy]$/i.test(event.key)) {
           setTimeout(() => {
             state.cancelled = event.defaultPrevented;
           });
@@ -841,7 +891,7 @@ async function recordTerminalChord(): Promise<void> {
       true,
     );
   });
-  sendNativeChord("primary+z");
+  sendNativeChord(sent);
   await new Promise((resolve) => setTimeout(resolve, 600));
   const events = await readProbe();
   const chord = await browser.execute(
@@ -851,7 +901,7 @@ async function recordTerminalChord(): Promise<void> {
   );
   const reached = chordKeydownReachedPage(events);
   recordEvidence({
-    cell: "terminal-undo-keystroke",
+    cell: `terminal-${sent.replaceAll("+", "-")}-keystroke`,
     chordKeydownReachedPage: reached,
     focus: await focusedElement(),
     chord,
@@ -869,6 +919,168 @@ async function recordTerminalChord(): Promise<void> {
       exec: 0,
     });
   }
+}
+
+/** Clicks the screen point under page coordinates `point` of the main window, as a person does. */
+async function nativeClickAtPagePoint(point: { x: number; y: number }): Promise<void> {
+  // The window's content origin on screen: the frame's position plus its title bar and borders.
+  const screen = await browser.execute(
+    (x: number, y: number) => {
+      const border = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+      return {
+        x: window.screenX + border + x,
+        y: window.screenY + window.outerHeight - window.innerHeight - border + y,
+        scale: window.devicePixelRatio,
+      };
+    },
+    point.x,
+    point.y,
+  );
+  const x = Math.round(screen.x);
+  const y = Math.round(screen.y);
+  if (platform === "mac") macSystemEvents([`click at {${x}, ${y}}`]);
+  else if (platform === "win") {
+    powershell(
+      [
+        'Add-Type -Namespace LabWin -Name Mouse -MemberDefinition \'[DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y); [DllImport("user32.dll")] public static extern void mouse_event(int f, int x, int y, int d, int e);\'',
+        "[LabWin.Mouse]::SetProcessDPIAware() | Out-Null",
+        `[LabWin.Mouse]::SetCursorPos(${Math.round(x * screen.scale)}, ${Math.round(y * screen.scale)}) | Out-Null`,
+        "[LabWin.Mouse]::mouse_event(2, 0, 0, 0, 0); Start-Sleep -Milliseconds 50; [LabWin.Mouse]::mouse_event(4, 0, 0, 0, 0)",
+      ].join("; "),
+    );
+  } else runNative("xdotool", ["mousemove", String(x), String(y), "click", "1"]);
+}
+
+/**
+ * The Link URL field, a plain input the rendered view's Link button opens: undo empties what was
+ * typed there natively and leaves the document's history where it was.
+ */
+async function measureLinkField(path: InputPath): Promise<void> {
+  const fileName = await openFreshFile("rendered", `undo-link-${path}`);
+  await placeCaretAtEnd("rendered", fileName);
+  typeNative("kqv");
+  await browser.waitUntil(async () => (await readState("rendered", fileName)).text.includes("kqv"));
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const filesBefore = await readState("rendered", fileName);
+  expect(filesBefore.canUndo).toBe(true);
+  await clickToolbar("Link");
+  const field = browser.$('input[aria-label="Link URL"]');
+  await field.waitForDisplayed({ timeoutMsg: "The Link button did not open the Link URL field." });
+  await browser.execute(() =>
+    document.querySelector<HTMLElement>('input[aria-label="Link URL"]')?.focus(),
+  );
+  typeNative("Lnkq");
+  await browser.waitUntil(async () => (await field.getValue()).toLowerCase().includes("lnkq"), {
+    timeoutMsg: "The typed text never reached the Link URL field.",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  await startProbe();
+  const sent = await sendChord(path, "primary+z", "undo");
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const fieldValue = await field.getValue();
+  const events = await readProbe();
+  await browser.keys("Escape");
+  await field.waitForDisplayed({ reverse: true });
+  const filesAfter = await readState("rendered", fileName);
+  const fieldUndone = !fieldValue.toLowerCase().includes("lnkq");
+  recordEvidence({
+    cell: `link-url-undo-${path}`,
+    passed: fieldUndone && JSON.stringify(filesAfter) === JSON.stringify(filesBefore),
+    fieldValue,
+    filesBefore,
+    filesAfter,
+    sent,
+    events,
+  });
+  expect({ fieldUndone, files: filesAfter }).toEqual({ fieldUndone: true, files: filesBefore });
+}
+
+// A page for the preview webview: it remembers the longest value its field held, and Return
+// reloads it with the field's value, so the tab title (read at each page load) reports both.
+const previewProbePage = `<!doctype html>
+<html><head><meta charset="utf-8"><title>echo:</title>
+<script>
+  const key = "peak:" + location.pathname;
+  document.title = "echo:" + decodeURIComponent(location.hash.slice(1)) + "|peak:" + (sessionStorage.getItem(key) ?? "");
+</script></head>
+<body style="margin:0">
+<input aria-label="Preview probe" autofocus style="box-sizing:border-box;width:100vw;height:100vh;border:0;font-size:32px"
+  oninput="if (this.value.length > (sessionStorage.getItem(key) ?? '').length) sessionStorage.setItem(key, this.value)"
+  onkeydown="if (event.key === 'Enter') { location.hash = encodeURIComponent(this.value); location.reload(); }">
+</body></html>
+`;
+
+/**
+ * Undo in the preview webview, the browser opened by "Open file in preview browser": the host's
+ * focus check sends it to the native responder, so the page's own field undoes and the Files
+ * history behind it stays where it was.
+ */
+async function measurePreviewFallback(path: InputPath): Promise<void> {
+  const fileName = await openFreshFile("source", `undo-preview-${path}`, {
+    extension: "html",
+    content: previewProbePage,
+  });
+  await placeCaretAtEnd("source", fileName);
+  typeNative("kq");
+  await browser.waitUntil(async () => (await readState("source", fileName)).text.includes("kq"));
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const filesBefore = await readState("source", fileName);
+  expect(filesBefore.canUndo).toBe(true);
+  const open = browser.$('button[aria-label="Open file in preview browser"]');
+  await open.waitForDisplayed();
+  await open.click();
+  const tabTitle = async () =>
+    browser.execute(() => {
+      const close = document.querySelector(
+        '[data-right-panel-tab-list] button[aria-label^="Close echo:"]',
+      );
+      return close?.getAttribute("aria-label")?.slice("Close ".length) ?? null;
+    });
+  await browser.waitUntil(async () => (await tabTitle()) === "echo:|peak:", {
+    timeout: 30_000,
+    timeoutMsg: "The preview browser did not load the probe page.",
+  });
+  // The preview webview takes focus only from a real click; the field fills the page.
+  const slot = await browser.execute(() => {
+    const candidates = [
+      ...document.querySelectorAll<HTMLElement>("[data-thread-key] > div.relative"),
+    ];
+    const visible = candidates.find((candidate) => candidate.getBoundingClientRect().height > 40);
+    const rect = visible?.getBoundingClientRect();
+    return rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null;
+  });
+  if (!slot) throw new Error("The preview browser's slot was not found.");
+  await nativeClickAtPagePoint(slot);
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  typeNative("Undq");
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const sent = await sendChord(path, "primary+z", "undo");
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  typeNativeReturn();
+  await browser.waitUntil(async () => (await tabTitle()) !== "echo:|peak:", {
+    timeout: 15_000,
+    timeoutMsg: "The preview page never reloaded with its field's value: typing did not reach it.",
+  });
+  const title = await tabTitle();
+  const close = browser.$('[data-right-panel-tab-list] button[aria-label^="Close echo:"]');
+  await close.click();
+  await openFilesSurface();
+  const filesAfter = await readState("source", fileName);
+  const typed = title?.toLowerCase().includes("peak:undq") ?? false;
+  const undone = title?.toLowerCase().startsWith("echo:|") ?? false;
+  recordEvidence({
+    cell: `preview-undo-${path}`,
+    passed: typed && undone && JSON.stringify(filesAfter) === JSON.stringify(filesBefore),
+    title,
+    filesBefore,
+    filesAfter,
+    sent,
+  });
+  expect({ typed, undone, files: filesAfter }).toEqual({
+    typed: true,
+    undone: true,
+    files: filesBefore,
+  });
 }
 
 describe("packaged Files undo and redo (#398)", () => {
@@ -906,6 +1118,11 @@ describe("packaged Files undo and redo (#398)", () => {
 
   it("driver: the undo chord still undoes in the chat composer", async () => {
     await measureTextField("composer", "driver");
+  });
+
+  it("driver: Ctrl+Z undoes a plain textarea on the Linux desktop (#408)", async function () {
+    if (platform !== "linux") this.skip();
+    await measureTextField("textarea", "driver");
   });
 
   describe("native input (BIBCODE_E2E_NATIVE_INPUT=1)", function () {
@@ -977,5 +1194,23 @@ describe("packaged Files undo and redo (#398)", () => {
     it("keystroke: the terminal keeps the undo chord", async () => {
       await recordTerminalChord();
     });
+
+    for (const chord of ["primary+shift+z", "ctrl+y"] as const) {
+      it(`keystroke: the terminal keeps ${chord} off macOS`, async function () {
+        if (platform === "mac") this.skip();
+        await recordTerminalChord(chord);
+      });
+    }
+
+    for (const path of ["keystroke", "menu"] as const) {
+      it(`${path}: undo in the Link URL field stays in the field`, async function () {
+        if (path === "menu" && platform === "linux") this.skip();
+        await measureLinkField(path);
+      });
+      it(`${path}: undo in the preview browser stays in its page`, async function () {
+        if (path === "menu" && platform === "linux") this.skip();
+        await measurePreviewFallback(path);
+      });
+    }
   });
 });
