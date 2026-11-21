@@ -185,10 +185,13 @@ fn quit_menu_item<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<tauri::menu::
 #[cfg(target_os = "macos")]
 fn run_edit_menu_action<R: Runtime>(app: &AppHandle<R>, action: &'static str) {
     if main_webview_has_first_responder(app) {
-        if let Err(error) = app.emit_to(MAIN_WINDOW_LABEL, MENU_ACTION_EVENT, action) {
-            tracing::warn!("failed to send the Edit menu action to the main webview: {error}");
+        match app.emit_to(MAIN_WINDOW_LABEL, MENU_ACTION_EVENT, action) {
+            Ok(()) => return,
+            // The page never got it, so the native action below still runs.
+            Err(error) => {
+                tracing::warn!("failed to send the Edit menu action to the main webview: {error}");
+            }
         }
-        return;
     }
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         tracing::warn!("the Edit menu ran off the main thread; its action was dropped");
@@ -208,6 +211,8 @@ fn run_edit_menu_action<R: Runtime>(app: &AppHandle<R>, action: &'static str) {
 /// view inside it. The preview's child webview is a sibling of the main one, so it does not count.
 #[cfg(target_os = "macos")]
 fn main_webview_has_first_responder<R: Runtime>(app: &AppHandle<R>) -> bool {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
     use objc2_app_kit::{NSApplication, NSView};
 
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
@@ -215,19 +220,31 @@ fn main_webview_has_first_responder<R: Runtime>(app: &AppHandle<R>) -> bool {
     };
     let (sender, receiver) = std::sync::mpsc::sync_channel::<bool>(1);
     let sent = window.with_webview(move |platform| {
+        // SAFETY: tauri-runtime-wry 2.11.4 passes each of these as `Retained::into_raw`, a +1
+        // retain it never releases (`WebviewMessage::WithWebview`), so taking them back here
+        // releases each exactly once. `with_webview_ownership_matches_the_pinned_runtime` fails
+        // when that runtime version changes. The closure runs on the main thread.
+        let (webview, _controller, _window) = unsafe {
+            (
+                Retained::<NSView>::from_raw(platform.inner().cast()),
+                Retained::<AnyObject>::from_raw(platform.controller().cast()),
+                Retained::<AnyObject>::from_raw(platform.ns_window().cast()),
+            )
+        };
+        let Some(webview) = webview else {
+            let _ = sender.send(false);
+            return;
+        };
         let Some(mtm) = objc2::MainThreadMarker::new() else {
             let _ = sender.send(false);
             return;
         };
-        // SAFETY: on macOS `inner()` is the live main WKWebView, and this closure runs on the
-        // main thread.
-        let webview: &NSView = unsafe { &*platform.inner().cast() };
         let owns_focus = NSApplication::sharedApplication(mtm)
             .keyWindow()
             .filter(|key_window| webview.window().is_some_and(|own| own == *key_window))
             .and_then(|key_window| key_window.firstResponder())
             .and_then(|responder| responder.downcast::<NSView>().ok())
-            .is_some_and(|view| view.isDescendantOf(webview));
+            .is_some_and(|view| view.isDescendantOf(&webview));
         let _ = sender.send(owns_focus);
     });
     // The menu handler runs on the main thread, where Tauri runs this closure at once.
@@ -958,6 +975,18 @@ mod tests {
         recorded.guard.request(LeaveReason::Close, Instant::now());
         assert_eq!(recorded.left(), vec![LeaveReason::Close]);
         assert!(recorded.asked.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn with_webview_ownership_matches_the_pinned_runtime() {
+        // `main_webview_has_first_responder` releases the retains this runtime version hands
+        // over; a newer one that only lends the pointers would make that an over-release.
+        let lock = include_str!("../../../../Cargo.lock");
+        assert!(
+            lock.contains("name = \"tauri-runtime-wry\"\nversion = \"2.11.4\""),
+            "tauri-runtime-wry changed: recheck who owns the pointers `with_webview` passes"
+        );
     }
 
     #[cfg(target_os = "macos")]
