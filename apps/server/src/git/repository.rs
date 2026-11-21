@@ -4596,7 +4596,10 @@ impl GitRepository {
             .execute(
                 "GitManager.remoteBranchDeleteCheck",
                 cwd,
+                // Protocol v2 advertises the target of a symbolic branch, which v0 omits.
                 &[
+                    "-c".into(),
+                    "protocol.version=2".into(),
                     "ls-remote".into(),
                     "--symref".into(),
                     remote.into(),
@@ -9784,7 +9787,10 @@ mod tests {
         );
         assert_network_transfer(
             &requests[2],
+            // Protocol v2 advertises a symbolic branch's target (#397 round 2, Codex 4).
             &[
+                "-c",
+                "protocol.version=2",
                 "ls-remote",
                 "--symref",
                 "origin",

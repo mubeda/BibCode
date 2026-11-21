@@ -340,6 +340,10 @@ mod telemetry {
             .await
             .expect("remote branch delete operation");
         repository
+            .git_manager_remote_heads(cwd, "origin", "renamed", &cancellation)
+            .await
+            .expect("remote branch delete check");
+        repository
             .git_manager_fetch(cwd, "origin", &cancellation)
             .await
             .expect("fetch operation");

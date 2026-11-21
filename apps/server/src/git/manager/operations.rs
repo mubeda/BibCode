@@ -336,6 +336,10 @@ pub enum GitManagerOperationRequest {
         name: String,
         force: bool,
         delete_remote: bool,
+        /// A delete with its remote resumed after a sign-in its remote check needed (#325,
+        /// #397): refuse unless the remote still has exactly this one URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_destination: Option<String>,
     },
     /// Deletes `branch` on `remote` only, leaving any local branch alone.
     RemoteBranchDelete {
@@ -1233,25 +1237,31 @@ fn refuse_option_like_operands(
 }
 
 /// The remote a network operation contacts, its direction, and the request that resumes it
-/// after a sign-in (#325). A branch delete resumes as a delete of its remote branch only. Its
-/// local branch is gone when the push fails, but stays when the `ls-remote` check before it
-/// needed the sign-in; the client then deletes the local branch after the resume (#397).
+/// after a sign-in (#325), and for a branch delete with its remote the request that resumes it
+/// once its local branch is gone: a delete of the remote branch only. Before that, while the
+/// `ls-remote` check needed the sign-in, the whole delete resumes, so its local guards run again
+/// before anything is deleted (#397).
 async fn network_step(
     repository: &GitRepository,
     request: &GitManagerOperationRequest,
     cancellation: &CancellationToken,
-) -> Option<(String, SignInDirection, GitManagerOperationRequest)> {
+) -> Option<(
+    String,
+    SignInDirection,
+    GitManagerOperationRequest,
+    Option<GitManagerOperationRequest>,
+)> {
     use GitManagerOperationRequest as Request;
     match request {
         Request::Fetch { remote, .. } | Request::Pull { remote, .. } => {
-            Some((remote.clone(), SignInDirection::Fetch, request.clone()))
+            Some((remote.clone(), SignInDirection::Fetch, request.clone(), None))
         }
         Request::Push { remote, .. }
         | Request::PublishBranch { remote, .. }
         | Request::ForcePush { remote, .. }
         | Request::RemoteBranchDelete { remote, .. }
         | Request::TagPush { remote, .. } => {
-            Some((remote.clone(), SignInDirection::Push, request.clone()))
+            Some((remote.clone(), SignInDirection::Push, request.clone(), None))
         }
         Request::BranchDelete {
             cwd,
@@ -1264,13 +1274,14 @@ async fn network_step(
             Some((
                 remote.clone(),
                 SignInDirection::Push,
-                Request::RemoteBranchDelete {
+                request.clone(),
+                Some(Request::RemoteBranchDelete {
                     cwd: cwd.clone(),
                     project_id: project_id.clone(),
                     remote,
                     branch,
                     expected_destination: None,
-                },
+                }),
             ))
         }
         _ => None,
@@ -1319,6 +1330,10 @@ fn expected_destination_mut(
             expected_destination,
             ..
         }
+        | Request::BranchDelete {
+            expected_destination,
+            ..
+        }
         | Request::TagPush {
             expected_destination,
             ..
@@ -1341,9 +1356,9 @@ async fn execute_branch_or_sync_operation(
     // Taken from the resume copy: a later offer sets the newly frozen destination there.
     let expected = network
         .as_mut()
-        .and_then(|(_, _, resume)| expected_destination_mut(resume))
+        .and_then(|(_, _, resume, _)| expected_destination_mut(resume))
         .and_then(Option::take);
-    if let (Some(expected), Some((remote, direction, _))) = (expected, &network) {
+    if let (Some(expected), Some((remote, direction, ..))) = (expected, &network) {
         let current =
             resolve_destination(repository, request.cwd(), remote, *direction, cancellation).await;
         if !matches!(current, Destination::Offer { ref destination, .. } if *destination == expected)
@@ -1356,10 +1371,29 @@ async fn execute_branch_or_sync_operation(
             ));
         }
     }
-    let result = execute_operation_steps(repository, snapshot, request, cancellation).await;
+    let mut local_branch_deleted = false;
+    let result = execute_operation_steps(
+        repository,
+        snapshot,
+        request,
+        &mut local_branch_deleted,
+        cancellation,
+    )
+    .await;
     let result = match (result, network, prompt) {
-        (Err(error), Some(step), CredentialPrompt::OfferSignIn) => {
-            Err(offer_sign_in(repository, request.cwd(), error, step, cancellation).await)
+        (Err(error), Some((remote, direction, whole, after_local)), CredentialPrompt::OfferSignIn) => {
+            let resume = match after_local {
+                Some(remote_only) if local_branch_deleted => remote_only,
+                _ => whole,
+            };
+            Err(offer_sign_in(
+                repository,
+                request.cwd(),
+                error,
+                (remote, direction, resume),
+                cancellation,
+            )
+            .await)
         }
         (result, ..) => result,
     };
@@ -1456,10 +1490,13 @@ async fn offer_sign_in(
     error
 }
 
+/// `local_branch_deleted` is set once a branch delete with its remote has deleted the local
+/// branch, so a sign-in its push needs resumes the remote delete only.
 async fn execute_operation_steps(
     repository: &GitRepository,
     snapshot: &GitManagerRefsSnapshot,
     request: &GitManagerOperationRequest,
+    local_branch_deleted: &mut bool,
     cancellation: &CancellationToken,
 ) -> Result<GitManagerOperationOutcome, GitManagerOperationError> {
     let operation = request.operation();
@@ -1597,6 +1634,7 @@ async fn execute_operation_steps(
                     .git_manager_delete_branch(cwd, name, *force, cancellation)
                     .await,
             )?;
+            *local_branch_deleted = true;
             if let Some((remote, remote_branch, checked)) = remote_target {
                 let remote_output = repository
                     .git_manager_delete_remote_branch(
@@ -2314,7 +2352,6 @@ async fn remote_urls(
             output
                 .stdout
                 .lines()
-                .map(str::trim)
                 .filter(|line| !line.is_empty())
                 .map(str::to_owned)
                 .collect()
@@ -2348,31 +2385,30 @@ async fn local_ref_tip(
     (output.exit_code == 0 && !tip.is_empty()).then(|| tip.to_owned())
 }
 
-/// Whether one of `refspecs` (a remote's `fetch` lines) stores `source` in `tracking`. Negative
-/// refspecs are not applied: they only exclude refs, and an excluded branch has no mapping here.
-fn fetch_maps(refspecs: &str, source: &str, tracking: &str) -> bool {
-    refspecs
-        .lines()
-        .map(str::trim)
-        .filter(|spec| !spec.starts_with('^'))
-        .filter_map(|spec| spec.trim_start_matches('+').split_once(':'))
-        .any(
-            |(src, dst)| match (src.split_once('*'), dst.split_once('*')) {
-                (Some((src_head, src_tail)), Some((dst_head, dst_tail))) => source
-                    .strip_prefix(src_head)
-                    .and_then(|rest| rest.strip_suffix(src_tail))
-                    .is_some_and(|matched| format!("{dst_head}{matched}{dst_tail}") == tracking),
-                (None, None) => src == source && dst == tracking,
-                _ => false,
-            },
-        )
+/// Whether every `fetch` line of a remote stores each branch it fetches under the same name in
+/// `refs/remotes/<remote>/`. A negative refspec, or a branch source with any other destination
+/// (or none), is not: Git's post-push tracking update or a tracking name could then reach
+/// another ref than the one checked. Sources outside `refs/heads/`, such as pull requests, are
+/// left alone.
+fn fetch_mapping_is_identity(refspecs: &str, remote: &str) -> bool {
+    let tracking = format!("refs/remotes/{remote}/");
+    refspecs.lines().filter(|spec| !spec.is_empty()).all(|spec| {
+        let spec = spec.strip_prefix('+').unwrap_or(spec);
+        if spec.starts_with('^') {
+            return false;
+        }
+        let (source, destination) = spec.split_once(':').unwrap_or((spec, ""));
+        source
+            .strip_prefix("refs/heads/")
+            .is_none_or(|branch| destination.strip_prefix(tracking.as_str()) == Some(branch))
+    })
 }
 
 /// R7 (#397, #404): the server decides every remote branch delete, and returns the commit it
 /// checked so the push can lease it. Before anything is deleted it refuses a remote that pushes
-/// to another URL than the one it reads, a remote it cannot ask, a `HEAD` that names the branch
-/// or no branch, a branch that is missing, a tracking ref filled from another branch, and a
-/// tracking ref at another commit (a branch never fetched is not compared). The `ls-remote`
+/// to another URL than the one it reads, a fetch configuration that renames branches, a remote
+/// it cannot ask, a `HEAD` that names the branch or no branch, a branch that is missing or
+/// symbolic, and a tracking ref at another commit (a branch never fetched is not compared). The `ls-remote`
 /// runs through the network runner, so a sign-in can be offered and a resumed request checks
 /// again. A remote that answers with no `HEAD` (unborn) has no default branch to protect.
 async fn check_remote_branch_delete(
@@ -2390,6 +2426,26 @@ async fn check_remote_branch_delete(
         return refuse(
             "remote-push-url-differs",
             "This remote pushes to another URL than it fetches from, so the branch cannot be checked. Delete it from a terminal.",
+        );
+    }
+    let refspecs = repository
+        .run_allowing_failure(
+            "GitManager.remoteBranchDeleteCheck.fetchRefspecs",
+            cwd,
+            &[
+                "config".to_owned(),
+                "--get-all".to_owned(),
+                format!("remote.{remote}.fetch"),
+            ],
+            cancellation,
+        )
+        .await
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+    if !fetch_mapping_is_identity(&refspecs, remote) {
+        return refuse(
+            "remote-fetch-mapping-unsupported",
+            "This remote's fetch settings store branches under other names, so the branch cannot be checked. Delete it with git on the command line.",
         );
     }
     let outputs = one_output(
@@ -2411,6 +2467,7 @@ async fn check_remote_branch_delete(
     let mut default_ref = None;
     let mut head_advertised = false;
     let mut remote_tip = None;
+    let mut symbolic = false;
     for line in outputs.iter().flat_map(|output| output.stdout.lines()) {
         if let Some((target, name)) = line
             .strip_prefix("ref: ")
@@ -2418,6 +2475,8 @@ async fn check_remote_branch_delete(
         {
             if name == "HEAD" {
                 default_ref = Some(target);
+            } else if name == branch_ref {
+                symbolic = true;
             }
         } else if let Some((sha, name)) = line.split_once('\t') {
             if name == "HEAD" {
@@ -2452,28 +2511,16 @@ async fn check_remote_branch_delete(
             },
         );
     };
+    // Deleting a symbolic branch also deletes the ref it points to (reproduced on Git 2.56.1).
+    // Protocol v2 advertises the target; a remote that speaks only v0 does not.
+    if symbolic {
+        return refuse(
+            "remote-branch-symbolic",
+            "This branch on the remote points to another branch, and deleting it would delete that one too. Delete it with git on the command line.",
+        );
+    }
     let tracking = format!("refs/remotes/{remote}/{branch}");
     if let Some(tracking_tip) = local_ref_tip(repository, cwd, &tracking, cancellation).await {
-        let refspecs = repository
-            .run_allowing_failure(
-                "GitManager.remoteBranchDeleteCheck.fetchRefspecs",
-                cwd,
-                &[
-                    "config".to_owned(),
-                    "--get-all".to_owned(),
-                    format!("remote.{remote}.fetch"),
-                ],
-                cancellation,
-            )
-            .await
-            .map(|output| output.stdout)
-            .unwrap_or_default();
-        if !fetch_maps(&refspecs, &branch_ref, &tracking) {
-            return refuse(
-                "remote-tracking-mapped",
-                "This row tracks another branch on the remote. Delete the branch from a terminal.",
-            );
-        }
         if tracking_tip != remote_tip {
             return refuse(
                 "remote-branch-changed",
@@ -4604,6 +4651,7 @@ mod tests {
             name: "topic".into(),
             force: true,
             delete_remote: false,
+            expected_destination: None,
         };
 
         let reason = blocked_reason_for_operation(&snapshot, &request)
@@ -6523,6 +6571,7 @@ mod tests {
                 name: "topic".into(),
                 force: true,
                 delete_remote: true,
+                expected_destination: None,
             },
         ] {
             let failure = delete_on_remote(fixture.path(), &request)
@@ -6696,6 +6745,7 @@ mod tests {
                 name: "local".into(),
                 force: true,
                 delete_remote: true,
+                expected_destination: None,
             },
         )
         .await
@@ -6740,6 +6790,7 @@ mod tests {
                 name: "dash".into(),
                 force: true,
                 delete_remote: true,
+                expected_destination: None,
             },
         )
         .await
@@ -6786,10 +6837,184 @@ mod tests {
             .await
             .expect_err("a mapped tracking ref is refused");
 
-        assert_eq!(failure.code, "remote-tracking-mapped");
+        assert_eq!(failure.code, "remote-fetch-mapping-unsupported");
         assert_eq!(
             remote_refs(remote.path()),
             "refs/heads/alias\nrefs/heads/feature\nrefs/heads/main\nrefs/heads/topic"
+        );
+    }
+
+    fn local_delete_with_remote(fixture: &Path, name: &str) -> GitManagerOperationRequest {
+        GitManagerOperationRequest::BranchDelete {
+            cwd: fixture.to_path_buf(),
+            project_id: "p".into(),
+            name: name.into(),
+            force: true,
+            delete_remote: true,
+            expected_destination: None,
+        }
+    }
+
+    fn local_branches(fixture: &Path) -> String {
+        git(fixture, &["branch", "--format=%(refname:short)"])
+    }
+
+    /// Round 2 ruling B (Codex 5, 6, 8; Antigravity 3, 6, 8): a fetch configuration that is not
+    /// the identity `refs/heads/<x>` to `refs/remotes/<remote>/<x>` is refused before anything is
+    /// deleted, by both operations. A first mapping into `refs/heads/` would let Git's
+    /// post-push tracking update delete the local branch; a negative refspec hides which branch
+    /// fills a tracking name.
+    #[tokio::test]
+    async fn every_delete_refuses_a_fetch_mapping_that_renames_branches() {
+        for mapping in [
+            vec!["+refs/heads/feature:refs/heads/feature", "+refs/heads/*:refs/remotes/origin/*"],
+            vec!["+refs/heads/*:refs/remotes/origin/*", "^refs/heads/secret"],
+            vec!["+refs/heads/*:refs/remotes/cache/*"],
+            vec!["refs/heads/feature"],
+        ] {
+            let (remote, fixture) = remote_delete_fixture();
+            git(fixture.path(), &["fetch", "-q", "origin"]);
+            git(
+                fixture.path(),
+                &["branch", "--track", "topic", "origin/feature"],
+            );
+            git(fixture.path(), &["config", "--unset-all", "remote.origin.fetch"]);
+            for spec in &mapping {
+                git(fixture.path(), &["config", "--add", "remote.origin.fetch", spec]);
+            }
+            for request in [
+                remote_delete(fixture.path(), "feature"),
+                local_delete_with_remote(fixture.path(), "topic"),
+            ] {
+                let failure = delete_on_remote(fixture.path(), &request)
+                    .await
+                    .expect_err("a renaming fetch mapping is refused");
+                // A local delete whose upstream Git cannot name stops at `no-upstream`.
+                if failure.code == "no-upstream" {
+                    continue;
+                }
+                assert_eq!(
+                    failure.code, "remote-fetch-mapping-unsupported",
+                    "{mapping:?} {}",
+                    request.operation()
+                );
+                assert_eq!(
+                    failure.message,
+                    "This remote's fetch settings store branches under other names, so the branch cannot be checked. Delete it with git on the command line."
+                );
+            }
+            assert_eq!(local_branches(fixture.path()), "feature\nmain\ntopic", "{mapping:?}");
+            assert_eq!(
+                remote_refs(remote.path()),
+                "refs/heads/feature\nrefs/heads/main",
+                "{mapping:?}"
+            );
+        }
+    }
+
+    /// Ruling B keeps ordinary clones working: a shallow single-branch clone, and a pull-request
+    /// refspec whose source is outside `refs/heads/`.
+    #[tokio::test]
+    async fn a_single_branch_clone_and_a_pull_request_refspec_still_delete() {
+        let (remote, _seed) = remote_delete_fixture();
+        git(remote.path(), &["branch", "gone-one", "main"]);
+        git(remote.path(), &["branch", "gone-two", "main"]);
+        let shallow = tempfile::tempdir().expect("shallow clone");
+        git(
+            shallow.path(),
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--branch",
+                "feature",
+                &format!("file://{}", remote.path().to_string_lossy()),
+                &shallow.path().to_string_lossy(),
+            ],
+        );
+        delete_on_remote(shallow.path(), &remote_delete(shallow.path(), "gone-one"))
+            .await
+            .expect("a single-branch clone deletes a branch it never fetched");
+        git(shallow.path(), &["branch", "topic", "origin/feature"]);
+        git(shallow.path(), &["config", "branch.topic.remote", "origin"]);
+        git(
+            shallow.path(),
+            &["config", "branch.topic.merge", "refs/heads/feature"],
+        );
+        delete_on_remote(
+            shallow.path(),
+            &local_delete_with_remote(shallow.path(), "topic"),
+        )
+        .await
+        .expect("a single-branch clone deletes its upstream");
+
+        let fixture = tempfile::tempdir().expect("clone");
+        git(
+            fixture.path(),
+            &[
+                "clone",
+                "-q",
+                &remote.path().to_string_lossy(),
+                &fixture.path().to_string_lossy(),
+            ],
+        );
+        git(
+            fixture.path(),
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/pull/*/head:refs/remotes/origin/pr/*",
+            ],
+        );
+        delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "gone-two"))
+            .await
+            .expect("a pull-request refspec does not block a delete");
+        assert_eq!(remote_refs(remote.path()), "refs/heads/main");
+    }
+
+    /// Codex 3: the fetch and push URLs are compared exactly; a push URL that differs only by a
+    /// trailing space names another repository.
+    #[tokio::test]
+    async fn remote_branch_delete_compares_push_and_fetch_urls_exactly() {
+        let (remote, fixture) = remote_delete_fixture();
+        let spaced = format!("{} ", remote.path().to_string_lossy());
+        git(
+            fixture.path(),
+            &["remote", "set-url", "--push", "origin", &spaced],
+        );
+
+        let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "feature"))
+            .await
+            .expect_err("a push URL that differs by a space is refused");
+
+        assert_eq!(failure.code, "remote-push-url-differs");
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main"
+        );
+    }
+
+    /// Codex 4 (reproduced on Git 2.56.1): a delete push of a symbolic remote branch deletes its
+    /// referent too, so a branch the remote advertises as symbolic is refused.
+    #[tokio::test]
+    async fn remote_branch_delete_refuses_a_symbolic_remote_branch() {
+        let (remote, fixture) = remote_delete_fixture();
+        git(
+            remote.path(),
+            &["symbolic-ref", "refs/heads/topic", "refs/heads/main"],
+        );
+
+        let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "topic"))
+            .await
+            .expect_err("a symbolic remote branch is refused");
+
+        assert_eq!(failure.code, "remote-branch-symbolic");
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main\nrefs/heads/topic"
         );
     }
 
@@ -6896,6 +7121,7 @@ mod tests {
                 name: "mainline".into(),
                 force: true,
                 delete_remote: true,
+                expected_destination: None,
             },
         )
         .await

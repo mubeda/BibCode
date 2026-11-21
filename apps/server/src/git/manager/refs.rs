@@ -299,21 +299,25 @@ pub async fn build_refs_snapshot(
         .map(str::to_owned)
         .collect::<Vec<_>>();
 
-    // Each remote's own symbolic `<remote>/HEAD` names its default branch (#397) and is not a
-    // branch row; a branch such as `origin/release/HEAD` is one (#407).
+    // A symbolic `<name>/HEAD` is not a branch row, even one a removed remote left behind; a
+    // branch such as `origin/release/HEAD` is one (#407). Only a configured remote's own
+    // `<remote>/HEAD` names that remote's default branch (#397).
     let remote_heads = raw_refs
         .iter()
         .filter(|reference| {
             reference.kind == RawRefKind::RemoteBranch
                 && reference.symref.is_some()
-                && reference
-                    .name
-                    .strip_suffix("/HEAD")
-                    .is_some_and(|remote| remote_names.iter().any(|known| known == remote))
+                && reference.name.ends_with("/HEAD")
         })
         .collect::<Vec<_>>();
     let remote_defaults = remote_heads
         .iter()
+        .filter(|reference| {
+            reference
+                .name
+                .strip_suffix("/HEAD")
+                .is_some_and(|remote| remote_names.iter().any(|known| known == remote))
+        })
         .filter_map(|reference| reference.symref.clone())
         .collect::<HashSet<_>>();
     let remote_heads = remote_heads
@@ -882,6 +886,28 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(remote_names, ["origin/main", "origin/release/HEAD"]);
+    }
+
+    /// #397 round 2 (Antigravity 9): a symbolic `<name>/HEAD` left behind by a removed remote is
+    /// not a branch row either, and marks no default.
+    #[tokio::test]
+    async fn a_removed_remotes_symbolic_head_is_not_listed() {
+        let repository = repository_with_one_commit();
+        let path = repository.path();
+        git(path, &["update-ref", "refs/remotes/old/main", "HEAD"]);
+        git(
+            path,
+            &["symbolic-ref", "refs/remotes/old/HEAD", "refs/remotes/old/main"],
+        );
+
+        let snapshot = snapshot(&repository).await;
+        let remote_rows = snapshot
+            .remote_branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.is_default))
+            .collect::<Vec<_>>();
+
+        assert_eq!(remote_rows, [("old/main", false)]);
     }
 
     #[tokio::test]

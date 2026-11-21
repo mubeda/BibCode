@@ -1108,6 +1108,44 @@ async fn a_remote_delete_that_stops_reporting_keeps_the_local_deletion_and_its_t
     fixture.harness.shutdown().await;
 }
 
+/// #397 round 2 (Antigravity 4): when the refs cannot be read after a failed delete, whether
+/// either branch was deleted is unknown, and the answer says so instead of "nothing deleted".
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_delete_whose_refs_cannot_be_read_is_an_unknown_outcome() {
+    let fixture = fixture().await;
+    publish_feature(&fixture).await;
+    let git_dir = fixture.repo.join(".git");
+    let moved = fixture.repo.join("git-moved-away");
+    hook(
+        &fixture,
+        &format!(
+            "mv '{}' '{}'\nexit 1",
+            git_dir.to_string_lossy(),
+            moved.to_string_lossy()
+        ),
+    );
+    let failed = fixture
+        .call(
+            "git_delete_branch",
+            json!({ "name": "feature", "deleteRemote": true, "clientRequestId": "del-blind" }),
+        )
+        .await;
+    assert_eq!(error_tag(&failed), "McpPartialOutcomeError", "{failed}");
+    let outcome = error(&failed);
+    assert_eq!(outcome["local"], "unknown");
+    assert_eq!(outcome["remote"], "unknown");
+    assert_eq!(outcome["outcome"], "unknown");
+    assert_eq!(
+        outcome["recovery"]["arguments"],
+        json!({ "remote": "origin", "branch": "feature" })
+    );
+    std::fs::rename(&moved, &git_dir).unwrap();
+    assert_eq!(branches(&fixture.repo), "main");
+    assert_eq!(branches(&fixture.remote), "feature\nmain");
+    fixture.harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn tools_list_carries_each_tools_hints_and_source_control_off_hides_them() {
     let fixture = fixture().await;

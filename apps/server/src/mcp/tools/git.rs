@@ -967,7 +967,8 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
             )
             .await;
             let after = refs(&owned, &cwd).await.ok();
-            let local_gone = after.as_ref().is_some_and(|refs| {
+            // `None` when the refs cannot be read: whether the local branch is gone is unknown.
+            let local_gone = after.as_ref().map(|refs| {
                 !refs["localBranches"].as_array().is_some_and(|branches| {
                     branches
                         .iter()
@@ -975,7 +976,7 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
                 })
             });
             // A label must not name the branch this call deleted: it takes the folder's own.
-            if local_gone
+            if local_gone == Some(true)
                 && let Ok(thread_target) = owned.target(&thread).await
                 && thread_target.thread.branch.as_deref() == Some(name.as_str())
                 && let Some(head) = after.as_ref().and_then(|refs| refs["headRef"].as_str())
@@ -989,9 +990,15 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
             match deleted {
                 Ok(_) => Ok(json!({ "branch": name, "local": "deleted", "remote": "deleted" })),
                 // Nothing was deleted: the remote check or the local delete refused it.
-                Err(failure) if !local_gone => Err(failure),
-                // Whether a stream that stopped reporting reached the remote is unknown, and is
-                // recorded so, with the known local deletion and the remote target.
+                Err(failure) if local_gone == Some(false) => Err(failure),
+                // Unreadable refs leave both deletions unknown; a stream that stopped reporting
+                // leaves the remote one unknown. Either is recorded so, with the remote target.
+                Err(failure) if local_gone.is_none() => Err(outcome_unknown(partial(
+                    &remote,
+                    &remote_branch,
+                    &failure,
+                    Outcome::LocalUnknown,
+                ))),
                 Err(failure)
                     if failure["structuredContent"]["error"]["_tag"]
                         == crate::rpc::STREAM_ENDED_TAG =>
@@ -1000,37 +1007,64 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
                         &remote,
                         &remote_branch,
                         &failure,
-                        true,
+                        Outcome::RemoteUnknown,
                     )))
                 }
-                Err(failure) => Err(partial(&remote, &remote_branch, &failure, false)),
+                Err(failure) => Err(partial(
+                    &remote,
+                    &remote_branch,
+                    &failure,
+                    Outcome::RemoteFailed,
+                )),
             }
         })
         .await;
     finish(call, &thread_id, result).await
 }
 
-/// The local branch is gone and the remote one is not, or may not be (`unknown`, when the
-/// remote step stopped reporting): the truth, with the call that finishes it. A keyed retry
-/// replays it.
-fn partial(remote: &str, remote_branch: &str, failure: &Value, unknown: bool) -> Value {
+/// What a failed delete with its remote is known to have done.
+#[derive(Clone, Copy, PartialEq)]
+enum Outcome {
+    /// The local branch is gone and the remote push failed.
+    RemoteFailed,
+    /// The local branch is gone; the remote step stopped before it reported.
+    RemoteUnknown,
+    /// The refs could not be read afterwards, so neither deletion is known.
+    LocalUnknown,
+}
+
+/// A delete with its remote that did not fully succeed: the truth, with the call that finishes
+/// it. A keyed retry replays it.
+fn partial(remote: &str, remote_branch: &str, failure: &Value, outcome: Outcome) -> Value {
     let error = &failure["structuredContent"]["error"];
     let reason = error["message"].as_str().unwrap_or("the remote refused it");
     let mut partial = typed_tool_failure(
         PARTIAL_TAG,
-        &if unknown {
-            format!(
+        &match outcome {
+            Outcome::LocalUnknown => format!(
+                "The delete failed and the branches could not be read afterwards, so whether the local and the remote branch were deleted is unknown: {reason} Run git_status and git_fetch; if {remote}/{remote_branch} is still listed, call git_delete_remote_branch with this remote and branch to finish."
+            ),
+            Outcome::RemoteUnknown => format!(
                 "The local branch was deleted, but whether the remote branch was deleted is unknown: {reason} Run git_fetch; if {remote}/{remote_branch} is still listed, call git_delete_remote_branch with this remote and branch to finish."
-            )
-        } else {
-            format!(
+            ),
+            Outcome::RemoteFailed => format!(
                 "The local branch was deleted, but deleting the remote branch failed: {reason} Call git_delete_remote_branch with this remote and branch to finish."
-            )
+            ),
         },
     );
     let fields = &mut partial["structuredContent"]["error"];
-    fields["local"] = "deleted".into();
-    fields["remote"] = if unknown { "unknown" } else { "failed" }.into();
+    fields["local"] = if outcome == Outcome::LocalUnknown {
+        "unknown"
+    } else {
+        "deleted"
+    }
+    .into();
+    fields["remote"] = if outcome == Outcome::RemoteFailed {
+        "failed"
+    } else {
+        "unknown"
+    }
+    .into();
     fields["remoteName"] = remote.into();
     fields["remoteBranch"] = remote_branch.into();
     fields["reason"] = error
