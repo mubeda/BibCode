@@ -91,20 +91,27 @@ export function useEditMenuActions(): void {
   useEffect(() => {
     const onMenuAction = window.desktopBridge?.onMenuAction;
     if (typeof onMenuAction !== "function") return;
-    let composing = false;
-    const start = () => {
-      composing = true;
+    // The element a composition started in. It counts only while it is still in the page and
+    // focused: an editor removed mid-composition never delivers compositionend to the document.
+    let composingIn: Element | null = null;
+    const start = (event: Event) => {
+      const target = event.composedPath()[0];
+      composingIn = target instanceof Element ? target : null;
     };
     const end = () => {
-      composing = false;
+      composingIn = null;
     };
+    const composing = () =>
+      composingIn !== null &&
+      composingIn.isConnected &&
+      deepActiveElement(document) === composingIn;
     document.addEventListener("compositionstart", start, true);
     document.addEventListener("compositionend", end, true);
     // The Linux desktop has no Edit menu Undo to bind the text fields' chords.
     const linux = isLinuxPlatform(navigator.platform);
     if (linux) document.addEventListener("keydown", runTextFieldHistoryChord);
     const unsubscribe = onMenuAction((action) => {
-      if (isEditMenuAction(action)) runEditMenuAction(action, composing);
+      if (isEditMenuAction(action)) runEditMenuAction(action, composing());
     });
     return () => {
       document.removeEventListener("compositionstart", start, true);
