@@ -6,6 +6,12 @@ Scope is macOS only. Windows and Linux keep their menu: every Files cell
 passed there by the real chord, and the Windows menu items inject the same
 chords (measured, see the diagnosis). On those platforms Ctrl+Z also stays
 the terminal's suspend key, because nothing here intercepts it.
+
+Issue #408, ticketed for this PR, adds one Linux desktop rule outside the
+Edit menu: an uncancelled Ctrl+Z, Shift+Ctrl+Z or Ctrl+Y in an `input` or
+`textarea` runs `document.execCommand`, because WebKitGTK binds no undo key
+for those fields and GTK has no Edit > Undo item. Editors, the composer and
+xterm cancel their own chords first, so only plain fields change.
 Evidence: [diagnosis-398.md](2026-11-20-undo-remote-delete-antigravity/diagnosis-398.md).
 Requirements: spec R5 and decision D10, with R1, R2 and R4.
 
