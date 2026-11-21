@@ -777,6 +777,28 @@ describe("GitManagerToolbar", () => {
       blocked: null,
       signIn: { ...offer, resume },
     };
+    const wholeDeleteResume = {
+      _tag: "branch-delete" as const,
+      cwd: "/opaque/main",
+      projectId: "project-current" as never,
+      name: "develop",
+      force: true,
+      deleteRemote: true,
+      expectedDestination: offer.destination,
+    };
+    const wholeDeleteSignIn: GitManagerOperationEvent = {
+      ...signInFailure,
+      operation: "branch-delete",
+      signIn: { ...offer, resume: wholeDeleteResume },
+    };
+    const localWithUpstream = () => ({
+      ...refsSnapshot(),
+      localBranches: [
+        ...refsSnapshot().localBranches,
+        ref("develop", { upstream: "origin/develop" }),
+      ],
+      remoteBranches: [ref("origin/develop")],
+    });
     let container: HTMLDivElement;
     let root: ReturnType<typeof createRoot>;
 
@@ -1001,7 +1023,7 @@ describe("GitManagerToolbar", () => {
         ],
         remoteBranches: [ref("origin/develop")],
       };
-      h.events = { "branch-delete": [{ ...signInFailure, operation: "branch-delete" }] };
+      h.events = { "branch-delete": [wholeDeleteSignIn] };
       await mount();
       try {
         await act(async () =>
@@ -1024,19 +1046,9 @@ describe("GitManagerToolbar", () => {
           "gitlab.example.test",
         );
         await clickButton("Sign in");
-        // The pre-check needed the sign-in, so the local branch is still listed: after the
-        // resumed remote delete, the local one is deleted too, then the dialog closes.
-        expect(sentInputs().slice(1)).toEqual([
-          resume,
-          {
-            _tag: "branch-delete",
-            cwd: "/opaque/main",
-            projectId: "project-current",
-            name: "develop",
-            force: true,
-            deleteRemote: false,
-          },
-        ]);
+        // The server's offer names what resumes: here the whole delete, because its remote check
+        // needed the sign-in before anything was deleted. The client sends it unchanged, once.
+        expect(sentInputs().slice(1)).toEqual([wholeDeleteResume]);
         expect(lastDialogProps().dialog).toBeNull();
       } finally {
         await unmount();
@@ -1060,7 +1072,7 @@ describe("GitManagerToolbar", () => {
           container.querySelector<HTMLButtonElement>('[aria-label="Delete develop"]')!.click(),
         );
         await submit({ kind: "delete", name: "develop", deleteRemote: true });
-        // The push failed after the local delete, so the refreshed refs no longer list it.
+        // The push failed after the local delete, so the server offers the remote delete only.
         h.snapshot = { ...withLocal, localBranches: refsSnapshot().localBranches };
         await rerender();
         await clickButton("Sign in");
@@ -1093,6 +1105,117 @@ describe("GitManagerToolbar", () => {
 
         expect(sentInputs()).toHaveLength(1);
         expect(lastDialogProps().dialog).not.toBeNull();
+      } finally {
+        await unmount();
+      }
+    });
+
+    const fetchResume = {
+      _tag: "fetch" as const,
+      cwd: "/opaque/main",
+      projectId: "project-current" as never,
+      remote: "origin",
+      expectedDestination: offer.destination,
+    };
+    const fetchSignIn: GitManagerOperationEvent = {
+      _tag: "failed",
+      operation: "fetch",
+      code: "sign-in-required",
+      message: "Sign in to continue.",
+      blocked: null,
+      signIn: { ...offer, direction: "fetch", resume: fetchResume },
+    };
+
+    // Round 2 (Codex 1, Antigravity 1): a cancelled delete leaves nothing behind that a later,
+    // unrelated sign-in could act on.
+    it("never deletes a branch after an unrelated sign-in that follows a cancelled delete", async () => {
+      h.snapshot = localWithUpstream();
+      h.events = { "branch-delete": [wholeDeleteSignIn] };
+      await mount();
+      try {
+        await act(async () =>
+          container.querySelector<HTMLButtonElement>('[aria-label="Delete develop"]')!.click(),
+        );
+        await submit({ kind: "delete", name: "develop", deleteRemote: true });
+        await clickButton("Not now");
+        await act(async () => (lastDialogProps().onClose as () => void)());
+
+        h.events = { fetch: [fetchSignIn] };
+        const fetchButton = [...document.querySelectorAll("button")].find((entry) =>
+          entry.textContent?.includes("Fetch origin"),
+        );
+        await act(async () => fetchButton!.click());
+        await clickButton("Sign in");
+
+        expect(sentInputs().map((input) => input._tag)).toEqual([
+          "branch-delete",
+          "fetch",
+          "fetch",
+        ]);
+        expect(sentInputs().at(-1)).toEqual(fetchResume);
+      } finally {
+        await unmount();
+      }
+    });
+
+    // Round 2 (Antigravity 2): a sign-in that resolves just after the dialog closed resumes
+    // nothing.
+    it("resumes nothing when the sign-in finishes after the dialog was closed", async () => {
+      let finish: (value: unknown) => void = () => undefined;
+      h.runSignIn.mockImplementation(() => ({
+        cancel: vi.fn(),
+        result: new Promise((resolve) => {
+          finish = resolve;
+        }),
+      }));
+      h.snapshot = { ...refsSnapshot(), remoteBranches: [ref("origin/develop")] };
+      h.events = { "remote-branch-delete": [signInFailure] };
+      await mount();
+      try {
+        await act(async () =>
+          container
+            .querySelector<HTMLButtonElement>('[aria-label="Delete remote branch origin/develop"]')!
+            .click(),
+        );
+        await submit({ kind: "delete-remote", remote: "origin", branch: "develop" });
+        await clickButton("Sign in");
+        await act(async () => (lastDialogProps().onClose as () => void)());
+        await act(async () =>
+          finish({ _tag: "Success", value: { outcome: "signedIn", message: "" } }),
+        );
+
+        expect(sentInputs()).toHaveLength(1);
+        expect(lastDialogProps().dialog).toBeNull();
+      } finally {
+        await unmount();
+      }
+    });
+
+    // Round 2 (Antigravity 7): a branch dialog opened while a sync sign-in waits shows that
+    // prompt, and closing the dialog leaves the sign-in for the toolbar.
+    it("keeps a pending sync sign-in reachable from New Branch and never ends it on close", async () => {
+      h.snapshot = refsSnapshot();
+      h.events = { fetch: [fetchSignIn] };
+      await mount();
+      try {
+        const fetchButton = [...document.querySelectorAll("button")].find((entry) =>
+          entry.textContent?.includes("Fetch origin"),
+        );
+        await act(async () => fetchButton!.click());
+        const newBranch = [...document.querySelectorAll("button")].find((entry) =>
+          entry.textContent?.includes("New branch"),
+        );
+        await act(async () => newBranch!.click());
+        expect(lastDialogProps().dialog).toMatchObject({ kind: "create" });
+        expect(container.querySelector('[role="dialog"]')?.textContent).toContain(
+          "gitlab.example.test",
+        );
+
+        await act(async () => (lastDialogProps().onClose as () => void)());
+        expect(lastDialogProps().dialog).toBeNull();
+        await clickButton("Sign in");
+
+        expect(sentInputs().at(-1)).toEqual(fetchResume);
       } finally {
         await unmount();
       }

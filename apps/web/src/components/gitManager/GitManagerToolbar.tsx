@@ -135,6 +135,11 @@ function leaveChangesSwitchFailure(
 const EMPTY_BRANCHES: ReadonlyArray<GitManagerRefEntry> = Object.freeze([]);
 const EMPTY_TAG_NAMES: ReadonlyArray<string> = Object.freeze([]);
 const EMPTY_REMOTES: ReadonlyArray<string> = Object.freeze([]);
+
+/** The only branch dialog requests that reach a remote, and so can need a sign-in. */
+function isBranchDialogRequest(tag: GitManagerOperationRequest["_tag"] | null): boolean {
+  return tag === "branch-delete" || tag === "remote-branch-delete";
+}
 const LOADING_SYNC_STATE: SyncState = Object.freeze({
   kind: "running",
   label: "Loading repository state…",
@@ -342,33 +347,16 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   const executeOperationRef = useRef<
     ((input: GitManagerOperationRequest) => Promise<boolean>) | null
   >(null);
-  // The local branch a delete-with-remote submission asked to delete, and the newest refs.
-  const pendingLocalDeleteRef = useRef<string | null>(null);
-  const localBranchesRef = useRef(localBranches);
-  useEffect(() => {
-    localBranchesRef.current = localBranches;
-  }, [localBranches]);
+  // The request tag of the newest sign-in offer, which tells a dialog's own offer from a sync one.
+  const offeredResumeTagRef = useRef<GitManagerOperationRequest["_tag"] | null>(null);
   const { flow: signIn, present: presentOperationEvent } = useGitManagerSignIn(environmentId, {
-    // A resumed request that succeeds closes the dialog that sent the original one. The resume
-    // of a delete-with-remote deletes the remote branch only; when the sign-in came from the
-    // check before the local delete, the local branch is still listed and is deleted next.
+    // A resumed delete that succeeds closes the dialog that sent it. The server decides what
+    // resumes: the whole delete while its local branch stays, else the remote delete only.
     resume: async (request) => {
       const execute = executeOperationRef.current;
-      if (execute === null || !(await execute(request))) return;
-      const local = pendingLocalDeleteRef.current;
-      pendingLocalDeleteRef.current = null;
-      if (local !== null && localBranchesRef.current.some((branch) => branch.name === local)) {
-        const deleted = await execute({
-          _tag: "branch-delete",
-          cwd: request.cwd,
-          projectId: request.projectId,
-          name: local,
-          force: true,
-          deleteRemote: false,
-        });
-        if (!deleted) return;
+      if (execute !== null && (await execute(request)) && isBranchDialogRequest(request._tag)) {
+        setBranchDialog(null);
       }
-      setBranchDialog(null);
     },
     onEnded: (failure) => {
       setOperationEvent(failure);
@@ -387,6 +375,9 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       let stderr = "";
       const handle = runGitManagerOperation(registry, { environmentId, input }, (received) => {
         if (received._tag === "output" && received.stream === "stderr") stderr += received.text;
+        if (received._tag === "failed" && received.signIn !== undefined) {
+          offeredResumeTagRef.current = received.signIn.resume._tag;
+        }
         const event = presentOperationEvent(received);
         setOperationEvent(event);
         if (event._tag === "failed") {
@@ -552,8 +543,11 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
   const closeBranchDialog = useCallback(() => {
     if (isOperationRunning) return;
     // A sign-in offered for the dialog's request ends with it, so nothing resumes unconfirmed.
-    if (signInPhase === "waiting") cancelSignIn();
-    else if (signInPhase === "approval") declineSignIn();
+    // Only a branch delete raises one from a dialog; a sync sign-in stays the toolbar's.
+    if (isBranchDialogRequest(offeredResumeTagRef.current)) {
+      if (signInPhase === "waiting") cancelSignIn();
+      else if (signInPhase === "approval") declineSignIn();
+    }
     setBranchDialog(null);
   }, [cancelSignIn, declineSignIn, isOperationRunning, signInPhase]);
   const submitBranchDialog = useCallback(
@@ -564,8 +558,6 @@ export const GitManagerToolbar = memo(function GitManagerToolbar({
       }
       // An offer belongs to the submission that raised it; a second one waits for its end.
       if (signInPending) return;
-      pendingLocalDeleteRef.current =
-        submission.kind === "delete" && submission.deleteRemote ? submission.name : null;
       let request: GitManagerOperationRequest;
       switch (submission.kind) {
         case "create":

@@ -5,7 +5,7 @@ import type {
 } from "@bibcode/contracts";
 import { useCallback, useEffect, useRef } from "react";
 
-import { SIGN_IN_REPEATED_MESSAGE } from "../gitSignIn/gitSignIn.logic";
+import { SIGN_IN_CANCELLED_MESSAGE, SIGN_IN_REPEATED_MESSAGE } from "../gitSignIn/gitSignIn.logic";
 import { type GitSignInFlow, useGitSignInFlow } from "../gitSignIn/useGitSignInFlow";
 
 type FailedEvent = Extract<GitManagerOperationEvent, { _tag: "failed" }>;
@@ -36,16 +36,39 @@ export function useGitManagerSignIn(
     handlersRef.current = handlers;
   });
   const resumingRef = useRef(false);
+  // Cancel and Not now end the offer here at once: a sign-in that still reports success after
+  // them (it raced the Cancel) resumes nothing.
+  const generationRef = useRef(0);
+  const { cancel: cancelFlow, decline: declineFlow } = flow;
+  const cancel = useCallback(() => {
+    generationRef.current += 1;
+    cancelFlow();
+  }, [cancelFlow]);
+  const decline = useCallback(() => {
+    generationRef.current += 1;
+    declineFlow();
+  }, [declineFlow]);
   const present = useCallback(
     (event: GitManagerOperationEvent): GitManagerOperationEvent => {
       if (event._tag !== "failed" || event.signIn === undefined) return event;
       const { signIn: offer, ...failure } = event;
       if (resumingRef.current) return { ...failure, message: SIGN_IN_REPEATED_MESSAGE };
+      generationRef.current += 1;
+      const generation = generationRef.current;
       offerSignIn({
         offer,
         cwd: offer.resume.cwd,
         projectId: offer.resume.projectId,
         onSignedIn: () => {
+          if (generation !== generationRef.current) {
+            handlersRef.current.onEnded({
+              ...failure,
+              code: "sign-in-cancelled",
+              message: SIGN_IN_CANCELLED_MESSAGE,
+              blocked: null,
+            });
+            return;
+          }
           resumingRef.current = true;
           void handlersRef.current.resume(offer.resume).finally(() => {
             resumingRef.current = false;
@@ -58,5 +81,5 @@ export function useGitManagerSignIn(
     },
     [offerSignIn],
   );
-  return { flow, present };
+  return { flow: { ...flow, cancel, decline }, present };
 }

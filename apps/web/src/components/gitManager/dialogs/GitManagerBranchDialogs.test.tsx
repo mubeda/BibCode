@@ -487,16 +487,69 @@ describe("GitManagerBranchDialogs", () => {
     );
   });
 
-  it("shows a Git error and a sign-in prompt inside the open dialog", async () => {
+  it("shows the Git error inside the open dialog", async () => {
     const error = "remote: error: protected branch hook declined";
-    await renderRemoteDelete([branch("origin/feature/a")], {
-      errorMessage: error,
-      signInPrompt: <p>Sign in to example.test?</p>,
-    });
+    await renderRemoteDelete([branch("origin/feature/a")], { errorMessage: error });
 
     expect(document.body.textContent).toContain(error);
-    expect(document.body.textContent).toContain("Sign in to example.test?");
-    expect(buttonWithText("Delete remote branch")).toBeDefined();
+  });
+
+  // Round 2 (Codex 9): the confirmation says the server checks the remote's default first.
+  it("says the server checks the remote's default branch before deleting", async () => {
+    await renderRemoteDelete([branch("origin/feature/a")]);
+
+    expect(document.body.textContent).toContain(
+      "Before deleting, BiBCode asks the remote for its default branch and refuses to delete it.",
+    );
+  });
+
+  // Round 2 (Antigravity 10, UI.md): during a sign-in each dialog shows the prompt alone, not
+  // the raw Git stderr and the disabled reason stacked with it; the submit stays disabled.
+  it.each([
+    ["delete-remote", "Delete remote branch"],
+    ["delete", "Delete branch"],
+    ["create", "Create and check out"],
+    ["rename", "Rename"],
+  ] as const)("shows only the sign-in prompt in the %s dialog", async (kind, action) => {
+    const stderr = "fatal: Cannot prompt because user interactivity has been disabled.";
+    const reason = "Finish or cancel the sign-in first.";
+    const dialog =
+      kind === "delete-remote"
+        ? {
+            kind,
+            branch: branch("origin/feature/a"),
+            remote: "origin",
+            remoteBranch: "feature/a",
+          }
+        : kind === "delete"
+          ? { kind, branch: branch("feature"), existsUpstream: true }
+          : kind === "create"
+            ? { kind, baseBranch: "main", baseCommit: null }
+            : { kind, branch: branch("feature") };
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={dialog}
+          disabledReason={reason}
+          errorMessage={`Sign in to continue.\n${stderr}`}
+          refs={[branch("main", { current: true })]}
+          remoteRefs={[branch("origin/feature/a")]}
+          signInPrompt={<p>Sign in to example.test?</p>}
+          onClose={() => undefined}
+          onSubmit={() => Promise.resolve()}
+        />,
+      ),
+    );
+
+    // The disabled button keeps its reason as a screen-reader description and a hover title.
+    const visible = document.body.cloneNode(true) as HTMLElement;
+    for (const hidden of visible.querySelectorAll(".sr-only")) hidden.remove();
+    const text = visible.textContent ?? "";
+    expect(text).toContain("Sign in to example.test?");
+    expect(text).not.toContain(stderr);
+    expect(text).not.toContain(reason);
+    expect(buttonWithText(action).disabled).toBe(true);
   });
 
   it("shows the server's rename reason and not an unrelated one", async () => {

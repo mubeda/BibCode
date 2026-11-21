@@ -97,6 +97,11 @@ interface SharedDialogProps {
   readonly busy: boolean;
   readonly errorMessage: string | null;
   readonly disabledReason: string | null;
+  /**
+   * A pending Git sign-in. While it shows, it replaces the dialog's error and its own disabled
+   * reason (UI.md: one message at a time); the submit stays disabled with that reason.
+   */
+  readonly signInPrompt: ReactNode;
   readonly onClose: () => void;
   readonly onSubmit: (submission: GitManagerBranchDialogSubmission) => Promise<void>;
 }
@@ -148,6 +153,7 @@ function CreateBranchDialog({
   busy,
   errorMessage,
   disabledReason: capabilityDisabledReason,
+  signInPrompt,
   onClose,
   onSubmit,
 }: SharedDialogProps & {
@@ -194,8 +200,9 @@ function CreateBranchDialog({
         ? `A branch named ${trimmedName} already exists.`
         : debouncedRulesMessage;
   const disabledReason = capabilityDisabledReason ?? validationMessage;
+  const shownReason = signInPrompt === null ? disabledReason : validationMessage;
   const disabledReasonId =
-    disabledReason === null ? undefined : "git-manager-create-branch-disabled-reason";
+    shownReason === null ? undefined : "git-manager-create-branch-disabled-reason";
   const submit = useCallback(() => {
     if (disabledReason !== null) return;
     void onSubmit({ kind: "create", name: trimmedName, startPoint: source.startPoint, checkout });
@@ -225,9 +232,9 @@ function CreateBranchDialog({
                 if (next.trim().length === 0) setDebouncedRulesMessage(null);
               }}
             />
-            {disabledReason === null ? null : (
+            {shownReason === null ? null : (
               <p className="text-xs text-muted-foreground" id={disabledReasonId}>
-                {disabledReason}
+                {shownReason}
               </p>
             )}
           </div>
@@ -292,7 +299,7 @@ function CreateBranchDialog({
                     : `You stay on ${currentBranch}.`}
             </p>
           </div>
-          <DialogError message={errorMessage} />
+          {signInPrompt === null ? <DialogError message={errorMessage} /> : signInPrompt}
         </div>
         <DialogFooter>
           <Button disabled={busy} variant="outline" onClick={onClose}>
@@ -319,6 +326,7 @@ function RenameBranchDialog({
   busy,
   errorMessage,
   disabledReason: capabilityDisabledReason,
+  signInPrompt,
   onClose,
   onSubmit,
 }: SharedDialogProps & { readonly branch: GitManagerRefEntry }) {
@@ -337,8 +345,10 @@ function RenameBranchDialog({
         ? `A branch named ${trimmedName} already exists.`
         : refRulesMessage(trimmedName);
   const disabledReason = capabilityDisabledReason ?? serverBlock?.message ?? localMessage;
+  const shownReason =
+    signInPrompt === null ? disabledReason : (serverBlock?.message ?? localMessage);
   const descriptionId =
-    disabledReason === null ? undefined : "git-manager-rename-branch-disabled-reason";
+    shownReason === null ? undefined : "git-manager-rename-branch-disabled-reason";
   const submit = useCallback(() => {
     if (disabledReason !== null) return;
     void onSubmit({ kind: "rename", name: branch.name, newName: trimmedName });
@@ -358,7 +368,7 @@ function RenameBranchDialog({
             value={name}
             onChange={(event) => setName(event.currentTarget.value)}
           />
-          {disabledReason === null ? null : (
+          {shownReason === null ? null : (
             <p
               className={
                 serverBlock === null && capabilityDisabledReason === null
@@ -367,10 +377,10 @@ function RenameBranchDialog({
               }
               id={descriptionId}
             >
-              {disabledReason}
+              {shownReason}
             </p>
           )}
-          <DialogError message={errorMessage} />
+          {signInPrompt === null ? <DialogError message={errorMessage} /> : signInPrompt}
         </div>
         <DialogFooter>
           <Button disabled={busy} variant="outline" onClick={onClose}>
@@ -404,13 +414,13 @@ function DeleteBranchDialog({
 }: Omit<SharedDialogProps, "refs"> & {
   readonly branch: GitManagerRefEntry;
   readonly existsUpstream: boolean;
-  readonly signInPrompt: ReactNode;
 }) {
   const [confirmed, setConfirmed] = useState(false);
   const [deleteRemote, setDeleteRemote] = useState(false);
   const serverBlock =
     branch.blocked.find((reason) => reason.operation === GUARD_DELETE_BRANCH) ?? null;
   const disabledReason = capabilityDisabledReason ?? serverBlock?.message ?? null;
+  const shownReason = signInPrompt === null ? disabledReason : (serverBlock?.message ?? null);
   const submit = useCallback(() => {
     if (!confirmed || disabledReason !== null) return;
     void onSubmit({ kind: "delete", name: branch.name, deleteRemote });
@@ -427,7 +437,7 @@ function DeleteBranchDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3 px-6 pb-4 text-sm">
-          {disabledReason === null ? null : <p className="text-destructive">{disabledReason}</p>}
+          {shownReason === null ? null : <p className="text-destructive">{shownReason}</p>}
           <label className="flex items-start gap-2">
             <input
               checked={confirmed}
@@ -450,8 +460,7 @@ function DeleteBranchDialog({
               <span>Also delete the branch from its remote.</span>
             </label>
           ) : null}
-          <DialogError message={errorMessage} />
-          {signInPrompt}
+          {signInPrompt === null ? <DialogError message={errorMessage} /> : signInPrompt}
         </div>
         <DialogFooter>
           <Button disabled={busy} variant="outline" onClick={onClose}>
@@ -487,16 +496,16 @@ function DeleteRemoteBranchDialog({
   readonly remote: string;
   readonly remoteBranch: string;
   readonly remoteRefs: ReadonlyArray<GitManagerRefEntry>;
-  readonly signInPrompt: ReactNode;
 }) {
   const [confirmed, setConfirmed] = useState(false);
   // Read the row from the newest snapshot: it may be gone, or have become the remote's default.
   const liveRow = remoteRefs.find((ref) => ref.name === branch.name);
-  const disabledReason =
-    capabilityDisabledReason ??
-    (liveRow === undefined
+  const rowReason =
+    liveRow === undefined
       ? "This remote branch no longer exists."
-      : remoteDeleteBlockedReason(liveRow, { remote, branch: remoteBranch }));
+      : remoteDeleteBlockedReason(liveRow, { remote, branch: remoteBranch });
+  const disabledReason = capabilityDisabledReason ?? rowReason;
+  const shownReason = signInPrompt === null ? disabledReason : rowReason;
   const submit = useCallback(() => {
     if (!confirmed || disabledReason !== null) return;
     void onSubmit({ kind: "delete-remote", remote, branch: remoteBranch });
@@ -510,11 +519,12 @@ function DeleteRemoteBranchDialog({
           <DialogDescription>
             Delete <span className="font-mono">{remoteBranch}</span> on remote{" "}
             <span className="font-mono">{remote}</span>. A local branch with the same name is kept.
-            The remote may refuse to delete a protected branch.
+            Before deleting, BiBCode asks the remote for its default branch and refuses to delete
+            it. The remote may refuse to delete a protected branch.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3 px-6 pb-4 text-sm">
-          {disabledReason === null ? null : <p className="text-destructive">{disabledReason}</p>}
+          {shownReason === null ? null : <p className="text-destructive">{shownReason}</p>}
           <label className="flex items-start gap-2">
             <input
               checked={confirmed}
@@ -525,8 +535,7 @@ function DeleteRemoteBranchDialog({
             />
             <span>I understand that deleting this branch cannot be undone.</span>
           </label>
-          <DialogError message={errorMessage} />
-          {signInPrompt}
+          {signInPrompt === null ? <DialogError message={errorMessage} /> : signInPrompt}
         </div>
         <DialogFooter>
           <Button disabled={busy} variant="outline" onClick={onClose}>
@@ -558,7 +567,7 @@ export const GitManagerBranchDialogs = memo(function GitManagerBranchDialogs({
   onSubmit,
 }: GitManagerBranchDialogsProps) {
   if (dialog === null) return null;
-  const shared = { refs, busy, disabledReason, errorMessage, onClose, onSubmit };
+  const shared = { refs, busy, disabledReason, errorMessage, signInPrompt, onClose, onSubmit };
   switch (dialog.kind) {
     case "create":
       return (
