@@ -70,3 +70,5 @@ Remaining per lane:
 - Lane E (3.9): the chat part (waits for 3.7 and 3.8), tests, the React and UI.md reviews, Codex review.
 - 3.10 (documentation): not started, no lane.
 - Coordinator: Codex and advisor review of every lane, then phase 4 as planned.
+- 2026-11-21 18:15 Run resumed at the owner's request. Lanes A, B, E, F and G continue on their branches; lane H wrote Task 3.10 (branch worktree-agent-a9cf9c75f12386a12, commit 10733a6df, not reviewed). Lane C merged into the integration branch (b0f5c684b; 44 logic tests pass).
+- 2026-11-21 18:25 Backlog checked again at the owner's request: 14 open issues, one new since the last triage, #410 (preview webview calls on macOS leak three native retains), a follow-up of #398 filed by lane A, which fixes it in this pull request. No duplicate found (searched open and closed issues for the function, "retain" and the runtime call). Lane E finished Task 3.9 (commits d44d89b1e, 0165ccd63, 057016ba1); Codex review running.
