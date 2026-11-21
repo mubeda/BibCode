@@ -857,11 +857,18 @@ async function recordTerminalChord(): Promise<void> {
     chord,
     events,
   });
-  // The page never runs its own undo for the terminal. On Windows and Linux the shell gets
-  // Ctrl+Z (xterm cancels the keydown it sends); on macOS Cmd+Z never reaches the page.
-  expect(chord.exec).toBe(0);
-  if (platform === "mac") expect(reached).toBe(false);
-  else expect({ reached, cancelled: chord.cancelled }).toEqual({ reached: true, cancelled: true });
+  // On Windows and Linux the shell gets Ctrl+Z (xterm cancels the keydown it sends) and the page
+  // runs no undo. On macOS Cmd+Z never reaches the page; the Edit menu takes it and, the terminal
+  // being no Files editor, runs the native undo once, as the predefined item did.
+  if (platform === "mac")
+    expect({ reached, exec: chord.exec }).toEqual({ reached: false, exec: 1 });
+  else {
+    expect({ reached, cancelled: chord.cancelled, exec: chord.exec }).toEqual({
+      reached: true,
+      cancelled: true,
+      exec: 0,
+    });
+  }
 }
 
 describe("packaged Files undo and redo (#398)", () => {
