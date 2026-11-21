@@ -944,8 +944,12 @@ async function nativeClickAtPagePoint(point: { x: number; y: number }): Promise<
   );
   const x = Math.round(screen.x);
   const y = Math.round(screen.y);
-  if (platform === "mac") macSystemEvents([`click at {${x}, ${y}}`]);
-  else if (platform === "win") {
+  if (platform === "mac") {
+    // System Events clicks at a screen point only inside an application process.
+    macSystemEvents([
+      `tell (first application process whose bundle identifier is "${bundleIdentifier}") to click at {${x}, ${y}}`,
+    ]);
+  } else if (platform === "win") {
     powershell(
       [
         'Add-Type -Namespace LabWin -Name Mouse -MemberDefinition \'[DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y); [DllImport("user32.dll")] public static extern void mouse_event(int f, int x, int y, int d, int e);\'',
