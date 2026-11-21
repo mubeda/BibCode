@@ -798,7 +798,11 @@ describe("Antigravity Terminal (R12)", () => {
     };
   }
 
-  function launch(settings: ServerSettings, instanceId = "antigravity", displayName = "Antigravity") {
+  function launch(
+    settings: ServerSettings,
+    instanceId = "antigravity",
+    displayName = "Antigravity",
+  ) {
     return resolveProviderTerminalAction(
       entry("antigravity", instanceId, displayName, catalog),
       settings,
@@ -896,7 +900,9 @@ describe("Antigravity Terminal (R12)", () => {
   });
 
   it("disables the action when the saved model exceeds command bounds", () => {
-    const action = launch(withDefault({ model: "x".repeat(TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH + 1) }));
+    const action = launch(
+      withDefault({ model: "x".repeat(TERMINAL_LAUNCH_ARGUMENT_MAX_LENGTH + 1) }),
+    );
 
     expect(action).toMatchObject({
       command: null,

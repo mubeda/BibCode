@@ -1711,7 +1711,10 @@ describe("ProviderSettingsPanel", () => {
     expect(typeof defaultCard.onSessionDefaultsChange).toBe("function");
     expect(customCard).not.toHaveProperty("onSessionDefaultsChange");
     expect(typeof customCard.onDelete).toBe("function");
-    expect(customCard.instance).toMatchObject({ enabled: true, config: { binaryPath: "custom-agy" } });
+    expect(customCard.instance).toMatchObject({
+      enabled: true,
+      config: { binaryPath: "custom-agy" },
+    });
   });
 
   it("writes enabled explicitly when the default Antigravity card is switched on", () => {
