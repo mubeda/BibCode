@@ -184,3 +184,55 @@ Steps
 1. [ ] Write `docs/providers/antigravity.md`: what is supported (AI Terminal, and chat as Preview over ACP), install check `agy --version` and the 1.5.4 minimum for chat, sign-in (`agy`, or `agy acp --login` without a browser), the first-run prompts, the launch commands and what `--dangerously-skip-permissions` means, the chat modes and approvals, the binary path setting, how a model and thinking-level default reaches the terminal and the chat, known limits, the PATH clash between the `agy` CLI and an IDE launcher of the same name, and Google's stated position on third-party hosts for consumer plans with a link to its terms. Versions and command names only; no account, host or local path. Expected: the guide exists with each of those sections.
 2. [ ] Name Antigravity in `README.md` (the intro sentence and the provider setup list, marked Preview), `docs/README.md`, `docs/providers/README.md`, `docs/getting-started/provider-setup.md`, `docs/architecture/providers.md` and `docs/reference/encyclopedia.md`, wherever each lists the providers. Expected: `rg -n "OpenCode" README.md docs/README.md docs/getting-started docs/architecture/providers.md docs/reference/encyclopedia.md` shows no provider list that lacks Antigravity.
 3. [ ] Run `vp run check:markdown-links` and `vp check`. Expected: exit 0 for both.
+
+### Task 3.11: Write and review the Antigravity usage design note
+
+- Satisfies: R18
+- Depends on: 3.2
+- Files: create `docs/plans/2026-11-21-antigravity-usage-design.md`
+- Interfaces: produces the decisions Task 3.12 implements: the wire shape for a provider with several quota groups, the status bar item, the fetch command and its guards
+- Skills: none
+- Read first: `packages/contracts/src/providerUsage.ts`; `apps/server/src/provider_usage/mod.rs`; `apps/server/src/production/server_terminal.rs` (the provider usage RPCs); `apps/web/src/components/status-bar/` (AppStatusBar, ProviderUsageControl, ProviderUsageDetail, providerUsagePresentation)
+- Tier: standard
+- TDD: exempt (a design document has no behavior to test)
+- Done when: `vp test run scripts/no-sensitive-data.test.ts scripts/bibcode-identity.test.ts` exits 0 and the note has passed a Codex and an advisor review
+
+Rules for this task
+
+- Measured on CLI 1.5.14 (2026-11-21): `agy -p "/usage" --output-format json` exits 0 with `num_turns` 0, zero tokens, and `command.name` `usage`; `command.data.groups[]` each have `name` and `buckets[]` with `id` (`gemini-weekly`, `gemini-5h`, `3p-weekly`, `3p-5h`), `window` (`weekly`, `5h`), `remaining_fraction` and `reset_time`. `/credits` returns `command.data.remaining_credits`. With an API key sign-in these commands exit with code 2, which means "no account quota", not an error (CLI changelog).
+- A result counts only when `command.name` is `usage` and `num_turns` is 0. An older CLI could treat the text as a prompt and spend quota on every poll: the note names the minimum CLI version from the changelog and what the fetcher does below it (no fetch).
+- The CLI reports two groups with two windows each; the current snapshot has one session and one weekly slot. The note weighs extending the contract against showing one group, and says what the status bar item and its detail show. The plan name is never stored or logged.
+- The child process is spawned through the supervised process path, with a timeout, and never with the skip-permissions flag.
+
+Steps
+
+1. [ ] Read how the two existing providers are fetched and rendered, and write the note with alternatives and one recommendation each.
+2. [ ] Run the guard tests. Hand the note to the executor for the Codex and advisor review, and revise it from the findings.
+
+### Task 3.12: Show Antigravity usage in the status bar and close the provider-list gaps
+
+- Satisfies: R18
+- Depends on: 3.11
+- Files: modify `packages/contracts/src/providerUsage.ts`, `packages/contracts/src/settings.ts` (the status bar item list), `apps/server/src/provider_usage/mod.rs` (or a sibling module), `apps/server/src/production/server_terminal.rs`, `apps/web/src/components/status-bar/**`, `apps/web/src/components/settings/StatusBarSettingsSection.tsx`, `apps/web/src/components/sendToAgent/outOfTokens.logic.ts`, `apps/web/src/components/settings/ProviderModelsSection.tsx`, `apps/web/src/components/activity/activityPresentation.ts`, each with its test
+- Interfaces: consumes the decisions of Task 3.11; produces the Antigravity usage snapshot on the existing provider usage RPCs
+- Skills: vercel-react-best-practices and `UI.md` review for the changed components
+- Read first: the reviewed design note
+- Tier: standard
+- TDD: red-green
+- Done when: `cargo test -p bibcode-server provider_usage` exits 0 and `cd apps/web && node ../../scripts/run-local-vp.mjs test run --project unit src/components/status-bar src/components/settings src/components/sendToAgent src/components/activity` exits 0
+
+Rules for this task
+
+- Fixtures are anonymized; no account plan name, no local paths.
+- Every two-way "Claude or Codex" branch in the status bar becomes a lookup that fails closed for an unknown provider, so a third provider can never render as Codex.
+- Antigravity gets its custom-model placeholder, its activity label and the out-of-tokens hint.
+- Register the provider usage fetch as long-running if its RPC waits on the CLI (`diagnostics/profiler/latency.rs`), and state the profiler coverage line in the task report.
+
+Steps
+
+1. [ ] Write failing tests: the parser accepts the measured shape, rejects a result whose command name is not `usage` or whose turn count is not 0, and maps exit code 2 to "no account quota"; the status bar shows an Antigravity item with its windows and reset times; an unknown provider does not render as Codex.
+2. [ ] Run the Done when commands. Expected: FAIL, because Antigravity is not a usage provider.
+3. [ ] Implement the fetcher, the wire mapping, the status bar item, its settings toggle and the three small list gaps.
+4. [ ] Run the Done when commands. Expected: PASS.
+5. [ ] Prove the tests can fail: make the parser accept any command name, run the Done when commands. Expected: FAIL. Restore and run again. Expected: PASS.
+6. [ ] Run `cargo fmt --all --check`, Clippy with warnings denied for the server, `vp check` and `vp run typecheck`. Expected: no errors. Compare the status bar values with a live `agy -p "/usage"` run and record the comparison.

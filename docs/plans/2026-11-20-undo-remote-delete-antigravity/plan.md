@@ -1,7 +1,7 @@
 # Files undo shortcuts, remote branch delete, Antigravity terminal
 
 Status: Approved 2026-11-20 (owner's standing rule: reviewed by Codex and the advisor. Codex's last verdict was "Needs rework"; all its findings were applied and the round 2 fixes were not reviewed again. The phase 3 revision for the chat got plan review 3, also "Needs rework", and an advisor review; their findings are in the task rules and were not reviewed again)
-Spec: spec.md (Status line: Approved 2026-11-20, sha256 3f5d29373cba)
+Spec: spec.md (Status line: Approved 2026-11-20, sha256 7fd875f43f88)
 Repository: this repository
 Base: main
 
@@ -60,13 +60,14 @@ Base: main
 
 ## Phases
 
-| Phase | File                                         | Goal                                                             | Round | Depends on | Tier         |
-| ----- | -------------------------------------------- | ---------------------------------------------------------------- | ----- | ---------- | ------------ |
-| 1     | phases/PHASE-01-files-undo-shortcuts.md      | Undo and redo chords and the Edit menu drive the Files history   | 1     | none       | most capable |
-| 2     | phases/PHASE-02-git-manager-remote-delete.md | Remote branch delete in Git Manager, with guard names that agree | 1     | none       | most capable |
-| 3     | phases/PHASE-03-antigravity-terminal.md      | Antigravity instance and terminal, terminal-only                 | 1     | none       | most capable |
-| 4     | phases/PHASE-04-integration.md               | Review, follow-up fixes, gates on the final commit, pull request | 2     | 1, 2, 3, 5 | standard     |
-| 5     | phases/PHASE-05-view-pr-panel.md             | View PR opens the PR/MR panel                                    | 1     | none       | standard     |
+| Phase | File                                         | Goal                                                             | Round | Depends on    | Tier         |
+| ----- | -------------------------------------------- | ---------------------------------------------------------------- | ----- | ------------- | ------------ |
+| 1     | phases/PHASE-01-files-undo-shortcuts.md      | Undo and redo chords and the Edit menu drive the Files history   | 1     | none          | most capable |
+| 2     | phases/PHASE-02-git-manager-remote-delete.md | Remote branch delete in Git Manager, with guard names that agree | 1     | none          | most capable |
+| 3     | phases/PHASE-03-antigravity-terminal.md      | Antigravity instance and terminal, terminal-only                 | 1     | none          | most capable |
+| 4     | phases/PHASE-04-integration.md               | Review, follow-up fixes, gates on the final commit, pull request | 2     | 1, 2, 3, 5, 6 | standard     |
+| 5     | phases/PHASE-05-view-pr-panel.md             | View PR opens the PR/MR panel                                    | 1     | none          | standard     |
+| 6     | phases/PHASE-06-linux-software-rendering.md  | Linux setting to run without GPU compositing                     | 1     | none          | most capable |
 
 Phases in the same round run in parallel. A phase depends only on phases in earlier rounds.
 
@@ -129,6 +130,8 @@ Parallel conflicts: none between round 1 phases, which own disjoint files: phase
 | R14         | 3.2, 3.10, 4.1     |
 | R15         | 2.1, 4.1, 4.2      |
 | R16         | 5.1                |
+| R17         | 6.1, 6.2           |
+| R18         | 3.11, 3.12, 4.2    |
 
 ## End-to-end verification
 
