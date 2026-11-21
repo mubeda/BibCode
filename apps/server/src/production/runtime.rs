@@ -479,7 +479,9 @@ impl ProductionRuntime {
                 .with_relay_hosts(relay_hosts.clone());
         let provider_settings = ProviderSettingsStore::new(&state_paths.state_dir);
         let provider_terminal_preparer = ProviderTerminalActivitySupervisor::new_with_authority(
-            Arc::new(ProviderSettingsInventoryAuthority::new(provider_settings)),
+            Arc::new(ProviderSettingsInventoryAuthority::new(
+                provider_settings.clone(),
+            )),
             terminal_activity_controller.clone(),
             activity_projections.terminal(),
             process_attribution.clone(),
@@ -686,8 +688,10 @@ impl ProductionRuntime {
                 started_at_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
             },
         ));
-        let provider_usage =
-            ProviderUsageService::new(production_fetchers(), Arc::new(OffsetDateTime::now_utc));
+        let provider_usage = ProviderUsageService::new(
+            production_fetchers(provider_settings.clone(), Some(process_attribution.clone())),
+            Arc::new(OffsetDateTime::now_utc),
+        );
         let relay = relay_client_service(config.state_dir());
         let agent_activity = Arc::new(ProductionAgentActivity::new(
             activity_projections.clone(),

@@ -285,6 +285,7 @@ function usageFixture(now: DateTime.Utc, usedPercent = 25): ServerProviderUsageR
         },
         weekly: null,
         fableWeekly: null,
+        windowGroups: [],
         planType: "plus",
         rateLimitResetCredits: {
           availableCount: 2,

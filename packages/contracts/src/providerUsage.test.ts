@@ -6,6 +6,7 @@ import {
   CodexRateLimitResetOutcome,
   ConsumeCodexRateLimitResetInput,
   ConsumeCodexRateLimitResetResult,
+  ServerProviderUsageReadInput,
   ServerProviderUsageResetCredits,
   ServerProviderUsageRefreshInput,
   ServerProviderUsageResult,
@@ -25,6 +26,8 @@ function decodes<S extends Schema.Top>(schema: S, input: unknown): boolean {
     return false;
   }
 }
+
+const decodeSnapshot = Schema.decodeUnknownSync(ServerProviderUsageSnapshot);
 
 describe("provider usage contracts", () => {
   it("preserves an explicit forced provider usage refresh request", () => {
@@ -208,6 +211,34 @@ describe("provider usage contracts", () => {
           providers: [],
         },
       }),
+    ).toBe(true);
+  });
+
+  it("decodes a snapshot without window groups to an empty list, and one with groups", () => {
+    const window = { usedPercent: 3, windowMinutes: 300, resetsAt: null, resetDescription: null };
+    const base = {
+      provider: "antigravity",
+      status: "ok",
+      session: null,
+      weekly: null,
+      updatedAt: DateTime.makeUnsafe("2026-11-21T18:00:00.000Z"),
+      error: null,
+      metadata: {},
+    };
+    expect(decodeSnapshot(base).windowGroups).toEqual([]);
+    const grouped = decodeSnapshot({
+      ...base,
+      windowGroups: [{ id: "gemini", label: "Gemini models", session: window, weekly: null }],
+    });
+    expect(grouped.windowGroups[0]?.session?.usedPercent).toBe(3);
+  });
+
+  it("reads and refreshes name providers, antigravity included, and nothing else", () => {
+    expect(decodes(ServerProviderUsageReadInput, {})).toBe(true);
+    expect(decodes(ServerProviderUsageReadInput, { providers: ["antigravity"] })).toBe(true);
+    expect(decodes(ServerProviderUsageReadInput, { providers: ["mystery"] })).toBe(false);
+    expect(
+      decodes(ServerProviderUsageRefreshInput, { providers: ["antigravity"], force: true }),
     ).toBe(true);
   });
 });

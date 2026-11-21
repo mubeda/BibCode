@@ -1,22 +1,29 @@
 import type { StatusBarUsageMode } from "@bibcode/contracts/settings";
 import { useState } from "react";
 
-import { ClaudeAI, OpenAI } from "../Icons";
+import { ClaudeAI, Gemini, OpenAI } from "../Icons";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { ProviderUsageDetail, type ProviderUsageDetailProps } from "./ProviderUsageDetail";
 import { ProviderUsageWindowMeter } from "./ProviderUsageWindowMeter";
-import type { ProviderUsageViewModel } from "./providerUsagePresentation";
-
-function providerLabel(provider: ProviderUsageViewModel["provider"]): string {
-  return provider === "claude" ? "Claude" : "Codex";
-}
+import { providerUsageLabel, type ProviderUsageViewModel } from "./providerUsagePresentation";
 
 function ProviderIcon({ provider }: { readonly provider: ProviderUsageViewModel["provider"] }) {
-  return provider === "claude" ? (
-    <ClaudeAI aria-hidden className="size-3 shrink-0" data-provider-icon="claude" />
-  ) : (
-    <OpenAI aria-hidden className="size-3 shrink-0 text-foreground" data-provider-icon="codex" />
-  );
+  switch (provider) {
+    case "claude":
+      return <ClaudeAI aria-hidden className="size-3 shrink-0" data-provider-icon="claude" />;
+    case "codex":
+      return (
+        <OpenAI
+          aria-hidden
+          className="size-3 shrink-0 text-foreground"
+          data-provider-icon="codex"
+        />
+      );
+    case "antigravity":
+      return <Gemini aria-hidden className="size-3 shrink-0" data-provider-icon="antigravity" />;
+    default:
+      return null;
+  }
 }
 
 function ProviderUsageBadge({ viewModel }: { readonly viewModel: ProviderUsageViewModel }) {
@@ -75,7 +82,9 @@ export function ProviderUsageControl({
   onConsumeCodexRateLimitReset,
 }: ProviderUsageControlProps) {
   const [open, setOpen] = useState(false);
-  const label = `${providerLabel(viewModel.provider)} usage`;
+  const providerName = providerUsageLabel(viewModel.provider);
+  if (providerName === null) return null;
+  const label = `${providerName} usage`;
   const handleOpenProviderSettings = () => {
     setOpen(false);
     onOpenProviderSettings();

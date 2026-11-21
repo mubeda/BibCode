@@ -31,7 +31,7 @@ use crate::{
     provider_usage::{
         CodexRateLimitResetOutcome, ConsumeCodexRateLimitResetResult, ProviderUsageCommandError,
         ProviderUsageProvider, ProviderUsageResult, ProviderUsageService, ProviderUsageSnapshot,
-        ProviderUsageStatus, ProviderUsageWindow, RateLimitResetCredits,
+        ProviderUsageStatus, ProviderUsageWindow, ProviderUsageWindowGroup, RateLimitResetCredits,
     },
     rpc::{RpcRegistry, RpcResult, RpcStreamChunk},
     terminal::{
@@ -760,9 +760,15 @@ fn register_diagnostics_rpcs(registry: &mut RpcRegistry, services: &ServerTermin
 
 fn register_provider_usage_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
     let usage = services.provider_usage.clone();
-    registry.register_unary("server.getProviderUsage", move |_request, _cancellation| {
+    registry.register_unary("server.getProviderUsage", move |request, _cancellation| {
         let usage = usage.clone();
-        async move { Ok(provider_usage_to_wire(usage.read().await)) }
+        async move {
+            let input: ReadProviderUsageInput = decode_payload(&request.payload)?;
+            let providers = parse_usage_providers(input.providers)?;
+            Ok(provider_usage_to_wire(
+                usage.read_selected(providers.as_deref()).await,
+            ))
+        }
     });
 
     let usage = services.provider_usage.clone();
@@ -772,19 +778,7 @@ fn register_provider_usage_rpcs(registry: &mut RpcRegistry, services: &ServerTer
             let usage = usage.clone();
             async move {
                 let input: RefreshProviderUsageInput = decode_payload(&request.payload)?;
-                let providers = input
-                    .providers
-                    .map(|providers| {
-                        providers
-                            .into_iter()
-                            .map(|provider| match provider.as_str() {
-                                "claude" => Ok(ProviderUsageProvider::Claude),
-                                "codex" => Ok(ProviderUsageProvider::Codex),
-                                _ => Err(invalid_request("provider must be claude or codex")),
-                            })
-                            .collect::<Result<Vec<_>, Value>>()
-                    })
-                    .transpose()?;
+                let providers = parse_usage_providers(input.providers)?;
                 let refreshed = if input.force {
                     usage.refresh_forced(providers).await
                 } else {
@@ -1796,6 +1790,32 @@ struct SignalProcessInput {
     signal: String,
 }
 #[derive(Deserialize)]
+struct ReadProviderUsageInput {
+    providers: Option<Vec<String>>,
+}
+
+/// Antigravity is accepted and answered only when a request names it.
+fn parse_usage_providers(
+    providers: Option<Vec<String>>,
+) -> Result<Option<Vec<ProviderUsageProvider>>, Value> {
+    providers
+        .map(|providers| {
+            providers
+                .into_iter()
+                .map(|provider| match provider.as_str() {
+                    "claude" => Ok(ProviderUsageProvider::Claude),
+                    "codex" => Ok(ProviderUsageProvider::Codex),
+                    "antigravity" => Ok(ProviderUsageProvider::Antigravity),
+                    _ => Err(invalid_request(
+                        "provider must be claude, codex or antigravity",
+                    )),
+                })
+                .collect::<Result<Vec<_>, Value>>()
+        })
+        .transpose()
+}
+
+#[derive(Deserialize)]
 struct RefreshProviderUsageInput {
     providers: Option<Vec<String>>,
     #[serde(default)]
@@ -1846,7 +1866,11 @@ fn provider_usage_to_wire(result: ProviderUsageResult) -> Value {
 
 fn provider_usage_snapshot_to_wire(snapshot: ProviderUsageSnapshot) -> Value {
     json!({
-        "provider": match snapshot.provider { ProviderUsageProvider::Claude => "claude", ProviderUsageProvider::Codex => "codex" },
+        "provider": match snapshot.provider {
+            ProviderUsageProvider::Claude => "claude",
+            ProviderUsageProvider::Codex => "codex",
+            ProviderUsageProvider::Antigravity => "antigravity",
+        },
         "status": match snapshot.status {
             ProviderUsageStatus::Idle => "idle", ProviderUsageStatus::Fetching => "fetching",
             ProviderUsageStatus::Ok => "ok", ProviderUsageStatus::Error => "error",
@@ -1855,6 +1879,7 @@ fn provider_usage_snapshot_to_wire(snapshot: ProviderUsageSnapshot) -> Value {
         "session": snapshot.session.map(provider_usage_window_to_wire),
         "weekly": snapshot.weekly.map(provider_usage_window_to_wire),
         "fableWeekly": snapshot.fable_weekly.map(provider_usage_window_to_wire),
+        "windowGroups": snapshot.window_groups.into_iter().map(provider_usage_group_to_wire).collect::<Vec<_>>(),
         "planType": snapshot.plan_type,
         "rateLimitResetCredits": snapshot.rate_limit_reset_credits.map(rate_limit_reset_credits_to_wire),
         "updatedAt": format_time(snapshot.updated_at),
@@ -1887,6 +1912,15 @@ fn provider_usage_reset_error_to_wire(error: ProviderUsageCommandError) -> Value
     json!({
         "_tag": "ServerProviderUsageResetError",
         "message": error.message,
+    })
+}
+
+fn provider_usage_group_to_wire(group: ProviderUsageWindowGroup) -> Value {
+    json!({
+        "id": group.id,
+        "label": group.label,
+        "session": group.session.map(provider_usage_window_to_wire),
+        "weekly": group.weekly.map(provider_usage_window_to_wire),
     })
 }
 
@@ -3159,6 +3193,36 @@ mod tests {
     }
 
     #[test]
+    fn usage_provider_lists_name_antigravity_only_when_asked() {
+        assert_eq!(parse_usage_providers(None).unwrap(), None);
+        assert_eq!(
+            parse_usage_providers(Some(vec!["antigravity".to_owned()])).unwrap(),
+            Some(vec![ProviderUsageProvider::Antigravity])
+        );
+        assert!(parse_usage_providers(Some(vec!["mystery".to_owned()])).is_err());
+        let wire = provider_usage_snapshot_to_wire(ProviderUsageSnapshot {
+            provider: ProviderUsageProvider::Antigravity,
+            status: ProviderUsageStatus::Ok,
+            session: None,
+            weekly: None,
+            fable_weekly: None,
+            window_groups: vec![ProviderUsageWindowGroup {
+                id: "gemini",
+                label: "Gemini models",
+                session: None,
+                weekly: None,
+            }],
+            plan_type: None,
+            rate_limit_reset_credits: None,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            error: None,
+            metadata: BTreeMap::new(),
+        });
+        assert_eq!(wire["provider"], "antigravity");
+        assert_eq!(wire["windowGroups"][0]["id"], "gemini");
+    }
+
+    #[test]
     fn terminal_resize_claim_decoding_accepts_legacy_and_bounds_new_claims() {
         assert!(validate_terminal_size_claim(None).unwrap().is_none());
         assert_eq!(
@@ -3724,6 +3788,7 @@ mod tests {
                     }),
                     weekly: None,
                     fable_weekly: None,
+                    window_groups: Vec::new(),
                     plan_type: None,
                     rate_limit_reset_credits: None,
                     updated_at: now,
@@ -3736,6 +3801,7 @@ mod tests {
                     session: None,
                     weekly: None,
                     fable_weekly: None,
+                    window_groups: Vec::new(),
                     plan_type: None,
                     rate_limit_reset_credits: None,
                     updated_at: now,
@@ -3892,6 +3958,7 @@ mod tests {
                     session: None,
                     weekly: None,
                     fable_weekly: None,
+                    window_groups: Vec::new(),
                     plan_type: None,
                     rate_limit_reset_credits: None,
                     updated_at: now,
@@ -3909,6 +3976,7 @@ mod tests {
                         resets_at: None,
                         reset_description: None,
                     }),
+                    window_groups: Vec::new(),
                     plan_type: Some("pro".to_owned()),
                     rate_limit_reset_credits: Some(RateLimitResetCredits {
                         available_count: 2,

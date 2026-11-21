@@ -1016,6 +1016,7 @@ async fn provider_usage_refresh_rpc_forces_a_fetch_only_when_requested() {
                             session: None,
                             weekly: None,
                             fable_weekly: None,
+                            window_groups: Vec::new(),
                             plan_type: None,
                             rate_limit_reset_credits: None,
                             updated_at: now,

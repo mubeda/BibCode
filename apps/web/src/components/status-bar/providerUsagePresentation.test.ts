@@ -2,7 +2,10 @@ import type { ServerProviderUsageSnapshot } from "@bibcode/contracts";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildProviderUsageViewModel } from "./providerUsagePresentation";
+import {
+  buildProviderUsageViewModel,
+  providerUsageRelativeLabelKey,
+} from "./providerUsagePresentation";
 
 const now = DateTime.makeUnsafe("2026-07-07T18:00:00.000Z");
 const updatedAt = DateTime.makeUnsafe("2026-07-07T17:59:00.000Z");
@@ -31,6 +34,7 @@ function providerSnapshot(
       resetsAt: null,
       resetDescription: null,
     },
+    windowGroups: [],
     planType: null,
     rateLimitResetCredits: null,
     updatedAt,
@@ -131,5 +135,58 @@ describe("providerUsagePresentation", () => {
     expect(vm.plan?.label).toBe("Chatgpt Plus");
     expect(vm.plan?.value).toBe("  chatgpt plus  ");
     expect(snapshot.planType).toBe("  chatgpt plus  ");
+  });
+});
+
+describe("window groups", () => {
+  const groupWindow = (usedPercent: number, minutes: number, resetsAt: string | null) => ({
+    usedPercent,
+    windowMinutes: minutes,
+    resetsAt: resetsAt === null ? null : DateTime.makeUnsafe(resetsAt),
+    resetDescription: null,
+  });
+  const antigravity = providerSnapshot({
+    provider: "antigravity",
+    session: null,
+    weekly: null,
+    fableWeekly: null,
+    windowGroups: [
+      {
+        id: "gemini",
+        label: "Gemini models",
+        session: groupWindow(3, 300, "2026-07-07T18:05:00.000Z"),
+        weekly: groupWindow(1, 10080, null),
+      },
+      {
+        id: "third-party",
+        label: "Claude and GPT models",
+        session: groupWindow(90, 300, null),
+        weekly: null,
+      },
+    ],
+  });
+
+  it("flattens every group window and compacts to the tightest one", () => {
+    const vm = buildProviderUsageViewModel(antigravity, { now });
+    expect(vm.windows.map((window) => window.label)).toEqual([
+      "Gemini session",
+      "Gemini weekly",
+      "Claude/GPT session",
+    ]);
+    expect(vm.windows.map((window) => window.key)).toEqual([
+      "gemini-session",
+      "gemini-weekly",
+      "third-party-session",
+    ]);
+    expect(vm.compactWindows.map((window) => window.label)).toEqual(["Claude/GPT session"]);
+  });
+
+  it("keys the countdown cache on group windows, so an expired reset changes the key", () => {
+    const before = providerUsageRelativeLabelKey([antigravity], now);
+    const after = providerUsageRelativeLabelKey(
+      [antigravity],
+      DateTime.makeUnsafe("2026-07-07T18:30:00.000Z"),
+    );
+    expect(before).not.toBe(after);
   });
 });

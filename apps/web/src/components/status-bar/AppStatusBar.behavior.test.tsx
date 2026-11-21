@@ -84,7 +84,10 @@ vi.mock("../../state/query", () => ({
   useEnvironmentQuery: (input: unknown) => {
     const index = harness.queryInputs.length;
     harness.queryInputs.push(input);
-    return harness.queries[index];
+    // The Antigravity read comes last and is off in these tests.
+    return (
+      harness.queries[index] ?? { data: null, error: null, refresh: vi.fn(), revalidate: vi.fn() }
+    );
   },
 }));
 vi.mock("../../state/server", () => ({
@@ -145,6 +148,8 @@ vi.mock("./providerUsagePresentation", () => ({
     return providers;
   },
   providerUsageRelativeLabelKey: () => "stable-label-bucket",
+  antigravityPlaceholderViewModel: () => ({ provider: "antigravity", windows: [] }),
+  providerUsageLabel: (provider: string) => provider,
 }));
 
 import {
@@ -383,7 +388,7 @@ describe("AppStatusBar", () => {
     const resourceCleanup = vi.fn();
     harness.refSeeds = { 3: usageCleanup, 4: "old", 5: resourceCleanup, 6: "old" };
     renderStatusBar();
-    expect(harness.queryInputs).toEqual([null, null, null]);
+    expect(harness.queryInputs).toEqual([null, null, null, null]);
     expect(harness.terminalInput).toEqual({ environmentId: null, threadId: null });
     harness.effects[0]?.();
     harness.effects[1]?.();
@@ -413,7 +418,7 @@ describe("AppStatusBar", () => {
     harness.queries = [query(null), query(), query()];
     harness.refSeeds = { 4: environmentId, 6: environmentId };
     renderStatusBar();
-    expect(harness.queryInputs).toHaveLength(3);
+    expect(harness.queryInputs).toHaveLength(4);
     expect(harness.primaryLocalSelectionInput).toBe(environmentId);
     expect(harness.providerUsage).toHaveBeenCalledWith({ environmentId, input: {} });
     expect(harness.diagnostics).toHaveBeenNthCalledWith(1, { environmentId, input: {} });

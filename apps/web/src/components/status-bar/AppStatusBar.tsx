@@ -1,5 +1,9 @@
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
-import type { EnvironmentId, ServerProviderUsageResult } from "@bibcode/contracts";
+import type {
+  EnvironmentId,
+  ServerProviderUsageProvider,
+  ServerProviderUsageResult,
+} from "@bibcode/contracts";
 import type {
   ClientSettings,
   StatusBarUsageMode,
@@ -38,8 +42,10 @@ import {
   type ResourceDiagnosticsQueryState,
 } from "./statusBarPresentation";
 import {
+  antigravityPlaceholderViewModel,
   buildProviderUsageViewModels,
   providerUsageRelativeLabelKey,
+  type AntigravityPlaceholder,
   type ProviderUsageViewModel,
 } from "./providerUsagePresentation";
 
@@ -64,6 +70,8 @@ interface ProviderUsagePresentation {
   readonly percentageDisplay: UsagePercentageDisplay;
   readonly showClaudeUsage: boolean;
   readonly showCodexUsage: boolean;
+  readonly showAntigravityUsage: boolean;
+  readonly antigravityPlaceholder: AntigravityPlaceholder | null;
   readonly relativeLabelKey: string;
   readonly providers: ReadonlyArray<ProviderUsageViewModel>;
 }
@@ -71,6 +79,7 @@ interface ProviderUsagePresentation {
 interface StatusBarClientSettings {
   readonly showClaudeUsage: boolean;
   readonly showCodexUsage: boolean;
+  readonly showAntigravityUsage: boolean;
   readonly showResourceUsage: boolean;
   readonly statusBarUsageMode: StatusBarUsageMode;
   readonly usagePercentageDisplay: UsagePercentageDisplay;
@@ -84,6 +93,7 @@ const providerUsageResetCacheAtom = Atom.family((_environmentId: EnvironmentId) 
 const selectStatusBarClientSettings = (settings: ClientSettings): StatusBarClientSettings => ({
   showClaudeUsage: settings.statusBarItems.includes("claude"),
   showCodexUsage: settings.statusBarItems.includes("codex"),
+  showAntigravityUsage: settings.showAntigravityUsage,
   showResourceUsage: settings.statusBarItems.includes("resource-usage"),
   statusBarUsageMode: settings.statusBarUsageMode,
   usagePercentageDisplay: settings.usagePercentageDisplay,
@@ -94,6 +104,7 @@ const equalStatusBarClientSettings = (
 ): boolean =>
   previous.showClaudeUsage === next.showClaudeUsage &&
   previous.showCodexUsage === next.showCodexUsage &&
+  previous.showAntigravityUsage === next.showAntigravityUsage &&
   previous.showResourceUsage === next.showResourceUsage &&
   previous.statusBarUsageMode === next.statusBarUsageMode &&
   previous.usagePercentageDisplay === next.usagePercentageDisplay;
@@ -123,10 +134,19 @@ function buildProviderUsagePresentation(
   const byProvider = new Map(derived.map((provider) => [provider.provider, provider]));
   return {
     ...input,
-    providers: (["claude", "codex"] as const).flatMap((provider) => {
+    providers: (["claude", "codex", "antigravity"] as const).flatMap((provider) => {
+      const visible = {
+        claude: input.showClaudeUsage,
+        codex: input.showCodexUsage,
+        antigravity: input.showAntigravityUsage,
+      }[provider];
+      if (!visible) return [];
       const viewModel = byProvider.get(provider);
-      const visible = provider === "claude" ? input.showClaudeUsage : input.showCodexUsage;
-      return visible && viewModel !== undefined ? [viewModel] : [];
+      if (viewModel !== undefined) return [viewModel];
+      // Antigravity renders before its first answer, and on a server that cannot serve it.
+      return provider === "antigravity" && input.antigravityPlaceholder !== null
+        ? [antigravityPlaceholderViewModel(input.antigravityPlaceholder, presentationNow)]
+        : [];
     }),
   };
 }
@@ -236,11 +256,13 @@ export function createStatusBarRefreshHandler(input: {
   readonly refreshProviderUsage: (value: {
     readonly environmentId: EnvironmentId;
     readonly input: {
-      readonly providers: readonly ["claude", "codex"];
+      readonly providers: readonly ServerProviderUsageProvider[];
       readonly force: boolean;
     };
   }) => Promise<unknown>;
   readonly refreshUsageQuery: () => void;
+  /** Antigravity refreshes in its own request: it can never delay or fail Claude and Codex. */
+  readonly antigravity?: { readonly refreshQuery: () => void } | null;
   readonly refreshProcessDiagnostics: () => void;
   readonly refreshLocalProcessDiagnostics: (() => void) | null;
 }) {
@@ -250,14 +272,33 @@ export function createStatusBarRefreshHandler(input: {
       environmentId: input.environmentId,
       input: { providers: ["claude", "codex"], force },
     });
+    const antigravityRefresh =
+      input.antigravity == null
+        ? null
+        : Promise.resolve(
+            input.refreshProviderUsage({
+              environmentId: input.environmentId,
+              input: { providers: ["antigravity"], force },
+            }),
+          ).then(
+            () => undefined,
+            () => undefined,
+          );
     input.refreshProcessDiagnostics();
     input.refreshLocalProcessDiagnostics?.();
     try {
-      await providerRefresh;
+      try {
+        await providerRefresh;
+      } finally {
+        // Read only after the native fetch commits its snapshots. Reading before
+        // this await leaves provider usage one refresh cycle behind.
+        input.refreshUsageQuery();
+      }
     } finally {
-      // Read only after the native fetch commits its snapshots. Reading before
-      // this await leaves provider usage one refresh cycle behind.
-      input.refreshUsageQuery();
+      if (antigravityRefresh !== null) {
+        await antigravityRefresh;
+        input.antigravity?.refreshQuery();
+      }
     }
   };
 }
@@ -276,6 +317,8 @@ export function createStatusBarResourceRefreshHandler(input: {
 
 export function AppStatusBarView({
   usage,
+  antigravityUsage = null,
+  showAntigravityUsage = false,
   diagnostics,
   localDiagnostics,
   terminalCount,
@@ -293,6 +336,9 @@ export function AppStatusBarView({
   onConsumeCodexRateLimitReset,
 }: {
   readonly usage: ServerProviderUsageResult | null;
+  /** The answer to the Antigravity-only read; null until it arrives. */
+  readonly antigravityUsage?: ServerProviderUsageResult | null;
+  readonly showAntigravityUsage?: boolean;
   readonly diagnostics: ResourceDiagnosticsQueryState;
   readonly localDiagnostics: ResourceDiagnosticsQueryState | null;
   readonly terminalCount: number;
@@ -311,7 +357,17 @@ export function AppStatusBarView({
     typeof ProviderUsageControl
   >["onConsumeCodexRateLimitReset"];
 }) {
-  const snapshots = usage?.providers ?? EMPTY_PROVIDER_USAGE_SNAPSHOTS;
+  const baseSnapshots = usage?.providers ?? EMPTY_PROVIDER_USAGE_SNAPSHOTS;
+  const antigravitySnapshot =
+    antigravityUsage?.providers.find((snapshot) => snapshot.provider === "antigravity") ?? null;
+  // Stable identity: the presentation cache below compares it.
+  const snapshots = useMemo(
+    () => (antigravitySnapshot === null ? baseSnapshots : [...baseSnapshots, antigravitySnapshot]),
+    [baseSnapshots, antigravitySnapshot],
+  );
+  // No entry in an answer that succeeded means a server that ignores the request for it.
+  const antigravityPlaceholder: AntigravityPlaceholder | null =
+    antigravitySnapshot !== null ? null : antigravityUsage === null ? "loading" : "unsupported";
   const readRelativeLabelKey = () =>
     providerUsageRelativeLabelKey(snapshots, presentationNow ?? DateTime.nowUnsafe());
   const relativeLabelKey = useSyncExternalStore(
@@ -324,6 +380,8 @@ export function AppStatusBarView({
     percentageDisplay: usagePercentageDisplay,
     showClaudeUsage,
     showCodexUsage,
+    showAntigravityUsage,
+    antigravityPlaceholder,
     relativeLabelKey,
   };
   // Rederive only when an input or a countdown label bucket changes, not on every clock tick.
@@ -336,6 +394,8 @@ export function AppStatusBarView({
     presentation.percentageDisplay !== usagePercentageDisplay ||
     presentation.showClaudeUsage !== showClaudeUsage ||
     presentation.showCodexUsage !== showCodexUsage ||
+    presentation.showAntigravityUsage !== showAntigravityUsage ||
+    presentation.antigravityPlaceholder !== antigravityPlaceholder ||
     presentation.relativeLabelKey !== relativeLabelKey
   ) {
     presentation = buildProviderUsagePresentation(presentationInput, presentationNow);
@@ -435,6 +495,7 @@ export function AppStatusBar() {
   const {
     showClaudeUsage,
     showCodexUsage,
+    showAntigravityUsage,
     showResourceUsage,
     statusBarUsageMode,
     usagePercentageDisplay,
@@ -460,6 +521,15 @@ export function AppStatusBar() {
           input: {},
         }),
   );
+  // Antigravity is named in its own read, so a server only answers for it when asked.
+  const antigravityUsage = useEnvironmentQuery(
+    environmentId === null || !showAntigravityUsage
+      ? null
+      : serverEnvironment.providerUsage({
+          environmentId,
+          input: { providers: ["antigravity"] },
+        }),
+  );
   const terminalSessions = useKnownTerminalSessions({ environmentId, threadId: null });
   const refreshProviderUsage = useAtomCommand(serverEnvironment.refreshProviderUsage, {
     reportFailure: false,
@@ -477,6 +547,15 @@ export function AppStatusBar() {
           refresh: usage.refresh,
           revalidate: usage.revalidate,
         }),
+        antigravity: showAntigravityUsage
+          ? {
+              refreshQuery: rereadFor({
+                force,
+                refresh: antigravityUsage.refresh,
+                revalidate: antigravityUsage.revalidate,
+              }),
+            }
+          : null,
         refreshProcessDiagnostics: rereadFor({
           force,
           refresh: diagnostics.refresh,
@@ -492,6 +571,9 @@ export function AppStatusBar() {
               }),
       })(force),
     [
+      antigravityUsage.refresh,
+      antigravityUsage.revalidate,
+      showAntigravityUsage,
       diagnostics.refresh,
       diagnostics.revalidate,
       environmentId,
@@ -669,6 +751,8 @@ export function AppStatusBar() {
         iconOnly={iconOnly}
         showClaudeUsage={showClaudeUsage}
         showCodexUsage={showCodexUsage}
+        showAntigravityUsage={showAntigravityUsage}
+        antigravityUsage={showAntigravityUsage ? antigravityUsage.data : null}
         showResourceUsage={showResourceUsage}
         providerStateKey={environmentId ?? "no-environment"}
         statusBarUsageMode={statusBarUsageMode}

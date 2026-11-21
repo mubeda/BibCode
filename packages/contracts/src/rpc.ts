@@ -398,6 +398,7 @@ import {
 import {
   ConsumeCodexRateLimitResetInput,
   ConsumeCodexRateLimitResetResult,
+  ServerProviderUsageReadInput,
   ServerProviderUsageRefreshInput,
   ServerProviderUsageResetError,
   ServerProviderUsageResult,
@@ -1011,7 +1012,7 @@ export const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess,
 });
 
 export const WsServerGetProviderUsageRpc = Rpc.make(WS_METHODS.serverGetProviderUsage, {
-  payload: Schema.Struct({}),
+  payload: ServerProviderUsageReadInput,
   success: ServerProviderUsageResult,
   error: EnvironmentRpcError,
 });

@@ -25,6 +25,7 @@ use crate::{
     provider::environment::sanitize_provider_subprocess_environment,
 };
 
+mod antigravity;
 mod codex_backend;
 
 pub const MIN_MANUAL_REFRESH_MS: i64 = 30_000;
@@ -48,6 +49,7 @@ struct MacOsKeychainCommand {
 pub enum ProviderUsageProvider {
     Claude,
     Codex,
+    Antigravity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +69,16 @@ pub struct ProviderUsageWindow {
     pub reset_description: Option<String>,
 }
 
+/// One quota group of a provider that reports several (Antigravity: one per model family).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderUsageWindowGroup {
+    /// `gemini`, `third-party` or `other`.
+    pub id: &'static str,
+    pub label: &'static str,
+    pub session: Option<ProviderUsageWindow>,
+    pub weekly: Option<ProviderUsageWindow>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RateLimitResetCredits {
     pub available_count: u32,
@@ -81,6 +93,7 @@ pub struct ProviderUsageSnapshot {
     pub session: Option<ProviderUsageWindow>,
     pub weekly: Option<ProviderUsageWindow>,
     pub fable_weekly: Option<ProviderUsageWindow>,
+    pub window_groups: Vec<ProviderUsageWindowGroup>,
     pub plan_type: Option<String>,
     pub rate_limit_reset_credits: Option<RateLimitResetCredits>,
     pub updated_at: OffsetDateTime,
@@ -224,6 +237,39 @@ pub struct ProviderUsageService {
     state: Arc<Mutex<ProviderUsageState>>,
     consume_codex_reset: ConsumeCodexReset,
     codex_reset_lock: Arc<Mutex<()>>,
+    /// One gate per provider with a minimum interval: no second fetch runs at once, and the
+    /// cooldown is measured on a monotonic clock.
+    interval_gates: Arc<BTreeMap<ProviderUsageProvider, Arc<Mutex<IntervalGate>>>>,
+}
+
+#[derive(Default)]
+struct IntervalGate {
+    started: Option<tokio::time::Instant>,
+    finished: Option<tokio::time::Instant>,
+    /// What the last attempt produced: a joined or cooling-down caller commits it as its own
+    /// answer, so it never reads a state the first caller has not committed yet.
+    last: Option<ProviderUsageSnapshot>,
+}
+
+/// How often an automatic refresh may run a provider's fetch, and how long one may take.
+struct ProviderFetchPolicy {
+    min_interval: Option<Duration>,
+    timeout: Duration,
+}
+
+fn provider_fetch_policy(provider: ProviderUsageProvider) -> ProviderFetchPolicy {
+    match provider {
+        ProviderUsageProvider::Antigravity => ProviderFetchPolicy {
+            min_interval: Some(antigravity::MIN_INTERVAL),
+            // Above the fetcher's own deadline plus both cleanup windows, so this outer timeout
+            // never drops a supervised future before its cleanup ran.
+            timeout: antigravity::SERVICE_TIMEOUT,
+        },
+        ProviderUsageProvider::Claude | ProviderUsageProvider::Codex => ProviderFetchPolicy {
+            min_interval: None,
+            timeout: USAGE_TIMEOUT,
+        },
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -249,6 +295,13 @@ impl ProviderUsageService {
             state: Arc::new(Mutex::new(ProviderUsageState::default())),
             consume_codex_reset: production_codex_rate_limit_reset_consumer(),
             codex_reset_lock: Arc::new(Mutex::new(())),
+            interval_gates: Arc::new(
+                [ProviderUsageProvider::Antigravity]
+                    .into_iter()
+                    .filter(|provider| provider_fetch_policy(*provider).min_interval.is_some())
+                    .map(|provider| (provider, Arc::new(Mutex::new(IntervalGate::default()))))
+                    .collect(),
+            ),
         }
     }
 
@@ -266,12 +319,21 @@ impl ProviderUsageService {
     }
 
     pub async fn read(&self) -> ProviderUsageResult {
+        self.read_selected(None).await
+    }
+
+    /// The legacy providers, plus any other provider the request names: a client that does not
+    /// know a provider never receives it, because it would fail to decode the whole result.
+    pub async fn read_selected(
+        &self,
+        selected: Option<&[ProviderUsageProvider]>,
+    ) -> ProviderUsageResult {
         let read_at = (self.now)();
         let state = self.state.lock().await;
         ProviderUsageResult {
             read_at,
             is_fetching: state.active_refreshes > 0,
-            providers: providers()
+            providers: response_providers(selected)
                 .into_iter()
                 .map(|provider| {
                     let snapshot = state.snapshots.get(&provider).cloned().unwrap_or_else(|| {
@@ -352,15 +414,22 @@ impl ProviderUsageService {
         let read_at = (self.now)();
         let now_ms = unix_timestamp_ms(read_at);
         let selected = selected_providers.unwrap_or_else(providers);
+        // The global 30 s slot belongs to the providers without an interval of their own, so a
+        // Claude or Codex poll cannot starve Antigravity and an Antigravity-only request does not
+        // consume the slot.
+        let uses_global_slot = selected
+            .iter()
+            .any(|provider| provider_fetch_policy(*provider).min_interval.is_none());
         let refresh_generation = {
             let mut state = self.state.lock().await;
             state.refresh_started_at_ms.retain(|_, started_at_ms| {
                 now_ms.saturating_sub(*started_at_ms) < MIN_MANUAL_REFRESH_MS
             });
             if matches!(policy, RefreshPolicy::Throttled)
+                && uses_global_slot
                 && state.refresh_started_at_ms.last_key_value().is_some()
             {
-                return drop_and_read(state, self).await;
+                return drop_and_read(state, self, Some(&selected)).await;
             }
             state.active_refreshes = state.active_refreshes.saturating_add(1);
             state.next_refresh_generation = state.next_refresh_generation.saturating_add(1);
@@ -370,16 +439,22 @@ impl ProviderUsageService {
                     .provider_refresh_generations
                     .insert(*provider, refresh_generation);
             }
-            state
-                .refresh_started_at_ms
-                .insert(refresh_generation, now_ms);
+            if uses_global_slot {
+                state
+                    .refresh_started_at_ms
+                    .insert(refresh_generation, now_ms);
+            }
             refresh_generation
         };
 
         let mut worker = tokio::spawn({
             let service = self.clone();
             let selected = selected.clone();
-            async move { service.fetch_refresh_snapshots(&selected, read_at).await }
+            async move {
+                service
+                    .fetch_refresh_snapshots(&selected, read_at, policy)
+                    .await
+            }
         });
         tokio::select! {
             biased;
@@ -391,7 +466,7 @@ impl ProviderUsageService {
             worker_result = &mut worker => {
                 match worker_result {
                     Ok(next_snapshots) => {
-                        self.commit_refresh(refresh_generation, next_snapshots).await
+                        self.commit_refresh(refresh_generation, &selected, next_snapshots).await
                     }
                     Err(error) => {
                         self.cancel_refresh(refresh_generation, &selected).await;
@@ -406,20 +481,54 @@ impl ProviderUsageService {
         &self,
         selected: &[ProviderUsageProvider],
         read_at: OffsetDateTime,
+        policy: RefreshPolicy,
     ) -> Vec<(ProviderUsageProvider, ProviderUsageSnapshot)> {
+        let arrival = tokio::time::Instant::now();
         let mut next_snapshots = Vec::with_capacity(selected.len());
         for &provider in selected {
+            let fetch_policy = provider_fetch_policy(provider);
             let snapshot = match self.fetchers.get(&provider) {
-                Some(fetcher) => match tokio::time::timeout(USAGE_TIMEOUT, (fetcher.fetch)()).await
-                {
-                    Ok(Ok(snapshot)) => snapshot,
-                    Ok(Err(error)) => error_snapshot(provider, read_at, error.message),
-                    Err(_) => error_snapshot(
-                        provider,
-                        read_at,
-                        "Provider usage request timed out.".to_owned(),
-                    ),
-                },
+                Some(fetcher) => {
+                    let mut held = match self.interval_gates.get(&provider) {
+                        Some(gate) => Some(gate.clone().lock_owned().await),
+                        None => None,
+                    };
+                    if let Some(held) = held.as_mut() {
+                        let now = tokio::time::Instant::now();
+                        // An attempt that finished after this caller arrived is the answer this
+                        // caller would have fetched: join it instead of spawning again.
+                        let joined = held.finished.is_some_and(|finished| finished >= arrival);
+                        let cooling = matches!(policy, RefreshPolicy::Throttled)
+                            && match (held.started, fetch_policy.min_interval) {
+                                (Some(started), Some(interval)) => {
+                                    now.saturating_duration_since(started) < interval
+                                }
+                                _ => false,
+                            };
+                        if joined || cooling {
+                            if let Some(last) = held.last.clone() {
+                                next_snapshots.push((provider, last));
+                            }
+                            continue;
+                        }
+                        held.started = Some(now);
+                    }
+                    let snapshot =
+                        match tokio::time::timeout(fetch_policy.timeout, (fetcher.fetch)()).await {
+                            Ok(Ok(snapshot)) => snapshot,
+                            Ok(Err(error)) => error_snapshot(provider, read_at, error.message),
+                            Err(_) => error_snapshot(
+                                provider,
+                                read_at,
+                                "Provider usage request timed out.".to_owned(),
+                            ),
+                        };
+                    if let Some(held) = held.as_mut() {
+                        held.finished = Some(tokio::time::Instant::now());
+                        held.last = Some(snapshot.clone());
+                    }
+                    snapshot
+                }
                 None => unavailable_snapshot(
                     provider,
                     read_at,
@@ -434,6 +543,7 @@ impl ProviderUsageService {
     async fn commit_refresh(
         &self,
         refresh_generation: u128,
+        selected: &[ProviderUsageProvider],
         next_snapshots: Vec<(ProviderUsageProvider, ProviderUsageSnapshot)>,
     ) -> ProviderUsageResult {
         let mut state = self.state.lock().await;
@@ -449,7 +559,7 @@ impl ProviderUsageService {
             state.snapshots.insert(requested_provider, snapshot);
         }
         state.active_refreshes = state.active_refreshes.saturating_sub(1);
-        drop_and_read(state, self).await
+        drop_and_read(state, self, Some(selected)).await
     }
 
     async fn cancel_refresh(
@@ -465,7 +575,7 @@ impl ProviderUsageService {
                 state.provider_refresh_generations.remove(provider);
             }
         }
-        drop_and_read(state, self).await
+        drop_and_read(state, self, Some(selected)).await
     }
 }
 
@@ -490,8 +600,15 @@ fn production_codex_rate_limit_reset_consumer() -> ConsumeCodexReset {
 }
 
 #[must_use]
-pub fn production_fetchers() -> Vec<ProviderUsageFetcher> {
-    vec![claude_fetcher(), codex_fetcher()]
+pub fn production_fetchers(
+    settings: crate::server_settings::ProviderSettingsStore,
+    attribution: Option<crate::diagnostics::ProcessAttributionRegistry>,
+) -> Vec<ProviderUsageFetcher> {
+    vec![
+        claude_fetcher(),
+        codex_fetcher(),
+        antigravity::fetcher(settings, attribution),
+    ]
 }
 
 fn claude_fetcher() -> ProviderUsageFetcher {
@@ -800,6 +917,7 @@ async fn fetch_codex_usage() -> Result<ProviderUsageSnapshot, ProviderUsageFetch
                 session: usage.session,
                 weekly: usage.weekly,
                 fable_weekly: None,
+                window_groups: Vec::new(),
                 plan_type: Some(usage.plan_type),
                 rate_limit_reset_credits: usage.rate_limit_reset_credits,
                 updated_at: now,
@@ -1035,6 +1153,7 @@ fn usage_snapshot<const N: usize>(
         session,
         weekly,
         fable_weekly,
+        window_groups: Vec::new(),
         plan_type: None,
         rate_limit_reset_credits: None,
         updated_at: now,
@@ -1122,13 +1241,23 @@ fn parse_reset(value: &Value) -> Option<OffsetDateTime> {
 async fn drop_and_read(
     state: tokio::sync::MutexGuard<'_, ProviderUsageState>,
     service: &ProviderUsageService,
+    selected: Option<&[ProviderUsageProvider]>,
 ) -> ProviderUsageResult {
     drop(state);
-    service.read().await
+    service.read_selected(selected).await
 }
 
 fn providers() -> Vec<ProviderUsageProvider> {
     vec![ProviderUsageProvider::Claude, ProviderUsageProvider::Codex]
+}
+
+/// The legacy pair, plus Antigravity only when the request names it.
+fn response_providers(selected: Option<&[ProviderUsageProvider]>) -> Vec<ProviderUsageProvider> {
+    let mut list = providers();
+    if selected.is_some_and(|named| named.contains(&ProviderUsageProvider::Antigravity)) {
+        list.push(ProviderUsageProvider::Antigravity);
+    }
+    list
 }
 
 fn unavailable_snapshot(
@@ -1142,6 +1271,7 @@ fn unavailable_snapshot(
         session: None,
         weekly: None,
         fable_weekly: None,
+        window_groups: Vec::new(),
         plan_type: None,
         rate_limit_reset_credits: None,
         updated_at: now,
@@ -1161,6 +1291,7 @@ fn error_snapshot(
         session: None,
         weekly: None,
         fable_weekly: None,
+        window_groups: Vec::new(),
         plan_type: None,
         rate_limit_reset_credits: None,
         updated_at: now,
@@ -1206,6 +1337,7 @@ fn has_usable_usage(snapshot: &ProviderUsageSnapshot) -> bool {
     snapshot.session.is_some()
         || snapshot.weekly.is_some()
         || snapshot.fable_weekly.is_some()
+        || !snapshot.window_groups.is_empty()
         || snapshot.plan_type.is_some()
         || snapshot.rate_limit_reset_credits.is_some()
 }
@@ -1389,6 +1521,7 @@ done"#,
             session: None,
             weekly: None,
             fable_weekly: None,
+            window_groups: Vec::new(),
             plan_type: None,
             rate_limit_reset_credits: Some(RateLimitResetCredits {
                 available_count,
@@ -1417,6 +1550,7 @@ done"#,
             }),
             weekly: None,
             fable_weekly: None,
+            window_groups: Vec::new(),
             plan_type: None,
             rate_limit_reset_credits: None,
             updated_at,
@@ -2510,6 +2644,7 @@ done"#,
                         }),
                         weekly: None,
                         fable_weekly: None,
+                        window_groups: Vec::new(),
                         plan_type: None,
                         rate_limit_reset_credits: None,
                         updated_at: now,
@@ -2556,7 +2691,14 @@ done"#,
             missing.providers[0].status,
             ProviderUsageStatus::Unavailable
         );
-        assert_eq!(production_fetchers().len(), 2);
+        assert_eq!(
+            production_fetchers(
+                crate::server_settings::ProviderSettingsStore::new(std::env::temp_dir()),
+                None
+            )
+            .len(),
+            3
+        );
     }
 
     #[test]
@@ -2568,6 +2710,7 @@ done"#,
             session: None,
             weekly: None,
             fable_weekly: None,
+            window_groups: Vec::new(),
             plan_type: None,
             rate_limit_reset_credits: None,
             updated_at: now,
@@ -2614,5 +2757,192 @@ done"#,
             "Codex app-server exited before replying."
         );
         assert_eq!(rpc_error(&json!({}), "fallback"), "fallback");
+    }
+
+    fn antigravity_fetcher(calls: Arc<AtomicUsize>, delay: Duration) -> ProviderUsageFetcher {
+        ProviderUsageFetcher {
+            provider: ProviderUsageProvider::Antigravity,
+            fetch: Arc::new(move || {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    Ok(ProviderUsageSnapshot {
+                        provider: ProviderUsageProvider::Antigravity,
+                        status: ProviderUsageStatus::Ok,
+                        session: None,
+                        weekly: None,
+                        fable_weekly: None,
+                        window_groups: vec![ProviderUsageWindowGroup {
+                            id: "gemini",
+                            label: "Gemini models",
+                            session: Some(ProviderUsageWindow {
+                                used_percent: 3,
+                                window_minutes: 300,
+                                resets_at: None,
+                                reset_description: None,
+                            }),
+                            weekly: None,
+                        }],
+                        plan_type: None,
+                        rate_limit_reset_credits: None,
+                        updated_at: OffsetDateTime::now_utc(),
+                        error: None,
+                        metadata: BTreeMap::new(),
+                    })
+                })
+            }),
+        }
+    }
+
+    fn service_with(
+        calls: &Arc<AtomicUsize>,
+        delay: Duration,
+        codex: Arc<AtomicUsize>,
+    ) -> ProviderUsageService {
+        ProviderUsageService::new(
+            vec![
+                antigravity_fetcher(calls.clone(), delay),
+                test_fetcher(move || {
+                    let codex = codex.clone();
+                    async move {
+                        codex.fetch_add(1, Ordering::SeqCst);
+                        Ok(snapshot_with_session(
+                            ProviderUsageProvider::Codex,
+                            OffsetDateTime::now_utc(),
+                            10,
+                        ))
+                    }
+                }),
+            ],
+            Arc::new(OffsetDateTime::now_utc),
+        )
+    }
+
+    fn names(result: &ProviderUsageResult) -> Vec<ProviderUsageProvider> {
+        result
+            .providers
+            .iter()
+            .map(|snapshot| snapshot.provider)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn antigravity_appears_only_when_a_request_names_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::ZERO, Arc::default());
+        let legacy = vec![ProviderUsageProvider::Claude, ProviderUsageProvider::Codex];
+        assert_eq!(names(&service.read().await), legacy);
+        assert_eq!(names(&service.refresh(None).await), legacy);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an omitted list never fetches it"
+        );
+        let named = service
+            .refresh_forced(Some(vec![ProviderUsageProvider::Antigravity]))
+            .await;
+        assert_eq!(
+            names(&named).last(),
+            Some(&ProviderUsageProvider::Antigravity)
+        );
+        let antigravity = named.providers.last().unwrap();
+        assert_eq!(antigravity.status, ProviderUsageStatus::Ok);
+        assert_eq!(antigravity.window_groups.len(), 1);
+        let read = service
+            .read_selected(Some(&[ProviderUsageProvider::Antigravity]))
+            .await;
+        assert_eq!(read.providers.len(), 3);
+        // Naming only Codex (as the Codex reset result does) keeps the legacy shape.
+        let codex_only = service
+            .refresh_forced(Some(vec![ProviderUsageProvider::Codex]))
+            .await;
+        assert_eq!(names(&codex_only), legacy);
+    }
+
+    #[tokio::test]
+    async fn the_interval_serves_the_cache_and_a_forced_refresh_bypasses_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::ZERO, Arc::default());
+        let only = || Some(vec![ProviderUsageProvider::Antigravity]);
+        service.refresh(only()).await;
+        service.refresh(only()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "inside the interval");
+        service.refresh_forced(only()).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "forced bypasses the cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_global_slot_and_the_interval_do_not_starve_each_other() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let codex = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::ZERO, codex.clone());
+        // A legacy poll first, then the Antigravity request of the same cycle.
+        service
+            .refresh(Some(vec![ProviderUsageProvider::Codex]))
+            .await;
+        service
+            .refresh(Some(vec![ProviderUsageProvider::Antigravity]))
+            .await;
+        assert_eq!(
+            (codex.load(Ordering::SeqCst), calls.load(Ordering::SeqCst)),
+            (1, 1)
+        );
+        // An Antigravity-only request does not consume the slot a later legacy poll needs.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let codex = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::ZERO, codex.clone());
+        service
+            .refresh(Some(vec![ProviderUsageProvider::Antigravity]))
+            .await;
+        service
+            .refresh(Some(vec![ProviderUsageProvider::Codex]))
+            .await;
+        assert_eq!(
+            (codex.load(Ordering::SeqCst), calls.load(Ordering::SeqCst)),
+            (1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn simultaneous_forced_refreshes_run_one_process() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::from_millis(80), Arc::default());
+        let only = || Some(vec![ProviderUsageProvider::Antigravity]);
+        let (first, second) = tokio::join!(
+            service.refresh_forced(only()),
+            service.refresh_forced(only())
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second joins the first"
+        );
+        // The newer generation owns the commit, so the older caller may read before it lands.
+        let _ = first;
+        assert_eq!(
+            second.providers.last().unwrap().status,
+            ProviderUsageStatus::Ok
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_caller_does_not_wedge_the_next_forced_refresh() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::from_millis(300), Arc::default());
+        let only = || Some(vec![ProviderUsageProvider::Antigravity]);
+        let abandoned =
+            tokio::time::timeout(Duration::from_millis(30), service.refresh_forced(only())).await;
+        assert!(abandoned.is_err(), "the caller gave up mid-fetch");
+        let next = service.refresh_forced(only()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            next.providers.last().unwrap().status,
+            ProviderUsageStatus::Ok
+        );
     }
 }

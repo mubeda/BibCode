@@ -5546,6 +5546,19 @@ boolean `force`. Omitting `force`, or sending `false`, uses the normal refresh
 throttle; `force: true` starts an explicit fetch even inside that interval.
 The default preserves compatibility for older clients.
 
+Antigravity reports its account quota as several groups (one per model family,
+each with a 5-hour and a weekly window), carried in the snapshot's optional
+`windowGroups`. Its snapshot appears in a response only when the request names
+`antigravity`: both `server.getProviderUsage` (optional `providers` input) and
+`server.refreshProviderUsage` answer a request that omits the list, and the
+usage nested in the Codex reset result, with Claude and Codex alone, so an older
+client never receives a provider it cannot decode. The status bar asks for
+Antigravity in its own request and read. The server runs the Antigravity CLI at
+most once per five minutes for automatic refreshes (a forced refresh bypasses
+the cooldown and joins an attempt in flight), only when the default Antigravity
+instance is on, and only after `--version` proves CLI 1.1.11 or newer. The
+design is in `docs/plans/2026-11-21-antigravity-usage-design.md`.
+
 Forced refresh changes admission only. It does not authorize credential
 mutation or account management: provider usage fetchers remain observers of
 the local provider CLI's account. The client waits for the refresh command to

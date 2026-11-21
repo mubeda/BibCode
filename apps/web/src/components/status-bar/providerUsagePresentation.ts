@@ -2,6 +2,7 @@ import type {
   ServerProviderUsageResetCredits,
   ServerProviderUsageSnapshot,
   ServerProviderUsageWindow,
+  ServerProviderUsageWindowGroup,
 } from "@bibcode/contracts";
 import * as DateTime from "effect/DateTime";
 
@@ -13,12 +14,12 @@ import {
   providerUsageBarColorClass,
 } from "./statusBarFormat";
 
-export type UsageWindowKey = "session" | "weekly" | "fable";
+export type UsageWindowKey = string;
 export type UsagePercentageDisplay = "remaining" | "used";
 
 export interface UsageWindowViewModel {
   readonly key: UsageWindowKey;
-  readonly label: "Session" | "Weekly" | "Fable";
+  readonly label: string;
   readonly windowLabel: string;
   readonly consumedPercent: number;
   readonly displayedPercent: number;
@@ -69,6 +70,49 @@ const WINDOW_DEFINITIONS: ReadonlyArray<{
   { key: "weekly", label: "Weekly", snapshotKey: "weekly" },
   { key: "fable", label: "Fable", snapshotKey: "fableWeekly" },
 ];
+
+// Lookups with no default: a provider this build does not know renders nothing, never another
+// provider's name or icon.
+const PROVIDER_LABEL: Readonly<Record<ServerProviderUsageSnapshot["provider"], string>> = {
+  claude: "Claude",
+  codex: "Codex",
+  antigravity: "Antigravity",
+};
+
+export function providerUsageLabel(
+  provider: ServerProviderUsageSnapshot["provider"],
+): string | null {
+  return Object.hasOwn(PROVIDER_LABEL, provider) ? PROVIDER_LABEL[provider] : null;
+}
+
+const GROUP_SHORT_LABEL: Readonly<Record<ServerProviderUsageWindowGroup["id"], string>> = {
+  gemini: "Gemini",
+  "third-party": "Claude/GPT",
+  other: "Other",
+};
+
+function groupWindowDefinitions(
+  snapshot: ServerProviderUsageSnapshot,
+): ReadonlyArray<{ key: string; label: string; window: ServerProviderUsageWindow }> {
+  return snapshot.windowGroups.flatMap((group) =>
+    (
+      [
+        ["session", "Session", group.session],
+        ["weekly", "Weekly", group.weekly],
+      ] as const
+    ).flatMap(([slot, name, window]) =>
+      window === null
+        ? []
+        : [
+            {
+              key: `${group.id}-${slot}`,
+              label: `${GROUP_SHORT_LABEL[group.id]} ${name.toLowerCase()}`,
+              window,
+            },
+          ],
+    ),
+  );
+}
 
 function titleCasePlan(value: string): string {
   return value
@@ -131,19 +175,24 @@ export function buildProviderUsageViewModel(
 ): ProviderUsageViewModel {
   const now = options.now ?? DateTime.nowUnsafe();
   const percentageDisplay = options.percentageDisplay ?? "remaining";
-  const windows = WINDOW_DEFINITIONS.flatMap((definition) => {
-    const window = snapshot[definition.snapshotKey];
-    return window === null
-      ? []
-      : [
-          buildWindowViewModel({
-            ...definition,
-            window,
-            now,
-            percentageDisplay,
-          }),
-        ];
-  });
+  const windows = [
+    ...WINDOW_DEFINITIONS.flatMap((definition) => {
+      const window = snapshot[definition.snapshotKey];
+      return window === null
+        ? []
+        : [
+            buildWindowViewModel({
+              ...definition,
+              window,
+              now,
+              percentageDisplay,
+            }),
+          ];
+    }),
+    ...groupWindowDefinitions(snapshot).map((definition) =>
+      buildWindowViewModel({ ...definition, now, percentageDisplay }),
+    ),
+  ];
   const tightestWindow = windows.reduce<UsageWindowViewModel | null>(
     (tightest, window) =>
       tightest === null || window.consumedPercent > tightest.consumedPercent ? window : tightest,
@@ -170,6 +219,29 @@ export function buildProviderUsageViewModel(
   };
 }
 
+export type AntigravityPlaceholder = "loading" | "unsupported";
+
+/** The Antigravity item before it has a snapshot, or on a server that cannot serve it. */
+export function antigravityPlaceholderViewModel(
+  placeholder: AntigravityPlaceholder,
+  now: DateTime.Utc = DateTime.nowUnsafe(),
+): ProviderUsageViewModel {
+  return {
+    provider: "antigravity",
+    status: placeholder === "loading" ? "fetching" : "unavailable",
+    windows: [],
+    detailedWindows: [],
+    compactWindows: [],
+    plan: null,
+    credits: null,
+    updatedAt: now,
+    error:
+      placeholder === "unsupported"
+        ? "This BiBCode server is too old to show Antigravity usage."
+        : null,
+  };
+}
+
 export function buildProviderUsageViewModels(
   snapshots: ReadonlyArray<ServerProviderUsageSnapshot>,
   options: ProviderUsagePresentationOptions = {},
@@ -189,6 +261,9 @@ export function providerUsageRelativeLabelKey(
           ? null
           : formatProviderResetLabel(window.resetsAt, null, now);
       }),
+      ...groupWindowDefinitions(snapshot).map(({ window }) =>
+        window.resetsAt === null ? null : formatProviderResetLabel(window.resetsAt, null, now),
+      ),
       snapshot.rateLimitResetCredits?.nextExpiresAt === null ||
       snapshot.rateLimitResetCredits?.nextExpiresAt === undefined
         ? null
