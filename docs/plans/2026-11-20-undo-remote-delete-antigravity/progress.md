@@ -7,28 +7,28 @@ Plan review: Codex gpt-6.2-sol at high, round 2, Needs rework; all 25 findings o
 Executor: mstack-codex-review-workflow
 Branch: claude/backlog-triage-planning-pr-b5ee7f
 
-| Task | Title                                                                         | Phase | State       | Owner  | Note                                                         |
-| ---- | ----------------------------------------------------------------------------- | ----- | ----------- | ------ | ------------------------------------------------------------ |
-| 1.1  | Reproduce the failure and locate it per platform                              | 1     | In progress | lane A | measured on three platforms; in review                       |
-| 1.2  | Fix the located path and prove it in the packaged app                         | 1     | In progress | lane A | macOS fix committed; Codex review running                    |
-| 1.3  | Pin the chord behavior in web tests and correct the tooltip                   | 1     | In progress | lane A | committed; Codex review running                              |
-| 2.1  | Make the dialogs and the dropdown read the server's guard names               | 2     | In progress | lane B | review round 1: 9 findings being fixed                       |
-| 2.2  | Mark each remote's default branch on the server                               | 2     | In progress | lane B | review round 1: 9 findings being fixed                       |
-| 2.3  | Delete a remote branch from the branch list                                   | 2     | In progress | lane B | review round 1: 9 findings being fixed                       |
-| 3.1  | Write and review the Antigravity terminal design note                         | 3     | In progress | lane D | note reviewed; revised after live probes                     |
-| 3.2  | Register the antigravity driver in settings, inventory and the hermetic lists | 3     | In progress | lane D | committed 2225ede7d; Codex review running                    |
-| 3.6  | Add the Antigravity ACP session runtime                                       | 3     | In progress | lane F |                                                              |
-| 3.7  | Dispatch Antigravity chats in the provider runtime                            | 3     | In progress | lane F | after 3.6                                                    |
-| 3.8  | Probe Antigravity sign-in state and models in the inventory                   | 3     | In progress | lane G |                                                              |
-| 3.9  | Offer Antigravity Terminal and Antigravity chat in the client                 | 3     | In progress | lane E | terminal and Settings first; chat part waits for 3.7 and 3.8 |
-| 3.10 | Document Antigravity everywhere the providers are listed                      | 3     | Open        |        |                                                              |
-| 3.11 | Write and review the Antigravity usage design note                            | 3     | In progress | lane J |                                                              |
-| 3.12 | Show Antigravity usage in the status bar and close the provider-list gaps     | 3     | Open        | lane J | after 3.11                                                   |
-| 4.1  | Integrate, review and fix follow-ups                                          | 4     | Open        |        |                                                              |
-| 5.1  | Route View PR to the panel and keep a browser menu item                       | 5     | Closed      | lane C | accepted after one review round                              |
-| 6.1  | Write and review the software-rendering design note                           | 6     | In progress | lane I | issue #411                                                   |
-| 6.2  | Add the Linux software-rendering setting                                      | 6     | Open        | lane I | after 6.1                                                    |
-| 4.2  | Gate the candidate commit and open the pull request                           | 4     | Open        |        |                                                              |
+| Task | Title                                                                         | Phase | State       | Owner  | Note                                                                                  |
+| ---- | ----------------------------------------------------------------------------- | ----- | ----------- | ------ | ------------------------------------------------------------------------------------- |
+| 1.1  | Reproduce the failure and locate it per platform                              | 1     | In progress | lane A | measured on three platforms; in review                                                |
+| 1.2  | Fix the located path and prove it in the packaged app                         | 1     | In progress | lane A | macOS fix committed; Codex review running                                             |
+| 1.3  | Pin the chord behavior in web tests and correct the tooltip                   | 1     | In progress | lane A | committed; Codex review running                                                       |
+| 2.1  | Make the dialogs and the dropdown read the server's guard names               | 2     | In progress | lane B | review round 1: 9 findings being fixed                                                |
+| 2.2  | Mark each remote's default branch on the server                               | 2     | In progress | lane B | review round 1: 9 findings being fixed                                                |
+| 2.3  | Delete a remote branch from the branch list                                   | 2     | In progress | lane B | review round 1: 9 findings being fixed                                                |
+| 3.1  | Write and review the Antigravity terminal design note                         | 3     | In progress | lane D | note reviewed; revised after live probes                                              |
+| 3.2  | Register the antigravity driver in settings, inventory and the hermetic lists | 3     | In progress | lane D | committed 2225ede7d; Codex review running                                             |
+| 3.6  | Add the Antigravity ACP session runtime                                       | 3     | In progress | lane F |                                                                                       |
+| 3.7  | Dispatch Antigravity chats in the provider runtime                            | 3     | In progress | lane F | after 3.6                                                                             |
+| 3.8  | Probe Antigravity sign-in state and models in the inventory                   | 3     | In progress | lane G |                                                                                       |
+| 3.9  | Offer Antigravity Terminal and Antigravity chat in the client                 | 3     | Closed      | lane E | accepted after two review rounds; chat checked against the real server at integration |
+| 3.10 | Document Antigravity everywhere the providers are listed                      | 3     | Open        |        |                                                                                       |
+| 3.11 | Write and review the Antigravity usage design note                            | 3     | In progress | lane J |                                                                                       |
+| 3.12 | Show Antigravity usage in the status bar and close the provider-list gaps     | 3     | Open        | lane J | after 3.11                                                                            |
+| 4.1  | Integrate, review and fix follow-ups                                          | 4     | Open        |        |                                                                                       |
+| 5.1  | Route View PR to the panel and keep a browser menu item                       | 5     | Closed      | lane C | accepted after one review round                                                       |
+| 6.1  | Write and review the software-rendering design note                           | 6     | In progress | lane I | issue #411                                                                            |
+| 6.2  | Add the Linux software-rendering setting                                      | 6     | Open        | lane I | after 6.1                                                                             |
+| 4.2  | Gate the candidate commit and open the pull request                           | 4     | Open        |        |                                                                                       |
 
 ## Log
 
@@ -79,3 +79,5 @@ Remaining per lane:
 - 2026-11-21 18:40 Third backlog check at the owner's request: one new issue, #411 (Linux desktop: the WebKitGTK compositor hangs an Intel GPU and ends the desktop session), filed by the owner. No duplicate (searched open and closed issues for WebKitGTK, compositor, DMABUF, "GPU hang" and the variable names; #15 is a different Linux graphics problem). Added as spec R17 and phase 6 on the owner's instruction to include it in this pull request. Planned without a separate plan review; the design note of Task 6.1 gets the Codex and advisor review. The pull request refers to #411 without closing it, because the proof on the affected machine is the owner's.
 - 2026-11-21 18:36 Ruling by the owner: this pull request implements #411 and closes it. Cost if wrong: the issue is closed without the long run on the affected machine; the owner reopens it if the hang returns.
 - 2026-11-21 18:55 Owner asked for Antigravity in the usage status bar and a check of every provider selection spot. Measured: `agy -p "/usage" --output-format json` returns the limits without a prompt. A read-only audit of the provider lists found the status bar hardcoded to two providers, a server fallback that would give Antigravity another provider's binary settings (sent to lane F), and three small label gaps. Added as spec R18 and Tasks 3.11 and 3.12 (lane J). Owner's instruction of the same day: the Antigravity CLI (`gemini-4-neon-high`) is a second code reviewer, and Codex, Antigravity and advisor findings are triaged with mstack-receive-review.
+- 2026-11-21 19:02 3.9 Closed. Evidence: focused web tests 2695 of 2695, `npx tsc --noEmit` 0 errors, `vp check` passes. Reviews: Codex round 1, 5 findings (3 fixed, 1 expected by integration order, 1 verified as existing state: the add-instance button is hidden for every provider on main); Antigravity CLI round 2, 5 findings (4 fixed, each reproduced first; 1 rejected: direct tests of trivial maps). Lane branch worktree-agent-a371e624fc394e24d, commits d44d89b1e..e97893e20. Not integrated yet.
+- 2026-11-21 19:02 Design reviews: phase 6 note (Codex, 7 findings: 6 accepted, 1 split) and the usage note of Task 3.11 (Codex, 13 findings: 11 accepted, 1 accepted in part, 1 answered by a scope cut: no out-of-tokens hint for Antigravity). Both lanes revise and then build.
