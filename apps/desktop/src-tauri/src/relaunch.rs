@@ -37,27 +37,55 @@ pub(crate) fn exit_takes_mount_from_children() -> bool {
 /// launcher such as `systemd-run --user`), its exit stops the unit, which kills that whole
 /// cgroup: the new AppImage's mount goes away and the relaunched app dies with SIGBUS
 /// (#94). Here the new app starts in its own transient scope instead, and this process
-/// exits; when that is not needed or `systemd-run` fails, Tauri's relaunch runs as before.
-pub(crate) fn relaunch_outside_service_unit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+/// exits. Tauri's relaunch also passes this process's environment on, so when BiBCode set
+/// the software rendering variables itself (#411), the new app is started here without
+/// them and reads the stored setting afresh. When neither applies, or a spawn fails,
+/// Tauri's relaunch runs as before; with the variables that fails safe.
+pub(crate) fn relaunch_with_handoff<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if !RELAUNCH_REQUESTED.load(Ordering::Acquire) {
         return;
     }
     #[cfg(target_os = "linux")]
     {
         let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-        if !linux::runs_in_service_unit(&cgroup) {
+        let in_service_unit = linux::runs_in_service_unit(&cgroup);
+        let set_by_bibcode = crate::software_rendering::variables_set_by_bibcode();
+        if !in_service_unit && set_by_bibcode.is_empty() {
             return;
         }
         let env = tauri::Manager::env(app);
         let Ok(binary) = tauri::process::current_binary(&env) else {
             return;
         };
+        if !in_service_unit {
+            let mut command = std::process::Command::new(binary);
+            command.args(env.args_os.iter().skip(1));
+            for name in set_by_bibcode {
+                command.env_remove(name);
+            }
+            match command.spawn() {
+                Ok(_) => {
+                    tracing::info!(
+                        removed = ?set_by_bibcode,
+                        "relaunching without the software rendering variables BiBCode set"
+                    );
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not relaunch without the software rendering variables; relaunching in place");
+                    return;
+                }
+            }
+        }
         let mut command = std::process::Command::new("systemd-run");
         command
             .args(["--user", "--scope", "--collect", "--quiet", "--"])
             .arg(binary)
             .args(env.args_os.iter().skip(1));
         bibcode_server::process::isolate_appimage_environment(&mut command);
+        for name in set_by_bibcode {
+            command.env_remove(name);
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {

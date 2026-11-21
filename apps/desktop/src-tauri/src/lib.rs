@@ -42,6 +42,8 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_set_wsl_backend_enabled,
             desktop_bridge_set_wsl_distro,
             desktop_bridge_set_wsl_only,
+            desktop_bridge_get_linux_software_rendering,
+            desktop_bridge_set_linux_software_rendering,
             desktop_bridge_set_theme,
             desktop_bridge_show_context_menu,
             desktop_bridge_get_update_state,
@@ -158,6 +160,7 @@ pub fn run() {
             linux_theme::configure_theme(&app.state::<linux_theme::LinuxThemeState>());
         }
         shell_path_hydration.record();
+        software_rendering::record_startup();
         window::configure_application_menu(app.handle())?;
         window::restore_main_window_state(app.handle())?;
 
@@ -247,6 +250,8 @@ pub fn run() {
         bridge::desktop_bridge_set_wsl_backend_enabled,
         bridge::desktop_bridge_set_wsl_distro,
         bridge::desktop_bridge_set_wsl_only,
+        bridge::desktop_bridge_get_linux_software_rendering,
+        bridge::desktop_bridge_set_linux_software_rendering,
         bridge::desktop_bridge_set_theme,
         bridge::desktop_bridge_show_context_menu,
         bridge::desktop_bridge_get_update_state,
@@ -306,7 +311,7 @@ pub fn run() {
                 }
                 // Mark after backend shutdown, at the last callback before Tauri's relaunch spawn.
                 crate::relaunch::prepare_descriptors_for_relaunch();
-                crate::relaunch::relaunch_outside_service_unit(app_handle);
+                crate::relaunch::relaunch_with_handoff(app_handle);
                 #[cfg(windows)]
                 if !EXIT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
                     end_session(app_handle);
@@ -414,6 +419,9 @@ mod remote_update_delegate;
 mod security;
 mod server_exposure;
 mod shell_environment;
+mod software_rendering;
+#[cfg(target_os = "linux")]
+pub use software_rendering::apply_process_environment as apply_software_rendering_environment;
 pub mod ssh;
 mod tailscale;
 #[cfg(test)]

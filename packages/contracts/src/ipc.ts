@@ -766,6 +766,17 @@ export interface DesktopWslState {
   preflightError: DesktopWslPreflightError | null;
 }
 
+export interface DesktopLinuxSoftwareRenderingState {
+  /** The stored setting: BiBCode starts WebKit without GPU compositing. */
+  enabled: boolean;
+  /** Set when `BIBCODE_SOFTWARE_RENDERING` decides this launch instead of the setting. */
+  override: "on" | "off" | null;
+  /** WebKit runs without GPU compositing in this session, from any source. */
+  gpuCompositingDisabled: boolean;
+  /** Restarting from Settings would apply the stored setting. */
+  restartApplies: boolean;
+}
+
 export const DesktopWslStateSchema = Schema.Struct({
   enabled: Schema.Boolean,
   distro: Schema.NullOr(Schema.String),
@@ -1357,6 +1368,9 @@ export interface DesktopBridge {
   setWslBackendEnabled: (enabled: boolean) => Promise<DesktopWslState>;
   setWslDistro: (distro: string | null) => Promise<DesktopWslState>;
   setWslOnly: (enabled: boolean) => Promise<DesktopWslState>;
+  /** Linux desktop only: the setting that disables GPU compositing. */
+  getLinuxSoftwareRendering?: () => Promise<DesktopLinuxSoftwareRenderingState>;
+  setLinuxSoftwareRendering?: (enabled: boolean) => Promise<DesktopLinuxSoftwareRenderingState>;
   pickFolder: (options?: PickFolderOptions) => Promise<string | null>;
   saveDiagnosticLogs?: (filename: string, bytes: Uint8Array) => Promise<string | null>;
   /**

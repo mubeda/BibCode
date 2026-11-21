@@ -64,7 +64,7 @@ const AUTH_ENVIRONMENT_BOOTSTRAP_TOKEN_TYPE: &str =
 const AUTH_TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const CLIENT_SETTINGS_FILE_NAME: &str = "client-settings.json";
 const CONNECTION_CATALOG_FILE_NAME: &str = "connection-catalog.tauri.json";
-const DESKTOP_SETTINGS_FILE_NAME: &str = "desktop-settings.json";
+pub(crate) const DESKTOP_SETTINGS_FILE_NAME: &str = "desktop-settings.json";
 /// Tailscale Serve's default HTTPS port. BiBCode only probes it; it never configures Serve.
 const TAILSCALE_SERVE_HTTPS_PORT: u16 = 443;
 const PRIMARY_LOCAL_ENVIRONMENT_ID: &str = "primary";
@@ -78,6 +78,8 @@ struct DesktopSettings {
     wsl_backend_enabled: bool,
     wsl_distro: Option<String>,
     wsl_only: bool,
+    #[cfg(target_os = "linux")]
+    linux_software_rendering: bool,
 }
 
 /// Keys an earlier version wrote, such as `tailscaleServeEnabled`, are ignored on read and
@@ -262,6 +264,8 @@ fn default_desktop_settings() -> DesktopSettings {
         wsl_backend_enabled: false,
         wsl_distro: None,
         wsl_only: false,
+        #[cfg(target_os = "linux")]
+        linux_software_rendering: false,
     }
 }
 
@@ -310,16 +314,24 @@ fn normalize_desktop_settings_document(document: DesktopSettingsDocument) -> Des
         wsl_backend_enabled,
         wsl_distro: normalize_wsl_distro(document.wsl_distro),
         wsl_only,
+        #[cfg(target_os = "linux")]
+        linux_software_rendering: false,
     }
 }
 
 fn desktop_settings_to_value(settings: &DesktopSettings) -> Value {
-    json!({
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut value = json!({
         "serverExposureMode": &settings.server_exposure_mode,
         "wslBackendEnabled": settings.wsl_backend_enabled,
         "wslDistro": &settings.wsl_distro,
         "wslOnly": settings.wsl_only,
-    })
+    });
+    #[cfg(target_os = "linux")]
+    {
+        value[crate::software_rendering::SETTING_KEY] = json!(settings.linux_software_rendering);
+    }
+    value
 }
 
 fn normalize_client_settings_document(value: Value) -> Value {
@@ -404,8 +416,22 @@ fn read_desktop_settings<R: Runtime>(app: &AppHandle<R>) -> Result<DesktopSettin
     let Some(value) = read_json_file(&path)? else {
         return Ok(default_desktop_settings());
     };
+    Ok(desktop_settings_from_value(value))
+}
+
+/// The Linux software rendering key is decoded on its own, so a bad value for it, or for
+/// any other key, cannot reset the rest.
+fn desktop_settings_from_value(value: Value) -> DesktopSettings {
+    #[cfg(target_os = "linux")]
+    let linux_software_rendering = crate::software_rendering::setting_from_document(&value);
     let document = serde_json::from_value::<DesktopSettingsDocument>(value).unwrap_or_default();
-    Ok(normalize_desktop_settings_document(document))
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut settings = normalize_desktop_settings_document(document);
+    #[cfg(target_os = "linux")]
+    {
+        settings.linux_software_rendering = linux_software_rendering;
+    }
+    settings
 }
 
 fn write_desktop_settings<R: Runtime>(
@@ -1097,6 +1123,9 @@ pub fn desktop_bridge_restart_app(
     )?;
     // If requesting exit fails, Tauri restarts without RunEvent::Exit.
     crate::relaunch::prepare_descriptors_for_relaunch();
+    // The exit callback then relaunches through the systemd scope handoff when needed, and
+    // without the software rendering variables BiBCode set itself.
+    crate::relaunch::note_relaunch_requested();
     app.request_restart();
     Ok(())
 }
@@ -1521,6 +1550,77 @@ pub async fn desktop_bridge_set_wsl_only(
             Ok(wsl_state(&settings, &backend))
         })
         .await
+}
+
+/// The Linux setting that disables GPU compositing (#411), with this launch's state.
+#[cfg(target_os = "linux")]
+fn linux_software_rendering_state(enabled: bool) -> Value {
+    use crate::software_rendering::{
+        Override, WEBKIT_VARIABLES, gpu_compositing_disabled, restart_applies, startup_decision,
+    };
+    let decision = startup_decision();
+    json!({
+        "enabled": enabled,
+        "override": decision.override_value.map(Override::as_str),
+        "gpuCompositingDisabled": gpu_compositing_disabled(
+            std::env::var_os(WEBKIT_VARIABLES[0]).as_deref()
+        ),
+        "restartApplies": restart_applies(enabled, &decision, |name| {
+            std::env::var_os(name).is_some()
+        }),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_software_rendering_unsupported(method: &str) -> Value {
+    json!({
+        "code": "tauri_capability_unsupported",
+        "method": method,
+        "capability": "Linux software rendering",
+        "message": format!("{method} is available on Linux only."),
+    })
+}
+
+#[tauri::command]
+pub fn desktop_bridge_get_linux_software_rendering(
+    app: AppHandle<DesktopRuntime>,
+) -> Result<Value, Value> {
+    #[cfg(target_os = "linux")]
+    return read_desktop_settings(&app)
+        .map(|settings| linux_software_rendering_state(settings.linux_software_rendering))
+        .map_err(Value::String);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        Err(linux_software_rendering_unsupported(
+            "getLinuxSoftwareRendering",
+        ))
+    }
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_set_linux_software_rendering(
+    app: AppHandle<DesktopRuntime>,
+    coordinator: State<'_, ServerExposureCoordinator>,
+    enabled: bool,
+) -> Result<Value, Value> {
+    #[cfg(target_os = "linux")]
+    return coordinator
+        .run_exclusive(async {
+            update_desktop_settings(&app, |settings| {
+                settings.linux_software_rendering = enabled;
+            })
+        })
+        .await
+        .map(|settings| linux_software_rendering_state(settings.linux_software_rendering))
+        .map_err(Value::String);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (app, coordinator, enabled);
+        Err(linux_software_rendering_unsupported(
+            "setLinuxSoftwareRendering",
+        ))
+    }
 }
 
 #[tauri::command]
@@ -3569,6 +3669,8 @@ mod tests {
     }
 
     #[test]
+    // The struct update fills the Linux-only field.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::needless_update))]
     fn normalizes_desktop_settings_with_legacy_wsl_mode() {
         let settings = normalize_desktop_settings_document(DesktopSettingsDocument {
             server_exposure_mode: Some("network-accessible".to_string()),
@@ -3585,7 +3687,46 @@ mod tests {
                 wsl_backend_enabled: true,
                 wsl_distro: Some("Ubuntu-24.04".to_string()),
                 wsl_only: true,
+                ..default_desktop_settings()
             }
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn software_rendering_setting_survives_a_bad_value_elsewhere_and_other_writes() {
+        // A wrong type for another key resets that document, but not this key.
+        let settings = desktop_settings_from_value(json!({
+            "linuxSoftwareRendering": true,
+            "wslOnly": "not a boolean",
+        }));
+        assert!(settings.linux_software_rendering);
+        // A WSL or exposure write keeps it.
+        let value = desktop_settings_to_value(&settings);
+        assert_eq!(value["linuxSoftwareRendering"], json!(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn software_rendering_bad_value_does_not_reset_other_settings() {
+        let settings = desktop_settings_from_value(json!({
+            "serverExposureMode": "network-accessible",
+            "wslOnly": true,
+            "linuxSoftwareRendering": "yes",
+        }));
+        assert!(!settings.linux_software_rendering);
+        assert_eq!(settings.server_exposure_mode, "network-accessible");
+        assert!(settings.wsl_only);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn software_rendering_setting_is_not_written_off_linux() {
+        let settings = desktop_settings_from_value(json!({ "linuxSoftwareRendering": true }));
+        assert!(
+            desktop_settings_to_value(&settings)
+                .get("linuxSoftwareRendering")
+                .is_none()
         );
     }
 
@@ -4538,6 +4679,8 @@ mod tests {
                 desktop_bridge_set_wsl_backend_enabled,
                 desktop_bridge_set_wsl_distro,
                 desktop_bridge_set_wsl_only,
+                desktop_bridge_get_linux_software_rendering,
+                desktop_bridge_set_linux_software_rendering,
                 desktop_bridge_set_theme,
                 desktop_bridge_show_context_menu,
                 desktop_bridge_get_update_state,
@@ -4988,6 +5131,7 @@ mod tests {
             "desktop_bridge_set_tailscale_serve_enabled",
             "desktop_bridge_set_wsl_backend_enabled",
             "desktop_bridge_set_wsl_only",
+            "desktop_bridge_set_linux_software_rendering",
             "desktop_bridge_confirm",
         ] {
             assert!(

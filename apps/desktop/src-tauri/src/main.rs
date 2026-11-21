@@ -30,6 +30,9 @@ fn main() {
     {
         std::process::exit(code);
     }
+    // The GUI only, still single-threaded: before any webview, whose web processes inherit it.
+    #[cfg(target_os = "linux")]
+    bibcode_desktop_lib::apply_software_rendering_environment();
     bibcode_desktop_lib::run();
 }
 

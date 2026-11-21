@@ -19,6 +19,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { toastManager } from "../ui/toast";
+import { LinuxRenderingSection } from "./LinuxRenderingSection";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import { ThemeEditor } from "./ThemeEditor";
 import { ThemeImportDialog } from "./ThemeImportDialog";
@@ -519,6 +520,7 @@ export function AppearanceSettingsPanel() {
           </p>
         </div>
       </SettingsSection>
+      <LinuxRenderingSection />
       <ThemeImportDialog open={importing} onOpenChange={setImporting} />
     </SettingsPageContainer>
   );
