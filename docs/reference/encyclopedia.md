@@ -189,8 +189,8 @@ arrives as carried rows. See
 ### Provider Driver
 
 The implementation that probes, launches, and translates one backend agent
-protocol. BiBCode supports four built-in drivers: Codex, Claude, Cursor, and
-OpenCode.
+protocol. BiBCode supports five built-in drivers: Codex, Claude, Cursor, Antigravity,
+and OpenCode.
 
 ### Provider Instance
 

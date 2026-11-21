@@ -2,12 +2,13 @@
 
 BiBCode currently supports these coding-agent providers:
 
-| Provider                  | Default state | Native integration        | Activity                                              |
-| ------------------------- | ------------- | ------------------------- | ----------------------------------------------------- |
-| [Codex](./codex.md)       | Enabled       | Codex App Server JSON-RPC | Structured chat and conditional terminal observation. |
-| [Claude](./claude.md)     | Enabled       | Stream-JSON CLI and hooks | Capability-gated chat and terminal observation.       |
-| [OpenCode](./opencode.md) | Enabled       | HTTP and server events    | Structured chat and conditional terminal observation. |
-| [Cursor](./cursor.md)     | Enabled       | Agent Client Protocol     | Chat; no structured activity in protocol v2.          |
+| Provider                        | Default state      | Native integration        | Activity                                              |
+| ------------------------------- | ------------------ | ------------------------- | ----------------------------------------------------- |
+| [Codex](./codex.md)             | Enabled            | Codex App Server JSON-RPC | Structured chat and conditional terminal observation. |
+| [Claude](./claude.md)           | Enabled            | Stream-JSON CLI and hooks | Capability-gated chat and terminal observation.       |
+| [OpenCode](./opencode.md)       | Enabled            | HTTP and server events    | Structured chat and conditional terminal observation. |
+| [Cursor](./cursor.md)           | Enabled            | Agent Client Protocol     | Chat; no structured activity in protocol v2.          |
+| [Antigravity](./antigravity.md) | Disabled (Preview) | Agent Client Protocol     | Chat and terminal; no structured activity.            |
 
 The legacy Grok driver is intentionally not exposed as a supported provider:
 it is omitted from Settings and from chat/terminal action menus even if an old
@@ -80,7 +81,7 @@ forever. A server's progress also shows in **Settings → Connections**.
 The chat menu combines the selected provider's user skills with skills from the
 active repository or worktree. User skills outside the repository remain
 available even when the repository has no skills. Use `$` for Codex and `/` for
-Claude, Cursor, and OpenCode. Each provider's native visibility and name
+Claude, Cursor, Antigravity, and OpenCode. Each provider's native visibility and name
 precedence apply; disabled or non-invocable native skills are not suggestions.
 Like `@` for files and agents, `$` and `/` open the menu at the start of any
 word, mid-prompt too, while BiBCode's own `:` actions open it only at the start
