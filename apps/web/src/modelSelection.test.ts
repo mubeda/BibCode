@@ -471,6 +471,36 @@ describe("instance-scoped model selection", () => {
     });
   });
 
+  it("skips a ready Antigravity entry with no models for text generation", () => {
+    const antigravity = provider({
+      provider: ProviderDriverKind.make("antigravity"),
+      instanceId: "antigravity",
+      models: [],
+    });
+    const usable = provider({ instanceId: "claudeAgent", models: ["claude-fallback"] });
+    const settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      textGenerationModelSelection: {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-selected",
+      },
+    };
+
+    expect(resolveAppModelSelectionState(settings, [antigravity, usable])).toMatchObject({
+      instanceId: "claudeAgent",
+      model: "claude-fallback",
+    });
+    const withCatalog = provider({
+      provider: ProviderDriverKind.make("antigravity"),
+      instanceId: "antigravity",
+      models: ["model-alpha"],
+    });
+    expect(resolveAppModelSelectionState(settings, [withCatalog, usable])).toMatchObject({
+      instanceId: "antigravity",
+      model: "model-alpha",
+    });
+  });
+
   it("covers duplicate custom models and empty instance fallbacks", () => {
     const serverCustom = {
       ...provider({ instanceId: "codex", models: [] }),

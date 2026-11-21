@@ -8,6 +8,7 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  buildCodeReviewMenuReviewers,
   CODE_REVIEW_INSTRUCTIONS_MAX_LENGTH,
   codeReviewGuardLine,
   codeReviewScopeText,
@@ -152,6 +153,37 @@ describe("codeReviewGuardLine", () => {
     );
     expect(line("terminal", "claudeAgent")).toBe("Starts in Claude's plan mode.");
     expect(line("terminal", "codex")).toBe("Runs in Codex's read-only sandbox.");
+  });
+
+  it("offers the Antigravity chat as a reviewer with the instructed guard, and no terminal review", () => {
+    const antigravity = {
+      instanceId: ProviderInstanceId.make("antigravity"),
+      driver: ProviderDriverKind.make("antigravity"),
+      displayName: "Antigravity",
+      enabled: true,
+      installed: true,
+      status: "ready",
+      availability: "available",
+      models: [],
+    } as unknown as ServerProvider;
+    const actions = buildProviderAgentActions([antigravity], {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [antigravity.instanceId]: { driver: antigravity.driver, enabled: true },
+      },
+    });
+
+    expect(
+      buildCodeReviewMenuReviewers(actions, () => null).map(({ value, guardLine }) => ({
+        value,
+        guardLine,
+      })),
+    ).toEqual([
+      {
+        value: "chat:antigravity",
+        guardLine: "Told not to edit. BiBCode cannot block edits for this agent.",
+      },
+    ]);
   });
 
   it("says a Codex chat review runs on its own only on a server with read-only Codex reviews", () => {

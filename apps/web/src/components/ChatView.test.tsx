@@ -886,6 +886,8 @@ import { newDraftId } from "../lib/utils";
 import type { ProviderInstanceEntry } from "../providerInstances";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+import { buildProviderAgentActions } from "./chat/providerAgentActions";
+import type { ProviderTerminalAction } from "./chat/providerTerminalActions";
 import { FileEditingSessionRegistry } from "./files/fileEditingSessionRegistry";
 import { toastManager } from "./ui/toast";
 import type {
@@ -6057,6 +6059,90 @@ describe("ChatView handlers (captured from mocked children)", () => {
         expect(capturedProps<Record<string, unknown>>("planSidebar")["label"]).toBe("Plan");
       } finally {
         await view.unmount();
+      }
+    });
+  });
+
+  describe("Antigravity from the AI Terminal menu (R12, R13)", () => {
+    const antigravityInstanceId = ProviderInstanceId.make("antigravity_work");
+    const antigravityProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: antigravityInstanceId,
+      driver: ProviderDriverKind.make("antigravity"),
+      displayName: "Antigravity",
+      models: [{ slug: "model-alpha", name: "Model Alpha", isCustom: false, capabilities: null }],
+    };
+
+    it("opens the selected instance's Antigravity Terminal in the thread checkout", async () => {
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: { providers: [codexProvider, antigravityProvider] },
+        } as never),
+      );
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      h.settings = {
+        ...h.settings,
+        providerInstances: {
+          [antigravityInstanceId]: {
+            driver: ProviderDriverKind.make("antigravity"),
+            displayName: "Antigravity",
+            enabled: true,
+            config: { binaryPath: "custom-agy" },
+          },
+        },
+      };
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+        const header = capturedProps<{
+          providerStatuses: ServerProvider[];
+          settings: Parameters<typeof buildProviderAgentActions>[1];
+          onOpenProviderTerminalPanel: (action: ProviderTerminalAction) => void;
+        }>("chatHeaderActions");
+        const menu = buildProviderAgentActions(header.providerStatuses, header.settings).filter(
+          (action) => action.entry.instanceId === antigravityInstanceId,
+        );
+        expect(menu.map(({ value, disabled }) => ({ value, disabled }))).toEqual([
+          { value: "chat:antigravity_work", disabled: false },
+          { value: "terminal:antigravity_work", disabled: false },
+        ]);
+        const terminal = menu[1]!;
+        if (terminal.kind !== "terminal" || terminal.terminalAction.command === null) {
+          throw new Error("expected an enabled Antigravity Terminal action");
+        }
+
+        await act(async () =>
+          header.onOpenProviderTerminalPanel(terminal.terminalAction as ProviderTerminalAction),
+        );
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+        const opened = commandCallsFor("terminal.open")[0]!.input as {
+          input: { cwd: string; command: unknown };
+        };
+        expect(opened.input.cwd).toBe("X:/demo");
+        expect(opened.input.command).toEqual({
+          executable: "custom-agy",
+          args: ["--dangerously-skip-permissions"],
+          label: "Antigravity Terminal",
+          activity: {
+            driverKind: ProviderDriverKind.make("antigravity"),
+            providerInstanceId: antigravityInstanceId,
+          },
+        });
+        expect(JSON.stringify(opened)).not.toMatch(/observer/i);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
       }
     });
   });

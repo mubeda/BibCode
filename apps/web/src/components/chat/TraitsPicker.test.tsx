@@ -918,6 +918,64 @@ describe("TraitsPicker", () => {
     expect(document.querySelector('button[aria-label^="Reasoning effort:"]')).toBeNull();
   });
 
+  it("shows each Antigravity model's own advertised thinking levels (R13)", async () => {
+    const level = (ids: ReadonlyArray<string>) =>
+      selectDescriptor(
+        "reasoning",
+        "Thinking level",
+        ids.map((id) => ({
+          id,
+          label: id.toUpperCase(),
+          ...(id === "low" ? { isDefault: true } : {}),
+        })),
+      );
+    const models: ReadonlyArray<ServerProviderModel> = [
+      {
+        slug: "model-alpha",
+        name: "Model Alpha",
+        isCustom: false,
+        capabilities: { optionDescriptors: [level(["low", "medium", "high"])] },
+      },
+      {
+        slug: "model-beta",
+        name: "Model Beta",
+        isCustom: false,
+        capabilities: { optionDescriptors: [level(["low", "medium", "high", "xhigh"])] },
+      },
+    ];
+    const antigravity = ProviderDriverKind.make("antigravity");
+
+    await mount(
+      <div>
+        <ComposerTraitControls
+          provider={antigravity}
+          models={models}
+          model="model-alpha"
+          prompt=""
+          modelOptions={selections(["reasoning", "high"])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={vi.fn()}
+        />
+        <ComposerTraitControls
+          provider={antigravity}
+          models={models}
+          model="model-beta"
+          prompt=""
+          modelOptions={selections(["reasoning", "xhigh"])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={vi.fn()}
+        />
+      </div>,
+    );
+
+    const bars = (label: string) =>
+      document
+        .querySelector<HTMLButtonElement>(`button[aria-label="Reasoning effort: ${label}"]`)
+        ?.querySelector('[aria-hidden="true"]')?.children;
+    expect(bars("HIGH")).toHaveLength(3);
+    expect(bars("XHIGH")).toHaveLength(4);
+  });
+
   it("replaces composer controls when the provider instance and model change", async () => {
     const mounted = await mount(
       <ComposerTraitControls

@@ -291,8 +291,17 @@ export function resolveAppModelSelectionState(
   const selectedEntry = entries.find(
     (entry) => entry.instanceId === selection.instanceId && entry.enabled && entry.isAvailable,
   );
+  const available = entries.filter((candidate) => candidate.enabled && candidate.isAvailable);
+  // Antigravity has no built-in text-generation model, so without a catalog it would yield an
+  // empty model; a usable provider later in the list wins (design note, text generation).
   const entry =
-    selectedEntry ?? entries.find((candidate) => candidate.enabled && candidate.isAvailable);
+    selectedEntry ??
+    available.find(
+      (candidate) =>
+        candidate.driverKind !== ProviderDriverKind.make("antigravity") ||
+        candidate.models.length > 0,
+    ) ??
+    available[0];
   if (entry) {
     // When the instance changed due to fallback (e.g. selected instance was disabled),
     // don't carry over the old instance's model — use the fallback instance's default.
