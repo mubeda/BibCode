@@ -100,6 +100,14 @@ Source: https://github.com/mubeda/BibCode/issues/397, https://github.com/mubeda/
 - The menu offers "Open PR in browser", which opens the PR URL in the browser.
 - GIVEN the panel cannot open, THEN View PR opens the browser, as before (D12).
 
+### R17. Linux: run without GPU compositing
+
+- GIVEN the Linux desktop app with the software-rendering setting on, WHEN the app starts by any route (the launcher, the binary itself, or a `bibcode://` link), THEN the process sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` and `WEBKIT_DISABLE_DMABUF_RENDERER=1` before any webview is created.
+- GIVEN the setting off (the default), THEN neither variable is set by BiBCode, and a value the user exported is left as it is.
+- The setting is reachable without a working window (an environment variable or a file the user can edit), and from Settings on Linux; Settings says a restart is needed.
+- macOS and Windows are unchanged.
+- Not proven by this pull request: that the GPU hang of issue #411 stops on the affected machine. That needs 20 launches and a 24 hour run there, so #411 stays open until the owner reports it.
+
 ## Non-goals
 
 - ACP elicitation forms (agent questions), MCP servers passed to the Antigravity chat, and signing the user in from BiBCode: later issues.

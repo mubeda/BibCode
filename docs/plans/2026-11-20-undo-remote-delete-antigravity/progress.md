@@ -1,7 +1,7 @@
 # Progress: Files undo shortcuts, remote branch delete, Antigravity terminal
 
 Plan: plan.md
-Spec: spec.md (sha256 3f5d29373cba)
+Spec: spec.md (sha256 f67ba6219586)
 Plan status: Approved 2026-11-20
 Plan review: Codex gpt-6.2-sol at high, round 2, Needs rework; all 25 findings of both rounds handled (reviews/), no third round
 Executor: mstack-codex-review-workflow
@@ -24,6 +24,8 @@ Branch: claude/backlog-triage-planning-pr-b5ee7f
 | 3.10 | Document Antigravity everywhere the providers are listed                      | 3     | Open        |        |                                                              |
 | 4.1  | Integrate, review and fix follow-ups                                          | 4     | Open        |        |                                                              |
 | 5.1  | Route View PR to the panel and keep a browser menu item                       | 5     | Closed      | lane C | accepted after one review round                              |
+| 6.1  | Write and review the software-rendering design note                           | 6     | In progress | lane I | issue #411                                                   |
+| 6.2  | Add the Linux software-rendering setting                                      | 6     | Open        | lane I | after 6.1                                                    |
 | 4.2  | Gate the candidate commit and open the pull request                           | 4     | Open        |        |                                                              |
 
 ## Log
@@ -72,3 +74,4 @@ Remaining per lane:
 - Coordinator: Codex and advisor review of every lane, then phase 4 as planned.
 - 2026-11-21 18:15 Run resumed at the owner's request. Lanes A, B, E, F and G continue on their branches; lane H wrote Task 3.10 (branch worktree-agent-a9cf9c75f12386a12, commit 10733a6df, not reviewed). Lane C merged into the integration branch (b0f5c684b; 44 logic tests pass).
 - 2026-11-21 18:25 Backlog checked again at the owner's request: 14 open issues, one new since the last triage, #410 (preview webview calls on macOS leak three native retains), a follow-up of #398 filed by lane A, which fixes it in this pull request. No duplicate found (searched open and closed issues for the function, "retain" and the runtime call). Lane E finished Task 3.9 (commits d44d89b1e, 0165ccd63, 057016ba1); Codex review running.
+- 2026-11-21 18:40 Third backlog check at the owner's request: one new issue, #411 (Linux desktop: the WebKitGTK compositor hangs an Intel GPU and ends the desktop session), filed by the owner. No duplicate (searched open and closed issues for WebKitGTK, compositor, DMABUF, "GPU hang" and the variable names; #15 is a different Linux graphics problem). Added as spec R17 and phase 6 on the owner's instruction to include it in this pull request. Planned without a separate plan review; the design note of Task 6.1 gets the Codex and advisor review. The pull request refers to #411 without closing it, because the proof on the affected machine is the owner's.
