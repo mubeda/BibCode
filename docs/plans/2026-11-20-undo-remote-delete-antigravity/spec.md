@@ -108,6 +108,13 @@ Source: https://github.com/mubeda/BibCode/issues/397, https://github.com/mubeda/
 - macOS and Windows are unchanged.
 - The pull request closes #411 (owner's ruling, 2026-11-21). The pull request proves that the variables are set and that the app renders in the Linux lab; the 20 launches and the 24 hour run on the affected machine named in the issue are not run, and the pull request says so.
 
+### R18. Antigravity in the usage status bar and in every provider list
+
+- GIVEN Antigravity enabled and signed in with an account, WHEN the status bar's Antigravity item is on, THEN it shows the five-hour and weekly limits the CLI reports, with their reset times, read without sending a prompt.
+- GIVEN an API key sign-in, a CLI below the minimum version, or a CLI that is not signed in, THEN the item says why no quota is shown and no prompt is sent.
+- A provider the status bar does not know never renders as another provider.
+- Every place where a provider can be picked offers Antigravity or records why it does not (PR: review terminal, MCP client registration, session import, native skill invocation).
+
 ## Non-goals
 
 - ACP elicitation forms (agent questions), MCP servers passed to the Antigravity chat, and signing the user in from BiBCode: later issues.

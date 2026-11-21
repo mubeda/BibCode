@@ -1,7 +1,7 @@
 # Progress: Files undo shortcuts, remote branch delete, Antigravity terminal
 
 Plan: plan.md
-Spec: spec.md (sha256 f51be8b89ea5)
+Spec: spec.md (sha256 7fd875f43f88)
 Plan status: Approved 2026-11-20
 Plan review: Codex gpt-6.2-sol at high, round 2, Needs rework; all 25 findings of both rounds handled (reviews/), no third round
 Executor: mstack-codex-review-workflow
@@ -22,6 +22,8 @@ Branch: claude/backlog-triage-planning-pr-b5ee7f
 | 3.8  | Probe Antigravity sign-in state and models in the inventory                   | 3     | In progress | lane G |                                                              |
 | 3.9  | Offer Antigravity Terminal and Antigravity chat in the client                 | 3     | In progress | lane E | terminal and Settings first; chat part waits for 3.7 and 3.8 |
 | 3.10 | Document Antigravity everywhere the providers are listed                      | 3     | Open        |        |                                                              |
+| 3.11 | Write and review the Antigravity usage design note                            | 3     | In progress | lane J |                                                              |
+| 3.12 | Show Antigravity usage in the status bar and close the provider-list gaps     | 3     | Open        | lane J | after 3.11                                                   |
 | 4.1  | Integrate, review and fix follow-ups                                          | 4     | Open        |        |                                                              |
 | 5.1  | Route View PR to the panel and keep a browser menu item                       | 5     | Closed      | lane C | accepted after one review round                              |
 | 6.1  | Write and review the software-rendering design note                           | 6     | In progress | lane I | issue #411                                                   |
@@ -76,3 +78,4 @@ Remaining per lane:
 - 2026-11-21 18:25 Backlog checked again at the owner's request: 14 open issues, one new since the last triage, #410 (preview webview calls on macOS leak three native retains), a follow-up of #398 filed by lane A, which fixes it in this pull request. No duplicate found (searched open and closed issues for the function, "retain" and the runtime call). Lane E finished Task 3.9 (commits d44d89b1e, 0165ccd63, 057016ba1); Codex review running.
 - 2026-11-21 18:40 Third backlog check at the owner's request: one new issue, #411 (Linux desktop: the WebKitGTK compositor hangs an Intel GPU and ends the desktop session), filed by the owner. No duplicate (searched open and closed issues for WebKitGTK, compositor, DMABUF, "GPU hang" and the variable names; #15 is a different Linux graphics problem). Added as spec R17 and phase 6 on the owner's instruction to include it in this pull request. Planned without a separate plan review; the design note of Task 6.1 gets the Codex and advisor review. The pull request refers to #411 without closing it, because the proof on the affected machine is the owner's.
 - 2026-11-21 18:36 Ruling by the owner: this pull request implements #411 and closes it. Cost if wrong: the issue is closed without the long run on the affected machine; the owner reopens it if the hang returns.
+- 2026-11-21 18:55 Owner asked for Antigravity in the usage status bar and a check of every provider selection spot. Measured: `agy -p "/usage" --output-format json` returns the limits without a prompt. A read-only audit of the provider lists found the status bar hardcoded to two providers, a server fallback that would give Antigravity another provider's binary settings (sent to lane F), and three small label gaps. Added as spec R18 and Tasks 3.11 and 3.12 (lane J). Owner's instruction of the same day: the Antigravity CLI (`gemini-4-neon-high`) is a second code reviewer, and Codex, Antigravity and advisor findings are triaged with mstack-receive-review.
