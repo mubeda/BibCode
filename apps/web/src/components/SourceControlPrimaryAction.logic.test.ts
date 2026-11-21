@@ -219,12 +219,36 @@ describe("resolveSourceControlPrimaryAction — commit-first ladder", () => {
         hasPrimaryRemote: false,
       }),
     );
-    assert.deepEqual(action, { kind: "open_pr", label: "View PR", disabled: false });
+    assert.deepEqual(action, { kind: "open_pr_panel", label: "View PR", disabled: false });
   });
 
-  it("views an open PR when clean, synced, and a PR is open", () => {
+  it("views an open PR in the panel when clean, synced, and a PR is open", () => {
     const action = resolveSourceControlPrimaryAction(makeInput({ status: { pr: OPEN_PR } }));
-    assert.deepEqual(action, { kind: "open_pr", label: "View PR", disabled: false });
+    assert.deepEqual(action, { kind: "open_pr_panel", label: "View PR", disabled: false });
+  });
+
+  it("views an open PR in the browser when the panel cannot show it", () => {
+    for (const statusOverrides of [
+      { pr: OPEN_PR },
+      { hasUpstream: false, aheadCount: 0, pr: OPEN_PR },
+    ]) {
+      const action = resolveSourceControlPrimaryAction(
+        makeInput({ status: statusOverrides, hasPrimaryRemote: false, canOpenInPanel: false }),
+      );
+      assert.deepEqual(action, { kind: "open_pr", label: "View PR", disabled: false });
+    }
+  });
+
+  it("words the panel action View MR on GitLab", () => {
+    const action = resolveSourceControlPrimaryAction(
+      makeInput({
+        status: {
+          pr: OPEN_PR,
+          sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+        },
+      }),
+    );
+    assert.deepEqual(action, { kind: "open_pr_panel", label: "View MR", disabled: false });
   });
 
   it("creates a PR when synced with upstream but ahead of the default ref", () => {
@@ -408,19 +432,19 @@ describe("buildSourceControlMenuItems — always-rendered, disabled-with-reason"
       "push",
       "pull",
       "merge",
-      "open_pr",
       "open_pr_panel",
+      "open_pr",
     ]);
-    assert.deepInclude(menuItem(items, "open_pr"), {
-      label: "View PR",
-      disabled: false,
-      kind: "open_pr",
-    });
     assert.deepInclude(menuItem(items, "open_pr_panel"), {
-      label: "Open PR in panel",
+      label: "View PR",
       disabled: false,
       kind: "open_pr_panel",
       group: "remote",
+    });
+    assert.deepInclude(menuItem(items, "open_pr"), {
+      label: "Open PR in browser",
+      disabled: false,
+      kind: "open_pr",
     });
   });
 
@@ -429,7 +453,7 @@ describe("buildSourceControlMenuItems — always-rendered, disabled-with-reason"
       makeInput({ status: { aheadCount: 2, pr: OPEN_PR }, canOpenInPanel: false }),
     );
     assert.notInclude(menuIds(items), "open_pr_panel");
-    assert.include(menuIds(items), "open_pr");
+    assert.deepInclude(menuItem(items, "open_pr"), { label: "View PR", kind: "open_pr" });
   });
 
   it("offers no in-panel action without an open request", () => {

@@ -2,6 +2,7 @@ import { VcsActionRemoteFailureError } from "@bibcode/client-runtime/state/vcs";
 import type {
   GitRunStackedActionResult,
   GitStackedAction,
+  SourceControlProviderKind,
   VcsStatusResult,
 } from "@bibcode/contracts";
 import { isTemporaryWorktreeBranch } from "@bibcode/shared/git";
@@ -11,13 +12,14 @@ import {
   getChangeRequestTerminology,
   type ChangeRequestTerminology,
 } from "../sourceControlPresentation";
+import { canOpenPullRequestInPanel } from "./pullRequests/pullRequestsAvailability";
 
 export type GitActionIconName = "commit" | "push" | "pr";
 
 export type GitDialogAction = "commit" | "push" | "create_pr";
 
 export interface GitActionMenuItem {
-  id: "commit" | "push" | "pr" | "pr_panel";
+  id: "commit" | "push" | "pr" | "pr_browser";
   label: string;
   disabled: boolean;
   icon: GitActionIconName;
@@ -28,7 +30,7 @@ export interface GitActionMenuItem {
 export interface GitQuickAction {
   label: string;
   disabled: boolean;
-  kind: "run_action" | "run_pull" | "open_pr" | "open_publish" | "show_hint";
+  kind: "run_action" | "run_pull" | "open_pr" | "open_pr_panel" | "open_publish" | "show_hint";
   action?: GitStackedAction;
   hint?: string;
 }
@@ -154,7 +156,7 @@ export function buildMenuItems(
           label: `View ${terminology.shortLabel}`,
           disabled: !canOpenPr,
           icon: "pr",
-          kind: "open_pr",
+          kind: canOpenInPanel ? "open_pr_panel" : "open_pr",
         }
       : {
           id: "pr",
@@ -167,11 +169,11 @@ export function buildMenuItems(
   ];
   if (canOpenInPanel && hasOpenPr) {
     items.push({
-      id: "pr_panel",
-      label: `Open ${terminology.shortLabel} in panel`,
+      id: "pr_browser",
+      label: `Open ${terminology.shortLabel} in browser`,
       disabled: !canOpenPr,
       icon: "pr",
-      kind: "open_pr_panel",
+      kind: "open_pr",
     });
   }
   return items;
@@ -182,6 +184,7 @@ export function resolveQuickAction(
   isBusy: boolean,
   isDefaultRef = false,
   hasPrimaryRemote = true,
+  canOpenInPanel = false,
 ): GitQuickAction {
   if (isBusy) {
     return { label: "Commit", disabled: true, kind: "show_hint", hint: "Git action in progress." };
@@ -204,6 +207,7 @@ export function resolveQuickAction(
   const isBehind = gitStatus.behindCount > 0;
   const isDiverged = isAhead && isBehind;
   const terminology = resolveChangeRequestTerminology(gitStatus);
+  const viewKind = canOpenInPanel ? "open_pr_panel" : "open_pr";
 
   if (!hasBranch) {
     return {
@@ -232,7 +236,7 @@ export function resolveQuickAction(
   if (!gitStatus.hasUpstream) {
     if (!hasPrimaryRemote) {
       if (hasOpenPr && !isAhead) {
-        return { label: `View ${terminology.shortLabel}`, disabled: false, kind: "open_pr" };
+        return { label: `View ${terminology.shortLabel}`, disabled: false, kind: viewKind };
       }
       return {
         label: "Publish repository",
@@ -242,7 +246,7 @@ export function resolveQuickAction(
     }
     if (!isAhead) {
       if (hasOpenPr) {
-        return { label: `View ${terminology.shortLabel}`, disabled: false, kind: "open_pr" };
+        return { label: `View ${terminology.shortLabel}`, disabled: false, kind: viewKind };
       }
       return {
         label: "Push",
@@ -302,7 +306,7 @@ export function resolveQuickAction(
   }
 
   if (hasOpenPr && gitStatus.hasUpstream) {
-    return { label: `View ${terminology.shortLabel}`, disabled: false, kind: "open_pr" };
+    return { label: `View ${terminology.shortLabel}`, disabled: false, kind: viewKind };
   }
 
   if (hasDefaultBranchDelta && !isDefaultRef) {
@@ -320,6 +324,45 @@ export function resolveQuickAction(
     kind: "show_hint",
     hint: "Branch is up to date. No action needed.",
   };
+}
+
+/**
+ * Whether a request can be shown in the thread's right panel: the setting is on, the host has
+ * request details, and the server reads pull requests. A disconnect is not lack of support.
+ */
+export function canShowPullRequestInPanel(input: {
+  readonly enabled: boolean;
+  readonly pullRequestsReads: boolean;
+  readonly providerKind: SourceControlProviderKind;
+}): boolean {
+  return (
+    input.pullRequestsReads &&
+    canOpenPullRequestInPanel({ enabled: input.enabled, providerKind: input.providerKind })
+  );
+}
+
+const REQUEST_PATH_MARKER = /\/(?:-\/)?(?:pull|merge_requests)\/\d+/;
+
+/**
+ * True when a request URL names a repository other than `repository` (the checkout's origin,
+ * as the panel addresses it). Source Control finds a branch's request through the host CLI's
+ * default repository, which can be the parent of a copy. An unknown repository or an
+ * unrecognised URL is "cannot tell", reported as false.
+ */
+export function isPullRequestInOtherRepository(
+  requestUrl: string,
+  repository: string | null,
+): boolean {
+  if (repository === null) return false;
+  let pathname: string;
+  try {
+    pathname = new URL(requestUrl).pathname;
+  } catch {
+    return false;
+  }
+  const marker = REQUEST_PATH_MARKER.exec(pathname);
+  if (marker === null) return false;
+  return pathname.slice(1, marker.index).toLowerCase() !== repository.toLowerCase();
 }
 
 const isRemoteFailure = Schema.is(VcsActionRemoteFailureError);
