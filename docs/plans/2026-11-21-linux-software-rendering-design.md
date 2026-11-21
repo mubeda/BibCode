@@ -1,8 +1,9 @@
-# Linux software rendering setting
+# Linux setting to disable GPU compositing
 
-Status: draft for Codex and advisor review (Task 6.1 of
+Status: revised after Codex and advisor review round 1 (Task 6.1 of
 `docs/plans/2026-11-20-undo-remote-delete-antigravity/`, requirement R17,
-issue #411).
+issue #411). The pull request closes #411, so the proof in
+[Verification](#verification) must come from the packaged app.
 
 ## Problem
 
@@ -30,23 +31,27 @@ a `bibcode://` link starts the binary directly.
 - `run()` hydrates `PATH` from the login shell before any thread
   (`lib.rs:101-102`), starts the crash monitor child (`lib.rs:104`) and
   builds Tauri. The first webview is the main window, built in `setup`
-  (`lib.rs:139-146`); preview webviews come later. Decisions made before
-  tracing exists are recorded and logged in `setup`, as
-  `shell_path_hydration.record()` does (`lib.rs:102`, `lib.rs:160`).
+  (`lib.rs:139-146`); preview webviews come later. A decision made before
+  the log sink exists is kept and logged in `setup`, as
+  `shell_path_hydration.record()` does (`lib.rs:102`, `lib.rs:160`,
+  `shell_environment.rs:93-105`).
 - Desktop-level settings live in `desktop-settings.json` under the state
   directory: `<data root>/userdata` in release builds and `<data root>/dev`
   in debug builds (`config.rs:170-176`). The data root is `BIBCODE_HOME` or
   `~/.bibcode` (`config.rs:147-164`, `apps/server/src/data_root.rs:80-104`).
   The bridge reads and writes the file (`bridge.rs:67`, `bridge.rs:76-92`,
-  `bridge.rs:402-426`) and the backend reads it by its own route
-  (`backend.rs:3215-3224`). The writer emits only the keys it knows
-  (`bridge.rs:316-323`), so a key added by hand is dropped on the next
-  write.
-- The state directory needs an `AppHandle` only for the home directory:
-  Tauri 2.11.6 resolves it with `dirs::home_dir()`
-  (`src/path/desktop.rs:153-155`), which on Linux is `$HOME`, then the
-  password database. `std::env::home_dir()` follows the same order on Unix,
-  so `main` can resolve the same file before Tauri starts.
+  `bridge.rs:402-426`) and the backend reads it through
+  `config::data_root` (`backend.rs:3215-3224`, `backend.rs:3257-3259`).
+- Two loss cases exist in that code. The writer emits only the keys it
+  knows (`bridge.rs:316-323`), so a key added by hand is dropped on the
+  next write. And the reader decodes the whole document at once with
+  `unwrap_or_default()` (`bridge.rs:407`), so one field of the wrong type
+  resets every field to its default, and the next write saves those
+  defaults.
+- The home directory is the only part of the state directory that needs
+  an `AppHandle`: Tauri 2.11.6 resolves it with `dirs::home_dir()`
+  (`src/path/desktop.rs:153-155`). The server already depends on the same
+  crate (`apps/server/Cargo.toml:33`, `dirs.workspace = true`).
 - The `bibcode://` handler: `tauri-plugin-deep-link` 2.4.10 writes
   `<exe name>-handler.desktop` with `Exec` set to `$APPIMAGE` when that is
   set, else to the binary itself (`src/lib.rs:285-296`). From an extracted
@@ -56,19 +61,37 @@ a `bibcode://` link starts the binary directly.
 - Launcher-level options exist today only in the GTK hook:
   `BIBCODE_GDK_BACKEND` is applied by `AppRun`
   (`scripts/tauri/linuxdeploy-plugin-gtk.sh:121`), so it has the same gap.
-- Restarts start the new process from the old one. The Settings restart
-  (`bridge.rs:1088-1101`) and the update restart (`updates.rs:933-935`) end
-  in Tauri's `restart`, which spawns the current binary with the inherited
-  environment (Tauri 2.11.6 `src/process.rs:74-83`). The systemd scope
-  relaunch also inherits it, apart from AppImage path isolation
-  (`relaunch.rs:39-58`).
-- Child processes inherit the desktop process environment. Terminals,
-  providers, Git and other user-facing commands go through the AppImage
-  isolation policy, which strips bundled paths and launcher markers but
-  keeps unrelated variables byte for byte
-  (`docs/superpowers/specs/2026-09-23-appimage-child-environment-design.md`,
-  "Alternatives and decisions"). WebKitGTK's own child processes and the
-  in-process server are excluded from that policy.
+- Restarts start the new process from the old one, which passes its
+  environment on.
+  - Settings' restart (`bridge.rs:1088-1101`) calls `request_restart`.
+    Tauri then emits `RunEvent::Exit`, whose callback
+    (`lib.rs:303-309`) calls `relaunch_outside_service_unit`, and
+    afterwards spawns the current binary with the inherited environment
+    (Tauri 2.11.6 `src/process.rs:74-83`). Settings' restart never calls
+    `note_relaunch_requested`, so it skips the systemd scope handoff that
+    keeps a service-unit launch alive (`relaunch.rs:15-18`,
+    `relaunch.rs:39-58`).
+  - The update restart (`updates.rs:931-935`) sets that flag and calls
+    `app.restart()` on the main thread, which skips `RunEvent::Exit`, so
+    only Tauri's own spawn runs.
+  - Only the systemd path builds its own child command (`relaunch.rs:52-58`).
+- Child processes inherit the desktop process environment, with
+  exceptions. Terminals, providers, Git and other user-facing commands go
+  through the AppImage isolation policy, which strips bundled paths and
+  launcher markers but keeps unrelated variables
+  (`docs/superpowers/specs/2026-09-23-appimage-child-environment-design.md`).
+  Some Git commands run with a cleared environment
+  (`apps/server/src/git/process.rs:322`, `:332`, `:921`). WebKitGTK's own
+  child processes (`WebKitWebProcess`, `WebKitNetworkProcess`) and the
+  in-process server are outside that policy and inherit everything.
+- Engine version: release AppImages are built on Ubuntu 22.04 runners
+  (`.github/workflows/release.yml:403-409`) and bundle that host's
+  `libwebkit2gtk-4.1`, the 2.50 series per
+  `docs/testing/linux-desktop.md` ("AppImage build and inspection"). The
+  exact bundled version is read in the lab and recorded in the task report.
+  WebKitGTK 2.54 changed how it renders without compositing. This note,
+  and the proof, cover the 2.50 engine BiBCode ships. A move to a newer
+  engine must check the two variables again.
 
 ## Decisions
 
@@ -78,124 +101,202 @@ a `bibcode://` link starts the binary directly.
   (recommended).** It is in the data root, so it survives an AppDir
   replacement. It applies to every route that runs the binary: the menu
   launcher, the binary itself and a `bibcode://` link. A user can edit it
-  without a window. Settings writes it through the existing desktop
-  settings code. Cost: `main` does one small file read per GUI start, and
-  the bridge's settings struct, document and writer gain one field, or
-  the next WSL or exposure write would drop it.
-- **B. A separate file owned by the new module.** Avoids touching
-  `bridge.rs`'s settings struct, but adds a second desktop settings file
-  with the same location rules. Rejected: one desktop settings file is
-  easier to find and back up, and the struct change is one field.
-- **C. An environment variable only.** No file and no Settings control,
-  but R17 requires the Settings control, and a variable set in a shell
-  does not reach a launch from the application menu or a link. Kept as the
-  override in decision 3.
+  without a window. Cost: `main` reads one small file per GUI start, and
+  the bridge's settings code gains one Linux-only field.
+- **B. A separate file owned by the new module.** It would leave the
+  bridge's settings struct alone, but it adds a second desktop settings
+  file with the same location rules. Rejected: one desktop settings file
+  is easier to find and back up.
+- **C. An environment variable only.** Rejected: R17 requires a Settings
+  control, and a variable set in a shell does not reach a launch from the
+  application menu or a link. It stays as the override in decision 3.
 - **D. A launcher change (an `AppRun` hook, like `BIBCODE_GDK_BACKEND`).**
   Rejected: a direct-binary `Exec` skips it, an AppDir replacement resets
-  it, and the hook cannot read the Settings value without duplicating the
-  data-root rules in shell.
+  it, and the hook cannot read the Settings value without copying the
+  data-root rules into shell.
 
-The key is `linuxSoftwareRendering` (boolean). A missing file, missing key,
-unreadable file or malformed JSON means off; the reason is recorded and
-logged once tracing starts. `main` resolves the file with
-`std::env::home_dir()` and `BIBCODE_HOME` through the same
-`resolve_data_root` and `dev`/`userdata` rule as `config::state_dir`; that
-rule moves into one helper both use, so the two cannot disagree.
+Details:
+
+- The key is `linuxSoftwareRendering`, a boolean. One function in the new
+  module decodes it from the parsed document, separately from
+  `DesktopSettingsDocument`, so a bad value for it, or for any other key,
+  cannot reset the other settings. A non-boolean value means off.
+- The field exists only on Linux. The writer keeps it on every write, so
+  WSL and exposure writes cannot drop it. macOS and Windows write the file
+  as they do today.
+- Settings writes it through the server exposure coordinator's
+  `run_exclusive` (as `bridge.rs:1464-1477` does for WSL), so it cannot
+  interleave with another read-modify-write.
+- **One resolver.** `config::data_root` uses a new `config::home_dir()`
+  (`dirs::home_dir()`, the function Tauri's `home_dir()` calls, so no
+  platform changes behavior). The state directory rule becomes one helper
+  that takes the home directory, and both `main` and `state_dir(app)` call
+  it. The desktop crate adds `dirs.workspace = true`.
+- A missing file means off. An unreadable file or malformed JSON also means
+  off, and the reason is logged once the log sink is ready (decision 6).
+- A `BIBCODE_HOME` exported in one shell only moves every BiBCode setting
+  for launches from that shell. This is existing behavior; the user
+  document says so in one line.
 
 ### 2. Default
 
 - **Off (recommended).** Tauri's Linux graphics guidance is not to ship
   these variables unconditionally. Software rendering moves painting to
-  one CPU thread, and most machines are not affected.
-- **On for detected Intel GPUs.** Rejected: detection before Tauri means
-  probing DRM devices, the hang is not limited to one device ID, and it
-  would slow every unaffected Intel machine.
+  the CPU, and most machines are not affected.
+- **On for detected Intel GPUs.** Rejected: detecting the GPU before Tauri
+  means probing DRM devices, the hang is not limited to one device ID, and
+  it would slow every unaffected Intel machine.
 
 ### 3. Override without a window
 
-`BIBCODE_SOFTWARE_RENDERING=1` turns it on and `=0` turns it off for that
-launch, winning over the stored setting in both directions. Any other
-value, including empty, is ignored, the stored setting applies, and a
-warning is logged once tracing starts. Together with editing the JSON key,
-this covers a machine where no window can be shown.
+`BIBCODE_SOFTWARE_RENDERING=1` turns the setting on for that launch, and
+`BIBCODE_SOFTWARE_RENDERING=0` makes BiBCode set neither variable,
+whatever is stored. Any other value, including empty, is ignored, the
+stored setting applies, and a warning is logged. Together with editing the
+JSON key, this covers a machine where no window can be shown.
 
 ### 4. Which variables, and the user's own values
 
 When on, BiBCode sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` and
-`WEBKIT_DISABLE_DMABUF_RENDERER=1`. `WEBKIT_SKIA_ENABLE_CPU_RENDERING` is
-not set: the issue shows it alone did not prevent a hang.
+`WEBKIT_DISABLE_DMABUF_RENDERER=1`. It does not set
+`WEBKIT_SKIA_ENABLE_CPU_RENDERING`: the issue shows that variable alone
+did not prevent a hang.
 
-A variable present in the environment, with any value including empty, is
-the user's and is never overwritten or removed. The check is per variable,
-so a user who exported one still gets the other.
+A variable already in the environment, with any value including empty,
+belongs to the user. BiBCode never overwrites or removes it. The check is
+per variable, so a user who exported one still gets the other.
 
-A restart inherits the environment, so a value BiBCode set would look
-exported in the next process, and turning the setting off then restarting
-would keep software rendering on. BiBCode therefore also sets
-`BIBCODE_SOFTWARE_RENDERING_SET` to the comma-separated names it set. At
-start, a variable named in an inherited marker is treated as BiBCode's,
-not the user's: it is removed before the decision, then set again only if
-the decision is on. The marker is rewritten to the names set by this
-launch, or removed when none.
+BiBCode remembers, in process memory only, which of the two variables it
+set itself. No marker variable is used: an inherited marker could not tell
+a user's export apart from BiBCode's own.
 
-- **Alternative: remove the variables before restarting.** Rejected: by
-  then the process is multi-threaded, so mutating its environment is
-  unsound, and it would not cover a BiBCode started from its own terminal.
-- **Accepted limit:** a user who re-exports the same variable in a shell
-  that also carries the marker (a BiBCode terminal) is indistinguishable
-  from an inherited value; that launch follows the setting.
+### 5. Restarts
 
-### 5. What child processes inherit
+Every in-app restart reaches the `RunEvent::Exit` callback through one
+path, and that path strips exactly the variables BiBCode set from the new
+process:
 
-- **Inherit everywhere (recommended).** WebKitGTK's child processes and
-  the preview webviews in this process need the variables to stay off the
-  GPU. Terminals, providers and Git also inherit them and the marker.
-  Their only effect is on another WebKitGTK program started from a BiBCode
-  terminal, which then also runs without GPU compositing: the safe
-  direction on an affected machine, and what the `AppRun` workaround
-  already does.
-- **Remove them from user-facing children.** Rejected for now: it needs a
-  change to the server's shared AppImage isolation policy
-  (`apps/server/src/process/appimage.rs`), outside this phase's ownership,
-  and the policy would need the marker to tell BiBCode's values from the
-  user's. No reported problem requires it.
+- Settings' restart calls `note_relaunch_requested()` before
+  `request_restart`, so it also gets the systemd scope handoff (#94).
+- In the exit callback, `relaunch_outside_service_unit` (renamed for what
+  it now does) builds the child command itself:
+  - when the process runs in a service unit, as today;
+  - when BiBCode set either variable.
+    It removes those variables from the command, spawns it and exits, as the
+    systemd path already does. Otherwise it returns and Tauri's own restart
+    runs unchanged.
+- If that spawn fails, the warning is logged and Tauri's restart runs. The
+  new process then inherits the variables and stays in software rendering,
+  which fails safe.
 
-### 6. Code shape
+The update restart skips `RunEvent::Exit` (`updates.rs:931-935`). If the
+user turned the setting off and an update restarts BiBCode before the user
+did, that restart keeps software rendering until the next quit and reopen.
+This also fails safe; it is documented, not changed.
 
-- New module `apps/desktop/src-tauri/src/software_rendering.rs`. A pure
-  function takes the stored setting, the override value, a lookup of the
-  current environment (variables and marker) and whether the platform is
-  Linux, and returns the variables to set, the inherited ones to remove,
-  the new marker, and whether software rendering is active. It compiles on
-  every platform so its tests run anywhere; off Linux it changes nothing.
-  The file read takes the path as a parameter, so tests use a temporary
-  directory.
+Rejected: removing the variables from this process before restarting.
+By then the process is multi-threaded, so changing its environment is
+unsound.
+
+Residual, documented and not fixed: a BiBCode started from a BiBCode
+terminal inherits the variables as if the user exported them, and stays in
+software rendering until it is started from elsewhere. That fails safe.
+Fixing it would need the server's process policy, which this change does
+not touch.
+
+### 6. What child processes inherit
+
+- **Inherit (recommended).** WebKitGTK's child processes and the preview
+  webviews need the variables to stay off the GPU. Terminals, providers and
+  most Git commands also inherit them. The only visible effect is on
+  another WebKitGTK program started from a BiBCode terminal: it also runs
+  without GPU compositing, which is the safe direction on an affected
+  machine and what the `AppRun` workaround already does. Git commands with
+  a cleared environment do not get them; Git does not use WebKit.
+- **Remove them from user-facing children.** Rejected: it needs a change
+  to the server's shared AppImage isolation policy
+  (`apps/server/src/process/appimage.rs`), which is outside this phase's
+  ownership, and no reported problem requires it.
+
+### 7. Code shape
+
+- New module `apps/desktop/src-tauri/src/software_rendering.rs`, whose test
+  names all contain `software_rendering`.
+  - A pure decision function takes the stored setting, the override value,
+    a lookup of the present environment and whether the platform is
+    Linux. It returns which variables to set and a record for the log.
+  - Pure helpers say whether a restart can apply the stored setting and
+    whether GPU compositing is off in this process: the
+    `WEBKIT_DISABLE_COMPOSITING_MODE` value is present and is not `"0"`.
+    WebKitGTK reads the variable that way, an assumption checked in the
+    lab.
+  - The module compiles on every platform, so its tests run anywhere, and
+    off Linux it changes nothing. The file read takes the path as a
+    parameter, so tests use a temporary directory.
 - `main` calls the Linux-only apply step after the open-url and CLI
-  branches have exited and immediately before `run()`: the crash hook is
-  still first, the process is still single-threaded, and the CLI paths,
-  which create no webview, skip the file read. The decision is kept in a
-  `OnceLock` and logged in `setup`.
+  branches and immediately before `run()`. The crash hook is still first,
+  the process is still single-threaded, and the CLI paths, which create no
+  webview, skip the file read. The result goes into a `OnceLock`, and
+  `setup` logs it with `tracing` beside `shell_path_hydration.record()`.
 - Bridge: `getLinuxSoftwareRendering()` and
-  `setLinuxSoftwareRendering(enabled)` return `{ enabled, override,
-  active }`, where `override` is `"on" | "off" | null` and `active` is
-  this launch's decision. Files: `bridge.rs` (settings field and two
-  commands), `lib.rs` handler lists, `permissions/desktop-bridge.toml`,
-  `packages/contracts/src/ipc.ts`, `apps/web/src/tauriDesktopBridge.ts`.
-  The methods are optional on the bridge type, as `restartApp` is, so the
-  bridge version does not change.
+  `setLinuxSoftwareRendering(enabled)` return
+  `{ enabled, override, gpuCompositingDisabled, restartApplies }`:
+  - `override` is `"on" | "off" | null`.
+  - `gpuCompositingDisabled` is the state of this process.
+  - `restartApplies` is true only when no override is set and a restart
+    would change what BiBCode sets: on, and a variable is still missing;
+    or off, and BiBCode set one.
+
+  Off Linux both commands return the existing `tauri_capability_unsupported`
+  payload, so the command lists stay the same on every platform. Files:
+  `bridge.rs`, the `lib.rs` handler lists,
+  `permissions/desktop-bridge.toml`, `packages/contracts/src/ipc.ts` and
+  `apps/web/src/tauriDesktopBridge.ts`. The methods are optional on the
+  bridge type, as `restartApp` is, so the bridge version does not change.
+
 - Settings: a row in `AppearanceSettingsPanel.tsx`, shown only when
-  `isLinuxPlatform(navigator.platform)` and the bridge has the methods. A
-  switch labelled "Render without the GPU", with one line on what it is
-  for and its cost. When `override` is set, the switch is disabled and says
-  that `BIBCODE_SOFTWARE_RENDERING` controls it. When `enabled` differs
-  from `active`, the row says a restart is needed and offers "Restart now"
-  through the existing `restartApp`.
-- Docs: `docs/user/linux-desktop.md` gets the setting, the variable and
-  the JSON key; `docs/testing/linux-desktop.md` gets the packaged check.
+  `isLinuxPlatform(navigator.platform)` and the bridge has the methods.
+  - The switch is labelled "Disable GPU compositing". One line says what
+    it is for and that the CPU then renders the window.
+  - A status line says whether GPU compositing is off for this session,
+    from `gpuCompositingDisabled`, so a user's `=0` export never shows as
+    off.
+  - When `override` is set, the switch is disabled and the row names
+    `BIBCODE_SOFTWARE_RENDERING` as the reason.
+  - When `restartApplies` is true, the row says a restart is needed and
+    offers "Restart now" through the existing `restartApp`.
+- Docs: `docs/user/linux-desktop.md` gets the setting, the variable, the
+  JSON key, the `BIBCODE_HOME` line and the terminal residual.
+  `docs/testing/linux-desktop.md` gets the packaged check.
+
+## Verification
+
+`/proc/<pid>/environ` of the desktop process shows only its initial
+environment, so it proves nothing about variables set in `main`. The lab
+reads the variables from the environment of the WebKit child processes
+(`WebKitWebProcess`, `WebKitNetworkProcess`), which are spawned after
+`main` ran.
+
+The Linux lab runs the packaged build with the Profiler on and records
+these cases:
+
+| Case                                                    | What is checked                                                                          |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Setting on, cold start                                  | Both variables are set in the WebKit children, and the app renders                       |
+| Setting off (default), cold start                       | Neither variable is set                                                                  |
+| On to off through "Restart now"                         | After the restart, the WebKit children of the new process lack both variables            |
+| Cold start through the generated handler's `Exec` line  | With the setting on, both variables are set                                              |
+| User exported `WEBKIT_DISABLE_COMPOSITING_MODE=0`       | The value is kept, the other variable is set, and the UI does not say compositing is off |
+| Override `=0` with the setting on, and `=1` with it off | The override wins                                                                        |
+| Malformed `desktop-settings.json`                       | Off, with a log line, and the other settings survive the next write                      |
+| Write failure (read-only state directory)               | Settings shows the error and changes nothing                                             |
+
+Unit tests cover the decision function, the decoding of the key, both
+settings loss cases, and the Linux-only UI states. Whether the GPU hang
+itself stops on the affected machine can only be shown there, by the 20
+launches and the 24-hour run named in #411.
 
 ## Not changed
 
 macOS and Windows behavior, the crash hook order, the AppImage hooks, the
-child isolation policy and the deep-link plugin. Whether the hang stops on
-the affected machine is not proven by this change; issue #411 stays open
-until its owner reports the 20 launches and 24-hour run.
+child isolation policy, the update restart and the deep-link plugin.
