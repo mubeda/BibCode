@@ -689,3 +689,55 @@ describe("AppStatusBarView defaults", () => {
     expect(markup).not.toContain("Refresh status bar usage");
   });
 });
+
+describe("AppStatusBar with Antigravity on", () => {
+  const environmentId = EnvironmentId.make("environment-local");
+  const antigravityCalls = () =>
+    harness.refreshProviderUsage.mock.calls.filter(
+      ([request]) =>
+        (request as { input: { providers: string[] } }).input.providers[0] === "antigravity",
+    );
+
+  beforeEach(() => {
+    harness.selectedEnvironment = { environmentId };
+    harness.clientSettings = {
+      ...harness.clientSettings,
+      showAntigravityUsage: true,
+    } as typeof harness.clientSettings;
+  });
+
+  it("reads Antigravity as soon as the item is turned on, not at the next poll", () => {
+    harness.queries = [query({ providers: [] }), query(), query(), query()];
+    renderStatusBar();
+    harness.effects[0]?.();
+    harness.effects.at(-1)?.();
+    expect(antigravityCalls()).toHaveLength(1);
+    expect(antigravityCalls()[0]?.[0]).toMatchObject({
+      input: { providers: ["antigravity"], force: false },
+    });
+  });
+
+  it("keeps polling Antigravity with the legacy request on a server that serves it", () => {
+    harness.queries = [
+      query({ providers: [] }),
+      query(),
+      query(),
+      query({ providers: [{ provider: "antigravity" }] }),
+    ];
+    renderStatusBar();
+    harness.effects[0]?.();
+    invokeRef(1);
+    expect(antigravityCalls()).toHaveLength(1);
+    expect(harness.refreshProviderUsage).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops polling a server whose answer has no Antigravity entry", () => {
+    harness.queries = [query({ providers: [] }), query(), query(), query({ providers: [] })];
+    renderStatusBar();
+    harness.effects[0]?.();
+    harness.effects.at(-1)?.();
+    invokeRef(1);
+    expect(antigravityCalls()).toHaveLength(0);
+    expect(harness.refreshProviderUsage).toHaveBeenCalledTimes(1);
+  });
+});

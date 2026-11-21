@@ -8,7 +8,12 @@ import * as DateTime from "effect/DateTime";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import { AppStatusBarView, createStatusBarRefreshHandler } from "./AppStatusBar";
+import {
+  AppStatusBarView,
+  createAntigravityUsageRefreshHandler,
+  createStatusBarRefreshHandler,
+  statusBarRefreshControl,
+} from "./AppStatusBar";
 import { ProviderUsageControl } from "./ProviderUsageControl";
 
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
@@ -76,6 +81,12 @@ const diagnostics = {
   queryError: null,
 };
 
+/** The bar and the popover of a rendered status bar (the popover is always rendered here). */
+function parts(markup: string): [string, string] {
+  const at = markup.indexOf('data-testid="provider-usage-detail"');
+  return [markup.slice(0, at), markup.slice(at)];
+}
+
 function render(props: Partial<React.ComponentProps<typeof AppStatusBarView>>): string {
   return renderToStaticMarkup(
     <AppStatusBarView
@@ -98,19 +109,60 @@ describe("the Antigravity usage item", () => {
     expect(render({ antigravityUsage: result(snapshot()) })).not.toContain("antigravity");
   });
 
-  it("shows both groups with their windows and reset times", () => {
-    const markup = render({ showAntigravityUsage: true, antigravityUsage: result(snapshot()) });
-    expect(markup).toContain('data-provider="antigravity"');
-    for (const label of ["Gemini session", "Gemini weekly", "Claude/GPT session"]) {
-      expect(markup).toContain(label);
+  it("shows only the tightest window in the bar, in both modes", () => {
+    for (const statusBarUsageMode of ["detailed", "compact"] as const) {
+      const [bar] = parts(
+        render({
+          showAntigravityUsage: true,
+          antigravityUsage: result(snapshot()),
+          statusBarUsageMode,
+        }),
+      );
+      expect(bar).toContain('data-provider="antigravity"');
+      expect(bar).toContain("Claude/GPT 5-hour");
+      expect(bar).not.toContain("Gemini");
+      expect(bar).not.toContain("Weekly");
     }
+  });
+
+  it("shows one popover section per group, with 5-hour and weekly windows and reset times", () => {
+    const [, popover] = parts(
+      render({ showAntigravityUsage: true, antigravityUsage: result(snapshot()) }),
+    );
+    expect(popover).toContain('aria-label="Gemini models"');
+    expect(popover).toContain('aria-label="Claude and GPT models"');
+    expect(popover.match(/>5-hour</g)).toHaveLength(2);
+    expect(popover.match(/>Weekly</g)).toHaveLength(2);
+    expect(popover).not.toContain("Reset time unavailable");
+    expect(popover).toContain("Updated");
+  });
+
+  it("uses the Antigravity icon, not the Gemini one", () => {
+    const markup = render({ showAntigravityUsage: true, antigravityUsage: result(snapshot()) });
+    expect(markup).toContain('data-provider-icon="antigravity"');
+    expect(markup).toContain("<image");
+    expect(markup).not.toContain("gemini__");
+  });
+
+  it("reads before the first answer, quietly, with no update time, and keeps the refresh control", () => {
+    const markup = render({ showAntigravityUsage: true, antigravityUsage: null });
+    expect(markup).toContain(
+      'class="text-muted-foreground" role="status">Reading Antigravity usage...',
+    );
+    expect(markup).not.toContain("Updated");
     expect(markup).toContain("Refresh provider usage");
   });
 
-  it("reads before the first answer and keeps the refresh control reachable", () => {
-    const markup = render({ showAntigravityUsage: true, antigravityUsage: null });
-    expect(markup).toContain("Reading Antigravity usage...");
-    expect(markup).toContain("Refresh provider usage");
+  it("says how to recover when the read failed, instead of reading forever", () => {
+    const markup = render({
+      showAntigravityUsage: true,
+      antigravityUsage: null,
+      antigravityUsageError: "The environment is not connected.",
+    });
+    expect(markup).toContain(
+      "Could not load Antigravity usage. Use the refresh button to try again.",
+    );
+    expect(markup).not.toContain("Reading Antigravity usage...");
   });
 
   it("says the server is too old when its answer has no Antigravity entry", () => {
@@ -142,7 +194,10 @@ describe("the Antigravity usage item", () => {
         }),
       ),
     });
-    expect(notFetched).toContain("Reading Antigravity usage...");
+    expect(notFetched).toContain(
+      'class="text-muted-foreground" role="status">Reading Antigravity usage...',
+    );
+    expect(notFetched).not.toContain("Updated");
     const stale = render({
       showAntigravityUsage: true,
       antigravityUsage: result(
@@ -150,6 +205,10 @@ describe("the Antigravity usage item", () => {
       ),
     });
     expect(stale).toContain("Antigravity usage is out of date. It will be tried again.");
+    // Expired data shows the sentence only: no meters in the bar or the popover.
+    expect(stale).not.toContain("5-hour");
+    expect(stale).not.toContain("Weekly");
+    expect(stale).not.toContain("Showing last available usage");
   });
 
   it("keeps the last data on an error and says so", () => {
@@ -177,6 +236,7 @@ describe("the Antigravity usage item", () => {
           windows: [],
           detailedWindows: [],
           compactWindows: [],
+          groups: [],
           plan: null,
           credits: null,
           updatedAt: readAt,
@@ -190,58 +250,84 @@ describe("the Antigravity usage item", () => {
 });
 
 describe("the status bar refresh with Antigravity", () => {
-  const base = () => ({
-    environmentId: EnvironmentId.make("environment-1"),
-    refreshUsageQuery: vi.fn(),
-    refreshProcessDiagnostics: vi.fn(),
-    refreshLocalProcessDiagnostics: null,
-  });
+  const environmentId = EnvironmentId.make("environment-1");
 
-  it("asks for Antigravity in its own request and never in the Claude and Codex one", async () => {
+  it("never names Antigravity in the Claude and Codex request", async () => {
     const refreshProviderUsage = vi.fn().mockResolvedValue(undefined);
-    const refreshQuery = vi.fn();
     await createStatusBarRefreshHandler({
-      ...base(),
+      environmentId,
       refreshProviderUsage,
-      antigravity: { refreshQuery },
+      refreshUsageQuery: vi.fn(),
+      refreshProcessDiagnostics: vi.fn(),
+      refreshLocalProcessDiagnostics: null,
     })(true);
-    expect(refreshProviderUsage).toHaveBeenCalledTimes(2);
+    expect(refreshProviderUsage).toHaveBeenCalledTimes(1);
     expect(refreshProviderUsage.mock.calls[0]?.[0].input).toEqual({
       providers: ["claude", "codex"],
       force: true,
     });
+  });
+
+  it("asks for Antigravity alone and re-reads it when its own request settles", async () => {
+    const legacyNeverSettles = new Promise<never>(() => undefined);
+    const refreshProviderUsage = vi.fn(({ input }: { input: { providers: readonly string[] } }) =>
+      input.providers[0] === "antigravity" ? Promise.resolve() : legacyNeverSettles,
+    );
+    void createStatusBarRefreshHandler({
+      environmentId,
+      refreshProviderUsage,
+      refreshUsageQuery: vi.fn(),
+      refreshProcessDiagnostics: vi.fn(),
+      refreshLocalProcessDiagnostics: null,
+    })(false);
+    const refreshQuery = vi.fn();
+    await createAntigravityUsageRefreshHandler({
+      environmentId,
+      refreshProviderUsage,
+      refreshQuery,
+    })(false);
     expect(refreshProviderUsage.mock.calls[1]?.[0].input).toEqual({
       providers: ["antigravity"],
-      force: true,
+      force: false,
     });
     expect(refreshQuery).toHaveBeenCalledTimes(1);
   });
 
-  it("a failing Antigravity request neither fails nor delays the Claude and Codex answer", async () => {
-    const order: string[] = [];
-    const refreshProviderUsage = vi.fn(
-      async ({ input }: { input: { providers: readonly string[] } }) => {
-        if (input.providers[0] === "antigravity") {
-          await Promise.resolve();
-          throw new Error("rejected by an old server");
-        }
-      },
-    );
-    const input = base();
-    input.refreshUsageQuery.mockImplementation(() => order.push("claude-codex"));
+  it("a rejected Antigravity request still re-reads, so an old server is recognized", async () => {
+    const refreshQuery = vi.fn();
     await expect(
-      createStatusBarRefreshHandler({
-        ...input,
-        refreshProviderUsage,
-        antigravity: { refreshQuery: () => order.push("antigravity") },
-      })(false),
+      createAntigravityUsageRefreshHandler({
+        environmentId,
+        refreshProviderUsage: vi.fn().mockRejectedValue(new Error("invalid request")),
+        refreshQuery,
+      })(true),
     ).resolves.toBeUndefined();
-    expect(order).toEqual(["claude-codex", "antigravity"]);
+    expect(refreshQuery).toHaveBeenCalledTimes(1);
   });
 
-  it("without the opt-in sends only the legacy request", async () => {
-    const refreshProviderUsage = vi.fn().mockResolvedValue(undefined);
-    await createStatusBarRefreshHandler({ ...base(), refreshProviderUsage })(false);
-    expect(refreshProviderUsage).toHaveBeenCalledTimes(1);
+  it("a slow request disables the button only when every visible request is busy", () => {
+    const legacy = (busy: boolean) => ({ visible: true, busy });
+    const antigravity = (busy: boolean) => ({ visible: true, busy });
+    expect(statusBarRefreshControl([legacy(false), antigravity(true)])).toEqual({
+      busy: true,
+      disabled: false,
+    });
+    expect(statusBarRefreshControl([legacy(true), antigravity(false)])).toEqual({
+      busy: true,
+      disabled: false,
+    });
+    expect(statusBarRefreshControl([legacy(true), antigravity(true)])).toEqual({
+      busy: true,
+      disabled: true,
+    });
+    // Antigravity alone: its own request decides; a hidden legacy poll never spins the button.
+    expect(statusBarRefreshControl([{ visible: false, busy: true }, antigravity(false)])).toEqual({
+      busy: false,
+      disabled: false,
+    });
+    expect(statusBarRefreshControl([legacy(true), { visible: false, busy: false }])).toEqual({
+      busy: true,
+      disabled: true,
+    });
   });
 });

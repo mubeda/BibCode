@@ -169,16 +169,46 @@ describe("window groups", () => {
   it("flattens every group window and compacts to the tightest one", () => {
     const vm = buildProviderUsageViewModel(antigravity, { now });
     expect(vm.windows.map((window) => window.label)).toEqual([
-      "Gemini session",
+      "Gemini 5-hour",
       "Gemini weekly",
-      "Claude/GPT session",
+      "Claude/GPT 5-hour",
     ]);
     expect(vm.windows.map((window) => window.key)).toEqual([
       "gemini-session",
       "gemini-weekly",
       "third-party-session",
     ]);
-    expect(vm.compactWindows.map((window) => window.label)).toEqual(["Claude/GPT session"]);
+    expect(vm.compactWindows.map((window) => window.label)).toEqual(["Claude/GPT 5-hour"]);
+    // The bar shows the tightest window in detailed mode too; the popover shows the groups.
+    expect(vm.detailedWindows).toEqual(vm.compactWindows);
+    expect(
+      vm.groups.map((group) => [group.label, group.windows.map((window) => window.label)]),
+    ).toEqual([
+      ["Gemini models", ["5-hour", "Weekly"]],
+      ["Claude and GPT models", ["5-hour"]],
+    ]);
+  });
+
+  it("drops the meters of an expired or unavailable snapshot and keeps an error's", () => {
+    for (const status of ["unavailable", "fetching", "idle"] as const) {
+      const vm = buildProviderUsageViewModel({ ...antigravity, status }, { now });
+      expect([vm.windows, vm.groups, vm.detailedWindows]).toEqual([[], [], []]);
+    }
+    const retained = buildProviderUsageViewModel({ ...antigravity, status: "error" }, { now });
+    expect(retained.groups).toHaveLength(2);
+  });
+
+  it("shows no update time for the server's not-fetched placeholder", () => {
+    const vm = buildProviderUsageViewModel(
+      {
+        ...antigravity,
+        status: "unavailable",
+        windowGroups: [],
+        error: "Provider usage has not been fetched yet.",
+      },
+      { now },
+    );
+    expect(vm.updatedAt).toBeNull();
   });
 
   it("keys the countdown cache on group windows, so an expired reset changes the key", () => {

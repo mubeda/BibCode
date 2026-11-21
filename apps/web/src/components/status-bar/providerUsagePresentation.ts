@@ -44,15 +44,24 @@ export interface ProviderUsageCreditsViewModel {
   readonly nextExpiresLabel: string | null;
 }
 
+export interface UsageWindowGroupViewModel {
+  readonly id: ServerProviderUsageWindowGroup["id"];
+  readonly label: string;
+  readonly windows: ReadonlyArray<UsageWindowViewModel>;
+}
+
 export interface ProviderUsageViewModel {
   readonly provider: ServerProviderUsageSnapshot["provider"];
   readonly status: ServerProviderUsageSnapshot["status"];
   readonly windows: ReadonlyArray<UsageWindowViewModel>;
   readonly detailedWindows: ReadonlyArray<UsageWindowViewModel>;
   readonly compactWindows: ReadonlyArray<UsageWindowViewModel>;
+  /** One section per quota group (Antigravity); empty for a provider with flat windows. */
+  readonly groups: ReadonlyArray<UsageWindowGroupViewModel>;
   readonly plan: ProviderUsagePlanViewModel | null;
   readonly credits: ProviderUsageCreditsViewModel | null;
-  readonly updatedAt: ServerProviderUsageSnapshot["updatedAt"];
+  /** Null for a placeholder: nothing was read, so there is no time to show. */
+  readonly updatedAt: ServerProviderUsageSnapshot["updatedAt"] | null;
   readonly error: string | null;
 }
 
@@ -91,27 +100,26 @@ const GROUP_SHORT_LABEL: Readonly<Record<ServerProviderUsageWindowGroup["id"], s
   other: "Other",
 };
 
+/** The server's sentence for a provider it has not read yet: a placeholder, not data. */
+export const NOT_FETCHED_MESSAGE = "Provider usage has not been fetched yet.";
+
+function groupWindows(
+  group: ServerProviderUsageWindowGroup,
+): ReadonlyArray<{ key: string; label: string; window: ServerProviderUsageWindow }> {
+  return (
+    [
+      ["session", "5-hour", group.session],
+      ["weekly", "Weekly", group.weekly],
+    ] as const
+  ).flatMap(([slot, label, window]) =>
+    window === null ? [] : [{ key: `${group.id}-${slot}`, label, window }],
+  );
+}
+
 function groupWindowDefinitions(
   snapshot: ServerProviderUsageSnapshot,
 ): ReadonlyArray<{ key: string; label: string; window: ServerProviderUsageWindow }> {
-  return snapshot.windowGroups.flatMap((group) =>
-    (
-      [
-        ["session", "Session", group.session],
-        ["weekly", "Weekly", group.weekly],
-      ] as const
-    ).flatMap(([slot, name, window]) =>
-      window === null
-        ? []
-        : [
-            {
-              key: `${group.id}-${slot}`,
-              label: `${GROUP_SHORT_LABEL[group.id]} ${name.toLowerCase()}`,
-              window,
-            },
-          ],
-    ),
-  );
+  return snapshot.windowGroups.flatMap(groupWindows);
 }
 
 function titleCasePlan(value: string): string {
@@ -175,6 +183,17 @@ export function buildProviderUsageViewModel(
 ): ProviderUsageViewModel {
   const now = options.now ?? DateTime.nowUnsafe();
   const percentageDisplay = options.percentageDisplay ?? "remaining";
+  // Only live or retained data has meters: an expired or unavailable snapshot shows its sentence.
+  const groups =
+    snapshot.status === "ok" || snapshot.status === "error"
+      ? snapshot.windowGroups.map((group) => ({
+          id: group.id,
+          label: group.label,
+          windows: groupWindows(group).map((definition) =>
+            buildWindowViewModel({ ...definition, now, percentageDisplay }),
+          ),
+        }))
+      : [];
   const windows = [
     ...WINDOW_DEFINITIONS.flatMap((definition) => {
       const window = snapshot[definition.snapshotKey];
@@ -189,8 +208,12 @@ export function buildProviderUsageViewModel(
             }),
           ];
     }),
-    ...groupWindowDefinitions(snapshot).map((definition) =>
-      buildWindowViewModel({ ...definition, now, percentageDisplay }),
+    // In the status bar a group window needs its group's name.
+    ...groups.flatMap((group) =>
+      group.windows.map((window) => ({
+        ...window,
+        label: `${GROUP_SHORT_LABEL[group.id]} ${window.label.toLowerCase()}`,
+      })),
     ),
   ];
   const tightestWindow = windows.reduce<UsageWindowViewModel | null>(
@@ -206,25 +229,34 @@ export function buildProviderUsageViewModel(
           return label.length === 0 ? null : { value: snapshot.planType, label };
         })();
 
+  const compactWindows = tightestWindow === null ? [] : [tightestWindow];
+
   return {
     provider: snapshot.provider,
     status: snapshot.status,
     windows,
-    detailedWindows: windows,
-    compactWindows: tightestWindow === null ? [] : [tightestWindow],
+    // Several groups do not fit the bar: it shows the tightest window, the popover the groups.
+    detailedWindows: groups.length > 0 ? compactWindows : windows,
+    compactWindows,
+    groups,
     plan,
     credits: buildCreditsViewModel(snapshot.rateLimitResetCredits, now),
-    updatedAt: snapshot.updatedAt,
+    updatedAt: snapshot.error === NOT_FETCHED_MESSAGE ? null : snapshot.updatedAt,
     error: snapshot.error,
   };
 }
 
-export type AntigravityPlaceholder = "loading" | "unsupported";
+export type AntigravityPlaceholder = "loading" | "failed" | "unsupported";
 
-/** The Antigravity item before it has a snapshot, or on a server that cannot serve it. */
+const ANTIGRAVITY_PLACEHOLDER_ERROR: Readonly<Record<AntigravityPlaceholder, string | null>> = {
+  loading: null,
+  failed: "Could not load Antigravity usage. Use the refresh button to try again.",
+  unsupported: "This BiBCode server is too old to show Antigravity usage.",
+};
+
+/** The Antigravity item before it has a snapshot, after a failed read, or on an old server. */
 export function antigravityPlaceholderViewModel(
   placeholder: AntigravityPlaceholder,
-  now: DateTime.Utc = DateTime.nowUnsafe(),
 ): ProviderUsageViewModel {
   return {
     provider: "antigravity",
@@ -232,13 +264,11 @@ export function antigravityPlaceholderViewModel(
     windows: [],
     detailedWindows: [],
     compactWindows: [],
+    groups: [],
     plan: null,
     credits: null,
-    updatedAt: now,
-    error:
-      placeholder === "unsupported"
-        ? "This BiBCode server is too old to show Antigravity usage."
-        : null,
+    updatedAt: null,
+    error: ANTIGRAVITY_PLACEHOLDER_ERROR[placeholder],
   };
 }
 

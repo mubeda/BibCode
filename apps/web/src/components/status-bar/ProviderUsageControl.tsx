@@ -1,7 +1,7 @@
 import type { StatusBarUsageMode } from "@bibcode/contracts/settings";
 import { useState } from "react";
 
-import { ClaudeAI, Gemini, OpenAI } from "../Icons";
+import { AntigravityIcon, ClaudeAI, OpenAI } from "../Icons";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { ProviderUsageDetail, type ProviderUsageDetailProps } from "./ProviderUsageDetail";
 import { ProviderUsageWindowMeter } from "./ProviderUsageWindowMeter";
@@ -20,7 +20,9 @@ function ProviderIcon({ provider }: { readonly provider: ProviderUsageViewModel[
         />
       );
     case "antigravity":
-      return <Gemini aria-hidden className="size-3 shrink-0" data-provider-icon="antigravity" />;
+      return (
+        <AntigravityIcon aria-hidden className="size-3 shrink-0" data-provider-icon="antigravity" />
+      );
     default:
       return null;
   }
