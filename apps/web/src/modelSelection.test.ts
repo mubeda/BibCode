@@ -1,4 +1,5 @@
 import {
+  DEFAULT_GIT_TEXT_GENERATION_MODEL,
   ProviderDriverKind,
   ProviderInstanceId,
   ServerProviderModel,
@@ -519,6 +520,69 @@ describe("instance-scoped model selection", () => {
     });
   });
 
+  it("never falls back to a provider that cannot name a model, whatever its driver", () => {
+    const noModels = provider({
+      provider: ProviderDriverKind.make("futureDriver"),
+      instanceId: "futureDriver",
+      models: [],
+    });
+    const usable = provider({ instanceId: "claudeAgent", models: ["claude-fallback"] });
+    const settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      textGenerationModelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+    };
+
+    expect(resolveAppModelSelectionState(settings, [noModels, usable])).toMatchObject({
+      instanceId: "claudeAgent",
+      model: "claude-fallback",
+    });
+  });
+
+  it("leaves a saved Antigravity selection whose catalog emptied for a usable provider", () => {
+    const emptied = provider({
+      provider: ProviderDriverKind.make("antigravity"),
+      instanceId: "antigravity",
+      models: [],
+    });
+    const usable = provider({ instanceId: "claudeAgent", models: ["claude-fallback"] });
+    const settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      textGenerationModelSelection: {
+        instanceId: ProviderInstanceId.make("antigravity"),
+        model: "model-alpha",
+      },
+    };
+
+    expect(resolveAppModelSelectionState(settings, [emptied, usable])).toMatchObject({
+      instanceId: "claudeAgent",
+      model: "claude-fallback",
+    });
+    expect(resolveAppModelSelectionState(settings, [emptied])).toEqual({
+      instanceId: ProviderInstanceId.make("antigravity"),
+      model: "model-alpha",
+    });
+  });
+
+  it("never picks a disabled Antigravity, even with models, ahead of a usable provider", () => {
+    const disabled = {
+      ...provider({
+        provider: ProviderDriverKind.make("antigravity"),
+        instanceId: "antigravity",
+        models: ["model-alpha"],
+      }),
+      enabled: false,
+    };
+    const usable = provider({ instanceId: "claudeAgent", models: ["claude-fallback"] });
+    const settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      textGenerationModelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+    };
+
+    expect(resolveAppModelSelectionState(settings, [disabled, usable])).toMatchObject({
+      instanceId: "claudeAgent",
+    });
+  });
+
   it("covers duplicate custom models and empty instance fallbacks", () => {
     const serverCustom = {
       ...provider({ instanceId: "codex", models: [] }),
@@ -583,6 +647,9 @@ describe("instance-scoped model selection", () => {
         },
         [custom],
       ),
-    ).toEqual({ instanceId: ProviderInstanceId.make("custom"), model: "" });
+    ).toEqual({
+      instanceId: ProviderInstanceId.make("codex"),
+      model: DEFAULT_GIT_TEXT_GENERATION_MODEL,
+    });
   });
 });

@@ -6111,6 +6111,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
       const root = createRoot(container);
       const menuContainer = document.createElement("div");
       document.body.append(menuContainer);
+      const menuRoot = createRoot(menuContainer);
       try {
         await act(async () => {
           root.render(
@@ -6134,7 +6135,6 @@ describe("ChatView handlers (captured from mocked children)", () => {
               | "onOpenProviderTerminalPanel"
             >
           >("chatHeaderActions");
-        const menuRoot = createRoot(menuContainer);
         await act(async () =>
           menuRoot.render(
             <ChatHeaderPanelMenu
@@ -6163,7 +6163,6 @@ describe("ChatView handlers (captured from mocked children)", () => {
           items.find((item) => item.textContent === "Antigravity Terminal")!.click(),
         );
         await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
-        await act(async () => menuRoot.unmount());
         const opened = commandCallsFor("terminal.open")[0]!.input as {
           input: { cwd: string; command: unknown };
         };
@@ -6179,6 +6178,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
         });
         expect(JSON.stringify(opened)).not.toMatch(/observer/i);
       } finally {
+        await act(async () => menuRoot.unmount());
         await act(async () => root.unmount());
         container.remove();
         menuContainer.remove();

@@ -465,6 +465,19 @@ describe("ProviderSessionDefaultsControls", () => {
     expect(markup).not.toContain("new sessions will use");
   });
 
+  it("names no chat model for a saved Antigravity default while the model list is empty", () => {
+    const markup = render(
+      baseProps({
+        driver: ProviderDriverKind.make("antigravity"),
+        models: [],
+        value: { model: "model-beta" },
+      }),
+    );
+
+    expect(markup).toContain("The model list is not loaded. The terminal starts with model-beta.");
+    expect(markup).not.toContain("New chats use");
+  });
+
   it("keeps the full control row mounted when model capabilities change", async () => {
     const mounted = await mount(
       baseProps({ driver: OPENCODE, models: richModels, value: richValue }),

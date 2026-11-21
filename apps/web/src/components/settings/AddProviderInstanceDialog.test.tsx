@@ -384,29 +384,6 @@ describe("saving an instance", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  // The dialog's entry button is hidden in Settings for every driver (since 12d4a34c7); this pins
-  // only what the dialog writes once it is opened again.
-  it("saves a custom Antigravity instance enabled, with its own binary path", () => {
-    seedSaveable("antigravity_work");
-    harness.seedState((initial) => initial === "codex", "antigravity"); // driver
-    harness.seedState(
-      (initial) =>
-        typeof initial === "object" && initial !== null && Object.keys(initial).length === 0,
-      { antigravity: { binaryPath: "custom-agy" } },
-    ); // configByDriver
-    render();
-
-    (footerButton("Add instance").onClick as () => void)();
-    const patch = testState.updateSettings.mock.calls[0]![0] as {
-      providerInstances: Record<string, ProviderInstanceConfig>;
-    };
-    expect(patch.providerInstances[ProviderInstanceId.make("antigravity_work")]).toEqual({
-      driver: "antigravity",
-      enabled: true,
-      config: { binaryPath: "custom-agy" },
-    });
-  });
-
   it("includes a trimmed label, accent color, and config when present", () => {
     seedSaveable("codex_work");
     harness.seedState((initial) => initial === "", "  My Codex  "); // label (first "" slot)

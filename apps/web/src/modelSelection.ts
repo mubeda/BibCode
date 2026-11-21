@@ -288,34 +288,28 @@ export function resolveAppModelSelectionState(
     model: DEFAULT_GIT_TEXT_GENERATION_MODEL,
   };
   const entries = deriveProviderInstanceEntries(providers);
-  const selectedEntry = entries.find(
-    (entry) => entry.instanceId === selection.instanceId && entry.enabled && entry.isAvailable,
-  );
   const available = entries.filter((candidate) => candidate.enabled && candidate.isAvailable);
-  // Antigravity has no built-in text-generation model, so a fallback to it needs a model it can
-  // resolve; otherwise it would yield an empty model (design note, text generation).
+  // An instance with no catalog, no custom model and no built-in default (Antigravity before its
+  // probe, a custom driver) cannot run text generation, so it is never chosen with an empty model.
+  const resolveModel = (candidate: ProviderInstanceEntry, selectedModel: string | null) =>
+    resolveAppModelSelectionForInstance(candidate.instanceId, settings, providers, selectedModel) ??
+    candidate.models[0]?.slug ??
+    DEFAULT_GIT_TEXT_GENERATION_MODEL_BY_PROVIDER[candidate.driverKind] ??
+    null;
+  const selectedEntry = available.find(
+    (candidate) =>
+      candidate.instanceId === selection.instanceId &&
+      resolveModel(candidate, selection.model) !== null,
+  );
   const entry =
-    selectedEntry ??
-    available.find(
-      (candidate) =>
-        candidate.driverKind !== ProviderDriverKind.make("antigravity") ||
-        resolveAppModelSelectionForInstance(candidate.instanceId, settings, providers, null) !==
-          null,
-    );
+    selectedEntry ?? available.find((candidate) => resolveModel(candidate, null) !== null);
   if (!entry && available.length > 0) {
     return createModelSelection(selection.instanceId, selection.model, selection.options ?? []);
   }
   if (entry) {
     // When the instance changed due to fallback (e.g. selected instance was disabled),
     // don't carry over the old instance's model — use the fallback instance's default.
-    const selectedModel = selectedEntry ? selection.model : null;
-    const model =
-      resolveAppModelSelectionForInstance(entry.instanceId, settings, providers, selectedModel) ??
-      entry.models[0]?.slug ??
-      DEFAULT_GIT_TEXT_GENERATION_MODEL_BY_PROVIDER[entry.driverKind];
-    if (!model) {
-      return createModelSelection(entry.instanceId, "", []);
-    }
+    const model = resolveModel(entry, selectedEntry ? selection.model : null)!;
     const provider = entry.driverKind;
     const { modelOptionsForDispatch } = getComposerProviderState({
       provider,

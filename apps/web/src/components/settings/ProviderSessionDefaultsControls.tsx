@@ -122,9 +122,11 @@ export function ProviderSessionDefaultsControls({
         {!controls.modelAvailable && !cliPicksModel ? (
           <p className="text-muted-foreground text-xs">
             {/* The Antigravity Terminal passes the saved model unchanged (spec R12). */}
-            {driver === "antigravity"
-              ? `Not in the current model list. New chats use ${controls.resolvedModel}. The terminal still starts with ${controls.configuredModel}.`
-              : `Unavailable here; new sessions will use ${controls.resolvedModel}.`}
+            {driver !== "antigravity"
+              ? `Unavailable here; new sessions will use ${controls.resolvedModel}.`
+              : modelSupported
+                ? `Not in the current model list. New chats use ${controls.resolvedModel}. The terminal still starts with ${controls.configuredModel}.`
+                : `The model list is not loaded. The terminal starts with ${controls.configuredModel}.`}
           </p>
         ) : null}
       </div>
