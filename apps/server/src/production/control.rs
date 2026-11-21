@@ -2827,6 +2827,7 @@ fn validate_legacy_provider_settings(providers: &Value) -> Result<(), String> {
             "opencode",
             &["binaryPath", "serverUrl", "serverPassword"][..],
         ),
+        ("antigravity", &["binaryPath"][..]),
     ] {
         let Some(settings) = providers.get(driver) else {
             continue;
@@ -3718,7 +3719,8 @@ mod tests {
                     "claudeAgent": missing_provider,
                     "cursor": missing_provider,
                     "grok": missing_provider,
-                    "opencode": missing_provider
+                    "opencode": missing_provider,
+                    "antigravity": missing_provider
                 },
                 "providerInstances": {
                     "codex": { "driver": "codex", "enabled": true, "config": { "binaryPath": missing_binary } },
@@ -4800,15 +4802,22 @@ done
         apply_settings_defaults(&mut settings);
 
         let missing_binary = missing_provider_executable(&temp);
-        let host_fallbacks = ["codex", "claudeAgent", "cursor", "grok", "opencode"]
-            .into_iter()
-            .filter_map(|driver| {
-                let target = provider_inventory::maintenance_target(&settings, driver, None)
-                    .unwrap_or_else(|| panic!("{driver} has a provider definition"));
-                (target.binary_path != missing_binary)
-                    .then(|| format!("{driver} -> {}", target.binary_path))
-            })
-            .collect::<Vec<_>>();
+        let host_fallbacks = [
+            "codex",
+            "claudeAgent",
+            "cursor",
+            "grok",
+            "opencode",
+            "antigravity",
+        ]
+        .into_iter()
+        .filter_map(|driver| {
+            let target = provider_inventory::maintenance_target(&settings, driver, None)
+                .unwrap_or_else(|| panic!("{driver} has a provider definition"));
+            (target.binary_path != missing_binary)
+                .then(|| format!("{driver} -> {}", target.binary_path))
+        })
+        .collect::<Vec<_>>();
         assert!(
             host_fallbacks.is_empty(),
             "providers must not resolve CLIs from the host PATH: {host_fallbacks:?}"
@@ -5970,6 +5979,45 @@ done
         apply_settings_defaults(&mut settings);
 
         assert_eq!(settings["providers"]["grok"]["enabled"], false);
+    }
+
+    #[test]
+    fn native_settings_default_antigravity_to_disabled_with_the_agy_binary() {
+        let mut settings = json!({});
+        apply_settings_defaults(&mut settings);
+
+        assert_eq!(settings["providers"]["antigravity"]["enabled"], false);
+        assert_eq!(settings["providers"]["antigravity"]["binaryPath"], "agy");
+    }
+
+    #[test]
+    fn an_antigravity_settings_patch_keeps_an_explicit_enable_and_validates_its_fields() {
+        let patch = json!({
+            "providers": { "antigravity": { "enabled": true, "binaryPath": "custom-agy" } }
+        });
+        assert!(validate_settings_document(&patch).is_ok());
+        let mut settings = json!({});
+        apply_settings_defaults(&mut settings);
+        apply_settings_patch(&mut settings, patch);
+        apply_settings_defaults(&mut settings);
+        assert_eq!(settings["providers"]["antigravity"]["enabled"], true);
+        assert_eq!(
+            settings["providers"]["antigravity"]["binaryPath"],
+            "custom-agy"
+        );
+
+        assert!(
+            validate_settings_document(&json!({
+                "providers": { "antigravity": { "binaryPath": 5 } }
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_settings_document(&json!({
+                "providers": { "antigravity": { "enabled": "yes" } }
+            }))
+            .is_err()
+        );
     }
 
     #[test]
