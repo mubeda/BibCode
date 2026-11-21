@@ -327,12 +327,13 @@ fn read_web_content_pid<R: tauri::Runtime>(app: &tauri::AppHandle<R>, label: &st
         let read = webview.with_webview(|platform| {
             use objc2::{msg_send, runtime::NSObjectProtocol, sel};
 
-            // SAFETY: on macOS Tauri passes its live WKWebView and runs this on the main
-            // thread.
-            let webview: &objc2_web_kit::WKWebView = unsafe { &*platform.inner().cast() };
+            // Tauri runs this on the main thread.
+            let Some(webview) = crate::macos_webview::take_platform_webview(platform) else {
+                return;
+            };
             if webview.respondsToSelector(sel!(_webProcessIdentifier)) {
                 // SAFETY: the check above proves this WKWebView implements the private getter.
-                let pid: libc::pid_t = unsafe { msg_send![webview, _webProcessIdentifier] };
+                let pid: libc::pid_t = unsafe { msg_send![&*webview, _webProcessIdentifier] };
                 if let Ok(pid) = u32::try_from(pid)
                     && pid > 0
                 {

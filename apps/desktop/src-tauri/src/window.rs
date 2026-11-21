@@ -211,8 +211,6 @@ fn run_edit_menu_action<R: Runtime>(app: &AppHandle<R>, action: &'static str) {
 /// view inside it. The preview's child webview is a sibling of the main one, so it does not count.
 #[cfg(target_os = "macos")]
 fn main_webview_has_first_responder<R: Runtime>(app: &AppHandle<R>) -> bool {
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
     use objc2_app_kit::{NSApplication, NSView};
 
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
@@ -220,18 +218,8 @@ fn main_webview_has_first_responder<R: Runtime>(app: &AppHandle<R>) -> bool {
     };
     let (sender, receiver) = std::sync::mpsc::sync_channel::<bool>(1);
     let sent = window.with_webview(move |platform| {
-        // SAFETY: tauri-runtime-wry 2.11.4 passes each of these as `Retained::into_raw`, a +1
-        // retain it never releases (`WebviewMessage::WithWebview`), so taking them back here
-        // releases each exactly once. `with_webview_ownership_matches_the_pinned_runtime` fails
-        // when that runtime version changes. The closure runs on the main thread.
-        let (webview, _controller, _window) = unsafe {
-            (
-                Retained::<NSView>::from_raw(platform.inner().cast()),
-                Retained::<AnyObject>::from_raw(platform.controller().cast()),
-                Retained::<AnyObject>::from_raw(platform.ns_window().cast()),
-            )
-        };
-        let Some(webview) = webview else {
+        // The closure runs on the main thread.
+        let Some(webview) = crate::macos_webview::take_platform_webview(platform) else {
             let _ = sender.send(false);
             return;
         };
@@ -977,12 +965,12 @@ mod tests {
         assert!(recorded.asked.lock().unwrap().is_empty());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn with_webview_ownership_matches_the_pinned_runtime() {
-        // `main_webview_has_first_responder` releases the retains this runtime version hands
-        // over; a newer one that only lends the pointers would make that an over-release.
-        let lock = include_str!("../../../../Cargo.lock");
+        // `macos_webview::take_platform_webview` releases the retains this runtime version hands
+        // over; a newer one lends the pointers, which would make that an over-release on macOS.
+        // Checked on every platform so a bump made on Linux or Windows fails too.
+        let lock = include_str!("../../../../Cargo.lock").replace("\r\n", "\n");
         assert!(
             lock.contains("name = \"tauri-runtime-wry\"\nversion = \"2.11.4\""),
             "tauri-runtime-wry changed: recheck who owns the pointers `with_webview` passes"

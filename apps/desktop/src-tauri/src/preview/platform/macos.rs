@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use block2::RcBlock;
 use objc2::MainThreadMarker;
-use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSImage,
@@ -36,24 +35,6 @@ fn ensure_completion_wait_allowed() -> Result<(), PreviewPlatformError> {
     completion_wait_guard(NSThread::isMainThread_class())
 }
 
-/// Takes back the three objects tauri-runtime-wry 2.11.4 hands a `with_webview` callback as
-/// `Retained::into_raw` (+1 retains it never releases, #410) and returns the WKWebView; the
-/// controller and window are released when this returns.
-/// `window::tests::with_webview_ownership_matches_the_pinned_runtime` fails when that version
-/// changes. Call it once per callback, on the main/UI thread where Tauri runs it.
-fn take_platform_webview(
-    platform: &tauri::webview::PlatformWebview,
-) -> Option<Retained<WKWebView>> {
-    // SAFETY: each pointer carries one retain the runtime gave up; from_raw adopts it once.
-    unsafe {
-        drop(Retained::<AnyObject>::from_raw(
-            platform.controller().cast(),
-        ));
-        drop(Retained::<AnyObject>::from_raw(platform.ns_window().cast()));
-        Retained::<WKWebView>::from_raw(platform.inner().cast())
-    }
-}
-
 /// Run `f` with the WKWebView on the main thread and post the result back.
 fn with_wk<T: Send + 'static>(
     webview: &tauri::Webview,
@@ -62,7 +43,7 @@ fn with_wk<T: Send + 'static>(
     let (tx, rx) = mpsc::sync_channel::<T>(1);
     webview
         .with_webview(move |platform| {
-            let Some(wk) = take_platform_webview(&platform) else {
+            let Some(wk) = crate::macos_webview::take_platform_webview(platform) else {
                 return;
             };
             let _ = tx.send(f(&wk));
@@ -83,7 +64,7 @@ impl PlatformWebviewOps for MacosWebviewOps {
         let (tx, rx) = mpsc::sync_channel::<Result<String, PreviewPlatformError>>(1);
         webview
             .with_webview(move |platform| {
-                let Some(wk) = take_platform_webview(&platform) else {
+                let Some(wk) = crate::macos_webview::take_platform_webview(platform) else {
                     return;
                 };
                 let wk: &WKWebView = &wk;
@@ -159,7 +140,7 @@ impl PlatformWebviewOps for MacosWebviewOps {
         let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>, PreviewPlatformError>>(1);
         webview
             .with_webview(move |platform| {
-                let Some(wk) = take_platform_webview(&platform) else {
+                let Some(wk) = crate::macos_webview::take_platform_webview(platform) else {
                     return;
                 };
                 let wk: &WKWebView = &wk;
@@ -229,7 +210,7 @@ impl PlatformWebviewOps for MacosWebviewOps {
         let (tx, rx) = mpsc::sync_channel::<()>(1);
         webview
             .with_webview(move |platform| {
-                let Some(wk) = take_platform_webview(&platform) else {
+                let Some(wk) = crate::macos_webview::take_platform_webview(platform) else {
                     return;
                 };
                 // SAFETY: all WKWebView and WebKit data-store access remains inside Tauri's

@@ -407,6 +407,8 @@ pub use gstreamer_environment::repair_process_environment as repair_gstreamer_en
 mod linux_text_rendering;
 #[cfg(target_os = "linux")]
 mod linux_theme;
+#[cfg(target_os = "macos")]
+mod macos_webview;
 mod network_interfaces;
 mod preview;
 mod relaunch;
