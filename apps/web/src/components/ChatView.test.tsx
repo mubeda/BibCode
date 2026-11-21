@@ -204,6 +204,16 @@ vi.mock("../state/threads", () => ({
   },
 }));
 
+// Only the real ChatHeaderPanelMenu reads closed chats; the menu test needs none.
+vi.mock("../lib/archivedThreadsState", () => ({
+  useArchivedThreadSnapshots: () => ({
+    snapshots: [],
+    isLoading: false,
+    error: null,
+    refresh: () => undefined,
+  }),
+}));
+
 vi.mock("../state/terminal", () => ({
   terminalEnvironment: {
     open: { key: "terminal.open" },
@@ -886,8 +896,7 @@ import { newDraftId } from "../lib/utils";
 import type { ProviderInstanceEntry } from "../providerInstances";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
-import { buildProviderAgentActions } from "./chat/providerAgentActions";
-import type { ProviderTerminalAction } from "./chat/providerTerminalActions";
+import { ChatHeaderPanelMenu } from "./chat/ChatHeaderPanelMenu";
 import { FileEditingSessionRegistry } from "./files/fileEditingSessionRegistry";
 import { toastManager } from "./ui/toast";
 import type {
@@ -6080,7 +6089,9 @@ describe("ChatView handlers (captured from mocked children)", () => {
         } as never),
       );
       seedProject(makeProject());
-      seedServerThread(makeThread());
+      seedServerThread(
+        makeThread({ branch: "feature", worktreePath: "X:/demo-worktrees/feature" }),
+      );
       seedGitStatus(true);
       h.settings = {
         ...h.settings,
@@ -6098,6 +6109,8 @@ describe("ChatView handlers (captured from mocked children)", () => {
       const container = document.createElement("div");
       document.body.append(container);
       const root = createRoot(container);
+      const menuContainer = document.createElement("div");
+      document.body.append(menuContainer);
       try {
         await act(async () => {
           root.render(
@@ -6105,31 +6118,56 @@ describe("ChatView handlers (captured from mocked children)", () => {
           );
           await Promise.resolve();
         });
-        const header = capturedProps<{
-          providerStatuses: ServerProvider[];
-          settings: Parameters<typeof buildProviderAgentActions>[1];
-          onOpenProviderTerminalPanel: (action: ProviderTerminalAction) => void;
-        }>("chatHeaderActions");
-        const menu = buildProviderAgentActions(header.providerStatuses, header.settings).filter(
-          (action) => action.entry.instanceId === antigravityInstanceId,
-        );
-        expect(menu.map(({ value, disabled }) => ({ value, disabled }))).toEqual([
-          { value: "chat:antigravity_work", disabled: false },
-          { value: "terminal:antigravity_work", disabled: false },
-        ]);
-        const terminal = menu[1]!;
-        if (terminal.kind !== "terminal" || terminal.terminalAction.command === null) {
-          throw new Error("expected an enabled Antigravity Terminal action");
-        }
-
+        // ChatHeaderActions is mocked here, so the real menu renders from the props ChatView gave it.
+        const header =
+          capturedProps<
+            Pick<
+              ComponentProps<typeof ChatHeaderPanelMenu>,
+              | "providerStatuses"
+              | "settings"
+              | "canCreatePanel"
+              | "onCreateChatPanel"
+              | "onCreateSideChat"
+              | "sideChatUnavailableReason"
+              | "onReopenChatPanel"
+              | "onOpenTerminalPanel"
+              | "onOpenProviderTerminalPanel"
+            >
+          >("chatHeaderActions");
+        const menuRoot = createRoot(menuContainer);
         await act(async () =>
-          header.onOpenProviderTerminalPanel(terminal.terminalAction as ProviderTerminalAction),
+          menuRoot.render(
+            <ChatHeaderPanelMenu
+              {...header}
+              environmentId={environmentId}
+              hostThreadId={threadId}
+              onAddCustomAction={() => undefined}
+            />,
+          ),
+        );
+        const trigger = menuContainer.querySelector<HTMLButtonElement>(
+          'button[aria-label="New panel"]',
+        )!;
+        await act(async () => {
+          trigger.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+          trigger.click();
+        });
+        const items = await vi.waitFor(() => {
+          const found = Array.from(document.querySelectorAll<HTMLElement>("[role='menuitem']"));
+          expect(found.map((item) => item.textContent)).toEqual(
+            expect.arrayContaining(["Antigravity", "Antigravity Terminal"]),
+          );
+          return found;
+        });
+        await act(async () =>
+          items.find((item) => item.textContent === "Antigravity Terminal")!.click(),
         );
         await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+        await act(async () => menuRoot.unmount());
         const opened = commandCallsFor("terminal.open")[0]!.input as {
           input: { cwd: string; command: unknown };
         };
-        expect(opened.input.cwd).toBe("X:/demo");
+        expect(opened.input.cwd).toBe("X:/demo-worktrees/feature");
         expect(opened.input.command).toEqual({
           executable: "custom-agy",
           args: ["--dangerously-skip-permissions"],
@@ -6143,6 +6181,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
       } finally {
         await act(async () => root.unmount());
         container.remove();
+        menuContainer.remove();
       }
     });
   });

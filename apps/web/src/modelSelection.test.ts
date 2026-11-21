@@ -499,6 +499,24 @@ describe("instance-scoped model selection", () => {
       instanceId: "antigravity",
       model: "model-alpha",
     });
+    // Nothing usable: keep the saved selection rather than an empty Antigravity model.
+    expect(resolveAppModelSelectionState(settings, [antigravity])).toEqual({
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-selected",
+    });
+    const withCustomModel = {
+      ...settings,
+      providerInstances: {
+        [ProviderInstanceId.make("antigravity")]: {
+          driver: ProviderDriverKind.make("antigravity"),
+          config: { customModels: ["model-custom"] },
+        },
+      },
+    };
+    expect(resolveAppModelSelectionState(withCustomModel, [antigravity, usable])).toMatchObject({
+      instanceId: "antigravity",
+      model: "model-custom",
+    });
   });
 
   it("covers duplicate custom models and empty instance fallbacks", () => {

@@ -384,7 +384,9 @@ describe("saving an instance", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("adds a custom Antigravity instance enabled, with its own binary path (R11)", () => {
+  // The dialog's entry button is hidden in Settings for every driver (since 12d4a34c7); this pins
+  // only what the dialog writes once it is opened again.
+  it("saves a custom Antigravity instance enabled, with its own binary path", () => {
     seedSaveable("antigravity_work");
     harness.seedState((initial) => initial === "codex", "antigravity"); // driver
     harness.seedState(

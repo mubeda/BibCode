@@ -450,6 +450,21 @@ describe("ProviderSessionDefaultsControls", () => {
     expect(entries("Select")[0]?.disabled).toBe(true);
   });
 
+  it("says the Antigravity Terminal keeps an unlisted saved model while chats fall back", () => {
+    const markup = render(
+      baseProps({
+        driver: ProviderDriverKind.make("antigravity"),
+        models: [{ slug: "model-alpha", name: "Model Alpha", isCustom: false, capabilities: null }],
+        value: { model: "model-beta" },
+      }),
+    );
+
+    expect(markup).toContain(
+      "Not in the current model list. New chats use model-alpha. The terminal still starts with model-beta.",
+    );
+    expect(markup).not.toContain("new sessions will use");
+  });
+
   it("keeps the full control row mounted when model capabilities change", async () => {
     const mounted = await mount(
       baseProps({ driver: OPENCODE, models: richModels, value: richValue }),
