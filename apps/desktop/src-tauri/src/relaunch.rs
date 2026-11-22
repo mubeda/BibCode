@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// An installed update asked for a relaunch; read at the last exit callback.
+/// An installed update or Settings' restart asked for a relaunch; read at the last exit callback.
 static RELAUNCH_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Marks every descriptor above stderr close-on-exec before relaunch.
@@ -12,7 +12,7 @@ pub(crate) fn prepare_descriptors_for_relaunch() {
     linux::mark_inherited_descriptors_close_on_exec();
 }
 
-/// Called just before `AppHandle::restart` after an update installs.
+/// Called just before an update's or Settings' restart.
 pub(crate) fn note_relaunch_requested() {
     RELAUNCH_REQUESTED.store(true, Ordering::Release);
 }
@@ -37,27 +37,45 @@ pub(crate) fn exit_takes_mount_from_children() -> bool {
 /// launcher such as `systemd-run --user`), its exit stops the unit, which kills that whole
 /// cgroup: the new AppImage's mount goes away and the relaunched app dies with SIGBUS
 /// (#94). Here the new app starts in its own transient scope instead, and this process
-/// exits; when that is not needed or `systemd-run` fails, Tauri's relaunch runs as before.
-pub(crate) fn relaunch_outside_service_unit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+/// exits. Tauri's relaunch also passes this process's environment on, so when BiBCode set
+/// the software rendering variables itself (#411), the new app is started here without
+/// them and reads the stored setting afresh. When neither applies, or a spawn fails,
+/// Tauri's relaunch runs as before; with the variables that fails safe.
+pub(crate) fn relaunch_with_handoff<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if !RELAUNCH_REQUESTED.load(Ordering::Acquire) {
         return;
     }
     #[cfg(target_os = "linux")]
     {
         let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-        if !linux::runs_in_service_unit(&cgroup) {
+        let in_service_unit = linux::runs_in_service_unit(&cgroup);
+        let set_by_bibcode = crate::software_rendering::variables_set_by_bibcode();
+        if !in_service_unit && set_by_bibcode.is_empty() {
             return;
         }
         let env = tauri::Manager::env(app);
         let Ok(binary) = tauri::process::current_binary(&env) else {
             return;
         };
-        let mut command = std::process::Command::new("systemd-run");
-        command
-            .args(["--user", "--scope", "--collect", "--quiet", "--"])
-            .arg(binary)
-            .args(env.args_os.iter().skip(1));
-        bibcode_server::process::isolate_appimage_environment(&mut command);
+        if !in_service_unit {
+            let mut command =
+                relaunch_command(&binary, env.args_os.iter().skip(1), false, set_by_bibcode);
+            match command.spawn() {
+                Ok(_) => {
+                    tracing::info!(
+                        removed = ?set_by_bibcode,
+                        "relaunching without the software rendering variables BiBCode set"
+                    );
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not relaunch without the software rendering variables; relaunching in place");
+                    return;
+                }
+            }
+        }
+        let mut command =
+            relaunch_command(&binary, env.args_os.iter().skip(1), true, set_by_bibcode);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -71,12 +89,12 @@ pub(crate) fn relaunch_outside_service_unit<R: tauri::Runtime>(app: &tauri::AppH
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Ok(Some(status)) = child.try_wait() {
-                tracing::warn!(%status, "systemd-run did not start the update's relaunch scope; relaunching in place");
+                tracing::warn!(%status, "systemd-run did not start the relaunch scope; relaunching in place");
                 return;
             }
             let cgroup = std::fs::read_to_string(&cgroup_path).unwrap_or_default();
             if !cgroup.is_empty() && !linux::runs_in_service_unit(&cgroup) {
-                tracing::info!("relaunching the updated app in its own systemd scope");
+                tracing::info!("relaunching the app in its own systemd scope");
                 std::process::exit(0);
             }
             if std::time::Instant::now() >= deadline {
@@ -92,6 +110,40 @@ pub(crate) fn relaunch_outside_service_unit<R: tauri::Runtime>(app: &tauri::AppH
     }
     #[cfg(not(target_os = "linux"))]
     let _ = app;
+}
+
+/// The relaunch command: the binary itself, or inside `systemd-run` with the AppImage child
+/// filter, and in both cases with only the WebKit variables BiBCode set removed (#411).
+#[cfg(target_os = "linux")]
+fn relaunch_command<'a>(
+    binary: &std::path::Path,
+    args: impl IntoIterator<Item = &'a std::ffi::OsString>,
+    systemd: bool,
+    set_by_bibcode: &[&str],
+) -> std::process::Command {
+    let mut command = if systemd {
+        let mut command = std::process::Command::new("systemd-run");
+        command
+            .args(["--user", "--scope", "--collect", "--quiet", "--"])
+            .arg(binary);
+        command
+    } else {
+        std::process::Command::new(binary)
+    };
+    command.args(args);
+    if systemd {
+        bibcode_server::process::isolate_appimage_environment(&mut command);
+    }
+    let overrides = crate::software_rendering::relaunch_overrides(set_by_bibcode, |name| {
+        std::env::var_os(name)
+    });
+    for (name, value) in overrides {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    command
 }
 
 #[cfg(target_os = "linux")]
@@ -180,6 +232,54 @@ mod tests {
             "0::/user.slice/user-1000.slice/session-2.scope\n"
         ));
         assert!(!runs_in_service_unit(""));
+    }
+
+    #[test]
+    fn a_relaunch_keeps_the_users_webkit_variables_on_both_paths() {
+        use crate::test_support::reexec;
+        const NAME: &str =
+            "relaunch::tests::a_relaunch_keeps_the_users_webkit_variables_on_both_paths";
+        const PHASE: &str = "relaunch-webkit-variables";
+        let Some(isolated) = reexec::enter(NAME, PHASE) else {
+            // The fixture environment goes to the child process, never through `set_var`.
+            reexec::run(NAME, PHASE, None, |command| {
+                command
+                    .env("APPIMAGE", "/tmp/bibcode-test.AppImage")
+                    .env("APPDIR", "/tmp/bibcode-test-appdir")
+                    // A user's value under the AppDir is one the AppImage child filter drops.
+                    .env(
+                        "WEBKIT_DISABLE_COMPOSITING_MODE",
+                        "/tmp/bibcode-test-appdir/usr",
+                    )
+                    .env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+            });
+            return;
+        };
+        let env_of = |command: &Command, name: &str| {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.map(std::ffi::OsStr::to_owned))
+        };
+        for systemd in [true, false] {
+            let command = super::relaunch_command(
+                std::path::Path::new("/bin/true"),
+                &[],
+                systemd,
+                &["WEBKIT_DISABLE_DMABUF_RENDERER"],
+            );
+            assert_eq!(
+                env_of(&command, "WEBKIT_DISABLE_DMABUF_RENDERER"),
+                Some(None),
+                "systemd={systemd}: the variable BiBCode set is removed"
+            );
+            assert_eq!(
+                env_of(&command, "WEBKIT_DISABLE_COMPOSITING_MODE"),
+                Some(Some("/tmp/bibcode-test-appdir/usr".into())),
+                "systemd={systemd}: the user's variable survives"
+            );
+        }
+        isolated.complete();
     }
 
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

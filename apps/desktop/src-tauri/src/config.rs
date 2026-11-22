@@ -144,35 +144,57 @@ fn resolve_data_root_from_home(
         .map_err(|error| config_error("Could not resolve the BiBCode data root", error))
 }
 
+/// The function Tauri's `home_dir()` calls, also usable before Tauri starts, so `main` and
+/// the running app always resolve the same data root.
+fn home_dir() -> Result<PathBuf, String> {
+    dirs::home_dir().ok_or_else(|| "Could not resolve the home directory".to_owned())
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn data_root_from_environment() -> Result<ResolvedDataRoot, String> {
+    resolve_data_root_from_home(
+        home_dir()?,
+        bibcode_env_var("BIBCODE_HOME").map(PathBuf::from),
+    )
+}
+
 pub(crate) fn data_root<R: Runtime>(app: &AppHandle<R>) -> Result<ResolvedDataRoot, String> {
-    let home = app
-        .path()
-        .home_dir()
-        .map_err(|error| config_error("Could not resolve the home directory", error))?;
     #[cfg(test)]
-    let requested = app
+    return app
         .try_state::<IsolatedTestDataRoot>()
         .map(|root| root.0.clone())
         .ok_or_else(|| {
             "mock Tauri apps must install an explicit isolated test data root".to_owned()
-        })?;
-    #[cfg(test)]
-    return resolve_data_root_from_home(home, Some(requested));
+        })
+        .and_then(|requested| resolve_data_root_from_home(home_dir()?, Some(requested)));
 
     #[cfg(not(test))]
-    resolve_data_root_from_home(home, bibcode_env_var("BIBCODE_HOME").map(PathBuf::from))
+    {
+        let _ = app;
+        data_root_from_environment()
+    }
 }
 
 pub(crate) fn base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     data_root(app).map(|resolved| resolved.effective)
 }
 
-pub fn state_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    Ok(base_dir(app)?.join(if cfg!(debug_assertions) {
+fn state_dir_in(data_root: PathBuf) -> PathBuf {
+    data_root.join(if cfg!(debug_assertions) {
         "dev"
     } else {
         "userdata"
-    }))
+    })
+}
+
+pub fn state_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    base_dir(app).map(state_dir_in)
+}
+
+/// The state directory before Tauri starts, by the same rules as [`state_dir`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn state_dir_from_environment() -> Result<PathBuf, String> {
+    data_root_from_environment().map(|resolved| state_dir_in(resolved.effective))
 }
 
 pub fn read_json_file(path: &Path) -> Result<Option<Value>, String> {
