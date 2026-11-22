@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, PoisonError},
     time::Duration,
 };
 
@@ -237,39 +237,19 @@ pub struct ProviderUsageService {
     state: Arc<Mutex<ProviderUsageState>>,
     consume_codex_reset: ConsumeCodexReset,
     codex_reset_lock: Arc<Mutex<()>>,
-    /// One gate per provider with a minimum interval: no second fetch runs at once, and the
-    /// cooldown is measured on a monotonic clock.
-    interval_gates: Arc<BTreeMap<ProviderUsageProvider, Arc<Mutex<IntervalGate>>>>,
+    /// Providers whose fetch runs as one attempt at a time that no caller owns (Antigravity).
+    single_flights: Arc<BTreeMap<ProviderUsageProvider, Arc<StdMutex<SingleFlight>>>>,
 }
 
+/// One attempt at a time for a provider whose fetch is expensive. The attempt is a task of its
+/// own: a caller that goes away neither stops it nor loses its result for the others, and its
+/// result is committed once.
 #[derive(Default)]
-struct IntervalGate {
-    started: Option<tokio::time::Instant>,
-    finished: Option<tokio::time::Instant>,
-    /// What the last attempt produced: a joined or cooling-down caller commits it as its own
-    /// answer, so it never reads a state the first caller has not committed yet.
-    last: Option<ProviderUsageSnapshot>,
-}
-
-/// How often an automatic refresh may run a provider's fetch, and how long one may take.
-struct ProviderFetchPolicy {
-    min_interval: Option<Duration>,
-    timeout: Duration,
-}
-
-fn provider_fetch_policy(provider: ProviderUsageProvider) -> ProviderFetchPolicy {
-    match provider {
-        ProviderUsageProvider::Antigravity => ProviderFetchPolicy {
-            min_interval: Some(antigravity::MIN_INTERVAL),
-            // Above the fetcher's own deadline plus both cleanup windows, so this outer timeout
-            // never drops a supervised future before its cleanup ran.
-            timeout: antigravity::SERVICE_TIMEOUT,
-        },
-        ProviderUsageProvider::Claude | ProviderUsageProvider::Codex => ProviderFetchPolicy {
-            min_interval: None,
-            timeout: USAGE_TIMEOUT,
-        },
-    }
+struct SingleFlight {
+    /// The running attempt; a caller that arrives meanwhile waits for its result.
+    running: Option<tokio::sync::watch::Receiver<Option<ProviderUsageSnapshot>>>,
+    /// When the last attempt that ran the provider's command finished: the cooldown starts here.
+    cooldown_from: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -295,13 +275,10 @@ impl ProviderUsageService {
             state: Arc::new(Mutex::new(ProviderUsageState::default())),
             consume_codex_reset: production_codex_rate_limit_reset_consumer(),
             codex_reset_lock: Arc::new(Mutex::new(())),
-            interval_gates: Arc::new(
-                [ProviderUsageProvider::Antigravity]
-                    .into_iter()
-                    .filter(|provider| provider_fetch_policy(*provider).min_interval.is_some())
-                    .map(|provider| (provider, Arc::new(Mutex::new(IntervalGate::default()))))
-                    .collect(),
-            ),
+            single_flights: Arc::new(BTreeMap::from([(
+                ProviderUsageProvider::Antigravity,
+                Arc::default(),
+            )])),
         }
     }
 
@@ -391,6 +368,136 @@ impl ProviderUsageService {
         selected_providers: Option<Vec<ProviderUsageProvider>>,
         policy: RefreshPolicy,
     ) -> ProviderUsageResult {
+        let named = selected_providers.clone().unwrap_or_default();
+        if !named
+            .iter()
+            .any(|provider| self.single_flights.contains_key(provider))
+        {
+            return self.refresh_legacy(selected_providers, policy).await;
+        }
+        let (flights, legacy): (Vec<_>, Vec<_>) = named
+            .iter()
+            .copied()
+            .partition(|provider| self.single_flights.contains_key(provider));
+        // The global slot only ever throttles the legacy part; Antigravity has its own cooldown.
+        let legacy_refresh = async {
+            if !legacy.is_empty() {
+                self.refresh_legacy(Some(legacy), policy).await;
+            }
+        };
+        let attempts =
+            futures_util::future::join_all(flights.into_iter().map(|provider| async move {
+                (provider, self.join_single_flight(provider, policy).await)
+            }));
+        let ((), attempts) = tokio::join!(legacy_refresh, attempts);
+        let mut result = self.read_selected(Some(&named)).await;
+        for (provider, attempt) in attempts {
+            let (Some(snapshot), Some(slot)) = (
+                attempt,
+                result
+                    .providers
+                    .iter_mut()
+                    .find(|snapshot| snapshot.provider == provider),
+            ) else {
+                continue;
+            };
+            // Every waiter answers with the attempt it waited for, not a later one.
+            *slot = apply_staleness(snapshot, result.read_at);
+        }
+        result
+    }
+
+    /// Waits for the running attempt, or starts one unless a throttled request is inside the
+    /// cooldown (then the cache answers). `None` means "read the cache".
+    async fn join_single_flight(
+        &self,
+        provider: ProviderUsageProvider,
+        policy: RefreshPolicy,
+    ) -> Option<ProviderUsageSnapshot> {
+        let flight = self.single_flights.get(&provider)?;
+        let mut receiver = {
+            let mut held = flight.lock().unwrap_or_else(PoisonError::into_inner);
+            // A closed channel is an attempt that died without answering: start another.
+            match held
+                .running
+                .clone()
+                .filter(|running| running.has_changed().is_ok())
+            {
+                Some(running) => running,
+                None => {
+                    if matches!(policy, RefreshPolicy::Throttled)
+                        && held
+                            .cooldown_from
+                            .is_some_and(|from| from.elapsed() < antigravity::MIN_INTERVAL)
+                    {
+                        return None;
+                    }
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    held.running = Some(receiver.clone());
+                    tokio::spawn(self.clone().run_single_flight(provider, sender));
+                    receiver
+                }
+            }
+        };
+        receiver
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.clone())
+    }
+
+    /// One attempt: fetch, commit once, release the flight, then answer every waiter.
+    async fn run_single_flight(
+        self,
+        provider: ProviderUsageProvider,
+        sender: tokio::sync::watch::Sender<Option<ProviderUsageSnapshot>>,
+    ) {
+        let read_at = (self.now)();
+        {
+            let mut state = self.state.lock().await;
+            state.active_refreshes = state.active_refreshes.saturating_add(1);
+        }
+        let snapshot = match self.fetchers.get(&provider) {
+            None => {
+                unavailable_snapshot(provider, read_at, "Provider usage fetcher is unavailable.")
+            }
+            Some(fetcher) => {
+                // A task of its own: neither this backstop timeout nor a panic drops the fetch
+                // before its own deadline has stopped the CLI and cleaned up.
+                let mut fetch = tokio::spawn((fetcher.fetch)());
+                match tokio::time::timeout(antigravity::SERVICE_TIMEOUT, &mut fetch).await {
+                    Ok(Ok(Ok(snapshot))) => snapshot,
+                    Ok(Ok(Err(error))) => error_snapshot(provider, read_at, error.message),
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::warn!(?provider, "provider usage attempt failed or overran");
+                        error_snapshot(provider, read_at, antigravity::MESSAGE_TRANSIENT.to_owned())
+                    }
+                }
+            }
+        };
+        let ran = !antigravity::ran_nothing(&snapshot);
+        let committed = {
+            let mut state = self.state.lock().await;
+            let snapshot = retain_last_good_usage(state.snapshots.get(&provider), snapshot);
+            state.snapshots.insert(provider, snapshot.clone());
+            state.active_refreshes = state.active_refreshes.saturating_sub(1);
+            snapshot
+        };
+        if let Some(flight) = self.single_flights.get(&provider) {
+            let mut held = flight.lock().unwrap_or_else(PoisonError::into_inner);
+            held.running = None;
+            if ran {
+                held.cooldown_from = Some(tokio::time::Instant::now());
+            }
+        }
+        sender.send_replace(Some(committed));
+    }
+
+    async fn refresh_legacy(
+        &self,
+        selected_providers: Option<Vec<ProviderUsageProvider>>,
+        policy: RefreshPolicy,
+    ) -> ProviderUsageResult {
         let (caller_lifetime, caller_dropped) = tokio::sync::oneshot::channel();
         let service = self.clone();
         let operation = tokio::spawn(async move {
@@ -414,22 +521,15 @@ impl ProviderUsageService {
         let read_at = (self.now)();
         let now_ms = unix_timestamp_ms(read_at);
         let selected = selected_providers.unwrap_or_else(providers);
-        // The global 30 s slot belongs to the providers without an interval of their own, so a
-        // Claude or Codex poll cannot starve Antigravity and an Antigravity-only request does not
-        // consume the slot.
-        let uses_global_slot = selected
-            .iter()
-            .any(|provider| provider_fetch_policy(*provider).min_interval.is_none());
         let refresh_generation = {
             let mut state = self.state.lock().await;
             state.refresh_started_at_ms.retain(|_, started_at_ms| {
                 now_ms.saturating_sub(*started_at_ms) < MIN_MANUAL_REFRESH_MS
             });
             if matches!(policy, RefreshPolicy::Throttled)
-                && uses_global_slot
                 && state.refresh_started_at_ms.last_key_value().is_some()
             {
-                return drop_and_read(state, self, Some(&selected)).await;
+                return drop_and_read(state, self).await;
             }
             state.active_refreshes = state.active_refreshes.saturating_add(1);
             state.next_refresh_generation = state.next_refresh_generation.saturating_add(1);
@@ -439,22 +539,16 @@ impl ProviderUsageService {
                     .provider_refresh_generations
                     .insert(*provider, refresh_generation);
             }
-            if uses_global_slot {
-                state
-                    .refresh_started_at_ms
-                    .insert(refresh_generation, now_ms);
-            }
+            state
+                .refresh_started_at_ms
+                .insert(refresh_generation, now_ms);
             refresh_generation
         };
 
         let mut worker = tokio::spawn({
             let service = self.clone();
             let selected = selected.clone();
-            async move {
-                service
-                    .fetch_refresh_snapshots(&selected, read_at, policy)
-                    .await
-            }
+            async move { service.fetch_refresh_snapshots(&selected, read_at).await }
         });
         tokio::select! {
             biased;
@@ -466,7 +560,7 @@ impl ProviderUsageService {
             worker_result = &mut worker => {
                 match worker_result {
                     Ok(next_snapshots) => {
-                        self.commit_refresh(refresh_generation, &selected, next_snapshots).await
+                        self.commit_refresh(refresh_generation, next_snapshots).await
                     }
                     Err(error) => {
                         self.cancel_refresh(refresh_generation, &selected).await;
@@ -481,54 +575,20 @@ impl ProviderUsageService {
         &self,
         selected: &[ProviderUsageProvider],
         read_at: OffsetDateTime,
-        policy: RefreshPolicy,
     ) -> Vec<(ProviderUsageProvider, ProviderUsageSnapshot)> {
-        let arrival = tokio::time::Instant::now();
         let mut next_snapshots = Vec::with_capacity(selected.len());
         for &provider in selected {
-            let fetch_policy = provider_fetch_policy(provider);
             let snapshot = match self.fetchers.get(&provider) {
-                Some(fetcher) => {
-                    let mut held = match self.interval_gates.get(&provider) {
-                        Some(gate) => Some(gate.clone().lock_owned().await),
-                        None => None,
-                    };
-                    if let Some(held) = held.as_mut() {
-                        let now = tokio::time::Instant::now();
-                        // An attempt that finished after this caller arrived is the answer this
-                        // caller would have fetched: join it instead of spawning again.
-                        let joined = held.finished.is_some_and(|finished| finished >= arrival);
-                        let cooling = matches!(policy, RefreshPolicy::Throttled)
-                            && match (held.started, fetch_policy.min_interval) {
-                                (Some(started), Some(interval)) => {
-                                    now.saturating_duration_since(started) < interval
-                                }
-                                _ => false,
-                            };
-                        if joined || cooling {
-                            if let Some(last) = held.last.clone() {
-                                next_snapshots.push((provider, last));
-                            }
-                            continue;
-                        }
-                        held.started = Some(now);
-                    }
-                    let snapshot =
-                        match tokio::time::timeout(fetch_policy.timeout, (fetcher.fetch)()).await {
-                            Ok(Ok(snapshot)) => snapshot,
-                            Ok(Err(error)) => error_snapshot(provider, read_at, error.message),
-                            Err(_) => error_snapshot(
-                                provider,
-                                read_at,
-                                "Provider usage request timed out.".to_owned(),
-                            ),
-                        };
-                    if let Some(held) = held.as_mut() {
-                        held.finished = Some(tokio::time::Instant::now());
-                        held.last = Some(snapshot.clone());
-                    }
-                    snapshot
-                }
+                Some(fetcher) => match tokio::time::timeout(USAGE_TIMEOUT, (fetcher.fetch)()).await
+                {
+                    Ok(Ok(snapshot)) => snapshot,
+                    Ok(Err(error)) => error_snapshot(provider, read_at, error.message),
+                    Err(_) => error_snapshot(
+                        provider,
+                        read_at,
+                        "Provider usage request timed out.".to_owned(),
+                    ),
+                },
                 None => unavailable_snapshot(
                     provider,
                     read_at,
@@ -543,7 +603,6 @@ impl ProviderUsageService {
     async fn commit_refresh(
         &self,
         refresh_generation: u128,
-        selected: &[ProviderUsageProvider],
         next_snapshots: Vec<(ProviderUsageProvider, ProviderUsageSnapshot)>,
     ) -> ProviderUsageResult {
         let mut state = self.state.lock().await;
@@ -559,7 +618,7 @@ impl ProviderUsageService {
             state.snapshots.insert(requested_provider, snapshot);
         }
         state.active_refreshes = state.active_refreshes.saturating_sub(1);
-        drop_and_read(state, self, Some(selected)).await
+        drop_and_read(state, self).await
     }
 
     async fn cancel_refresh(
@@ -575,7 +634,7 @@ impl ProviderUsageService {
                 state.provider_refresh_generations.remove(provider);
             }
         }
-        drop_and_read(state, self, Some(selected)).await
+        drop_and_read(state, self).await
     }
 }
 
@@ -1241,10 +1300,9 @@ fn parse_reset(value: &Value) -> Option<OffsetDateTime> {
 async fn drop_and_read(
     state: tokio::sync::MutexGuard<'_, ProviderUsageState>,
     service: &ProviderUsageService,
-    selected: Option<&[ProviderUsageProvider]>,
 ) -> ProviderUsageResult {
     drop(state);
-    service.read_selected(selected).await
+    service.read().await
 }
 
 fn providers() -> Vec<ProviderUsageProvider> {
@@ -1301,11 +1359,22 @@ fn error_snapshot(
 }
 
 fn apply_staleness(snapshot: ProviderUsageSnapshot, now: OffsetDateTime) -> ProviderUsageSnapshot {
-    if snapshot.status != ProviderUsageStatus::Ok {
-        return snapshot;
-    }
     let age_ms = (now - snapshot.updated_at).whole_milliseconds();
-    if age_ms <= i128::from(STALE_THRESHOLD_MS) {
+    let expired = age_ms > i128::from(STALE_THRESHOLD_MS);
+    if snapshot.provider == ProviderUsageProvider::Antigravity {
+        // Its quota moves fast: expired data, also data retained on an error, is not shown.
+        return if expired && has_usable_usage(&snapshot) {
+            ProviderUsageSnapshot {
+                status: ProviderUsageStatus::Unavailable,
+                error: Some("Provider usage snapshot is stale.".to_owned()),
+                window_groups: Vec::new(),
+                ..snapshot
+            }
+        } else {
+            snapshot
+        };
+    }
+    if snapshot.status != ProviderUsageStatus::Ok || !expired {
         return snapshot;
     }
     ProviderUsageSnapshot {
@@ -2759,40 +2828,71 @@ done"#,
         assert_eq!(rpc_error(&json!({}), "fallback"), "fallback");
     }
 
-    fn antigravity_fetcher(calls: Arc<AtomicUsize>, delay: Duration) -> ProviderUsageFetcher {
+    type AntigravityScript =
+        Arc<dyn Fn(usize) -> Result<ProviderUsageSnapshot, ProviderUsageFetchError> + Send + Sync>;
+
+    fn ok_antigravity() -> ProviderUsageSnapshot {
+        ProviderUsageSnapshot {
+            provider: ProviderUsageProvider::Antigravity,
+            status: ProviderUsageStatus::Ok,
+            session: None,
+            weekly: None,
+            fable_weekly: None,
+            window_groups: vec![ProviderUsageWindowGroup {
+                id: "gemini",
+                label: "Gemini models",
+                session: Some(ProviderUsageWindow {
+                    used_percent: 3,
+                    window_minutes: 300,
+                    resets_at: None,
+                    reset_description: None,
+                }),
+                weekly: None,
+            }],
+            plan_type: None,
+            rate_limit_reset_credits: None,
+            updated_at: OffsetDateTime::now_utc(),
+            error: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// An Antigravity fetcher whose answer depends on the call number (0-based).
+    fn scripted_antigravity(
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+        script: AntigravityScript,
+    ) -> ProviderUsageFetcher {
         ProviderUsageFetcher {
             provider: ProviderUsageProvider::Antigravity,
             fetch: Arc::new(move || {
                 let calls = calls.clone();
+                let script = script.clone();
                 Box::pin(async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(delay).await;
-                    Ok(ProviderUsageSnapshot {
-                        provider: ProviderUsageProvider::Antigravity,
-                        status: ProviderUsageStatus::Ok,
-                        session: None,
-                        weekly: None,
-                        fable_weekly: None,
-                        window_groups: vec![ProviderUsageWindowGroup {
-                            id: "gemini",
-                            label: "Gemini models",
-                            session: Some(ProviderUsageWindow {
-                                used_percent: 3,
-                                window_minutes: 300,
-                                resets_at: None,
-                                reset_description: None,
-                            }),
-                            weekly: None,
-                        }],
-                        plan_type: None,
-                        rate_limit_reset_credits: None,
-                        updated_at: OffsetDateTime::now_utc(),
-                        error: None,
-                        metadata: BTreeMap::new(),
-                    })
+                    script(call)
                 })
             }),
         }
+    }
+
+    fn antigravity_fetcher(calls: Arc<AtomicUsize>, delay: Duration) -> ProviderUsageFetcher {
+        scripted_antigravity(calls, delay, Arc::new(|_| Ok(ok_antigravity())))
+    }
+
+    fn codex_counter(codex: Arc<AtomicUsize>) -> ProviderUsageFetcher {
+        test_fetcher(move || {
+            let codex = codex.clone();
+            async move {
+                codex.fetch_add(1, Ordering::SeqCst);
+                Ok(snapshot_with_session(
+                    ProviderUsageProvider::Codex,
+                    OffsetDateTime::now_utc(),
+                    10,
+                ))
+            }
+        })
     }
 
     fn service_with(
@@ -2803,17 +2903,7 @@ done"#,
         ProviderUsageService::new(
             vec![
                 antigravity_fetcher(calls.clone(), delay),
-                test_fetcher(move || {
-                    let codex = codex.clone();
-                    async move {
-                        codex.fetch_add(1, Ordering::SeqCst);
-                        Ok(snapshot_with_session(
-                            ProviderUsageProvider::Codex,
-                            OffsetDateTime::now_utc(),
-                            10,
-                        ))
-                    }
-                }),
+                codex_counter(codex),
             ],
             Arc::new(OffsetDateTime::now_utc),
         )
@@ -2825,6 +2915,18 @@ done"#,
             .iter()
             .map(|snapshot| snapshot.provider)
             .collect()
+    }
+
+    fn antigravity_of(result: &ProviderUsageResult) -> &ProviderUsageSnapshot {
+        result
+            .providers
+            .iter()
+            .find(|snapshot| snapshot.provider == ProviderUsageProvider::Antigravity)
+            .expect("the request named Antigravity")
+    }
+
+    fn only_antigravity() -> Option<Vec<ProviderUsageProvider>> {
+        Some(vec![ProviderUsageProvider::Antigravity])
     }
 
     #[tokio::test]
@@ -2839,9 +2941,7 @@ done"#,
             0,
             "an omitted list never fetches it"
         );
-        let named = service
-            .refresh_forced(Some(vec![ProviderUsageProvider::Antigravity]))
-            .await;
+        let named = service.refresh_forced(only_antigravity()).await;
         assert_eq!(
             names(&named).last(),
             Some(&ProviderUsageProvider::Antigravity)
@@ -2864,11 +2964,11 @@ done"#,
     async fn the_interval_serves_the_cache_and_a_forced_refresh_bypasses_it() {
         let calls = Arc::new(AtomicUsize::new(0));
         let service = service_with(&calls, Duration::ZERO, Arc::default());
-        let only = || Some(vec![ProviderUsageProvider::Antigravity]);
-        service.refresh(only()).await;
-        service.refresh(only()).await;
+        service.refresh(only_antigravity()).await;
+        let cached = service.refresh(only_antigravity()).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "inside the interval");
-        service.refresh_forced(only()).await;
+        assert_eq!(antigravity_of(&cached).status, ProviderUsageStatus::Ok);
+        service.refresh_forced(only_antigravity()).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -2885,9 +2985,7 @@ done"#,
         service
             .refresh(Some(vec![ProviderUsageProvider::Codex]))
             .await;
-        service
-            .refresh(Some(vec![ProviderUsageProvider::Antigravity]))
-            .await;
+        service.refresh(only_antigravity()).await;
         assert_eq!(
             (codex.load(Ordering::SeqCst), calls.load(Ordering::SeqCst)),
             (1, 1)
@@ -2896,9 +2994,7 @@ done"#,
         let calls = Arc::new(AtomicUsize::new(0));
         let codex = Arc::new(AtomicUsize::new(0));
         let service = service_with(&calls, Duration::ZERO, codex.clone());
-        service
-            .refresh(Some(vec![ProviderUsageProvider::Antigravity]))
-            .await;
+        service.refresh(only_antigravity()).await;
         service
             .refresh(Some(vec![ProviderUsageProvider::Codex]))
             .await;
@@ -2909,40 +3005,231 @@ done"#,
     }
 
     #[tokio::test]
-    async fn simultaneous_forced_refreshes_run_one_process() {
+    async fn a_mixed_request_inside_the_global_cooldown_still_reads_antigravity() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let codex = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::ZERO, codex.clone());
+        service
+            .refresh(Some(vec![ProviderUsageProvider::Codex]))
+            .await;
+        let mixed = service
+            .refresh(Some(vec![
+                ProviderUsageProvider::Codex,
+                ProviderUsageProvider::Antigravity,
+            ]))
+            .await;
+        assert_eq!(codex.load(Ordering::SeqCst), 1, "Codex stays throttled");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "Antigravity is not");
+        assert_eq!(antigravity_of(&mixed).status, ProviderUsageStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_forced_refreshes_run_one_attempt_and_both_callers_get_it() {
         let calls = Arc::new(AtomicUsize::new(0));
         let service = service_with(&calls, Duration::from_millis(80), Arc::default());
-        let only = || Some(vec![ProviderUsageProvider::Antigravity]);
         let (first, second) = tokio::join!(
-            service.refresh_forced(only()),
-            service.refresh_forced(only())
+            service.refresh_forced(only_antigravity()),
+            service.refresh_forced(only_antigravity())
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
             "the second joins the first"
         );
-        // The newer generation owns the commit, so the older caller may read before it lands.
-        let _ = first;
-        assert_eq!(
-            second.providers.last().unwrap().status,
-            ProviderUsageStatus::Ok
-        );
+        assert_eq!(antigravity_of(&first).status, ProviderUsageStatus::Ok);
+        assert_eq!(antigravity_of(&second).status, ProviderUsageStatus::Ok);
     }
 
     #[tokio::test]
-    async fn a_cancelled_caller_does_not_wedge_the_next_forced_refresh() {
+    async fn a_caller_cancelled_mid_attempt_neither_aborts_it_nor_poisons_the_cooldown() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = service_with(&calls, Duration::from_millis(300), Arc::default());
-        let only = || Some(vec![ProviderUsageProvider::Antigravity]);
-        let abandoned =
-            tokio::time::timeout(Duration::from_millis(30), service.refresh_forced(only())).await;
+        let service = service_with(&calls, Duration::from_millis(200), Arc::default());
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(30),
+            service.refresh_forced(only_antigravity()),
+        )
+        .await;
         assert!(abandoned.is_err(), "the caller gave up mid-fetch");
-        let next = service.refresh_forced(only()).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A throttled poll joins the attempt that is still running and gets its answer.
+        let next = service.refresh(only_antigravity()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(antigravity_of(&next).status, ProviderUsageStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_waiter_cancelled_before_the_attempt_finishes_leaves_the_first_caller_its_result() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::from_millis(150), Arc::default());
+        let first = tokio::spawn({
+            let service = service.clone();
+            async move { service.refresh_forced(only_antigravity()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let waiter = tokio::time::timeout(
+            Duration::from_millis(30),
+            service.refresh_forced(only_antigravity()),
+        )
+        .await;
+        assert!(waiter.is_err(), "the waiter gave up");
+        let first = first.await.expect("first caller");
+        assert_eq!(antigravity_of(&first).status, ProviderUsageStatus::Ok);
+        let read = service
+            .read_selected(Some(&[ProviderUsageProvider::Antigravity]))
+            .await;
+        assert_eq!(antigravity_of(&read).status, ProviderUsageStatus::Ok);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_attempt_every_caller_abandoned_is_committed_once_and_starts_the_cooldown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::from_millis(60), Arc::default());
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(10),
+            service.refresh_forced(only_antigravity()),
+        )
+        .await;
+        assert!(abandoned.is_err());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let read = service
+            .read_selected(Some(&[ProviderUsageProvider::Antigravity]))
+            .await;
+        assert_eq!(antigravity_of(&read).status, ProviderUsageStatus::Ok);
+        let cooled = service.refresh(only_antigravity()).await;
         assert_eq!(
-            next.providers.last().unwrap().status,
-            ProviderUsageStatus::Ok
+            calls.load(Ordering::SeqCst),
+            1,
+            "the finished run cools down"
+        );
+        assert_eq!(antigravity_of(&cooled).status, ProviderUsageStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_result_that_ran_nothing_starts_no_cooldown() {
+        for message in [
+            antigravity::MESSAGE_DISABLED,
+            antigravity::MESSAGE_NOT_STARTED,
+            antigravity::MESSAGE_VERSION,
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let service = ProviderUsageService::new(
+                vec![scripted_antigravity(
+                    calls.clone(),
+                    Duration::ZERO,
+                    Arc::new(move |call| {
+                        Ok(if call == 0 {
+                            unavailable_snapshot(
+                                ProviderUsageProvider::Antigravity,
+                                OffsetDateTime::now_utc(),
+                                message,
+                            )
+                        } else {
+                            ok_antigravity()
+                        })
+                    }),
+                )],
+                Arc::new(OffsetDateTime::now_utc),
+            );
+            let first = service.refresh(only_antigravity()).await;
+            assert_eq!(antigravity_of(&first).error.as_deref(), Some(message));
+            // The user fixed the cause; the next automatic refresh runs at once.
+            let second = service.refresh(only_antigravity()).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{message}");
+            assert_eq!(antigravity_of(&second).status, ProviderUsageStatus::Ok);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_attempt_releases_its_waiters_and_the_next_one_runs() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = ProviderUsageService::new(
+            vec![scripted_antigravity(
+                calls.clone(),
+                Duration::ZERO,
+                Arc::new(|call| {
+                    assert!(call != 0, "the first attempt fails hard");
+                    Ok(ok_antigravity())
+                }),
+            )],
+            Arc::new(OffsetDateTime::now_utc),
+        );
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.refresh_forced(only_antigravity()),
+        )
+        .await
+        .expect("a panic does not leave the caller waiting");
+        assert_eq!(antigravity_of(&first).status, ProviderUsageStatus::Error);
+        let second = service.refresh_forced(only_antigravity()).await;
+        assert_eq!(antigravity_of(&second).status, ProviderUsageStatus::Ok);
+        assert!(!service.read().await.is_fetching);
+    }
+
+    #[tokio::test]
+    async fn expired_antigravity_data_live_or_retained_on_an_error_shows_no_windows() {
+        let fetched_at = OffsetDateTime::UNIX_EPOCH + time::Duration::days(20_000);
+        let clock = Arc::new(StdMutex::new(fetched_at));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = ProviderUsageService::new(
+            vec![scripted_antigravity(
+                calls.clone(),
+                Duration::ZERO,
+                Arc::new(move |call| {
+                    if call == 0 {
+                        Ok(ProviderUsageSnapshot {
+                            updated_at: fetched_at,
+                            ..ok_antigravity()
+                        })
+                    } else {
+                        Err(ProviderUsageFetchError::new(antigravity::MESSAGE_TRANSIENT))
+                    }
+                }),
+            )],
+            Arc::new({
+                let clock = clock.clone();
+                move || *clock.lock().unwrap()
+            }),
+        );
+        let named = [ProviderUsageProvider::Antigravity];
+        service.refresh_forced(only_antigravity()).await;
+        *clock.lock().unwrap() = fetched_at + time::Duration::minutes(31);
+        for (label, result) in [
+            ("live", service.read_selected(Some(&named)).await),
+            // A failed fetch retains the old data with its old time; it is expired too.
+            ("retained", service.refresh_forced(only_antigravity()).await),
+            ("retained read", service.read_selected(Some(&named)).await),
+        ] {
+            let snapshot = antigravity_of(&result);
+            assert_eq!(snapshot.status, ProviderUsageStatus::Unavailable, "{label}");
+            assert!(snapshot.window_groups.is_empty(), "{label}");
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some("Provider usage snapshot is stale."),
+                "{label}"
+            );
+        }
+        // Inside the limit, an error keeps the last data.
+        *clock.lock().unwrap() = fetched_at + time::Duration::minutes(5);
+        let retained = service.read_selected(Some(&named)).await;
+        assert_eq!(antigravity_of(&retained).status, ProviderUsageStatus::Error);
+        assert_eq!(antigravity_of(&retained).window_groups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_codex_reset_result_never_carries_cached_antigravity() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&calls, Duration::ZERO, Arc::default())
+            .with_codex_rate_limit_reset_consumer(|_| async {
+                Ok(CodexRateLimitResetOutcome::Reset)
+            });
+        service.refresh_forced(only_antigravity()).await;
+        let reset = service
+            .consume_codex_rate_limit_reset("request-1")
+            .await
+            .expect("reset");
+        assert_eq!(
+            names(&reset.usage),
+            [ProviderUsageProvider::Claude, ProviderUsageProvider::Codex]
         );
     }
 }

@@ -7,12 +7,17 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime},
 };
 
+use serde::{
+    Deserialize, Deserializer,
+    de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::process::Command;
@@ -83,10 +88,17 @@ pub(super) fn fetcher(
             let attribution = attribution.clone();
             let verified = verified.clone();
             Box::pin(async move {
-                let document = settings.get_document().await.map_err(|_| {
-                    ProviderUsageFetchError::new("Antigravity settings could not be read.")
-                })?;
-                fetch_for_document(&document, attribution.as_ref(), &verified).await
+                // The settings with their stored secrets, as the chat provider reads them: an
+                // instance signed in with an API key is not read with the host's account.
+                let document = settings
+                    .get()
+                    .await
+                    .ok()
+                    .and_then(|state| serde_json::to_value(state).ok())
+                    .ok_or_else(|| {
+                        ProviderUsageFetchError::new("Antigravity settings could not be read.")
+                    })?;
+                fetch_for_document(&document, attribution.as_ref(), &verified, DEADLINE).await
             })
         }),
     }
@@ -108,10 +120,22 @@ pub(super) fn default_instance_enabled(document: &Value) -> bool {
     }
 }
 
+/// Whether a result came back without running the usage command (instance off, CLI missing,
+/// version not confirmed). It starts no cooldown: the next request after the user fixes the cause
+/// runs at once.
+pub(super) fn ran_nothing(snapshot: &ProviderUsageSnapshot) -> bool {
+    snapshot.status == ProviderUsageStatus::Unavailable
+        && matches!(
+            snapshot.error.as_deref(),
+            Some(MESSAGE_DISABLED | MESSAGE_NOT_STARTED | MESSAGE_VERSION)
+        )
+}
+
 pub(super) async fn fetch_for_document(
     document: &Value,
     attribution: Option<&ProcessAttributionRegistry>,
     verified: &StdMutex<Option<VerifiedExecutable>>,
+    deadline: Duration,
 ) -> Result<ProviderUsageSnapshot, ProviderUsageFetchError> {
     let now = OffsetDateTime::now_utc();
     let unavailable = |message: &str| -> Result<ProviderUsageSnapshot, ProviderUsageFetchError> {
@@ -140,18 +164,28 @@ pub(super) async fn fetch_for_document(
         return unavailable(MESSAGE_NOT_STARTED);
     };
     let started = tokio::time::Instant::now();
+    let ends_at = started + deadline;
     let workdir =
         ScratchDirectory::create().map_err(|_| ProviderUsageFetchError::new(MESSAGE_TRANSIENT))?;
     let cancellation = CancellationToken::new();
+    // Both runs launch the file whose version was verified (the canonical path), never a path a
+    // symlink could retarget in between; the name it was called by stays its argv[0].
     let run = |arguments: &'static [&'static str], timeout: Duration| {
-        run_cli(
-            &executable,
-            arguments,
-            &target.environment,
-            workdir.path(),
-            timeout,
+        until_deadline(
+            run_cli(
+                CliLaunch {
+                    program: &identity.0,
+                    called_as: &executable,
+                },
+                arguments,
+                &target.environment,
+                workdir.path(),
+                timeout,
+                &cancellation,
+                attribution,
+            ),
+            ends_at,
             &cancellation,
-            attribution,
         )
     };
 
@@ -172,10 +206,10 @@ pub(super) async fn fetch_for_document(
         {
             return unavailable(MESSAGE_VERSION);
         }
-        *verified.lock().unwrap_or_else(|error| error.into_inner()) = Some(identity);
+        *verified.lock().unwrap_or_else(|error| error.into_inner()) = Some(identity.clone());
     }
 
-    let remaining = DEADLINE.saturating_sub(started.elapsed());
+    let remaining = deadline.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         return Err(ProviderUsageFetchError::new(MESSAGE_TRANSIENT));
     }
@@ -201,6 +235,22 @@ pub(super) async fn fetch_for_document(
         Some(snapshot) => Ok(snapshot),
         None => unavailable(MESSAGE_FORMAT),
     }
+}
+
+/// Cancels the runs through the supervisor's token at the deadline, then waits for the run to
+/// settle: the supervisor stops the whole process group, a descendant that kept the output pipes
+/// open included, before the run returns.
+async fn until_deadline<F: std::future::Future>(
+    run: F,
+    ends_at: tokio::time::Instant,
+    cancellation: &CancellationToken,
+) -> F::Output {
+    tokio::pin!(run);
+    tokio::select! {
+        output = &mut run => return output,
+        () = tokio::time::sleep_until(ends_at) => cancellation.cancel(),
+    }
+    run.await
 }
 
 fn run_error_class(error: &SupervisedRunError) -> &'static str {
@@ -235,8 +285,16 @@ fn version_is_supported(stdout: &[u8]) -> bool {
     (version.major, version.minor, version.patch) >= MINIMUM_VERSION && version.pre.is_empty()
 }
 
+/// The verified file to run, and the path it was configured as (its argv[0], which a
+/// version-manager shim dispatches on).
+#[derive(Clone, Copy)]
+struct CliLaunch<'a> {
+    program: &'a Path,
+    called_as: &'a Path,
+}
+
 async fn run_cli(
-    executable: &Path,
+    launch: CliLaunch<'_>,
     arguments: &[&str],
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
     workdir: &Path,
@@ -244,14 +302,23 @@ async fn run_cli(
     cancellation: &CancellationToken,
     attribution: Option<&ProcessAttributionRegistry>,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
-    let launch = prepare_provider_launch(executable, arguments)
+    let CliLaunch { program, called_as } = launch;
+    let launch = prepare_provider_launch(program, arguments)
         .map_err(|error| SupervisedRunError::Spawn(std::io::Error::other(error)))?;
     let mut command = Command::new(&launch.program);
+    #[cfg(unix)]
+    if launch.program.as_path() == program {
+        command.arg0(called_as);
+    }
+    #[cfg(not(unix))]
+    let _ = called_as;
     configure_background_command(&mut command);
     command
         .args(&launch.args)
         .current_dir(workdir)
         .envs(environment.iter().map(|(name, value)| (name, value)))
+        // Not the server's stdin: the CLI sees end-of-file at once if it ever reads.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     sanitize_provider_subprocess_environment(&mut command);
@@ -307,12 +374,12 @@ struct ScratchDirectory(PathBuf);
 
 impl ScratchDirectory {
     fn create() -> std::io::Result<Self> {
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        let path =
-            std::env::temp_dir().join(format!("bibcode-agy-usage-{}-{nanos}", std::process::id()));
-        std::fs::create_dir(&path)?;
+        // A random name, as the codebase names its temporary files: never two alike.
+        let path = std::env::temp_dir().join(format!("bibcode-agy-usage-{}", uuid::Uuid::new_v4()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&path)?;
         Ok(Self(path))
     }
 
@@ -327,71 +394,209 @@ impl Drop for ScratchDirectory {
     }
 }
 
-/// Reads only `command.name`, `command.data.groups[].buckets[]` and, per bucket, `id`, `window`,
-/// `remaining_fraction` and `reset_time`, plus `num_turns` and `status`. Anything else, including
-/// every free-text field, is ignored. `None` means "not the shape BiBCode reads".
+/// The only fields read. Every other field, free text included, is skipped by the decoder and
+/// never stored. The guard fields and the containers are strict: a wrong type there is not the
+/// shape BiBCode reads.
+#[derive(Deserialize)]
+struct UsageOutput {
+    status: Option<String>,
+    num_turns: Option<u64>,
+    command: Option<UsageCommand>,
+}
+
+#[derive(Deserialize)]
+struct UsageCommand {
+    name: Option<String>,
+    data: Option<UsageData>,
+}
+
+#[derive(Deserialize)]
+struct UsageData {
+    groups: Option<Vec<UsageGroup>>,
+}
+
+#[derive(Deserialize)]
+struct UsageGroup {
+    #[serde(default)]
+    buckets: Lenient<Vec<UsageBucket>>,
+}
+
+/// A bucket's fields are each optional: one of the wrong type drops the bucket, not the payload.
+#[derive(Deserialize)]
+struct UsageBucket {
+    #[serde(default)]
+    id: Lenient<String>,
+    #[serde(default)]
+    window: Lenient<String>,
+    #[serde(default)]
+    remaining_fraction: Lenient<f64>,
+    #[serde(default)]
+    reset_time: Lenient<String>,
+}
+
+/// A value of the expected kind, or `None` for anything else, skipped without being stored.
+struct Lenient<T>(Option<T>);
+
+impl<T> Default for Lenient<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+/// What a lenient field accepts.
+trait LenientKind: Sized {
+    fn from_str(_: &str) -> Option<Self> {
+        None
+    }
+    fn from_f64(_: f64) -> Option<Self> {
+        None
+    }
+    fn from_seq<'de, A: SeqAccess<'de>>(seq: A) -> Result<Option<Self>, A::Error> {
+        skip_seq(seq).map(|()| None)
+    }
+}
+
+impl LenientKind for String {
+    fn from_str(value: &str) -> Option<Self> {
+        Some(value.to_owned())
+    }
+}
+
+impl LenientKind for f64 {
+    fn from_f64(value: f64) -> Option<Self> {
+        Some(value)
+    }
+}
+
+impl LenientKind for Vec<UsageBucket> {
+    fn from_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<Option<Self>, A::Error> {
+        let mut buckets = Vec::new();
+        while let Some(bucket) = seq.next_element()? {
+            buckets.push(bucket);
+        }
+        Ok(Some(buckets))
+    }
+}
+
+fn skip_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
+    while seq.next_element::<IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+impl<'de, T: LenientKind> Deserialize<'de> for Lenient<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LenientVisitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: LenientKind> Visitor<'de> for LenientVisitor<T> {
+            type Value = Lenient<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("any JSON value")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(Lenient(T::from_str(value)))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(Lenient(T::from_f64(value)))
+            }
+
+            #[allow(clippy::cast_precision_loss)] // a fraction: whole numbers are 0 and 1
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(Lenient(T::from_f64(value as f64)))
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(Lenient(T::from_f64(value as f64)))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(Lenient(None))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Lenient(None))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                T::from_seq(seq).map(Lenient)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Lenient(None))
+            }
+        }
+
+        deserializer.deserialize_any(LenientVisitor(std::marker::PhantomData))
+    }
+}
+
+/// Reads the allowlisted fields of the CLI's JSON. `None` means "not the shape BiBCode reads".
+/// A group with no usable bucket is skipped. When two buckets land on the same group and window
+/// (two unknown prefixes both become "Other models"), the tighter one is kept: it is the limit
+/// that stops work first.
 pub(super) fn parse_usage(stdout: &[u8], now: OffsetDateTime) -> Option<ProviderUsageSnapshot> {
-    let value: Value = serde_json::from_slice(stdout).ok()?;
+    let output: UsageOutput = serde_json::from_slice(stdout).ok()?;
+    let command = output.command?;
     // The guard: a CLI that answered the text as a prompt has no command and spent a turn.
-    if value.pointer("/command/name")?.as_str()? != "usage"
-        || value.get("num_turns")?.as_u64()? != 0
-        || value.get("status")?.as_str()? != "SUCCESS"
+    if command.name.as_deref() != Some("usage")
+        || output.num_turns != Some(0)
+        || output.status.as_deref() != Some("SUCCESS")
     {
         return None;
     }
-    let groups = value.pointer("/command/data/groups")?.as_array()?;
+    let groups = command.data?.groups?;
     let mut by_class: BTreeMap<usize, ProviderUsageWindowGroup> = BTreeMap::new();
-    for group in groups {
-        for bucket in group.get("buckets")?.as_array()? {
-            let Some((rank, id, label)) = bucket
-                .get("id")
-                .and_then(Value::as_str)
-                .map(classify_bucket)
-            else {
-                continue;
-            };
-            let Some((is_session, minutes)) = bucket
-                .get("window")
-                .and_then(Value::as_str)
-                .and_then(|window| match window {
-                    "5h" => Some((true, 300)),
-                    "weekly" => Some((false, 10_080)),
-                    _ => None,
-                })
-            else {
-                continue;
-            };
-            let Some(remaining) = bucket
-                .get("remaining_fraction")
-                .and_then(Value::as_f64)
-                .filter(|fraction| fraction.is_finite())
-            else {
-                continue;
-            };
-            let window = ProviderUsageWindow {
-                used_percent: ((1.0 - remaining) * 100.0).round().clamp(0.0, 100.0) as u32,
-                window_minutes: minutes,
-                resets_at: bucket
-                    .get("reset_time")
-                    .and_then(Value::as_str)
-                    .and_then(|text| {
-                        OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
-                            .ok()
-                    }),
-                reset_description: None,
-            };
-            let entry = by_class.entry(rank).or_insert(ProviderUsageWindowGroup {
-                id,
-                label,
-                session: None,
-                weekly: None,
-            });
-            let slot = if is_session {
-                &mut entry.session
-            } else {
-                &mut entry.weekly
-            };
-            slot.get_or_insert(window);
+    for bucket in groups
+        .into_iter()
+        .flat_map(|group| group.buckets.0.unwrap_or_default())
+    {
+        let Some((rank, id, label)) = bucket.id.0.as_deref().map(classify_bucket) else {
+            continue;
+        };
+        let Some((is_session, minutes)) =
+            bucket.window.0.as_deref().and_then(|window| match window {
+                "5h" => Some((true, 300)),
+                "weekly" => Some((false, 10_080)),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let Some(remaining) = bucket
+            .remaining_fraction
+            .0
+            .filter(|fraction| fraction.is_finite())
+        else {
+            continue;
+        };
+        let window = ProviderUsageWindow {
+            used_percent: ((1.0 - remaining) * 100.0).round().clamp(0.0, 100.0) as u32,
+            window_minutes: minutes,
+            resets_at: bucket.reset_time.0.as_deref().and_then(|text| {
+                OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
+            }),
+            reset_description: None,
+        };
+        let entry = by_class.entry(rank).or_insert(ProviderUsageWindowGroup {
+            id,
+            label,
+            session: None,
+            weekly: None,
+        });
+        let slot = if is_session {
+            &mut entry.session
+        } else {
+            &mut entry.weekly
+        };
+        if slot
+            .as_ref()
+            .is_none_or(|kept| window.used_percent > kept.used_percent)
+        {
+            *slot = Some(window);
         }
     }
     let window_groups: Vec<_> = by_class.into_values().collect();
@@ -591,6 +796,43 @@ mod tests {
     }
 
     #[test]
+    fn a_group_without_usable_buckets_is_skipped_not_the_payload() {
+        for extra in [
+            json!({"name": MARKER}),
+            json!({"name": MARKER, "buckets": "none"}),
+            json!({"buckets": {"id": "gemini-5h"}}),
+            json!({"buckets": [{"id": 7, "window": ["5h"], "remaining_fraction": {"v": 1}}]}),
+        ] {
+            let mut value = payload();
+            value
+                .pointer_mut("/command/data/groups")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(extra.clone());
+            let snapshot = parse(&value).unwrap_or_else(|| panic!("{extra} rejected the payload"));
+            assert_eq!(snapshot.window_groups.len(), 2, "{extra}");
+        }
+    }
+
+    #[test]
+    fn two_buckets_on_one_group_and_window_keep_the_tighter() {
+        let mut value = payload();
+        let buckets = value
+            .pointer_mut("/command/data/groups/1/buckets")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        buckets.push(json!({"id": "new-5h", "window": "5h", "remaining_fraction": 0.9}));
+        buckets.push(json!({"id": "other-5h", "window": "5h", "remaining_fraction": 0.2}));
+        buckets.push(json!({"id": "late-5h", "window": "5h", "remaining_fraction": 0.6}));
+        let snapshot = parse(&value).expect("shape");
+        let other = snapshot.window_groups.last().unwrap();
+        assert_eq!(other.label, "Other models");
+        assert_eq!(other.session.as_ref().unwrap().used_percent, 80);
+    }
+
+    #[test]
     fn only_one_version_token_at_or_above_the_minimum_passes() {
         for (text, ok) in [
             ("1.5.14\n", true),
@@ -674,7 +916,7 @@ mod tests {
             document: &Value,
             verified: &StdMutex<Option<VerifiedExecutable>>,
         ) -> Result<ProviderUsageSnapshot, ProviderUsageFetchError> {
-            fetch_for_document(document, None, verified).await
+            fetch_for_document(document, None, verified, DEADLINE).await
         }
 
         #[tokio::test]
@@ -742,6 +984,267 @@ mod tests {
             let snapshot = fetch(&document, &StdMutex::default()).await.expect("fetch");
             assert_eq!(snapshot.error.as_deref(), Some(MESSAGE_DISABLED));
             assert!(fixture.calls().is_empty());
+        }
+
+        fn document_for(path: &Path) -> Value {
+            json!({
+                "providerInstances": {"antigravity": {
+                    "driver": "antigravity",
+                    "enabled": true,
+                    "config": {"binaryPath": path.to_string_lossy()}
+                }}
+            })
+        }
+
+        /// A fake `agy` that logs `$1` and answers `--version` with 1.5.14 unless `version`
+        /// replaces that branch, and the usage run with `usage`.
+        fn script(fixture: &Fixture, name: &str, version: &str, usage: &str) -> PathBuf {
+            let body = format!(
+                "echo \"$1\" >> '{log}'\nif [ \"$1\" = \"--version\" ]; then {version}; fi\n{usage}",
+                log = fixture.log.display(),
+            );
+            fixture.sandbox.executable_script(name, &body, "")
+        }
+
+        const VERSION_OK: &str = "printf 1.5.14; exit 0";
+        fn usage_ok() -> String {
+            format!("printf '%s' '{USAGE_JSON}'")
+        }
+
+        #[tokio::test]
+        async fn both_runs_launch_the_verified_file_even_when_its_symlink_is_retargeted() {
+            let fixture = Fixture::new();
+            let old_log = fixture.sandbox.path("old.log");
+            // The newer CLI holds its version answer while the link is switched to an older one.
+            let newer = script(
+                &fixture,
+                "agy-new",
+                "sleep 1; printf 1.5.14; exit 0",
+                &usage_ok(),
+            );
+            let older = fixture.sandbox.executable_script(
+                "agy-old",
+                &format!(
+                    "echo \"$1\" >> '{}'\nif [ \"$1\" = \"--version\" ]; then printf 1.1.10; exit 0; fi\nexit 0",
+                    old_log.display()
+                ),
+                "",
+            );
+            let link = fixture.sandbox.path("agy");
+            std::os::unix::fs::symlink(&newer, &link).expect("link");
+            let document = document_for(&link);
+            let fetch = tokio::spawn(async move {
+                fetch_for_document(&document, None, &StdMutex::default(), DEADLINE).await
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            std::fs::remove_file(&link).expect("unlink");
+            std::os::unix::fs::symlink(&older, &link).expect("relink");
+            let snapshot = fetch.await.expect("task").expect("fetch");
+            assert_eq!(snapshot.status, ProviderUsageStatus::Ok);
+            assert_eq!(fixture.calls(), ["--version", "-p"]);
+            assert!(
+                std::fs::read_to_string(&old_log)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "the unverified CLI ran"
+            );
+        }
+
+        #[tokio::test]
+        async fn both_runs_see_end_of_file_on_stdin() {
+            let fixture = Fixture::new();
+            let body = format!(
+                "if [ /dev/stdin -ef /dev/null ]; then s=closed; else s=open; fi\necho \"$1:$s\" >> '{log}'\nif [ \"$1\" = \"--version\" ]; then {VERSION_OK}; fi\n{usage}",
+                log = fixture.log.display(),
+                usage = usage_ok(),
+            );
+            let path = fixture.sandbox.executable_script("agy", &body, "");
+            let snapshot = fetch(&document_for(&path), &StdMutex::default())
+                .await
+                .expect("fetch");
+            assert_eq!(snapshot.status, ProviderUsageStatus::Ok);
+            assert_eq!(fixture.calls(), ["--version:closed", "-p:closed"]);
+        }
+
+        #[tokio::test]
+        async fn the_instance_environment_includes_its_stored_secret() {
+            use crate::server_settings::{
+                ProviderEnvironmentVariableInput, ProviderInstanceInput, ServerSettingsPatch,
+            };
+            let fixture = Fixture::new();
+            let body = format!(
+                "echo \"$1:$GEMINI_API_KEY\" >> '{log}'\nif [ \"$1\" = \"--version\" ]; then {VERSION_OK}; fi\nexit 2",
+                log = fixture.log.display(),
+            );
+            let path = fixture.sandbox.executable_script("agy", &body, "");
+            let root = fixture.sandbox.path("settings");
+            let store = ProviderSettingsStore::new(&root);
+            store
+                .update(ServerSettingsPatch {
+                    provider_instances: Some(BTreeMap::from([(
+                        "antigravity".to_owned(),
+                        ProviderInstanceInput {
+                            driver: "antigravity".to_owned(),
+                            enabled: true,
+                            display_name: None,
+                            environment: vec![ProviderEnvironmentVariableInput {
+                                name: "GEMINI_API_KEY".to_owned(),
+                                value: "test-key-value".to_owned(),
+                                sensitive: true,
+                                value_redacted: false,
+                            }],
+                            config: json!({"binaryPath": path.to_string_lossy()}),
+                        },
+                    )])),
+                    ..ServerSettingsPatch::default()
+                })
+                .await
+                .expect("save");
+            let persisted = std::fs::read_to_string(root.join("settings.json")).expect("saved");
+            assert!(
+                !persisted.contains("test-key-value"),
+                "the secret is stored apart"
+            );
+            let snapshot = (fetcher(store, None).fetch)().await.expect("fetch");
+            assert_eq!(snapshot.error.as_deref(), Some(MESSAGE_API_KEY));
+            assert_eq!(
+                fixture.calls(),
+                ["--version:test-key-value", "-p:test-key-value"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_descendant_holding_stdout_open_is_stopped_at_the_deadline() {
+            let fixture = Fixture::new();
+            let pid_file = fixture.sandbox.path("descendant.pid");
+            let path = script(
+                &fixture,
+                "agy",
+                VERSION_OK,
+                &format!(
+                    "sleep 30 &\necho $! > '{}'\nprintf partial\nexit 0",
+                    pid_file.display()
+                ),
+            );
+            let started = std::time::Instant::now();
+            let error = fetch_for_document(
+                &document_for(&path),
+                None,
+                &StdMutex::default(),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("the deadline cancels the run");
+            assert_eq!(error.message, MESSAGE_TRANSIENT);
+            assert!(started.elapsed() < Duration::from_secs(10));
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .expect("pid")
+                .trim()
+                .parse()
+                .expect("pid");
+            let mut alive = true;
+            for _ in 0..50 {
+                // SAFETY: signal 0 only checks whether the process exists.
+                alive = unsafe { libc::kill(pid, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(!alive, "the descendant survived the deadline");
+        }
+
+        #[tokio::test]
+        async fn truncated_version_or_usage_output_is_never_trusted() {
+            let fixture = Fixture::new();
+            let path = script(
+                &fixture,
+                "agy",
+                "printf 1.5.14; head -c 70000 /dev/zero | tr '\\0' ' '; exit 0",
+                &usage_ok(),
+            );
+            let snapshot = fetch(&document_for(&path), &StdMutex::default())
+                .await
+                .expect("fetch");
+            assert_eq!(snapshot.error.as_deref(), Some(MESSAGE_VERSION));
+            assert_eq!(fixture.calls(), ["--version"]);
+
+            let fixture = Fixture::new();
+            let path = script(
+                &fixture,
+                "agy",
+                VERSION_OK,
+                &format!("{}; head -c 70000 /dev/zero | tr '\\0' ' '", usage_ok()),
+            );
+            let snapshot = fetch(&document_for(&path), &StdMutex::default())
+                .await
+                .expect("fetch");
+            assert_eq!(snapshot.error.as_deref(), Some(MESSAGE_FORMAT));
+        }
+
+        #[tokio::test]
+        async fn failures_log_a_class_never_the_cli_text() {
+            let Some(child) = crate::test_support::in_own_process(
+                "provider_usage::antigravity::tests::fake_cli::failures_log_a_class_never_the_cli_text",
+            ) else {
+                return;
+            };
+            let log = CapturedLog::default();
+            let _logging = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer({
+                        let log = log.clone();
+                        move || log.clone()
+                    })
+                    .finish(),
+            );
+            // A non-zero exit, then a run cut off by the deadline, both with the marker on
+            // stdout and stderr.
+            for (usage, deadline) in [
+                (
+                    format!("{}; echo {MARKER} >&2; exit 1", usage_ok()),
+                    DEADLINE,
+                ),
+                (
+                    format!("echo {MARKER}; echo {MARKER} >&2; sleep 30"),
+                    Duration::from_secs(1),
+                ),
+            ] {
+                let fixture = Fixture::new();
+                let path = script(&fixture, "agy", VERSION_OK, &usage);
+                let error =
+                    fetch_for_document(&document_for(&path), None, &StdMutex::default(), deadline)
+                        .await
+                        .expect_err("failure");
+                assert!(!error.message.contains(MARKER));
+            }
+            let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                log.contains("Antigravity usage exited unsuccessfully"),
+                "{log}"
+            );
+            assert!(log.contains("Antigravity usage run failed"), "{log}");
+            assert!(
+                !log.contains(MARKER),
+                "the CLI's text reached the log:\n{log}"
+            );
+            child.complete();
+        }
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<StdMutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
     }
 }
