@@ -39418,6 +39418,54 @@ done
     }
 
     #[test]
+    fn antigravity_refusals_before_the_prompt_are_final_and_carry_no_provider_text() {
+        use crate::provider::antigravity::{AntigravityRuntimeError as Error, acp::AcpProtocolError};
+        const MARKER: &str = "SYNTHETIC-PROVIDER-TEXT-91c2";
+        let remote = || {
+            Error::Protocol(AcpProtocolError::RemoteRequest {
+                method: "session/set_config_option".to_owned(),
+                request_id: "4".to_owned(),
+                code: -32603,
+                message: MARKER.to_owned(),
+                data: Some(json!({ "text": MARKER })),
+            })
+        };
+        for (error, rejected) in [
+            (Error::SignInRequired, true),
+            (
+                Error::ModeUnavailable {
+                    mode: "default".to_owned(),
+                },
+                true,
+            ),
+            (
+                Error::Protocol(AcpProtocolError::LineTooLong {
+                    stream: "stdout",
+                    maximum: 128 * 1024,
+                }),
+                true,
+            ),
+            (Error::ControlTimedOut, false),
+            (remote(), false),
+        ] {
+            let outcome = super::antigravity_unsent_outcome(error);
+            let (actual, detail) = match outcome {
+                super::ProviderDeliveryOutcome::Rejected { detail } => (true, detail),
+                super::ProviderDeliveryOutcome::DefinitelyNotSent { detail } => (false, detail),
+                other => panic!("unexpected outcome {other:?}"),
+            };
+            assert_eq!(actual, rejected, "{detail}");
+            assert!(!detail.contains(MARKER), "{detail}");
+        }
+        let launch = super::antigravity_error(remote());
+        assert!(!launch.to_string().contains(MARKER), "{launch}");
+        assert!(
+            launch.to_string().contains("session/set_config_option") && launch.to_string().contains("-32603"),
+            "{launch}"
+        );
+    }
+
+    #[test]
     fn antigravity_dispatch_tables_name_it_and_never_fall_back_to_codex() {
         assert_eq!(super::native_adapter_key("antigravity"), "antigravity-acp");
         let providers = ProvidersState::default();
