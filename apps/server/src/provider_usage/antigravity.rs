@@ -184,8 +184,6 @@ pub(super) async fn fetch_for_document(
                     called_as: &executable,
                 },
                 arguments,
-                // Only the usage command can spend quota: its spawn starts the cooldown.
-                arguments.first() == Some(&"-p"),
                 &target.environment,
                 workdir.path(),
                 timeout,
@@ -305,7 +303,6 @@ struct CliLaunch<'a> {
 async fn run_cli(
     launch: CliLaunch<'_>,
     arguments: &[&str],
-    usage_run: bool,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
     workdir: &Path,
     timeout: Duration,
@@ -313,6 +310,8 @@ async fn run_cli(
     attribution: Option<&ProcessAttributionRegistry>,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
     let CliLaunch { program, called_as } = launch;
+    // Only the usage command can spend quota: its spawn starts the cooldown.
+    let usage_run = arguments.first() == Some(&"-p");
     let launch = prepare_provider_launch(program, arguments)
         .map_err(|error| SupervisedRunError::Spawn(std::io::Error::other(error)))?;
     let mut command = Command::new(&launch.program);
