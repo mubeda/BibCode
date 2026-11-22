@@ -66,6 +66,7 @@ fn merge_provider_snapshot(
     refreshed: provider_inventory::ProviderProbeResult,
 ) -> Value {
     let models_authoritative = refreshed.models_authoritative;
+    let session_reads = refreshed.session_reads;
     let mut next = refreshed.snapshot;
     if refreshed.rich_metadata == provider_inventory::RichMetadataOutcome::Succeeded {
         return next;
@@ -80,11 +81,17 @@ fn merge_provider_snapshot(
         return next;
     }
     let antigravity = next["driver"] == "antigravity";
-    // A disabled or missing instance carries nothing a past session read.
-    let keeps_session_reads =
+    // A disabled or missing instance carries nothing a past session read, nor does one whose
+    // CLI, session or launch inputs failed or changed since (`SessionReads::Lost`).
+    let installed_and_enabled =
         antigravity && next["installed"] != false && next["status"] != "disabled";
+    let keeps_session_reads =
+        installed_and_enabled && session_reads == provider_inventory::SessionReads::NotRead;
+    // A session that answered without listing a model keeps the last catalog.
+    let keeps_catalog =
+        installed_and_enabled && session_reads != provider_inventory::SessionReads::Lost;
     if !models_authoritative
-        && (keeps_session_reads || !antigravity)
+        && (keeps_catalog || !antigravity)
         && let Some(value) = current.get("models")
     {
         next["models"] = if antigravity {
@@ -306,8 +313,38 @@ impl fmt::Debug for AgentActivityHandlerSlot {
 struct ProviderRefreshState {
     last_completed: Option<Instant>,
     /// Per ACP-probed instance, when a full refresh last read its catalog and with which inputs.
-    catalog_reads: std::collections::HashMap<String, (Instant, String)>,
+    catalog_reads: std::collections::HashMap<String, (Instant, u64)>,
+    /// Per Antigravity instance, the launch inputs its published session reads belong to.
+    session_read_inputs: std::collections::HashMap<String, u64>,
     manual_refreshes: usize,
+}
+
+/// `settings` with each provider instance's environment as a chat launch reads it: sensitive
+/// values from the secret store, not the redacted copy held and published here. Only probes
+/// use it, so the inventory reads the account a chat runs with. When the store cannot supply a
+/// secret (a chat then refuses to start), the entries stay redacted and no session is probed.
+async fn with_stored_secrets(state_directory: &Path, settings: &Value) -> Value {
+    let mut probe = settings.clone();
+    let stored = match crate::server_settings::ProviderSettingsStore::new(state_directory)
+        .get()
+        .await
+    {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::warn!(%error, "provider secrets could not be read for the inventory probe");
+            return probe;
+        }
+    };
+    for (instance_id, instance) in stored.provider_instances {
+        if let Some(entry) = probe
+            .get_mut("providerInstances")
+            .and_then(|instances| instances.get_mut(&instance_id))
+            && let Ok(environment) = serde_json::to_value(&instance.environment)
+        {
+            entry["environment"] = environment;
+        }
+    }
+    probe
 }
 
 struct ManualFullProviderRefresh {
@@ -502,8 +539,9 @@ impl NativeServerControl {
             },
         );
         // Nothing subscribes yet, so the tools' publish during startup reaches no one.
+        let probe_settings = with_stored_secrets(&state_directory, &settings).await;
         *providers.write().await =
-            probe_startup_inventory(&settings, &cwd, &provider_maintenance, &tools).await;
+            probe_startup_inventory(&probe_settings, &cwd, &provider_maintenance, &tools).await;
         let control = Self {
             config,
             auth_descriptor,
@@ -1063,7 +1101,9 @@ impl NativeServerControl {
         {
             Some(providers) => {
                 if instance_id.is_none() {
-                    self.record_full_provider_refresh(&settings, &Default::default());
+                    let probe_settings =
+                        with_stored_secrets(&self.state_directory, &settings).await;
+                    self.record_full_provider_refresh(&probe_settings, &Default::default());
                 }
                 providers
             }
@@ -1699,6 +1739,7 @@ impl NativeServerControl {
             pause.entered.notify_one();
             pause.release.notified().await;
         }
+        let settings = &with_stored_secrets(&self.state_directory, settings).await;
         provider_inventory::probe(settings, instance_id, cwd, &self.provider_maintenance).await
     }
 
@@ -1717,6 +1758,7 @@ impl NativeServerControl {
             pause.entered.notify_one();
             pause.release.notified().await;
         }
+        let settings = &with_stored_secrets(&self.state_directory, settings).await;
         if instance_id.is_some() {
             return provider_inventory::probe_full(
                 settings,
@@ -1791,12 +1833,43 @@ impl NativeServerControl {
         Some(providers)
     }
 
+    /// What an Antigravity probe that opened no session keeps from the last session reads:
+    /// nothing once the binary path or environment differ from those the reads were taken with.
+    /// A probe that read or lost them records its inputs as theirs.
+    fn settle_session_reads(&self, result: &mut provider_inventory::ProviderProbeResult) {
+        use provider_inventory::SessionReads;
+        if result.snapshot["driver"] != "antigravity" {
+            return;
+        }
+        let Some(instance_id) = result.snapshot["instanceId"].as_str() else {
+            return;
+        };
+        let mut state = self
+            .provider_refresh_state
+            .lock()
+            .expect("provider refresh state lock");
+        if result.session_reads == SessionReads::NotRead
+            && state.session_read_inputs.get(instance_id) != Some(&result.launch_inputs)
+        {
+            result.session_reads = SessionReads::Lost;
+        }
+        if result.session_reads != SessionReads::NotRead {
+            state
+                .session_read_inputs
+                .insert(instance_id.to_owned(), result.launch_inputs);
+        }
+    }
+
     async fn merge_provider_snapshots(
         &self,
         refreshed: Vec<provider_inventory::ProviderProbeResult>,
         partial: bool,
     ) -> (Vec<Value>, bool) {
         let mut current = self.providers.write().await;
+        let mut refreshed = refreshed;
+        for result in &mut refreshed {
+            self.settle_session_reads(result);
+        }
         let mut merged = if partial {
             let mut merged = current.clone();
             for result in refreshed {
@@ -1943,7 +2016,10 @@ impl NativeServerControl {
             'refresh: loop {
                 loop {
                     let started = Instant::now();
-                    let reuse = control.reusable_acp_catalogs(&settings);
+                    // The catalog inputs carry the stored secrets: a changed one is read again.
+                    let probe_settings =
+                        with_stored_secrets(&control.state_directory, &settings).await;
+                    let reuse = control.reusable_acp_catalogs(&probe_settings);
                     let probe_sequence = control.begin_provider_probe();
                     let providers = if let FullProviderRefreshTrigger::BackgroundCheck {
                         cancellation,
@@ -1970,7 +2046,7 @@ impl NativeServerControl {
                         .await
                         .is_some()
                     {
-                        control.record_full_provider_refresh(&settings, &reuse);
+                        control.record_full_provider_refresh(&probe_settings, &reuse);
                         #[cfg(test)]
                         control
                             .latest_full_provider_refresh_generation
@@ -7056,6 +7132,7 @@ done
             }),
             rich_metadata: provider_inventory::RichMetadataOutcome::NotRequested,
             models_authoritative: false,
+            ..Default::default()
         };
         let failed = provider_inventory::ProviderProbeResult {
             rich_metadata: provider_inventory::RichMetadataOutcome::Failed,
@@ -7101,6 +7178,7 @@ done
             }),
             rich_metadata: provider_inventory::RichMetadataOutcome::NotRequested,
             models_authoritative: false,
+            ..Default::default()
         };
 
         let merged = merge_provider_snapshot(Some(&current), quick("antigravity"));
@@ -7124,6 +7202,7 @@ done
             }),
             rich_metadata: provider_inventory::RichMetadataOutcome::Succeeded,
             models_authoritative: true,
+            ..Default::default()
         };
         let replaced = merge_provider_snapshot(Some(&merged), signed_in.clone());
         assert_eq!(replaced, signed_in.snapshot);
@@ -7242,6 +7321,7 @@ done
                         snapshot: snapshot.clone(),
                         rich_metadata,
                         models_authoritative: false,
+                        ..Default::default()
                     },
                 );
                 assert_eq!(
@@ -7335,6 +7415,171 @@ done
         );
     }
 
+    /// The published Antigravity row's sign-in status, message and probed model slugs.
+    async fn antigravity_reads(control: &NativeServerControl) -> (Value, Value, Vec<Value>) {
+        let providers = control.providers.read().await;
+        let row = providers
+            .iter()
+            .find(|provider| provider["instanceId"] == "antigravity")
+            .expect("the Antigravity row");
+        let probed = row["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|model| model["isCustom"] != true)
+            .map(|model| model["slug"].clone())
+            .collect();
+        (
+            row["auth"]["status"].clone(),
+            row["message"].clone(),
+            probed,
+        )
+    }
+
+    /// The inventory probe launches with the environment a chat launches with: a sensitive
+    /// variable's stored value, not the redacted copy. A peer that answers "Authentication
+    /// required" without it lists its catalog with it, and a changed value is read again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_probe_launches_with_the_stored_secret() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-stored-secret");
+        let control = scheduler_control(&temp).await;
+        let binary = sandbox.path("agy-secret");
+        let requests = sandbox.path("agy-secret.requests");
+        let initialize = provider_inventory::tests::antigravity_initialize(1, "1.5.13", true);
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!(
+                r#"#!/bin/sh
+case "$1" in --version) echo 1.5.13; exit 0 ;; esac
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> '{requests}'
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) body='{initialize}' ;;
+    *'"method":"session/new"'*)
+      if [ "$TEST_ACCOUNT_KEY" = test-account-value ]; then
+        body='"result":{{"sessionId":"session-1","models":{{"availableModels":[{{"modelId":"alpha"}}]}}}}'
+      else
+        body='"error":{{"code":-32000,"message":"Authentication required"}}'
+      fi ;;
+    *) body='"result":{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,%s}}\n' "$id" "$body"
+done
+"#,
+                requests = requests.display(),
+            ),
+        );
+        let save = async |value: &str| {
+            control
+                .update_settings(json!({ "patch": { "providerInstances": { "antigravity": {
+                    "driver": "antigravity", "enabled": true,
+                    "config": { "binaryPath": binary },
+                    "environment": [{ "name": "TEST_ACCOUNT_KEY", "value": value, "sensitive": true }]
+                } } } }))
+                .await
+                .expect("settings update succeeds");
+            wait_for_full_refresh_idle(&control).await;
+        };
+        save("test-account-value").await;
+        let (auth, _, models) = antigravity_reads(&control).await;
+        assert_eq!(auth, "authenticated");
+        assert_eq!(models, [json!("alpha")]);
+        // Another stored value is another account: the reused catalog is not kept.
+        save("another-account-value").await;
+        let (auth, _, models) = antigravity_reads(&control).await;
+        assert_eq!(auth, "unauthenticated");
+        assert!(models.is_empty(), "{models:?}");
+        assert_eq!(antigravity_sessions(&requests), 2);
+    }
+
+    /// After the binary changes, or a probe of the same binary fails, the published row keeps
+    /// no sign-in, sign-in message or probed model from an earlier session; a manual refresh
+    /// clears them too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_changed_or_failing_antigravity_cli_keeps_no_earlier_session_reads() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-stale-reads");
+        let (control, _) = antigravity_control(&temp, &sandbox).await;
+        let signed_in = (json!("authenticated"), Value::Null, vec![json!("alpha")]);
+        assert_eq!(antigravity_reads(&control).await, signed_in);
+
+        let bad_version = sandbox.executable_script("agy-bad-version", "exit 3", "");
+        let (refused_protocol, _) = provider_inventory::tests::antigravity_acp_peer(
+            &sandbox,
+            "agy-protocol-2",
+            "1.5.13",
+            &provider_inventory::tests::antigravity_initialize(2, "1.5.13", true),
+            r#""result":{"sessionId":"session-2","models":{"availableModels":[{"modelId":"beta"}]}}"#,
+            r#""result":{}"#,
+        );
+        let (internal_error, _) = provider_inventory::tests::antigravity_acp_fixture(
+            &sandbox,
+            "agy-internal-error",
+            "1.5.13",
+            r#""error":{"code":-32000,"message":"Internal error"}"#,
+        );
+        let (signed_out, _) = provider_inventory::tests::antigravity_acp_fixture(
+            &sandbox,
+            "agy-signed-out",
+            "1.5.13",
+            r#""error":{"code":-32000,"message":"Authentication required"}"#,
+        );
+        for binary in [
+            &bad_version,
+            &refused_protocol,
+            &internal_error,
+            &signed_out,
+        ] {
+            // Each binary follows a signed-out one, so a kept sign-in message would show.
+            for binary in [&signed_out, binary] {
+                control
+                    .update_settings(json!({ "patch": { "providerInstances": { "antigravity": {
+                        "driver": "antigravity", "enabled": true,
+                        "config": { "binaryPath": binary }
+                    } } } }))
+                    .await
+                    .expect("settings update succeeds");
+                wait_for_full_refresh_idle(&control).await;
+            }
+            let (auth, message, models) = antigravity_reads(&control).await;
+            assert!(models.is_empty(), "{binary:?}: {models:?}");
+            if binary == &signed_out {
+                assert_eq!(auth, "unauthenticated");
+            } else {
+                assert_ne!(auth, "unauthenticated", "{binary:?}");
+                assert_ne!(auth, "authenticated", "{binary:?}");
+                assert!(
+                    !message
+                        .as_str()
+                        .is_some_and(|message| message.contains("not signed in")),
+                    "{binary:?}: {message}"
+                );
+            }
+        }
+
+        // The same binary path, now failing: a manual refresh clears what it read before.
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-stale-manual");
+        let (control, _) = antigravity_control(&temp, &sandbox).await;
+        let binary = control.settings.read().await["providerInstances"]["antigravity"]["config"]
+            ["binaryPath"]
+            .as_str()
+            .expect("binary path")
+            .to_owned();
+        crate::test_support::executable_fixture::write_executable(
+            Path::new(&binary),
+            "#!/bin/sh\nexit 3\n",
+        );
+        control.refresh_providers(&json!({})).await;
+        let (auth, _, models) = antigravity_reads(&control).await;
+        assert_ne!(auth, "authenticated");
+        assert!(models.is_empty(), "{models:?}");
+    }
+
     /// A settings save that leaves Antigravity's settings alone reuses the catalog of a full
     /// probe within the refresh TTL and opens no session; one that changes them probes again.
     #[cfg(unix)]
@@ -7420,6 +7665,7 @@ done
                 }),
                 rich_metadata,
                 models_authoritative: false,
+                ..Default::default()
             };
             let merged = merge_provider_snapshot(Some(&current), refreshed);
             assert_eq!(
@@ -7445,6 +7691,7 @@ done
                         snapshot,
                         rich_metadata: provider_inventory::RichMetadataOutcome::Succeeded,
                         models_authoritative: true,
+                        ..Default::default()
                     })
                     .collect(),
                 partial,
@@ -7625,6 +7872,7 @@ done
             }),
             rich_metadata: provider_inventory::RichMetadataOutcome::Failed,
             models_authoritative: true,
+            ..Default::default()
         };
 
         let merged = merge_provider_snapshot(Some(&current), refreshed);
@@ -7658,6 +7906,7 @@ done
             }),
             rich_metadata: provider_inventory::RichMetadataOutcome::NotRequested,
             models_authoritative: false,
+            ..Default::default()
         };
 
         let merged = merge_provider_snapshot(Some(&current), replacement);
@@ -7691,6 +7940,7 @@ done
                 }),
                 rich_metadata: provider_inventory::RichMetadataOutcome::Succeeded,
                 models_authoritative: true,
+                ..Default::default()
             },
         );
 
@@ -8020,6 +8270,7 @@ done
                             }),
                             rich_metadata: provider_inventory::RichMetadataOutcome::Succeeded,
                             models_authoritative: true,
+                            ..Default::default()
                         }],
                         false,
                         generation,
@@ -8046,6 +8297,7 @@ done
                     }),
                     rich_metadata: provider_inventory::RichMetadataOutcome::Succeeded,
                     models_authoritative: true,
+                    ..Default::default()
                 }],
                 false,
                 generation,
@@ -8816,6 +9068,7 @@ done
                         }),
                         rich_metadata: provider_inventory::RichMetadataOutcome::NotRequested,
                         models_authoritative: false,
+                        ..Default::default()
                     }],
                     true,
                 )
@@ -8877,6 +9130,7 @@ done
                     }),
                     rich_metadata: provider_inventory::RichMetadataOutcome::NotRequested,
                     models_authoritative: false,
+                    ..Default::default()
                 }],
                 true,
             )
@@ -9489,6 +9743,7 @@ done
                     snapshot: json!({"instanceId":"unit-provider","status":"disabled"}),
                     rich_metadata: provider_inventory::RichMetadataOutcome::Succeeded,
                     models_authoritative: true,
+                    ..Default::default()
                 }],
                 true,
             )

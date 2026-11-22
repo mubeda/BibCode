@@ -89,6 +89,8 @@ struct ProviderDefinition {
     endpoint: Option<String>,
     server_password: Option<String>,
     environment: Vec<(OsString, OsString)>,
+    /// A sensitive variable is still redacted: its stored value could not be supplied.
+    missing_secret: bool,
 }
 
 struct ProviderSessionDefaults {
@@ -117,18 +119,37 @@ struct ClaudeProbeMetadata {
     skills_loaded: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RichMetadataOutcome {
+    #[default]
     NotRequested,
     Succeeded,
     Failed,
 }
 
-#[derive(Clone, Debug)]
+/// What a probe learned about the reads only an Antigravity session gives (sign-in, its
+/// message, the probed catalog).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SessionReads {
+    /// No session was opened (a quick probe, a reused catalog): the last reads stay, while the
+    /// launch inputs are those they were read with.
+    #[default]
+    NotRead,
+    /// A session answered: its reads replace the last ones.
+    Read,
+    /// The CLI failed its version check, a session could not be opened, or the launch inputs
+    /// changed: nothing from the last reads stays.
+    Lost,
+}
+
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderProbeResult {
     pub(crate) snapshot: Value,
     pub(crate) rich_metadata: RichMetadataOutcome,
     pub(crate) models_authoritative: bool,
+    pub(crate) session_reads: SessionReads,
+    /// A digest of the binary path and environment the probe launched with.
+    pub(crate) launch_inputs: u64,
 }
 
 impl ProviderProbeResult {
@@ -137,6 +158,7 @@ impl ProviderProbeResult {
             snapshot,
             rich_metadata,
             models_authoritative: rich_metadata == RichMetadataOutcome::Succeeded,
+            ..Self::default()
         }
     }
 
@@ -210,22 +232,23 @@ pub(crate) async fn probe_full_reusing(
 /// session), each with the probe's inputs as one comparable text. While an instance's inputs
 /// stay those of its last read, within the refresh TTL, a full refresh may reuse its catalog:
 /// an Antigravity probe opens a session in the user's account.
-pub(crate) fn acp_catalog_inputs(settings: &Value) -> HashMap<String, String> {
+/// The inputs are a digest: the environment carries the stored secrets.
+pub(crate) fn acp_catalog_inputs(settings: &Value) -> HashMap<String, u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
     definitions(settings)
         .into_iter()
         .filter(|definition| matches!(definition.driver.as_str(), "cursor" | "antigravity"))
         .map(|definition| {
-            let inputs = format!(
-                "{:?}",
-                (
-                    definition.enabled,
-                    &definition.binary_path,
-                    &definition.environment,
-                    &definition.endpoint,
-                    &definition.custom_models,
-                )
-            );
-            (definition.instance_id, inputs)
+            let mut hasher = DefaultHasher::new();
+            (
+                definition.enabled,
+                &definition.binary_path,
+                &definition.environment,
+                &definition.endpoint,
+                &definition.custom_models,
+            )
+                .hash(&mut hasher);
+            (definition.instance_id, hasher.finish())
         })
         .collect()
 }
@@ -349,6 +372,12 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                             .filter(|value| !value.is_empty())
                             .map(str::to_owned),
                         environment: provider_environment(instance),
+                        missing_secret: instance
+                            .get("environment")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .any(|entry| entry["valueRedacted"] == true),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -397,6 +426,7 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
             environment: Vec::new(),
+            missing_secret: false,
         });
     }
     definitions
@@ -516,10 +546,19 @@ async fn probe_one(
         reuse_catalog,
     )
     .await;
+    result.launch_inputs = launch_inputs(&definition);
     maintenance
         .enrich_snapshot(&target, &mut result.snapshot, checks_enabled)
         .await;
     result
+}
+
+/// A digest of what a probe and a chat launch with: the binary path and the environment.
+fn launch_inputs(definition: &ProviderDefinition) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    (&definition.binary_path, &definition.environment).hash(&mut hasher);
+    hasher.finish()
 }
 
 fn maintenance_target_from_definition(
@@ -857,6 +896,12 @@ async fn probe_one_snapshot(
     };
 
     let mut versioned_model_catalog = false;
+    // A CLI that fails its version check keeps nothing an earlier session read.
+    let mut session_reads = if version_output.as_ref().is_some_and(|output| output.success) {
+        SessionReads::NotRead
+    } else {
+        SessionReads::Lost
+    };
     match definition.driver.as_str() {
         "codex" => {
             if include_slow_capabilities
@@ -1026,15 +1071,27 @@ async fn probe_one_snapshot(
                 && !reuse_catalog
                 && version_output.as_ref().is_some_and(|output| output.success) =>
         {
-            match probe_antigravity_catalog(
-                &definition.instance_id,
-                &executable,
-                &definition.custom_models,
-                &definition.environment,
-                attribution,
-            )
-            .await
-            {
+            // A stored secret that could not be read: probing without it would read another
+            // account than the chat launches with (which refuses to start), so nothing is read.
+            let catalog = if definition.missing_secret {
+                None
+            } else {
+                probe_antigravity_catalog(
+                    &definition.instance_id,
+                    &executable,
+                    &definition.custom_models,
+                    &definition.environment,
+                    attribution,
+                )
+                .await
+            };
+            // A session that could not be opened or answered keeps nothing an earlier one read.
+            session_reads = if catalog.is_some() {
+                SessionReads::Read
+            } else {
+                SessionReads::Lost
+            };
+            match catalog {
                 Some(AntigravityCatalog::Session {
                     models: discovered,
                     version: agent_version,
@@ -1062,7 +1119,7 @@ async fn probe_one_snapshot(
         _ => {}
     }
 
-    let result = ProviderProbeResult::new(
+    let mut result = ProviderProbeResult::new(
         snapshot(
             definition,
             installed,
@@ -1077,6 +1134,7 @@ async fn probe_one_snapshot(
         ),
         rich_metadata,
     );
+    result.session_reads = session_reads;
     if versioned_model_catalog {
         result.with_authoritative_models()
     } else {
@@ -3936,7 +3994,11 @@ done
     /// The JSON-RPC member of an `initialize` answer: `protocol`, `agent_version` as
     /// `agentInfo.version`, and `session/close` advertised only when `close` is set.
     #[cfg(unix)]
-    fn antigravity_initialize(protocol: u64, agent_version: &str, close: bool) -> String {
+    pub(crate) fn antigravity_initialize(
+        protocol: u64,
+        agent_version: &str,
+        close: bool,
+    ) -> String {
         let session_capabilities = if close {
             json!({ "close": {}, "resume": {} })
         } else {
@@ -3961,7 +4023,7 @@ done
     /// [`antigravity_acp_fixture`] with its `initialize` and `session/close` answers given; an
     /// empty `close` never answers `session/close`.
     #[cfg(unix)]
-    fn antigravity_acp_peer(
+    pub(crate) fn antigravity_acp_peer(
         sandbox: &TestSandbox,
         name: &str,
         version: &str,
@@ -5087,6 +5149,7 @@ done
             endpoint: None,
             server_password: None,
             environment: Vec::new(),
+            missing_secret: false,
         };
 
         assert_eq!(
