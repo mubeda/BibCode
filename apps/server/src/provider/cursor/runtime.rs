@@ -1588,7 +1588,10 @@ fn silence_message(timeout: Duration) -> String {
         seconds if seconds >= 120 => format!("{} minutes", seconds / 60),
         seconds => format!("{seconds} seconds"),
     };
-    format!("Cursor has sent nothing for {quiet}. Stop the turn if it seems stuck.")
+    format!(
+        "Cursor has sent nothing for {quiet}. It may be waiting for you to sign in to Cursor in \
+         your browser; otherwise stop the turn if it seems stuck."
+    )
 }
 
 /// A stopped turn's late request gets the refusal a cancel gives, never an approval: a
@@ -1891,7 +1894,7 @@ mod tests {
         assert_eq!(events[1].turn_id.as_deref(), Some(receipt.turn_id.as_str()));
         assert_eq!(
             events[1].payload["message"],
-            "Cursor has sent nothing for 0 seconds. Stop the turn if it seems stuck."
+            "Cursor has sent nothing for 0 seconds. It may be waiting for you to sign in to Cursor in your browser; otherwise stop the turn if it seems stuck."
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
