@@ -203,21 +203,21 @@ pub fn acp_model_values_are_bracketed(options: &[Value]) -> bool {
 /// The advertised model value for the chosen `model`: the value itself when advertised, otherwise
 /// the value whose base is `model` (the inventory publishes bases), the session's current one
 /// first. A model the session does not advertise is refused, so BiBCode never sends a value the
-/// CLI did not offer. `None` when the option lists no values to check against.
+/// CLI did not offer; an option listing no values advertises only its current value.
 pub fn resolve_advertised_model_value(
     descriptor: &Value,
     model: &str,
-) -> Result<Option<Value>, RefusedOption> {
-    let advertised = advertised_values(descriptor);
+) -> Result<Value, RefusedOption> {
+    let current = descriptor.get("currentValue");
+    let mut advertised = advertised_values(descriptor);
     if advertised.is_empty() {
-        return Ok(None);
+        advertised.extend(current.cloned());
     }
     let model = model.trim();
     if advertised.iter().any(|value| value.as_str() == Some(model)) {
-        return Ok(Some(json!(model)));
+        return Ok(json!(model));
     }
     let base_of = |value: &Value| value.as_str().map(resolve_acp_base_model_id);
-    let current = descriptor.get("currentValue");
     current
         .filter(|current| {
             advertised.contains(current) && base_of(current).as_deref() == Some(model)
@@ -229,7 +229,6 @@ pub fn resolve_advertised_model_value(
                 .find(|value| base_of(value).as_deref() == Some(model))
                 .cloned()
         })
-        .map(Some)
         .ok_or_else(|| {
             RefusedOption::new(
                 format!("Cursor session does not advertise model {model}"),
@@ -1268,16 +1267,27 @@ mod tests {
         );
         assert_eq!(
             resolve_advertised_model_value(&descriptor, "other").unwrap(),
-            Some(json!("other[]"))
+            json!("other[]")
         );
         assert_eq!(
             resolve_advertised_model_value(&descriptor, "m").unwrap(),
-            Some(json!("m[effort=extra-high,fast=false]"))
+            json!("m[effort=extra-high,fast=false]")
         );
+    }
+
+    /// An option listing no values offers only its current value: any other model is refused,
+    /// never sent as typed.
+    #[test]
+    fn an_option_without_values_refuses_every_model_but_its_current_one() {
+        let descriptor = json!({ "id": "model", "category": "model", "currentValue": "m", "options": [] });
         assert_eq!(
+            resolve_advertised_model_value(&descriptor, "m").unwrap(),
+            json!("m")
+        );
+        assert!(resolve_advertised_model_value(&descriptor, "other").is_err());
+        assert!(
             resolve_advertised_model_value(&json!({ "id": "model", "category": "model" }), "x")
-                .unwrap(),
-            None
+                .is_err()
         );
     }
 }

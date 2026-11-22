@@ -407,10 +407,8 @@ impl CursorSessionRuntime {
             let Some(config_id) = descriptor.get("id").and_then(Value::as_str) else {
                 return Ok(());
             };
-            // An option listing no values leaves nothing to check the model against.
             let value = resolve_advertised_model_value(descriptor, model)
-                .map_err(CursorRuntimeError::UnsupportedOption)?
-                .unwrap_or_else(|| json!(model));
+                .map_err(CursorRuntimeError::UnsupportedOption)?;
             (config_id.to_owned(), value)
         };
         let options = self
