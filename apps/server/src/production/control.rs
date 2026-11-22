@@ -1101,9 +1101,7 @@ impl NativeServerControl {
         {
             Some(providers) => {
                 if instance_id.is_none() {
-                    let probe_settings =
-                        with_stored_secrets(&self.state_directory, &settings).await;
-                    self.record_full_provider_refresh(&probe_settings, &Default::default());
+                    self.record_full_provider_refresh();
                 }
                 providers
             }
@@ -1834,8 +1832,10 @@ impl NativeServerControl {
     }
 
     /// What an Antigravity probe that opened no session keeps from the last session reads:
-    /// nothing once the binary path or environment differ from those the reads were taken with.
-    /// A probe that read or lost them records its inputs as theirs.
+    /// nothing once the binary path or environment differ from those the reads were taken with,
+    /// or once the instance is disabled or missing. A probe that read or lost them records its
+    /// inputs as theirs. Only a signed-in session read starts a catalog reuse window; any other
+    /// outcome ends it, so a sign-in, an install or a fix is read on the next full refresh.
     fn settle_session_reads(&self, result: &mut provider_inventory::ProviderProbeResult) {
         use provider_inventory::SessionReads;
         if result.snapshot["driver"] != "antigravity" {
@@ -1848,10 +1848,26 @@ impl NativeServerControl {
             .provider_refresh_state
             .lock()
             .expect("provider refresh state lock");
+        if result.snapshot["installed"] == false || result.snapshot["status"] == "disabled" {
+            result.session_reads = SessionReads::Lost;
+        }
+        match result.session_reads {
+            SessionReads::Read if result.snapshot["auth"]["status"] == "authenticated" => {
+                state.catalog_reads.insert(
+                    instance_id.to_owned(),
+                    (Instant::now(), result.catalog_inputs),
+                );
+            }
+            SessionReads::Read | SessionReads::Lost => {
+                state.catalog_reads.remove(instance_id);
+            }
+            SessionReads::NotRead => {}
+        }
         if result.session_reads == SessionReads::NotRead
             && state.session_read_inputs.get(instance_id) != Some(&result.launch_inputs)
         {
             result.session_reads = SessionReads::Lost;
+            state.catalog_reads.remove(instance_id);
         }
         if result.session_reads != SessionReads::NotRead {
             state
@@ -1908,6 +1924,21 @@ impl NativeServerControl {
         if !partial {
             self.provider_maintenance
                 .prune_update_states(merged.iter().filter_map(provider_snapshot_identity));
+            // A removed instance's reads go with it: one re-added later is read afresh.
+            let listed = merged
+                .iter()
+                .filter_map(|row| row["instanceId"].as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let mut state = self
+                .provider_refresh_state
+                .lock()
+                .expect("provider refresh state lock");
+            state
+                .catalog_reads
+                .retain(|instance_id, _| listed.contains(instance_id.as_str()));
+            state
+                .session_read_inputs
+                .retain(|instance_id, _| listed.contains(instance_id.as_str()));
         }
         for provider in merged.iter_mut() {
             self.provider_maintenance.overlay_update_state(provider);
@@ -1935,24 +1966,13 @@ impl NativeServerControl {
         }));
     }
 
-    /// Stamps the ACP catalogs this refresh read, every one but those in `reused`: only a read
-    /// starts an instance's reuse window, so reuse never outlives the TTL.
-    fn record_full_provider_refresh(
-        &self,
-        settings: &Value,
-        reused: &std::collections::HashSet<String>,
-    ) {
-        let mut state = self
-            .provider_refresh_state
+    /// Records that a full refresh completed. Catalog reuse windows start where a signed-in
+    /// session read is merged (`settle_session_reads`).
+    fn record_full_provider_refresh(&self) {
+        self.provider_refresh_state
             .lock()
-            .expect("provider refresh state lock");
-        let now = Instant::now();
-        state.last_completed = Some(now);
-        for (instance_id, inputs) in provider_inventory::acp_catalog_inputs(settings) {
-            if !reused.contains(&instance_id) {
-                state.catalog_reads.insert(instance_id, (now, inputs));
-            }
-        }
+            .expect("provider refresh state lock")
+            .last_completed = Some(Instant::now());
     }
 
     /// Whether a full refresh completed after `since`.
@@ -1964,15 +1984,15 @@ impl NativeServerControl {
             .is_some_and(|completed| completed >= since)
     }
 
-    /// The ACP-probed instances whose catalog a full refresh with `settings` reuses: each was
-    /// read within the refresh TTL with the probe inputs it has now. A Cursor probe costs a
-    /// connection; an Antigravity probe opens a session in the user's account.
+    /// The Antigravity instances whose catalog a full refresh with `settings` reuses: each was
+    /// read signed in, within the refresh TTL, with the inputs it has now. An Antigravity probe
+    /// opens a session in the user's account; Cursor is always probed again.
     fn reusable_acp_catalogs(&self, settings: &Value) -> std::collections::HashSet<String> {
         let state = self
             .provider_refresh_state
             .lock()
             .expect("provider refresh state lock");
-        provider_inventory::acp_catalog_inputs(settings)
+        provider_inventory::antigravity_catalog_inputs(settings)
             .into_iter()
             .filter(|(instance_id, inputs)| {
                 state
@@ -2046,7 +2066,7 @@ impl NativeServerControl {
                         .await
                         .is_some()
                     {
-                        control.record_full_provider_refresh(&probe_settings, &reuse);
+                        control.record_full_provider_refresh();
                         #[cfg(test)]
                         control
                             .latest_full_provider_refresh_generation
@@ -7619,13 +7639,104 @@ done
         wait_for_full_refresh_idle(&control).await;
         assert_eq!(antigravity_sessions(&requests), 2);
 
-        // That probe starts Antigravity's own reuse window, even though Cursor's was reused.
+        // That signed-in read starts a new reuse window.
         control
             .update_settings(json!({ "patch": { "enableAssistantStreaming": false } }))
             .await
             .expect("settings update succeeds");
         wait_for_full_refresh_idle(&control).await;
         assert_eq!(antigravity_sessions(&requests), 2);
+
+        // A disabled instance's window ends: enabled again, it is read afresh.
+        for enabled in [false, true] {
+            let (_, mut instances) = control.settings_snapshot().await;
+            instances["providerInstances"]["antigravity"]["enabled"] = json!(enabled);
+            control
+                .update_settings(
+                    json!({ "patch": { "providerInstances": instances["providerInstances"] } }),
+                )
+                .await
+                .expect("settings update succeeds");
+            wait_for_full_refresh_idle(&control).await;
+        }
+        assert_eq!(antigravity_sessions(&requests), 3);
+    }
+
+    /// A signed-out read starts no reuse window: once the user signs in, the next save reads
+    /// the session again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_signed_out_antigravity_read_is_read_again_on_the_next_save() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-signed-out-save");
+        let control = scheduler_control(&temp).await;
+        let (binary, requests) = provider_inventory::tests::antigravity_acp_fixture(
+            &sandbox,
+            "agy-signed-out-save",
+            "1.5.13",
+            r#""error":{"code":-32000,"message":"Authentication required"}"#,
+        );
+        control
+            .update_settings(json!({ "patch": { "providerInstances": {
+                "antigravity": { "driver": "antigravity", "enabled": true, "config": { "binaryPath": binary } }
+            } } }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        assert_eq!(antigravity_sessions(&requests), 1);
+        control
+            .update_settings(json!({ "patch": { "enableAssistantStreaming": true } }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        assert_eq!(antigravity_sessions(&requests), 2);
+    }
+
+    /// Cursor has no catalog reuse window, as before Antigravity: every full refresh reads its
+    /// model list (and its workspace skills, commands and agents) again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_full_refresh_reads_cursor_models_again() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("cursor-no-reuse");
+        let control = scheduler_control(&temp).await;
+        let binary = sandbox.path("cursor-agent-fixture");
+        let requests = sandbox.path("cursor-agent-fixture.requests");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!(
+                r#"#!/bin/sh
+case "$1" in --version) echo 2026.11.01; exit 0 ;; about) echo "Logged in"; exit 0 ;; esac
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> '{requests}'
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+done
+"#,
+                requests = requests.display(),
+            ),
+        );
+        let model_reads = || {
+            provider_inventory::tests::antigravity_requests(&requests)
+                .iter()
+                .filter(|request| request["method"] == "cursor/list_available_models")
+                .count()
+        };
+        control
+            .update_settings(json!({ "patch": { "providerInstances": {
+                "cursor": { "driver": "cursor", "enabled": true, "config": { "binaryPath": binary } }
+            } } }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        let first = model_reads();
+        assert!(first >= 1, "the enabling save reads Cursor's models");
+        control
+            .update_settings(json!({ "patch": { "enableAssistantStreaming": true } }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        assert_eq!(model_reads(), first + 1);
     }
 
     /// A probe that read the instance's version tells whether its chats report context usage
