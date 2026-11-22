@@ -59,16 +59,17 @@ pub fn isolate_appimage_environment<'a>(command: impl Into<ChildCommand<'a>>) {
     let _ = command;
 }
 
-/// The overrides that strip the AppImage bundle at `appdir` from `environment`, by the rules
-/// [`isolate_appimage_environment`] applies: the launcher variables, and every path entry under
-/// `appdir` or a `.mount_` folder. For the desktop's `AppRun` handoff, which drops the
-/// `APPDIR` this filter would otherwise find another bundle by (#413).
+/// The overrides that strip the AppImage bundle at `roots` (spellings of one AppDir) from
+/// `environment`, by the rules [`isolate_appimage_environment`] applies: the launcher
+/// variables, and every path entry under a root or a `.mount_` folder. For the desktop's
+/// `AppRun` handoff, which drops the `APPDIR` this filter would otherwise find another bundle
+/// by (#413).
 #[cfg(target_os = "linux")]
 pub fn appimage_bundle_overrides(
     environment: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
-    appdir: &std::path::Path,
+    roots: &[std::path::PathBuf],
 ) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
-    linux::child_environment_overrides(environment, &[appdir.to_path_buf()])
+    linux::child_environment_overrides(environment, roots)
 }
 
 #[cfg(target_os = "linux")]

@@ -222,20 +222,16 @@ where
         deadline.unwrap_or_else(|| tokio::time::Instant::now() + execution.timeout);
     #[cfg(windows)]
     let child = {
-        // Checked on the blocking thread too: a spawn still queued when the run is cancelled
-        // never starts.
+        // A spawn still queued on the blocking pool when the run is cancelled never starts.
+        // shortcut: a cancellation that arrives while CreateProcess is already running is not
+        // observed until the spawn returns (the run then stops the child as usual), and a caller
+        // dropped meanwhile leaves the child to its job's kill-on-close; upgrade if a Windows
+        // caller needs cancellation to interrupt process creation.
         let queued = cancellation.clone();
         let mut spawn = tokio::task::spawn_blocking(move || {
             (!queued.is_cancelled()).then(|| spawn_wrapped(&mut command))
         });
-        let settled = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => Err(SupervisedRunError::Cancelled),
-            joined = tokio::time::timeout_at(overall_deadline, &mut spawn) => {
-                joined.map_err(|_| SupervisedRunError::Timeout)
-            }
-        };
-        match settled {
+        match tokio::time::timeout_at(overall_deadline, &mut spawn).await {
             Ok(joined) => joined
                 .map_err(|error| {
                     SupervisedRunError::Spawn(io::Error::other(format!(
@@ -244,12 +240,10 @@ where
                 })?
                 .ok_or(SupervisedRunError::Cancelled)?
                 .map_err(SupervisedRunError::Spawn)?,
-            Err(error) => {
-                // The blocking spawn cannot be interrupted. Reap whatever it produces: before
-                // returning while the run's deadline allows, so a cancelled run's child is
-                // stopped first, and in the background after that, so a late child never runs
-                // unsupervised.
-                let mut late = Box::pin(async move {
+            Err(_) => {
+                // The blocking spawn cannot be interrupted; reap whatever it
+                // eventually produces so a late child never runs unsupervised.
+                tokio::spawn(async move {
                     if let Ok(Some(Ok(child))) = spawn.await {
                         terminate_and_wait_owned(
                             child,
@@ -261,13 +255,7 @@ where
                         .await;
                     }
                 });
-                if tokio::time::timeout_at(overall_deadline, &mut late)
-                    .await
-                    .is_err()
-                {
-                    tokio::spawn(late);
-                }
-                return Err(error);
+                return Err(SupervisedRunError::Timeout);
             }
         }
     };

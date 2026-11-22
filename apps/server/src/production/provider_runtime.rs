@@ -3196,6 +3196,9 @@ mod workspace_loss_tests {
         /// Every runtime mode written, and whether the write fails.
         mode_calls: Arc<std::sync::Mutex<Vec<String>>>,
         mode_fails: Arc<AtomicBool>,
+        /// A mode write waits for `mode_release` while set: a CLI that withholds its answer.
+        mode_held: Arc<AtomicBool>,
+        mode_release: Arc<Notify>,
     }
 
     type CompactScript = (ProviderCompactionStart, Vec<ProviderEvent>);
@@ -3334,6 +3337,9 @@ mod workspace_loss_tests {
         fn set_mode(&self, mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
             Box::pin(async move {
                 self.mode_calls.lock().unwrap().push(mode);
+                if self.mode_held.load(Ordering::SeqCst) {
+                    self.mode_release.notified().await;
+                }
                 if self.mode_fails.load(Ordering::SeqCst) {
                     return Err(ProviderRuntimeError::Provider {
                         provider: "antigravity".to_owned(),
@@ -4789,6 +4795,59 @@ mod workspace_loss_tests {
             sent,
             "no prompt was sent"
         );
+        f.shutdown().await;
+    }
+
+    /// An Antigravity CLI that withholds its mode answer holds only its own thread's delivery:
+    /// the shared supervisor keeps handling other commands, and the prompt still waits for the
+    /// mode.
+    #[tokio::test]
+    async fn a_withheld_antigravity_mode_answer_holds_no_other_thread() {
+        let f = Fixture::new(false).await;
+        let mut launch = f.launch.clone();
+        launch.provider = "antigravity".to_owned();
+        f.supervisor.launch(launch).await.unwrap();
+        f.driver.mode_held.store(true, Ordering::SeqCst);
+        let mut command = serde_json::to_value(turn("held", false)).unwrap();
+        command["runtimeMode"] = json!("approval-required");
+        let command = serde_json::from_value::<OrchestrationCommand>(command).unwrap();
+        let delivery = tokio::spawn({
+            let supervisor = f.supervisor.clone();
+            async move { supervisor.deliver_turn(command, "held-key".into()).await }
+        });
+        timeout(Duration::from_secs(5), async {
+            while f.driver.mode_calls.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the mode write started");
+        let other = timeout(
+            Duration::from_secs(1),
+            f.supervisor.capture_session_identity("another-thread"),
+        )
+        .await
+        .expect("another thread's command waited for the withheld mode answer");
+        assert!(other.unwrap().is_none());
+        assert_eq!(
+            f.driver.sends.load(Ordering::SeqCst),
+            0,
+            "prompt before mode"
+        );
+        f.driver.mode_release.notify_one();
+        let delivery = timeout(Duration::from_secs(5), delivery)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let outcome = timeout(Duration::from_secs(5), delivery.completion())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 1);
         f.shutdown().await;
     }
 
@@ -7578,8 +7637,10 @@ async fn run_supervisor(
                         .await?;
                     }
                     // A live Antigravity session runs the prompt in the mode it last confirmed, so
-                    // the turn's own modes are confirmed first; a failed confirmation refuses the
-                    // delivery before any prompt is written.
+                    // the turn's own modes are confirmed first, in the thread's delivery task so a
+                    // silent CLI holds no other thread; a failed confirmation refuses the delivery
+                    // before any prompt is written.
+                    let mut mode_changes = ModeChanges::default();
                     if let OrchestrationCommand::ThreadTurnStart {
                         thread_id,
                         runtime_mode,
@@ -7592,11 +7653,11 @@ async fn run_supervisor(
                     {
                         if entry.launch.runtime_mode != *runtime_mode {
                             entry.launch.runtime_mode = runtime_mode.clone();
-                            entry.driver.set_mode(runtime_mode.clone()).await?;
+                            mode_changes.runtime = Some(runtime_mode.clone());
                         }
                         if entry.launch.interaction_mode != *interaction_mode {
                             entry.launch.interaction_mode = interaction_mode.clone();
-                            entry.driver.set_interaction_mode(interaction_mode.clone()).await?;
+                            mode_changes.interaction = Some(interaction_mode.clone());
                         }
                     }
                     next_delivery_generation = next_delivery_generation.checked_add(1).ok_or_else(
@@ -7618,6 +7679,7 @@ async fn run_supervisor(
                         frozen_delivery.as_deref(),
                         terminal_sender.clone(),
                         generation,
+                        mode_changes,
                     )
                     .await;
                     if result.is_ok() {
@@ -8280,6 +8342,14 @@ async fn delivery_text(
         .map(DeliveryText::Turn)
 }
 
+/// Modes a live Antigravity session must confirm before a turn's prompt.
+#[derive(Default)]
+struct ModeChanges {
+    runtime: Option<String>,
+    interaction: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn spawn_delivery(
     engine: &OrchestrationEngine,
     sessions: &mut HashMap<String, SessionEntry>,
@@ -8288,6 +8358,7 @@ async fn spawn_delivery(
     frozen_delivery: Option<&ProviderTurnDelivery>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     generation: u64,
+    mode_changes: ModeChanges,
 ) -> Result<ProviderDeliveryHandle, ProviderRuntimeError> {
     let OrchestrationCommand::ThreadTurnStart {
         command_id,
@@ -8349,7 +8420,22 @@ async fn spawn_delivery(
         completed: false,
     };
     tokio::spawn(async move {
-        let freeze_failure = if let Some((row, provider_session_id)) = frozen_session {
+        let mode_failure = async {
+            if let Some(mode) = mode_changes.runtime {
+                driver.set_mode(mode).await?;
+            }
+            if let Some(mode) = mode_changes.interaction {
+                driver.set_interaction_mode(mode).await?;
+            }
+            Ok::<(), ProviderRuntimeError>(())
+        }
+        .await
+        .err();
+        let freeze_failure = if let Some(error) = mode_failure {
+            Some(ProviderDeliveryOutcome::DefinitelyNotSent {
+                detail: delivery_detail(&error, None),
+            })
+        } else if let Some((row, provider_session_id)) = frozen_session {
             match repositories
                 .freeze_provider_turn_session(
                     row.command_id.clone(),

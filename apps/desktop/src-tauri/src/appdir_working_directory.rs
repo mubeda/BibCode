@@ -105,12 +105,16 @@ pub(crate) fn foreign_bundle_overrides(
     let appdir = Path::new(appdir);
     if !(appdir.is_absolute()
         && appdir.parent().is_some()
-        && !launched_by_this_bundle(root, Some(appdir.as_os_str()), canonical)
+        && !launched_by_this_bundle(root, Some(appdir.as_os_str()), &canonical)
         && appdir.join("AppRun").exists())
     {
         return Vec::new();
     }
-    bibcode_server::process::appimage_bundle_overrides(environment, appdir)
+    // Entries may name the AppDir by its inherited spelling or, behind a symlink, its target.
+    let roots: Vec<_> = std::iter::once(appdir.to_path_buf())
+        .chain(canonical(appdir).filter(|resolved| resolved != appdir))
+        .collect();
+    bibcode_server::process::appimage_bundle_overrides(environment, &roots)
 }
 
 /// The handoff: this bundle's `AppRun` with the same arguments (the `bibcode://` URL among
@@ -422,6 +426,39 @@ mod tests {
             }
             assert_eq!(value("HOME"), Some("/home/test-user".into()));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appdir_working_directory_handoff_strips_a_symlinked_bundle_by_both_spellings() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(directory.path()).unwrap();
+        let root = base.join("BiBCode.AppDir");
+        let other = base.join("Other.AppDir");
+        for bundle in [&root, &other] {
+            std::fs::create_dir_all(bundle).unwrap();
+            std::fs::write(bundle.join("AppRun"), "launcher").unwrap();
+        }
+        let link = base.join("other-link");
+        symlink(&other, &link).unwrap();
+        let environment = std::collections::BTreeMap::from([
+            ("APPDIR".into(), link.clone().into_os_string()),
+            (
+                "LD_LIBRARY_PATH".into(),
+                format!(
+                    "{}/usr/lib:{}/usr/lib:/host/lib",
+                    other.display(),
+                    link.display()
+                )
+                .into(),
+            ),
+        ]);
+        let overrides =
+            foreign_bundle_overrides(&environment, &root, |path| std::fs::canonicalize(path).ok());
+        assert!(
+            overrides.contains(&("LD_LIBRARY_PATH".into(), Some("/host/lib".into()))),
+            "{overrides:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -1260,10 +1260,12 @@ mod tests {
             let fixture = Fixture::new();
             let release = fixture.sandbox.path("release");
             let ready = fixture.sandbox.path("ready");
-            // `--version` leaves a writer on the script until `release` exists, and answers
-            // only once that writer is open.
+            let version_pid = fixture.sandbox.path("version.pid");
+            // `--version` records its process id, leaves a writer on the script until `release`
+            // exists (for at most 30 s), and answers only once that writer is open.
             let holder = format!(
-                "(exec 3>>\"$0\"; : > '{ready}'; while [ ! -e '{release}' ]; do sleep 0.01; done) </dev/null >/dev/null 2>&1 &\nwhile [ ! -e '{ready}' ]; do sleep 0.01; done\n{VERSION_OK}",
+                "echo $$ > '{pid}'\n(exec 3>>\"$0\"; : > '{ready}'; i=0; while [ ! -e '{release}' ] && [ $i -lt 3000 ]; do sleep 0.01; i=$((i+1)); done) </dev/null >/dev/null 2>&1 &\nwhile [ ! -e '{ready}' ]; do sleep 0.01; done\n{VERSION_OK}",
+                pid = version_pid.display(),
                 ready = ready.display(),
                 release = release.display()
             );
@@ -1291,15 +1293,26 @@ mod tests {
                         .await
                 }
             });
+            // Ready once the version probe was reaped: the attempt then goes straight to the
+            // usage spawn, which retries against the busy script for up to one second.
             tokio::time::timeout(Duration::from_secs(10), async {
-                while !fixture.calls().iter().any(|call| call == "--version") {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                loop {
+                    if let Ok(pid) = std::fs::read_to_string(&version_pid)
+                        && !Path::new(&format!("/proc/{}", pid.trim())).exists()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await
-            .expect("the version probe ran");
-            // The usage spawn is now retrying against the busy script.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            .expect("the version probe ended");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Still inside the retry window: the attempt ends only when the spawn gives up.
+            assert!(
+                service.read().await.is_fetching,
+                "the usage spawn gave up before shutdown"
+            );
             let shutdown = tokio::spawn({
                 let service = service.clone();
                 async move { service.shutdown().await }
