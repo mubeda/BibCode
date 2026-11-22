@@ -570,7 +570,9 @@ from another extracted AppDir keeps the outer AppDir's paths after its own. This
 supports `squashfs-root/AppRun` on Ubuntu without FUSE, a preset or missing
 `APPDIR`, stacked AppDir and AppImage launches, and launchers that exec
 `usr/bin/bibcode-desktop` directly, while a stray `APPDIR` in an ordinary
-installation changes nothing. Once gated, the policy inspects every variable in
+installation changes nothing. The desktop's start-up handoff to its own
+`AppRun` (#412) drops an inherited `APPDIR`, so before it hands off it strips
+the bundle that `APPDIR` names by the same rules (#413). Once gated, the policy inspects every variable in
 the effective child environment and removes entries under those roots or
 absolute paths containing a stale `.mount_*` component. This covers launcher and plugin additions, including
 Python, Qt, and GStreamer settings, without a fixed path-variable list.

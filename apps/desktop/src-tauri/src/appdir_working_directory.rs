@@ -88,12 +88,47 @@ pub(crate) fn needs_handoff(
     !guard && !launched_by_this_bundle(root, appdir, canonical)
 }
 
+/// The overrides that strip another AppImage bundle, named by an inherited `APPDIR`, from
+/// `environment`. The handoff drops that `APPDIR`, and with it the only marker the server's
+/// child filter finds the other bundle's library and path entries by, so they go here
+/// instead (#413). The same validation as that filter: an absolute `APPDIR` other than `/`
+/// with an `AppRun`, and not this bundle, whose own entries the desktop needs.
+#[cfg(target_os = "linux")]
+pub(crate) fn foreign_bundle_overrides(
+    environment: &std::collections::BTreeMap<OsString, OsString>,
+    root: &Path,
+    canonical: impl Fn(&Path) -> Option<PathBuf>,
+) -> Vec<(OsString, Option<OsString>)> {
+    let Some(appdir) = environment.get(OsStr::new("APPDIR")) else {
+        return Vec::new();
+    };
+    let appdir = Path::new(appdir);
+    if !(appdir.is_absolute()
+        && appdir.parent().is_some()
+        && !launched_by_this_bundle(root, Some(appdir.as_os_str()), canonical)
+        && appdir.join("AppRun").exists())
+    {
+        return Vec::new();
+    }
+    bibcode_server::process::appimage_bundle_overrides(environment, appdir)
+}
+
 /// The handoff: this bundle's `AppRun` with the same arguments (the `bibcode://` URL among
-/// them), the guard set, and the inherited `APPDIR` and AppImage markers removed: they belong
-/// to whatever launched this process, so `AppRun`'s GTK hook uses this bundle's paths and a
-/// restart starts this bundle.
-pub(crate) fn handoff_command(root: &Path, args: impl IntoIterator<Item = OsString>) -> Command {
+/// them), the guard set, `overrides` applied, and the inherited `APPDIR` and AppImage markers
+/// removed: they belong to whatever launched this process, so `AppRun`'s GTK hook uses this
+/// bundle's paths and a restart starts this bundle.
+pub(crate) fn handoff_command(
+    root: &Path,
+    args: impl IntoIterator<Item = OsString>,
+    overrides: impl IntoIterator<Item = (OsString, Option<OsString>)>,
+) -> Command {
     let mut command = Command::new(root.join("AppRun"));
+    for (name, value) in overrides {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
     command
         .args(args)
         .env(HANDOFF_GUARD, "1")
@@ -139,7 +174,9 @@ pub unsafe fn enter_appdir_usr() {
     let handoff_error = needs_handoff(&root, appdir.as_deref(), guard, canonical)
         // `exec` returns only when it failed.
         .then(|| {
-            handoff_command(&root, std::env::args_os().skip(1))
+            let environment = std::env::vars_os().collect();
+            let overrides = foreign_bundle_overrides(&environment, &root, canonical);
+            handoff_command(&root, std::env::args_os().skip(1), overrides)
                 .exec()
                 .to_string()
         });
@@ -295,6 +332,7 @@ mod tests {
         let command = handoff_command(
             Path::new("/opt/BiBCode.AppDir"),
             [OsString::from("bibcode://open?x=1")],
+            [],
         );
         assert_eq!(command.get_program(), "/opt/BiBCode.AppDir/AppRun");
         assert_eq!(
@@ -315,5 +353,115 @@ mod tests {
             envs.iter().any(|(name, _)| *name == HANDOFF_GUARD),
             |path| Some(path.to_path_buf())
         ));
+    }
+
+    /// The environment the handoff gives `AppRun`, with every inherited variable that the
+    /// command neither overrides nor removes.
+    #[cfg(target_os = "linux")]
+    fn handoff_environment(
+        environment: &std::collections::BTreeMap<OsString, OsString>,
+        root: &Path,
+    ) -> std::collections::BTreeMap<OsString, OsString> {
+        let canonical = |path: &Path| Some(path.to_path_buf());
+        let overrides = foreign_bundle_overrides(environment, root, canonical);
+        let command = handoff_command(root, [], overrides);
+        let mut result = environment.clone();
+        for (name, value) in command.get_envs() {
+            match value {
+                Some(value) => result.insert(name.to_owned(), value.to_owned()),
+                None => result.remove(name),
+            };
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appdir_working_directory_handoff_strips_another_bundles_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("BiBCode.AppDir");
+        // Another application's extracted AppDir, and another AppImage's mount.
+        for other in ["Other.AppDir", ".mount_OtherAB12"] {
+            let other = directory.path().join(other);
+            for bundle in [&root, &other] {
+                std::fs::create_dir_all(bundle).unwrap();
+                std::fs::write(bundle.join("AppRun"), "launcher").unwrap();
+            }
+            let (o, r) = (other.display(), root.display());
+            let environment = std::collections::BTreeMap::from([
+                ("APPDIR".into(), other.clone().into_os_string()),
+                ("APPIMAGE".into(), "/opt/Other.AppImage".into()),
+                (
+                    "LD_LIBRARY_PATH".into(),
+                    format!("{o}/usr/lib:{r}/usr/lib:/host/lib").into(),
+                ),
+                ("PATH".into(), format!("{o}/usr/bin:/usr/bin").into()),
+                (
+                    "XDG_DATA_DIRS".into(),
+                    format!("{o}/usr/share:/usr/share").into(),
+                ),
+                (
+                    "GIO_MODULE_DIR".into(),
+                    format!("{o}/usr/lib/gio/modules").into(),
+                ),
+                ("GTK_DATA_PREFIX".into(), format!("{o}/usr").into()),
+                ("HOME".into(), "/home/test-user".into()),
+            ]);
+            let handed = handoff_environment(&environment, &root);
+            let value = |name: &str| handed.get(OsStr::new(name)).cloned();
+            // This bundle's own entries stay: the desktop and WebKit need them.
+            assert_eq!(
+                value("LD_LIBRARY_PATH"),
+                Some(format!("{r}/usr/lib:/host/lib").into()),
+                "{o}"
+            );
+            assert_eq!(value("PATH"), Some("/usr/bin".into()), "{o}");
+            assert_eq!(value("XDG_DATA_DIRS"), Some("/usr/share".into()), "{o}");
+            for gone in ["GIO_MODULE_DIR", "GTK_DATA_PREFIX", "APPDIR", "APPIMAGE"] {
+                assert_eq!(value(gone), None, "{gone} from {o}");
+            }
+            assert_eq!(value("HOME"), Some("/home/test-user".into()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appdir_working_directory_handoff_keeps_entries_without_another_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("BiBCode.AppDir");
+        let not_appdir = directory.path().join("NotAnAppDir");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&not_appdir).unwrap();
+        std::fs::write(root.join("AppRun"), "launcher").unwrap();
+        let library_path: OsString = format!(
+            "{}/usr/lib:{}/usr/lib:/usr/lib:/host/lib",
+            root.display(),
+            not_appdir.display()
+        )
+        .into();
+        // No APPDIR (a launcher started the binary), an empty one, this bundle's own (a
+        // genuine AppImage or AppRun start), or one that is no AppDir: nothing is stripped.
+        for appdir in [
+            None,
+            Some(OsString::new()),
+            Some(root.clone().into_os_string()),
+            Some(not_appdir.clone().into_os_string()),
+            Some("/usr".into()),
+            Some("/".into()),
+            Some("relative/AppDir".into()),
+        ] {
+            let mut environment = std::collections::BTreeMap::from([
+                ("LD_LIBRARY_PATH".into(), library_path.clone()),
+                ("GTK_THEME".into(), "Adwaita:dark".into()),
+            ]);
+            if let Some(appdir) = &appdir {
+                environment.insert("APPDIR".into(), appdir.clone());
+            }
+            assert!(
+                foreign_bundle_overrides(&environment, &root, |path| Some(path.to_path_buf()))
+                    .is_empty(),
+                "{appdir:?}"
+            );
+        }
     }
 }
