@@ -5566,8 +5566,14 @@ covers Claude and Codex only, also inside a request that names Antigravity too.
 The CLI runs only when the default Antigravity instance is on, with that
 instance's environment including its stored secrets, and only after
 `--version` of the same resolved executable proves CLI 1.1.11 or newer; both
-runs get a null stdin, and the deadline cancels them through the supervisor so
-no descendant survives. Antigravity data older than 30 minutes, including data
+runs get a null stdin. The service owns each attempt: one 20-second deadline
+covers the settings read, both runs and their cleanup, cancels through the
+supervisor so no descendant survives, and stops the task before another attempt
+may start; runtime shutdown closes admission and drains a running attempt
+before process ownership is frozen. The cooldown starts only when the usage
+command was spawned. An executable replaced at its resolved path between the
+version probe and the usage run is not detected: the configured binary is
+trusted as the chat provider trusts it. Antigravity data older than 30 minutes, including data
 retained on an error, is dropped and reads as out of date. The design is in
 `docs/plans/2026-11-21-antigravity-usage-design.md`.
 

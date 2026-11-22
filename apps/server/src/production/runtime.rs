@@ -143,6 +143,7 @@ pub struct ProductionRuntime {
     device_manager: crate::device::DeviceManager,
     /// Diff apps opened through `git difftool`, which outlive BiBCode.
     diff_tool_launcher: crate::production::diff_tool::DiffToolLauncher,
+    provider_usage: ProviderUsageService,
     preview_tunnels: PreviewTunnels,
     asset_access: AssetAccess,
     transfer_access: TransferAccess,
@@ -716,7 +717,7 @@ impl ProductionRuntime {
             process_sampler,
             resource_sampler.clone(),
             process_monitor.clone(),
-            provider_usage,
+            provider_usage.clone(),
             relay,
             control.clone(),
             process_tree_cleanup,
@@ -975,6 +976,7 @@ impl ProductionRuntime {
             preview_gateway,
             device_manager,
             diff_tool_launcher,
+            provider_usage,
             preview_tunnels,
             asset_access,
             transfer_access,
@@ -1211,6 +1213,10 @@ impl ProductionRuntime {
         steps.mark("diff-tool-launcher");
         self.preview_tunnels.shutdown();
         steps.mark("preview-tunnels");
+        // Before ownership is frozen: a running Antigravity usage read is stopped and its CLI
+        // reaped, and no read starts after this point.
+        self.provider_usage.shutdown().await;
+        steps.mark("provider-usage");
         let process_ownership = self.terminal_services.freeze_process_ownership().await;
         steps.mark("freeze-process-ownership");
         self.managed_endpoint.shutdown().await;

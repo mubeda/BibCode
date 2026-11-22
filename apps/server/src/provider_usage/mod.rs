@@ -18,6 +18,7 @@ use tokio::{
     process::Command,
     sync::Mutex,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     process::configure_background_command,
@@ -247,9 +248,20 @@ pub struct ProviderUsageService {
 #[derive(Default)]
 struct SingleFlight {
     /// The running attempt; a caller that arrives meanwhile waits for its result.
-    running: Option<tokio::sync::watch::Receiver<Option<ProviderUsageSnapshot>>>,
-    /// When the last attempt that ran the provider's command finished: the cooldown starts here.
+    running: Option<RunningAttempt>,
+    /// When the last attempt that spawned the provider's command finished: the cooldown starts
+    /// here.
     cooldown_from: Option<tokio::time::Instant>,
+    /// Set at shutdown: no attempt starts after it.
+    closed: bool,
+}
+
+/// The service owns a running attempt: its result channel, the token that stops it, and its
+/// task, which shutdown waits for.
+struct RunningAttempt {
+    receiver: tokio::sync::watch::Receiver<Option<ProviderUsageSnapshot>>,
+    cancel: CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -368,6 +380,10 @@ impl ProviderUsageService {
         selected_providers: Option<Vec<ProviderUsageProvider>>,
         policy: RefreshPolicy,
     ) -> ProviderUsageResult {
+        // Nothing to fetch: answer from the cache without taking the 30-second slot.
+        if selected_providers.as_ref().is_some_and(Vec::is_empty) {
+            return self.read_selected(Some(&[])).await;
+        }
         let named = selected_providers.clone().unwrap_or_default();
         if !named
             .iter()
@@ -417,10 +433,14 @@ impl ProviderUsageService {
         let flight = self.single_flights.get(&provider)?;
         let mut receiver = {
             let mut held = flight.lock().unwrap_or_else(PoisonError::into_inner);
+            if held.closed {
+                return None;
+            }
             // A closed channel is an attempt that died without answering: start another.
             match held
                 .running
-                .clone()
+                .as_ref()
+                .map(|running| running.receiver.clone())
                 .filter(|running| running.has_changed().is_ok())
             {
                 Some(running) => running,
@@ -433,8 +453,17 @@ impl ProviderUsageService {
                         return None;
                     }
                     let (sender, receiver) = tokio::sync::watch::channel(None);
-                    held.running = Some(receiver.clone());
-                    tokio::spawn(self.clone().run_single_flight(provider, sender));
+                    let cancel = CancellationToken::new();
+                    let task = tokio::spawn(self.clone().run_single_flight(
+                        provider,
+                        sender,
+                        cancel.clone(),
+                    ));
+                    held.running = Some(RunningAttempt {
+                        receiver: receiver.clone(),
+                        cancel,
+                        task: Some(task),
+                    });
                     receiver
                 }
             }
@@ -446,36 +475,84 @@ impl ProviderUsageService {
             .and_then(|snapshot| snapshot.clone())
     }
 
-    /// One attempt: fetch, commit once, release the flight, then answer every waiter.
+    /// Closes Antigravity admission, stops a running attempt through its token and waits for it,
+    /// processes reaped included. The runtime calls it before process ownership is frozen.
+    pub async fn shutdown(&self) {
+        let tasks: Vec<_> = self
+            .single_flights
+            .values()
+            .filter_map(|flight| {
+                let mut held = flight.lock().unwrap_or_else(PoisonError::into_inner);
+                held.closed = true;
+                let running = held.running.as_mut()?;
+                running.cancel.cancel();
+                running.task.take()
+            })
+            .collect();
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    /// One attempt: fetch under one deadline, commit once, release the flight, then answer every
+    /// waiter. The flight is released only after the fetch task has stopped.
     async fn run_single_flight(
         self,
         provider: ProviderUsageProvider,
         sender: tokio::sync::watch::Sender<Option<ProviderUsageSnapshot>>,
+        cancel: CancellationToken,
     ) {
         let read_at = (self.now)();
         {
             let mut state = self.state.lock().await;
             state.active_refreshes = state.active_refreshes.saturating_add(1);
         }
-        let snapshot = match self.fetchers.get(&provider) {
+        let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let snapshot = match self.fetchers.get(&provider).cloned() {
             None => {
                 unavailable_snapshot(provider, read_at, "Provider usage fetcher is unavailable.")
             }
             Some(fetcher) => {
-                // A task of its own: neither this backstop timeout nor a panic drops the fetch
-                // before its own deadline has stopped the CLI and cleaned up.
-                let mut fetch = tokio::spawn((fetcher.fetch)());
-                match tokio::time::timeout(antigravity::SERVICE_TIMEOUT, &mut fetch).await {
-                    Ok(Ok(Ok(snapshot))) => snapshot,
-                    Ok(Ok(Err(error))) => error_snapshot(provider, read_at, error.message),
-                    Ok(Err(_)) | Err(_) => {
-                        tracing::warn!(?provider, "provider usage attempt failed or overran");
+                let attempt = UsageAttempt {
+                    cancel: cancel.clone(),
+                    spawned: spawned.clone(),
+                };
+                // The factory runs inside the task too: a panic anywhere ends only the task.
+                let mut fetch = tokio::spawn(
+                    USAGE_ATTEMPT.scope(attempt, async move { (fetcher.fetch)().await }),
+                );
+                // One deadline covers the settings read, both runs and their cleanup.
+                let settled = tokio::select! {
+                    joined = &mut fetch => Some(joined),
+                    () = tokio::time::sleep(antigravity::ATTEMPT_DEADLINE) => None,
+                    () = cancel.cancelled() => None,
+                };
+                let joined = match settled {
+                    Some(joined) => joined,
+                    None => {
+                        // Stop the processes through the supervisor, let it reap them, and stop
+                        // a fetch that ignores the token: it never outlives the flight.
+                        cancel.cancel();
+                        match tokio::time::timeout(antigravity::CLEANUP_GRACE, &mut fetch).await {
+                            Ok(joined) => joined,
+                            Err(_) => {
+                                fetch.abort();
+                                fetch.await
+                            }
+                        }
+                    }
+                };
+                match joined {
+                    Ok(Ok(snapshot)) => snapshot,
+                    Ok(Err(error)) => error_snapshot(provider, read_at, error.message),
+                    Err(_) => {
+                        tracing::warn!(?provider, "provider usage attempt failed or was stopped");
                         error_snapshot(provider, read_at, antigravity::MESSAGE_TRANSIENT.to_owned())
                     }
                 }
             }
         };
-        let ran = !antigravity::ran_nothing(&snapshot);
+        let ran = spawned.load(std::sync::atomic::Ordering::SeqCst);
         let committed = {
             let mut state = self.state.lock().await;
             let snapshot = retain_last_good_usage(state.snapshots.get(&provider), snapshot);
@@ -636,6 +713,36 @@ impl ProviderUsageService {
         }
         drop_and_read(state, self).await
     }
+}
+
+/// What a single-flight attempt hands its fetch: the token that stops it, and where it records
+/// that the provider's command was spawned. Only a spawn starts the cooldown, so a failure before
+/// it (settings unreadable, CLI missing, version not confirmed) is retried at once.
+#[derive(Clone)]
+struct UsageAttempt {
+    cancel: CancellationToken,
+    spawned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+tokio::task_local! {
+    static USAGE_ATTEMPT: UsageAttempt;
+}
+
+/// Called by a fetch once its usage command was spawned.
+pub(super) fn note_usage_spawned() {
+    let _ = USAGE_ATTEMPT.try_with(|attempt| {
+        attempt
+            .spawned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// The token a fetch's processes must stop on: cancelled at the attempt's deadline and at
+/// service shutdown. Outside an attempt, a token nothing cancels.
+pub(super) fn attempt_cancellation() -> CancellationToken {
+    USAGE_ATTEMPT
+        .try_with(|attempt| attempt.cancel.child_token())
+        .unwrap_or_default()
 }
 
 fn production_codex_rate_limit_reset_consumer() -> ConsumeCodexReset {
@@ -2871,7 +2978,15 @@ done"#,
                 Box::pin(async move {
                     let call = calls.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(delay).await;
-                    script(call)
+                    let result = script(call);
+                    // Like the real fetcher: an answer that is data or a failure ran the CLI.
+                    if result
+                        .as_ref()
+                        .is_ok_and(|snapshot| snapshot.status != ProviderUsageStatus::Unavailable)
+                    {
+                        note_usage_spawned();
+                    }
+                    result
                 })
             }),
         }
@@ -3231,5 +3346,145 @@ done"#,
             names(&reset.usage),
             [ProviderUsageProvider::Claude, ProviderUsageProvider::Codex]
         );
+    }
+
+    /// An Antigravity fetcher whose first call waits for `gate` (not watching cancellation, like
+    /// a stuck settings read) before it would run the CLI; later calls run at once.
+    fn gated_antigravity(
+        gate: Arc<tokio::sync::Notify>,
+        runs: Arc<AtomicUsize>,
+    ) -> ProviderUsageFetcher {
+        let calls = Arc::new(AtomicUsize::new(0));
+        ProviderUsageFetcher {
+            provider: ProviderUsageProvider::Antigravity,
+            fetch: Arc::new(move || {
+                let (gate, runs, call) = (
+                    gate.clone(),
+                    runs.clone(),
+                    calls.fetch_add(1, Ordering::SeqCst),
+                );
+                Box::pin(async move {
+                    if call == 0 {
+                        gate.notified().await;
+                    }
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    note_usage_spawned();
+                    Ok(ok_antigravity())
+                })
+            }),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_stuck_before_its_spawn_is_stopped_at_the_deadline_and_runs_never() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let service = ProviderUsageService::new(
+            vec![gated_antigravity(gate.clone(), runs.clone())],
+            Arc::new(OffsetDateTime::now_utc),
+        );
+        let stuck = service.refresh_forced(only_antigravity()).await;
+        assert_eq!(antigravity_of(&stuck).status, ProviderUsageStatus::Error);
+        let next = service.refresh_forced(only_antigravity()).await;
+        assert_eq!(antigravity_of(&next).status, ProviderUsageStatus::Ok);
+        gate.notify_waiters();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the stuck attempt was stopped, not detached"
+        );
+        assert!(!service.read().await.is_fetching);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_paused_before_its_spawn_never_spawns_after_shutdown() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let service = ProviderUsageService::new(
+            vec![gated_antigravity(gate.clone(), runs.clone())],
+            Arc::new(OffsetDateTime::now_utc),
+        );
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(10),
+            service.refresh_forced(only_antigravity()),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the caller went away");
+        service.shutdown().await;
+        gate.notify_waiters();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        // After shutdown, no new attempt is admitted either.
+        service.refresh_forced(only_antigravity()).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failure_before_the_spawn_starts_no_cooldown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = ProviderUsageService::new(
+            vec![scripted_antigravity(
+                calls.clone(),
+                Duration::ZERO,
+                Arc::new(|call| {
+                    if call == 0 {
+                        Err(ProviderUsageFetchError::new(
+                            "Antigravity settings could not be read.",
+                        ))
+                    } else {
+                        Ok(ok_antigravity())
+                    }
+                }),
+            )],
+            Arc::new(OffsetDateTime::now_utc),
+        );
+        service.refresh(only_antigravity()).await;
+        let second = service.refresh(only_antigravity()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(antigravity_of(&second).status, ProviderUsageStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn an_empty_provider_list_reserves_no_refresh_slot() {
+        let codex = Arc::new(AtomicUsize::new(0));
+        let service = service_with(&Arc::default(), Duration::ZERO, codex.clone());
+        service.refresh(Some(Vec::new())).await;
+        service
+            .refresh(Some(vec![
+                ProviderUsageProvider::Claude,
+                ProviderUsageProvider::Codex,
+            ]))
+            .await;
+        assert_eq!(codex.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fetcher_that_panics_before_its_future_leaves_no_fetch_running() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = ProviderUsageService::new(
+            vec![ProviderUsageFetcher {
+                provider: ProviderUsageProvider::Antigravity,
+                fetch: Arc::new({
+                    let calls = calls.clone();
+                    move || {
+                        assert!(
+                            calls.fetch_add(1, Ordering::SeqCst) != 0,
+                            "the factory fails"
+                        );
+                        Box::pin(async {
+                            note_usage_spawned();
+                            Ok(ok_antigravity())
+                        })
+                    }
+                }),
+            }],
+            Arc::new(OffsetDateTime::now_utc),
+        );
+        let first = service.refresh_forced(only_antigravity()).await;
+        assert_eq!(antigravity_of(&first).status, ProviderUsageStatus::Error);
+        let second = service.refresh_forced(only_antigravity()).await;
+        assert_eq!(antigravity_of(&second).status, ProviderUsageStatus::Ok);
+        assert!(!service.read().await.is_fetching);
     }
 }

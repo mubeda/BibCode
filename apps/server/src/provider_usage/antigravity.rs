@@ -50,8 +50,10 @@ use crate::{
 
 /// Automatic refreshes run the CLI at most this often; a forced refresh bypasses it.
 pub(super) const MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// The service's timeout for this provider: above `DEADLINE` plus both cleanup windows.
-pub(super) const SERVICE_TIMEOUT: Duration = Duration::from_secs(25);
+/// The service's deadline for one attempt: the settings read, both runs and their cleanup.
+pub(super) const ATTEMPT_DEADLINE: Duration = DEADLINE;
+/// After the deadline cancels the runs, how long the supervisor gets to reap them.
+pub(super) const CLEANUP_GRACE: Duration = Duration::from_secs(5);
 /// One deadline for the version probe and the usage read together.
 const DEADLINE: Duration = Duration::from_secs(20);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -88,16 +90,30 @@ pub(super) fn fetcher(
             let attribution = attribution.clone();
             let verified = verified.clone();
             Box::pin(async move {
-                // The settings with their stored secrets, as the chat provider reads them: an
-                // instance signed in with an API key is not read with the host's account.
-                let document = settings
-                    .get()
-                    .await
-                    .ok()
-                    .and_then(|state| serde_json::to_value(state).ok())
-                    .ok_or_else(|| {
-                        ProviderUsageFetchError::new("Antigravity settings could not be read.")
-                    })?;
+                let unreadable =
+                    || ProviderUsageFetchError::new("Antigravity settings could not be read.");
+                let cancellation = super::attempt_cancellation();
+                let read = async {
+                    // Whether it is on, from the saved document: decoding fills a missing
+                    // instance `enabled` with true, which would skip the legacy fallback.
+                    let saved = settings.get_document().await.ok()?;
+                    // The environment with its stored secrets, as the chat provider reads it: an
+                    // API-key instance is not read with the host's account.
+                    let mut document = serde_json::to_value(settings.get().await.ok()?).ok()?;
+                    let enabled = Value::Bool(default_instance_enabled(&saved));
+                    for pointer in ["/providerInstances/antigravity", "/providers/antigravity"] {
+                        if let Some(Value::Object(entry)) = document.pointer_mut(pointer) {
+                            entry.insert("enabled".to_owned(), enabled.clone());
+                        }
+                    }
+                    Some(document)
+                };
+                let document = tokio::select! {
+                    document = read => document.ok_or_else(unreadable)?,
+                    () = cancellation.cancelled() => {
+                        return Err(ProviderUsageFetchError::new(MESSAGE_TRANSIENT));
+                    }
+                };
                 fetch_for_document(&document, attribution.as_ref(), &verified, DEADLINE).await
             })
         }),
@@ -118,17 +134,6 @@ pub(super) fn default_instance_enabled(document: &Value) -> bool {
             .unwrap_or(true),
         None => legacy.unwrap_or(false),
     }
-}
-
-/// Whether a result came back without running the usage command (instance off, CLI missing,
-/// version not confirmed). It starts no cooldown: the next request after the user fixes the cause
-/// runs at once.
-pub(super) fn ran_nothing(snapshot: &ProviderUsageSnapshot) -> bool {
-    snapshot.status == ProviderUsageStatus::Unavailable
-        && matches!(
-            snapshot.error.as_deref(),
-            Some(MESSAGE_DISABLED | MESSAGE_NOT_STARTED | MESSAGE_VERSION)
-        )
 }
 
 pub(super) async fn fetch_for_document(
@@ -167,7 +172,8 @@ pub(super) async fn fetch_for_document(
     let ends_at = started + deadline;
     let workdir =
         ScratchDirectory::create().map_err(|_| ProviderUsageFetchError::new(MESSAGE_TRANSIENT))?;
-    let cancellation = CancellationToken::new();
+    // Stopped by the service's attempt deadline and its shutdown, and by this fetch's deadline.
+    let cancellation = super::attempt_cancellation();
     // Both runs launch the file whose version was verified (the canonical path), never a path a
     // symlink could retarget in between; the name it was called by stays its argv[0].
     let run = |arguments: &'static [&'static str], timeout: Duration| {
@@ -178,6 +184,8 @@ pub(super) async fn fetch_for_document(
                     called_as: &executable,
                 },
                 arguments,
+                // Only the usage command can spend quota: its spawn starts the cooldown.
+                arguments.first() == Some(&"-p"),
                 &target.environment,
                 workdir.path(),
                 timeout,
@@ -297,6 +305,7 @@ struct CliLaunch<'a> {
 async fn run_cli(
     launch: CliLaunch<'_>,
     arguments: &[&str],
+    usage_run: bool,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
     workdir: &Path,
     timeout: Duration,
@@ -338,6 +347,9 @@ async fn run_cli(
         },
         cancellation,
         move |pid| {
+            if usage_run {
+                super::note_usage_spawned();
+            }
             let (Some(pid), Some(attribution)) = (pid, attribution) else {
                 return;
             };
@@ -402,18 +414,42 @@ impl Drop for ScratchDirectory {
 struct UsageOutput {
     status: Option<String>,
     num_turns: Option<u64>,
-    command: Option<UsageCommand>,
+    command: Option<Object<UsageCommand>>,
 }
 
 #[derive(Deserialize)]
 struct UsageCommand {
     name: Option<String>,
-    data: Option<UsageData>,
+    data: Option<Object<UsageData>>,
 }
 
 #[derive(Deserialize)]
 struct UsageData {
-    groups: Option<Vec<UsageGroup>>,
+    groups: Option<Vec<Object<UsageGroup>>>,
+}
+
+/// A JSON object, never an array: serde's derived decoder also accepts a positional array, which
+/// would let a reply with no `name` field pass the guard.
+struct Object<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+            type Value = Object<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Object)
+            }
+        }
+
+        deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
+    }
 }
 
 #[derive(Deserialize)]
@@ -550,8 +586,8 @@ impl<'de, T: LenientKind> Deserialize<'de> for Lenient<T> {
 /// (two unknown prefixes both become "Other models"), the tighter one is kept: it is the limit
 /// that stops work first.
 pub(super) fn parse_usage(stdout: &[u8], now: OffsetDateTime) -> Option<ProviderUsageSnapshot> {
-    let output: UsageOutput = serde_json::from_slice(stdout).ok()?;
-    let command = output.command?;
+    let Object(output) = serde_json::from_slice::<Object<UsageOutput>>(stdout).ok()?;
+    let Object(command) = output.command?;
     // The guard: a CLI that answered the text as a prompt has no command and spent a turn.
     if command.name.as_deref() != Some("usage")
         || output.num_turns != Some(0)
@@ -559,11 +595,12 @@ pub(super) fn parse_usage(stdout: &[u8], now: OffsetDateTime) -> Option<Provider
     {
         return None;
     }
-    let groups = command.data?.groups?;
+    let Object(data) = command.data?;
+    let groups = data.groups?;
     let mut by_class: BTreeMap<usize, ProviderUsageWindowGroup> = BTreeMap::new();
     for bucket in groups
         .into_iter()
-        .flat_map(|group| group.buckets.0.unwrap_or_default())
+        .flat_map(|Object(group)| group.buckets.0.unwrap_or_default())
     {
         let Some((rank, id, label)) = bucket.id.0.as_deref().map(classify_bucket) else {
             continue;
@@ -824,6 +861,18 @@ mod tests {
                 .push(extra.clone());
             let snapshot = parse(&value).unwrap_or_else(|| panic!("{extra} rejected the payload"));
             assert_eq!(snapshot.window_groups.len(), 2, "{extra}");
+        }
+    }
+
+    #[test]
+    fn positional_arrays_never_stand_in_for_the_guard_objects() {
+        let groups = payload().pointer("/command/data/groups").unwrap().clone();
+        for value in [
+            json!({"status": "SUCCESS", "num_turns": 0, "command": ["usage", {"groups": groups}]}),
+            json!(["SUCCESS", 0, {"name": "usage", "data": {"groups": groups}}]),
+            json!({"status": "SUCCESS", "num_turns": 0, "command": {"name": "usage", "data": [groups]}}),
+        ] {
+            assert!(parse(&value).is_none(), "{value}");
         }
     }
 
@@ -1123,6 +1172,31 @@ mod tests {
                 fixture.calls(),
                 ["--version:test-key-value", "-p:test-key-value"]
             );
+        }
+
+        #[tokio::test]
+        async fn a_saved_legacy_disable_still_wins_over_an_instance_without_enabled() {
+            let fixture = Fixture::new();
+            let path = script(&fixture, "agy", VERSION_OK, &usage_ok());
+            let root = fixture.sandbox.path("settings");
+            std::fs::create_dir_all(&root).expect("settings root");
+            std::fs::write(
+                root.join("settings.json"),
+                json!({
+                    "providers": {"antigravity": {"enabled": false}},
+                    "providerInstances": {"antigravity": {
+                        "driver": "antigravity",
+                        "config": {"binaryPath": path.to_string_lossy()}
+                    }}
+                })
+                .to_string(),
+            )
+            .expect("settings");
+            let snapshot = (fetcher(ProviderSettingsStore::new(&root), None).fetch)()
+                .await
+                .expect("fetch");
+            assert_eq!(snapshot.error.as_deref(), Some(MESSAGE_DISABLED));
+            assert!(fixture.calls().is_empty());
         }
 
         #[tokio::test]

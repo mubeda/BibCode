@@ -175,7 +175,7 @@ and the fetch proceeds only when it exits 0, its stdout is complete (not
 truncated) and is exactly one `major.minor.patch` token, at least 1.1.11. The
 result is cached keyed by (resolved absolute path, modified time, size) and the
 probe re-runs when any of them changes, so a replaced or retargeted executable
-is re-checked. A failed probe is not cached.
+is re-checked. A failed probe is not cached. Known limit (reviewed twice, kept): an executable replaced at its resolved path between the version probe and the usage run is not detected; the configured binary is trusted as the chat provider trusts it.
 
 Deadline and spawn (findings 7, 12). One combined deadline of 20 s covers the
 probe (at most 5 s) and the fetch; the service's timeout for this provider is
