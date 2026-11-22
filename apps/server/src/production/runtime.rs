@@ -333,10 +333,12 @@ impl ProductionRuntime {
             )
             .await,
         );
-        let provider_update_checks = control.start_provider_update_checks();
         // Built before the profiler, whose sampler reads it; it has no dependencies.
+        // Attached before the first provider refresh is scheduled, so that refresh's probe
+        // children are attributed too.
         let process_attribution = ProcessAttributionRegistry::new();
         control.attach_process_attribution(process_attribution.clone());
+        let provider_update_checks = control.start_provider_update_checks();
         let device_env = crate::device::android::sdk::SdkEnv::from_process();
         let android_devices = crate::device::android::AndroidBackend::new(
             crate::device::android::AndroidBackendConfig {
