@@ -74,7 +74,7 @@ const LOCAL_OPENCODE_STARTUP_ATTEMPTS: usize = 50;
 const OPENCODE_2_CATALOG_UNREADABLE: &str = "BiBCode couldn't read this OpenCode server's models, agents and commands, so chats use its default model. They are read again at the next provider check.";
 const PROBE_OUTPUT_LIMIT: usize = 256 * 1024;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct ProviderDefinition {
     instance_id: String,
     driver: String,
@@ -185,7 +185,7 @@ pub(crate) async fn probe_full(
 }
 
 /// [`probe_full`] that keeps the last ACP catalog of the instances in `reuse` instead of
-/// probing it again (see [`unchanged_acp_instances`]).
+/// probing it again (see [`acp_catalog_inputs`]).
 pub(crate) async fn probe_full_reusing(
     settings: &Value,
     selected: Option<&str>,
@@ -207,16 +207,26 @@ pub(crate) async fn probe_full_reusing(
 }
 
 /// The instances whose catalog an ACP connection reads (Cursor's model list, Antigravity's
-/// session) and whose definition is the same in `previous` and `next`. A full refresh within
-/// the refresh TTL of the probe that read `previous` reuses their catalog: an Antigravity
-/// probe opens a session in the user's account.
-pub(crate) fn unchanged_acp_instances(previous: &Value, next: &Value) -> HashSet<String> {
-    let previous = definitions(previous);
-    definitions(next)
+/// session), each with the probe's inputs as one comparable text. While an instance's inputs
+/// stay those of its last read, within the refresh TTL, a full refresh may reuse its catalog:
+/// an Antigravity probe opens a session in the user's account.
+pub(crate) fn acp_catalog_inputs(settings: &Value) -> HashMap<String, String> {
+    definitions(settings)
         .into_iter()
         .filter(|definition| matches!(definition.driver.as_str(), "cursor" | "antigravity"))
-        .filter(|definition| previous.contains(definition))
-        .map(|definition| definition.instance_id)
+        .map(|definition| {
+            let inputs = format!(
+                "{:?}",
+                (
+                    definition.enabled,
+                    &definition.binary_path,
+                    &definition.environment,
+                    &definition.endpoint,
+                    &definition.custom_models,
+                )
+            );
+            (definition.instance_id, inputs)
+        })
         .collect()
 }
 
@@ -2186,10 +2196,21 @@ async fn probe_cursor_models(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     sanitize_provider_subprocess_environment(&mut command);
-    let mut child = supervised_command(command).spawn().ok()?;
-    let stdout = child.stdout().take()?;
-    let stdin = child.stdin().take()?;
-    let stderr = child.stderr().take()?;
+    let mut spawned = supervised_command(command).spawn().ok()?;
+    let pipes = (
+        spawned.stdout().take(),
+        spawned.stdin().take(),
+        spawned.stderr().take(),
+    );
+    // A refresh that drops this probe still stops the whole group.
+    let child = ProbeChild {
+        child: Some(spawned),
+        registration: None,
+    };
+    let (Some(stdout), Some(stdin), Some(stderr)) = pipes else {
+        child.stop().await;
+        return None;
+    };
     let transport = AcpProbeTransport::spawn(stdout, stdin, stderr);
     let connection = &transport.0;
     let response = timeout(CURSOR_DISCOVERY_TIMEOUT, async {
@@ -2220,7 +2241,7 @@ async fn probe_cursor_models(
     .ok()
     .flatten();
     drop(transport);
-    stop_supervised_child(&mut *child).await;
+    child.stop().await;
     let models =
         cursor::discover_models_from_list_available_models(&response?, custom_models).ok()?;
     serde_json::to_value(models)
@@ -3814,6 +3835,7 @@ done
         })
     }
 
+    #[cfg(unix)]
     fn reasoning(options: Value) -> Value {
         json!({ "optionDescriptors": [
             { "id": "reasoning", "label": "Thinking Level", "type": "select", "options": options }
@@ -3822,6 +3844,7 @@ done
 
     /// The catalog `antigravity_session` advertises: the current model first, each model with
     /// its own thinking levels, a default only where the CLI names one.
+    #[cfg(unix)]
     fn expected_antigravity_models() -> Vec<Value> {
         let none = json!({ "optionDescriptors": [] });
         vec![
@@ -3877,6 +3900,7 @@ done
 
     /// The JSON-RPC member of an `initialize` answer: `protocol`, `agent_version` as
     /// `agentInfo.version`, and `session/close` advertised only when `close` is set.
+    #[cfg(unix)]
     fn antigravity_initialize(protocol: u64, agent_version: &str, close: bool) -> String {
         let session_capabilities = if close {
             json!({ "close": {}, "resume": {} })

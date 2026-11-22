@@ -305,8 +305,8 @@ impl fmt::Debug for AgentActivityHandlerSlot {
 #[derive(Debug, Default)]
 struct ProviderRefreshState {
     last_completed: Option<Instant>,
-    /// When the last full refresh that read every ACP catalog completed, and its settings.
-    last_catalog_probe: Option<(Instant, Value)>,
+    /// Per ACP-probed instance, when a full refresh last read its catalog and with which inputs.
+    catalog_reads: std::collections::HashMap<String, (Instant, String)>,
     manual_refreshes: usize,
 }
 
@@ -1063,7 +1063,7 @@ impl NativeServerControl {
         {
             Some(providers) => {
                 if instance_id.is_none() {
-                    self.record_full_provider_refresh(&settings, true);
+                    self.record_full_provider_refresh(&settings, &Default::default());
                 }
                 providers
             }
@@ -1862,17 +1862,23 @@ impl NativeServerControl {
         }));
     }
 
-    /// `catalogs_read` when the refresh probed every ACP catalog rather than reusing one: only
-    /// such a refresh starts a new reuse window, so reuse never outlives the TTL.
-    fn record_full_provider_refresh(&self, settings: &Value, catalogs_read: bool) {
+    /// Stamps the ACP catalogs this refresh read, every one but those in `reused`: only a read
+    /// starts an instance's reuse window, so reuse never outlives the TTL.
+    fn record_full_provider_refresh(
+        &self,
+        settings: &Value,
+        reused: &std::collections::HashSet<String>,
+    ) {
         let mut state = self
             .provider_refresh_state
             .lock()
             .expect("provider refresh state lock");
         let now = Instant::now();
         state.last_completed = Some(now);
-        if catalogs_read {
-            state.last_catalog_probe = Some((now, settings.clone()));
+        for (instance_id, inputs) in provider_inventory::acp_catalog_inputs(settings) {
+            if !reused.contains(&instance_id) {
+                state.catalog_reads.insert(instance_id, (now, inputs));
+            }
         }
     }
 
@@ -1885,20 +1891,26 @@ impl NativeServerControl {
             .is_some_and(|completed| completed >= since)
     }
 
-    /// The ACP-probed instances whose catalog a full refresh with `settings` reuses: their
-    /// settings are those the last full refresh probed, within the refresh TTL. A Cursor probe
-    /// costs a connection; an Antigravity probe opens a session in the user's account.
+    /// The ACP-probed instances whose catalog a full refresh with `settings` reuses: each was
+    /// read within the refresh TTL with the probe inputs it has now. A Cursor probe costs a
+    /// connection; an Antigravity probe opens a session in the user's account.
     fn reusable_acp_catalogs(&self, settings: &Value) -> std::collections::HashSet<String> {
         let state = self
             .provider_refresh_state
             .lock()
             .expect("provider refresh state lock");
-        match &state.last_catalog_probe {
-            Some((completed, previous)) if completed.elapsed() <= PROVIDER_REFRESH_TTL => {
-                provider_inventory::unchanged_acp_instances(previous, settings)
-            }
-            _ => std::collections::HashSet::new(),
-        }
+        provider_inventory::acp_catalog_inputs(settings)
+            .into_iter()
+            .filter(|(instance_id, inputs)| {
+                state
+                    .catalog_reads
+                    .get(instance_id)
+                    .is_some_and(|(read, read_inputs)| {
+                        read_inputs == inputs && read.elapsed() <= PROVIDER_REFRESH_TTL
+                    })
+            })
+            .map(|(instance_id, _)| instance_id)
+            .collect()
     }
 
     fn start_full_provider_refresh(
@@ -1958,7 +1970,7 @@ impl NativeServerControl {
                         .await
                         .is_some()
                     {
-                        control.record_full_provider_refresh(&settings, reuse.is_empty());
+                        control.record_full_provider_refresh(&settings, &reuse);
                         #[cfg(test)]
                         control
                             .latest_full_provider_refresh_generation
@@ -7294,7 +7306,8 @@ done
             .provider_refresh_state
             .lock()
             .expect("provider refresh state lock")
-            .last_catalog_probe = None;
+            .catalog_reads
+            .clear();
         let pause = control.install_next_full_provider_probe_pause().await;
         let (generation, settings) = control.settings_snapshot().await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
@@ -7356,6 +7369,14 @@ done
             .update_settings(
                 json!({ "patch": { "providerInstances": instances["providerInstances"] } }),
             )
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        assert_eq!(antigravity_sessions(&requests), 2);
+
+        // That probe starts Antigravity's own reuse window, even though Cursor's was reused.
+        control
+            .update_settings(json!({ "patch": { "enableAssistantStreaming": false } }))
             .await
             .expect("settings update succeeds");
         wait_for_full_refresh_idle(&control).await;
