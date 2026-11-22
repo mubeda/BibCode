@@ -24,17 +24,18 @@ pub(crate) fn take_platform_webview(
 }
 
 /// # Safety
-/// Each non-null pointer must carry one retain the caller owns and gives up.
-unsafe fn adopt(
+/// Each non-null pointer must carry one retain the caller owns and gives up, and `webview` must
+/// point to a `T`.
+unsafe fn adopt<T: objc2::Message>(
     webview: *mut std::ffi::c_void,
     controller: *mut std::ffi::c_void,
     window: *mut std::ffi::c_void,
-) -> Option<Retained<WKWebView>> {
+) -> Option<Retained<T>> {
     // SAFETY: the caller transfers one retain per pointer; from_raw adopts it once.
     unsafe {
         drop(Retained::<AnyObject>::from_raw(controller.cast()));
         drop(Retained::<AnyObject>::from_raw(window.cast()));
-        Retained::<WKWebView>::from_raw(webview.cast())
+        Retained::<T>::from_raw(webview.cast())
     }
 }
 
@@ -57,7 +58,7 @@ mod tests {
             .each_ref()
             .map(|object| Retained::into_raw(object.clone()).cast());
         // SAFETY: each pointer carries the retain created just above.
-        let adopted = unsafe { super::adopt(webview, controller, window) };
+        let adopted = unsafe { super::adopt::<NSObject>(webview, controller, window) };
         let after_adopt: Vec<_> = objects.iter().map(|object| retain_count(object)).collect();
         assert_eq!(after_adopt, [before[0] + 1, before[1], before[2]]);
         drop(adopted);
