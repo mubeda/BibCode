@@ -53,19 +53,20 @@ pub(crate) fn launcher_belongs_to(root: &Path) -> bool {
     metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 }
 
-/// Whether to hand this launch to the bundle's `AppRun`: never after a handoff, and
-/// otherwise unless `APPDIR` names this very bundle. An empty `APPDIR` or another
-/// application's AppDir (a link clicked inside another AppImage) does not count.
-pub(crate) fn needs_handoff(
+/// The AppImage runtime's markers besides `APPDIR`. Only this bundle's own mount may keep
+/// them: inherited from another AppImage application, `APPIMAGE` would make a restart start
+/// that application (Tauri restarts `APPIMAGE` when it is set).
+pub(crate) const APPIMAGE_MARKERS: [&str; 3] = ["APPIMAGE", "ARGV0", "OWD"];
+
+/// Whether `APPDIR` names this very bundle: its own `AppRun`, or its mounted AppImage, started
+/// this process. An empty `APPDIR` or another application's AppDir (a link clicked inside
+/// another AppImage) does not count.
+pub(crate) fn launched_by_this_bundle(
     root: &Path,
     appdir: Option<&OsStr>,
-    guard: bool,
     canonical: impl Fn(&Path) -> Option<PathBuf>,
 ) -> bool {
-    if guard {
-        return false;
-    }
-    let launched_by_this_bundle = match (
+    match (
         appdir
             .filter(|value| !value.is_empty())
             .and_then(|value| canonical(Path::new(value))),
@@ -73,19 +74,33 @@ pub(crate) fn needs_handoff(
     ) {
         (Some(appdir), Some(root)) => appdir == root,
         _ => false,
-    };
-    !launched_by_this_bundle
+    }
+}
+
+/// Whether to hand this launch to the bundle's `AppRun`: never after a handoff, and
+/// otherwise unless this bundle launched it.
+pub(crate) fn needs_handoff(
+    root: &Path,
+    appdir: Option<&OsStr>,
+    guard: bool,
+    canonical: impl Fn(&Path) -> Option<PathBuf>,
+) -> bool {
+    !guard && !launched_by_this_bundle(root, appdir, canonical)
 }
 
 /// The handoff: this bundle's `AppRun` with the same arguments (the `bibcode://` URL among
-/// them), the guard set, and any inherited `APPDIR` removed so `AppRun`'s GTK hook uses
-/// this bundle's paths.
+/// them), the guard set, and the inherited `APPDIR` and AppImage markers removed: they belong
+/// to whatever launched this process, so `AppRun`'s GTK hook uses this bundle's paths and a
+/// restart starts this bundle.
 pub(crate) fn handoff_command(root: &Path, args: impl IntoIterator<Item = OsString>) -> Command {
     let mut command = Command::new(root.join("AppRun"));
     command
         .args(args)
         .env(HANDOFF_GUARD, "1")
         .env_remove("APPDIR");
+    for marker in APPIMAGE_MARKERS {
+        command.env_remove(marker);
+    }
     command
 }
 
@@ -119,18 +134,23 @@ pub unsafe fn enter_appdir_usr() {
     else {
         return;
     };
-    let handoff_error = needs_handoff(
-        &root,
-        std::env::var_os("APPDIR").as_deref(),
-        guard,
-        |path| std::fs::canonicalize(path).ok(),
-    )
-    // `exec` returns only when it failed.
-    .then(|| {
-        handoff_command(&root, std::env::args_os().skip(1))
-            .exec()
-            .to_string()
-    });
+    let appdir = std::env::var_os("APPDIR");
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    let handoff_error = needs_handoff(&root, appdir.as_deref(), guard, canonical)
+        // `exec` returns only when it failed.
+        .then(|| {
+            handoff_command(&root, std::env::args_os().skip(1))
+                .exec()
+                .to_string()
+        });
+    // Still here without this bundle's launch: another AppImage's markers would make Tauri's
+    // restart (and the AppImage checks) target that application.
+    if !launched_by_this_bundle(&root, appdir.as_deref(), canonical) {
+        for marker in APPIMAGE_MARKERS {
+            // SAFETY: the caller guarantees the process is still single-threaded.
+            unsafe { std::env::remove_var(marker) };
+        }
+    }
     let usr = root.join("usr");
     let moved = if std::env::current_dir().ok().as_deref() == Some(usr.as_path()) {
         Ok(false)
@@ -251,6 +271,26 @@ mod tests {
     }
 
     #[test]
+    fn appdir_working_directory_keeps_appimage_markers_only_for_this_bundles_launch() {
+        let canonical = |path: &Path| Some(path.to_path_buf());
+        // A mounted BiBCode AppImage: its runtime set APPDIR to the mount the binary runs from.
+        let mount = Path::new("/tmp/.mount_BiBCodeX1");
+        assert!(launched_by_this_bundle(
+            mount,
+            Some(OsStr::new("/tmp/.mount_BiBCodeX1")),
+            canonical
+        ));
+        // An extracted AppDir started from inside another AppImage application.
+        let extracted = Path::new("/opt/squashfs-root");
+        for appdir in [Some("/tmp/.mount_OtherApp"), Some(""), None] {
+            assert!(
+                !launched_by_this_bundle(extracted, appdir.map(OsStr::new), canonical),
+                "{appdir:?}"
+            );
+        }
+    }
+
+    #[test]
     fn appdir_working_directory_handoff_forwards_the_link_and_sets_the_guard() {
         let command = handoff_command(
             Path::new("/opt/BiBCode.AppDir"),
@@ -264,6 +304,10 @@ mod tests {
         let envs: Vec<_> = command.get_envs().collect();
         assert!(envs.contains(&(OsStr::new(HANDOFF_GUARD), Some(OsStr::new("1")))));
         assert!(envs.contains(&(OsStr::new("APPDIR"), None)));
+        // Another AppImage's markers do not reach the handoff, so its restart starts BiBCode.
+        for marker in APPIMAGE_MARKERS {
+            assert!(envs.contains(&(OsStr::new(marker), None)), "{marker}");
+        }
         // The process the handoff starts sees the guard and does not hand off again.
         assert!(!needs_handoff(
             Path::new("/opt/BiBCode.AppDir"),
