@@ -1180,12 +1180,23 @@ describe("GitManagerToolbar", () => {
         await submit({ kind: "delete-remote", remote: "origin", branch: "develop" });
         await clickButton("Sign in");
         await act(async () => (lastDialogProps().onClose as () => void)());
+        // Round 3 (Antigravity 3): the cancelled delete's prompt does not move to the toolbar.
+        expect(container.textContent).not.toContain("gitlab.example.test");
+
+        // A newer failure is not overwritten when the cancelled sign-in settles late.
+        h.failures = { fetch: { code: "git-command-failed", message: "Fetch failed here." } };
+        const fetchButton = [...document.querySelectorAll("button")].find((entry) =>
+          entry.textContent?.includes("Fetch origin"),
+        );
+        await act(async () => fetchButton!.click());
         await act(async () =>
           finish({ _tag: "Success", value: { outcome: "signedIn", message: "" } }),
         );
 
-        expect(sentInputs()).toHaveLength(1);
+        expect(sentInputs().map((input) => input._tag)).toEqual(["remote-branch-delete", "fetch"]);
         expect(lastDialogProps().dialog).toBeNull();
+        expect(container.textContent).toContain("Fetch failed here.");
+        expect(container.textContent).not.toContain("cancelled");
       } finally {
         await unmount();
       }

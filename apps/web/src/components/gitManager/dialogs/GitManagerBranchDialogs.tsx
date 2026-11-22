@@ -371,7 +371,7 @@ function RenameBranchDialog({
           {shownReason === null ? null : (
             <p
               className={
-                serverBlock === null && capabilityDisabledReason === null
+                serverBlock === null && (capabilityDisabledReason === null || signInPrompt !== null)
                   ? "text-xs text-muted-foreground"
                   : "text-sm text-destructive"
               }
@@ -442,6 +442,8 @@ function DeleteBranchDialog({
             <input
               checked={confirmed}
               className="mt-1"
+              // The armed request keeps the submitted options until its sign-in ends.
+              disabled={signInPrompt !== null}
               name="confirm-delete"
               type="checkbox"
               onChange={(event) => setConfirmed(event.currentTarget.checked)}
@@ -453,6 +455,7 @@ function DeleteBranchDialog({
               <input
                 checked={deleteRemote}
                 className="mt-1"
+                disabled={signInPrompt !== null}
                 name="delete-remote"
                 type="checkbox"
                 onChange={(event) => setDeleteRemote(event.currentTarget.checked)}
@@ -529,6 +532,8 @@ function DeleteRemoteBranchDialog({
             <input
               checked={confirmed}
               className="mt-1"
+              // The armed request keeps the submitted options until its sign-in ends.
+              disabled={signInPrompt !== null}
               name="confirm-delete"
               type="checkbox"
               onChange={(event) => setConfirmed(event.currentTarget.checked)}

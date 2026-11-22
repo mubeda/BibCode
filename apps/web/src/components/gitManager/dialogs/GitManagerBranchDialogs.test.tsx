@@ -552,6 +552,66 @@ describe("GitManagerBranchDialogs", () => {
     expect(buttonWithText(action).disabled).toBe(true);
   });
 
+  // Round 3 (Codex 8): while a sign-in is pending the submitted options cannot change, so the
+  // dialog never shows options the armed request does not use.
+  it.each(["delete", "delete-remote"] as const)(
+    "locks the %s options while a sign-in is pending",
+    async (kind) => {
+      await act(async () =>
+        root?.render(
+          <GitManagerBranchDialogs
+            busy={false}
+            dialog={
+              kind === "delete"
+                ? { kind, branch: branch("feature"), existsUpstream: true }
+                : {
+                    kind,
+                    branch: branch("origin/feature/a"),
+                    remote: "origin",
+                    remoteBranch: "feature/a",
+                  }
+            }
+            errorMessage={null}
+            refs={[]}
+            remoteRefs={[branch("origin/feature/a")]}
+            signInPrompt={<p>Sign in to example.test?</p>}
+            onClose={() => undefined}
+            onSubmit={() => Promise.resolve()}
+          />,
+        ),
+      );
+
+      const boxes = [...document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+      expect(boxes.length).toBe(kind === "delete" ? 2 : 1);
+      for (const box of boxes) expect(box.disabled).toBe(true);
+    },
+  );
+
+  // Round 3 (Antigravity 5): a name hint stays a hint while a sign-in prompt shows.
+  it("keeps the rename name hint muted while a sign-in prompt shows", async () => {
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={{ kind: "rename", branch: branch("feature") }}
+          disabledReason="Finish or cancel the sign-in first."
+          errorMessage={null}
+          refs={[]}
+          remoteRefs={[]}
+          signInPrompt={<p>Sign in to example.test?</p>}
+          onClose={() => undefined}
+          onSubmit={() => Promise.resolve()}
+        />,
+      ),
+    );
+    const input = document.querySelector<HTMLInputElement>('input[aria-label="New branch name"]');
+    await setInputValue(input!, "");
+
+    const hint = document.getElementById("git-manager-rename-branch-disabled-reason");
+    expect(hint?.textContent).toBe("Branch name is required.");
+    expect(hint?.className).toContain("text-muted-foreground");
+  });
+
   it("shows the server's rename reason and not an unrelated one", async () => {
     const message =
       "Rename is blocked: the worktree at /opaque/feature has this branch checked out.";
