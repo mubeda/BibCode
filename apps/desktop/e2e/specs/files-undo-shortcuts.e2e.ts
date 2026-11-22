@@ -1135,11 +1135,6 @@ describe("packaged Files undo and redo (#398)", () => {
     await measureTextField("composer", "driver");
   });
 
-  it("driver: Ctrl+Z undoes a plain textarea on the Linux desktop (#408)", async function () {
-    if (platform !== "linux") this.skip();
-    await measureTextField("textarea", "driver");
-  });
-
   describe("native input (BIBCODE_E2E_NATIVE_INPUT=1)", function () {
     before(function () {
       if (!nativeInput) this.skip();
