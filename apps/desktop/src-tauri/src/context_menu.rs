@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 use tauri::{
-    AppHandle, LogicalPosition, Manager, Runtime, WebviewWindow,
+    AppHandle, LogicalPosition, Manager, Runtime, Window,
     menu::{MenuItemBuilder, PredefinedMenuItem, Submenu, SubmenuBuilder},
 };
 use tokio::sync::oneshot;
@@ -151,7 +151,7 @@ pub(crate) fn context_menu_request_from_values(items: Vec<Value>) -> NativeConte
 }
 
 pub(crate) fn show_native_context_menu<R: Runtime>(
-    window: &WebviewWindow<R>,
+    window: &Window<R>,
     request: &NativeContextMenuRequest,
     position: Option<ContextMenuPosition>,
 ) -> Result<(), String> {

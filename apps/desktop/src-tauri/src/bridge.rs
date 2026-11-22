@@ -2337,7 +2337,7 @@ pub async fn desktop_bridge_set_theme(
             ))
         }
     };
-    for window in app.webview_windows().values() {
+    for window in app.windows().values() {
         window
             .set_theme(native_theme)
             .map_err(|error| bridge_error("Could not update the Tauri window theme", error))?;
@@ -2357,7 +2357,7 @@ pub async fn desktop_bridge_show_context_menu(
         return Ok(None);
     }
 
-    let Some(window) = app.get_webview_window("main") else {
+    let Some(window) = crate::window::main_window(&app) else {
         return Ok(None);
     };
     let ticket = context_menus.begin(&request)?;

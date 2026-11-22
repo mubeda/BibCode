@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Runtime, Size,
-    WebviewWindow,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Runtime, Size, Webview,
+    Window,
     menu::{Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder},
 };
 
@@ -33,6 +33,17 @@ const EDIT_MENU_ITEMS: [(&str, &str, &str); 2] = [
 ];
 
 pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
+
+/// The main window. Not `get_webview_window`: Tauri leaves out a window that holds more than one
+/// webview, and a preview browser's child webview stays in the main window for the session (#418).
+pub(crate) fn main_window<R: Runtime>(app: &AppHandle<R>) -> Option<Window<R>> {
+    app.get_window(MAIN_WINDOW_LABEL)
+}
+
+/// The main window's own webview, found whether or not preview webviews share its window.
+pub(crate) fn main_webview<R: Runtime>(app: &AppHandle<R>) -> Option<Webview<R>> {
+    app.get_webview(MAIN_WINDOW_LABEL)
+}
 const MENU_ID_OPEN_SETTINGS: &str = "bibcode:open-settings";
 const MENU_ID_CHECK_FOR_UPDATES: &str = "bibcode:check-for-updates";
 const MENU_ID_CLOSE_SHORTCUT: &str = "bibcode:close-shortcut";
@@ -95,7 +106,7 @@ pub fn configure_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Resu
         match menu_action_for_id(event.id().0.as_str()) {
             Some(ApplicationMenuAction::Emit(action)) => {
                 if action == MENU_ACTION_OPEN_SETTINGS
-                    && let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL)
+                    && let Some(window) = main_window(app)
                 {
                     let _ = window.set_focus();
                 }
@@ -104,7 +115,7 @@ pub fn configure_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Resu
             #[cfg(target_os = "macos")]
             Some(ApplicationMenuAction::Edit(action)) => run_edit_menu_action(app, action),
             Some(ApplicationMenuAction::CloseWindow) => {
-                if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                if let Some(window) = main_window(app) {
                     let _ = window.close();
                 }
             }
@@ -213,11 +224,11 @@ fn run_edit_menu_action<R: Runtime>(app: &AppHandle<R>, action: &'static str) {
 fn main_webview_has_first_responder<R: Runtime>(app: &AppHandle<R>) -> bool {
     use objc2_app_kit::{NSApplication, NSView};
 
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+    let Some(main) = main_webview(app) else {
         return false;
     };
     let (sender, receiver) = std::sync::mpsc::sync_channel::<bool>(1);
-    let sent = window.with_webview(move |platform| {
+    let sent = main.with_webview(move |platform| {
         // The closure runs on the main thread.
         let Some(webview) = crate::macos_webview::take_platform_webview(platform) else {
             let _ = sender.send(false);
@@ -266,7 +277,7 @@ fn decode_main_window_state(value: Value) -> Result<MainWindowState, String> {
         .map_err(|error| format!("Could not decode Tauri main window state: {error}"))
 }
 
-fn apply_main_window_state<R: Runtime>(window: &WebviewWindow<R>, state: &MainWindowState) {
+fn apply_main_window_state<R: Runtime>(window: &Window<R>, state: &MainWindowState) {
     if let Err(error) = window.set_size(Size::Physical(PhysicalSize {
         width: state.width,
         height: state.height,
@@ -290,7 +301,7 @@ fn apply_main_window_state<R: Runtime>(window: &WebviewWindow<R>, state: &MainWi
 }
 
 fn capture_main_window_state<R: Runtime>(
-    window: &WebviewWindow<R>,
+    window: &Window<R>,
 ) -> Result<Option<MainWindowState>, String> {
     let size = window
         .outer_size()
@@ -381,7 +392,7 @@ pub(crate) fn build_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result
 /// Reports the main window's web content process dying to the profiler. macOS registers its
 /// hook on the app builder instead.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn watch_web_content_process<R: Runtime>(window: &WebviewWindow<R>) {
+fn watch_web_content_process<R: Runtime>(window: &tauri::WebviewWindow<R>) {
     let installed = window.with_webview(|webview| {
         #[cfg(target_os = "linux")]
         crate::webview_exit::watch(&webview.inner());
@@ -413,7 +424,7 @@ pub fn restore_main_window_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), S
             return Ok(());
         }
     };
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+    let Some(window) = main_window(app) else {
         return Ok(());
     };
     apply_main_window_state(&window, &state);
@@ -421,7 +432,7 @@ pub fn restore_main_window_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), S
 }
 
 pub fn persist_main_window_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+    let Some(window) = main_window(app) else {
         return Ok(());
     };
     let Some(state) = capture_main_window_state(&window)? else {
@@ -680,7 +691,7 @@ pub(crate) fn close_guard_for_app<R: Runtime>(app: &AppHandle<R>) -> CloseGuard 
 }
 
 fn ask_web_to_leave<R: Runtime>(app: &AppHandle<R>, request_id: u64, reason: LeaveReason) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+    let Some(window) = main_window(app) else {
         // No page can hold an edit, so leaving loses nothing.
         if let Some(guard) = app.try_state::<CloseGuard>() {
             guard.reply(request_id, CloseReply::Allow, Instant::now());
@@ -733,7 +744,7 @@ fn prompt_close_anyway<R: Runtime>(app: &AppHandle<R>, request_id: u64) {
 fn leave_now<R: Runtime>(app: &AppHandle<R>, reason: LeaveReason) {
     match reason {
         LeaveReason::Close => {
-            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL)
+            if let Some(window) = main_window(app)
                 && let Err(error) = window.destroy()
             {
                 tracing::warn!(%error, "failed to close the main window");
@@ -1161,6 +1172,45 @@ mod tests {
     }
 
     #[test]
+    fn main_window_is_found_after_a_child_webview_joins_it() {
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let mut context = mock_context(noop_assets());
+        context.config_mut().identifier =
+            format!("com.bibcode.window-child-tests-{}", std::process::id());
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
+            .build(context)
+            .expect("mock Tauri app");
+        let handle = app.handle();
+        let main = tauri::WebviewWindowBuilder::new(&app, MAIN_WINDOW_LABEL, Default::default())
+            .data_directory(temp.path().join("webview-data"))
+            .build()
+            .expect("mock webview");
+        main.as_ref()
+            .window()
+            .add_child(
+                tauri::webview::WebviewBuilder::new("preview-child", Default::default()),
+                tauri::LogicalPosition::new(0.0, 0.0),
+                tauri::LogicalSize::new(10.0, 10.0),
+            )
+            .expect("mock child webview");
+
+        // Tauri's own lookup drops a window holding two webviews (#418).
+        assert!(handle.get_webview_window(MAIN_WINDOW_LABEL).is_none());
+        assert_eq!(
+            main_window(handle).map(|window| window.label().to_string()),
+            Some(MAIN_WINDOW_LABEL.to_string())
+        );
+        assert_eq!(
+            main_webview(handle).map(|webview| webview.label().to_string()),
+            Some(MAIN_WINDOW_LABEL.to_string())
+        );
+    }
+
+    #[test]
     fn mock_window_exercises_menu_capture_and_restore_helpers() {
         use crate::config::IsolatedTestDataRoot;
         use tauri::test::{mock_builder, mock_context, noop_assets};
@@ -1186,6 +1236,7 @@ mod tests {
             .data_directory(temp.path().join("webview-data"))
             .build()
             .expect("mock webview");
+        let window = window.as_ref().window();
         assert!(
             !local_app_data.exists(),
             "the test leaves nothing in the local app-data folder"
