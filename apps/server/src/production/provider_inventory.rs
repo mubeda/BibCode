@@ -897,6 +897,8 @@ async fn probe_one_snapshot(
         // A failed Antigravity `--version` may print anything, an account included.
         .filter(|output| output.success || definition.driver != "antigravity")
         .and_then(|output| version_line(&definition.driver, output));
+    // The peer's own text, before any parsing could strip what identifies a stored secret.
+    let mut raw_versions = version.iter().cloned().collect::<Vec<_>>();
     let mut version = normalize_provider_version(&definition.driver, version);
     let mut installed = version_output.is_some();
     let mut status = match version_output.as_ref() {
@@ -1118,8 +1120,11 @@ async fn probe_one_snapshot(
                     version: agent_version,
                 }) => {
                     auth = json!({ "status": "authenticated" });
-                    if agent_version.is_some() {
-                        version = agent_version;
+                    if let Some(agent_version) = agent_version {
+                        if let Some(release) = release_version(&agent_version) {
+                            version = Some(release);
+                        }
+                        raw_versions.push(agent_version);
                     }
                     // A reply that listed no model keeps the last catalog until the next probe.
                     if let Some(discovered) = discovered {
@@ -1140,13 +1145,17 @@ async fn probe_one_snapshot(
         _ => {}
     }
 
-    // A CLI that echoes its environment can print a secret shaped like a release number.
-    let version = version.filter(|version| {
-        !definition
-            .secret_values
-            .iter()
-            .any(|secret| version.contains(secret.as_str()))
+    // A CLI that echoes its environment can print a secret shaped like a release number. The
+    // raw text is checked, since the parser drops a leading `v` (`v1.2.3` publishes `1.2.3`).
+    let leaks_secret = raw_versions.iter().any(|raw| {
+        definition.secret_values.iter().any(|secret| {
+            raw.contains(secret.as_str())
+                || secret
+                    .strip_prefix('v')
+                    .is_some_and(|bare| !bare.is_empty() && raw.contains(bare))
+        })
     });
+    let version = version.filter(|_| !leaks_secret);
     let mut result = ProviderProbeResult::new(
         snapshot(
             definition,
@@ -1712,7 +1721,8 @@ async fn probe_codex(
 
 enum AntigravityCatalog {
     /// A session opened, so the CLI is signed in. `models` is `None` when the reply listed no
-    /// model; `version` is the handshake's validated `agentInfo.version`.
+    /// model; `version` is the handshake's raw `agentInfo.version`, checked against the stored
+    /// secrets before it is parsed.
     Session {
         models: Option<Vec<Value>>,
         version: Option<String>,
@@ -1983,7 +1993,7 @@ async fn probe_antigravity_catalog(
                 version: initialize
                     .pointer("/agentInfo/version")
                     .and_then(Value::as_str)
-                    .and_then(release_version),
+                    .map(str::to_owned),
             })
         }
         Ok(Ok(None)) => {
