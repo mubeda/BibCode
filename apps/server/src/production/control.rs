@@ -79,8 +79,46 @@ fn merge_provider_snapshot(
     if provider_snapshot_identity(&next) != Some(current_identity) {
         return next;
     }
-    if !models_authoritative && let Some(value) = current.get("models") {
-        next["models"] = value.clone();
+    let antigravity = next["driver"] == "antigravity";
+    // A disabled or missing instance carries nothing a past session read.
+    let keeps_session_reads =
+        antigravity && next["installed"] != false && next["status"] != "disabled";
+    if !models_authoritative
+        && (keeps_session_reads || !antigravity)
+        && let Some(value) = current.get("models")
+    {
+        next["models"] = if antigravity {
+            // The probed catalog stays until the next full probe; custom models follow settings.
+            let probed = value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|model| model["isCustom"] != true)
+                .cloned()
+                .collect::<Vec<_>>();
+            let custom = next["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|model| !probed.iter().any(|listed| listed["slug"] == model["slug"]));
+            let custom = custom.cloned().collect::<Vec<_>>();
+            probed.into_iter().chain(custom).collect()
+        } else {
+            value.clone()
+        };
+    }
+    // Only a full probe opens an Antigravity session, so the sign-in it read stays until the next.
+    if keeps_session_reads
+        && next["auth"]["status"] == "unknown"
+        && let Some(auth) = current.get("auth")
+    {
+        next["auth"] = auth.clone();
+        if auth["status"] == "unauthenticated"
+            && next.get("message").is_none()
+            && let Some(message) = current.get("message")
+        {
+            next["message"] = message.clone();
+        }
     }
     for field in ["slashCommands", "skills", "agents"] {
         if let Some(value) = current.get(field) {
@@ -267,6 +305,8 @@ impl fmt::Debug for AgentActivityHandlerSlot {
 #[derive(Debug, Default)]
 struct ProviderRefreshState {
     last_completed: Option<Instant>,
+    /// When the last full refresh that read every ACP catalog completed, and its settings.
+    last_catalog_probe: Option<(Instant, Value)>,
     manual_refreshes: usize,
 }
 
@@ -362,6 +402,8 @@ pub struct NativeServerControl {
     providers: Arc<RwLock<Vec<Value>>>,
     provider_maintenance: ProviderMaintenance,
     tools: ToolMaintenance,
+    /// Attributes the processes a full provider probe starts, once the runtime attaches it.
+    process_attribution: Arc<std::sync::OnceLock<crate::diagnostics::ProcessAttributionRegistry>>,
     capability_tasks: TaskTracker,
     capability_shutdown: CancellationToken,
     capability_admission: Arc<std::sync::Mutex<()>>,
@@ -510,6 +552,7 @@ impl NativeServerControl {
             providers,
             provider_maintenance,
             tools,
+            process_attribution: Arc::default(),
             capability_tasks: TaskTracker::new(),
             capability_shutdown: CancellationToken::new(),
             capability_admission: Arc::new(std::sync::Mutex::new(())),
@@ -1005,7 +1048,7 @@ impl NativeServerControl {
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
         let probe_sequence = self.begin_provider_probe();
         let refreshed = self
-            .probe_full_provider_snapshots(&settings, instance_id, &cwd)
+            .probe_full_provider_snapshots(&settings, instance_id, &cwd, &Default::default())
             .await;
         let providers = match self
             .publish_provider_snapshots_if_current(
@@ -1020,7 +1063,7 @@ impl NativeServerControl {
         {
             Some(providers) => {
                 if instance_id.is_none() {
-                    self.record_full_provider_refresh();
+                    self.record_full_provider_refresh(&settings, true);
                 }
                 providers
             }
@@ -1065,6 +1108,7 @@ impl NativeServerControl {
         &self,
         registry: crate::diagnostics::ProcessAttributionRegistry,
     ) {
+        let _ = self.process_attribution.set(registry.clone());
         self.tools.attach_attribution(registry);
     }
 
@@ -1452,7 +1496,12 @@ impl NativeServerControl {
         let (generation, settings) = self.settings_snapshot().await;
         let probe_sequence = self.begin_provider_probe();
         let refreshed = self
-            .probe_full_provider_snapshots(&settings, Some(&target.instance_id), &cwd)
+            .probe_full_provider_snapshots(
+                &settings,
+                Some(&target.instance_id),
+                &cwd,
+                &Default::default(),
+            )
             .await;
         let verification = refreshed
             .iter()
@@ -1653,11 +1702,13 @@ impl NativeServerControl {
         provider_inventory::probe(settings, instance_id, cwd, &self.provider_maintenance).await
     }
 
+    /// `reuse` names the instances whose ACP catalog this probe keeps instead of reading again.
     async fn probe_full_provider_snapshots(
         &self,
         settings: &Value,
         instance_id: Option<&str>,
         cwd: &Path,
+        reuse: &std::collections::HashSet<String>,
     ) -> Vec<provider_inventory::ProviderProbeResult> {
         #[cfg(test)]
         let pause = self.next_full_provider_probe_pause.lock().await.take();
@@ -1672,12 +1723,20 @@ impl NativeServerControl {
                 instance_id,
                 cwd,
                 &self.provider_maintenance,
+                self.process_attribution.get(),
             )
             .await;
         }
         // Tools are re-checked with every full refresh; they publish their own changes.
         let (providers, ()) = tokio::join!(
-            provider_inventory::probe_full(settings, None, cwd, &self.provider_maintenance),
+            provider_inventory::probe_full_reusing(
+                settings,
+                None,
+                cwd,
+                &self.provider_maintenance,
+                self.process_attribution.get(),
+                reuse,
+            ),
             self.tools.refresh(update_checks_enabled(settings), cwd),
         );
         providers
@@ -1803,11 +1862,43 @@ impl NativeServerControl {
         }));
     }
 
-    fn record_full_provider_refresh(&self) {
+    /// `catalogs_read` when the refresh probed every ACP catalog rather than reusing one: only
+    /// such a refresh starts a new reuse window, so reuse never outlives the TTL.
+    fn record_full_provider_refresh(&self, settings: &Value, catalogs_read: bool) {
+        let mut state = self
+            .provider_refresh_state
+            .lock()
+            .expect("provider refresh state lock");
+        let now = Instant::now();
+        state.last_completed = Some(now);
+        if catalogs_read {
+            state.last_catalog_probe = Some((now, settings.clone()));
+        }
+    }
+
+    /// Whether a full refresh completed after `since`.
+    fn full_provider_refresh_completed_since(&self, since: Instant) -> bool {
         self.provider_refresh_state
             .lock()
             .expect("provider refresh state lock")
-            .last_completed = Some(Instant::now());
+            .last_completed
+            .is_some_and(|completed| completed >= since)
+    }
+
+    /// The ACP-probed instances whose catalog a full refresh with `settings` reuses: their
+    /// settings are those the last full refresh probed, within the refresh TTL. A Cursor probe
+    /// costs a connection; an Antigravity probe opens a session in the user's account.
+    fn reusable_acp_catalogs(&self, settings: &Value) -> std::collections::HashSet<String> {
+        let state = self
+            .provider_refresh_state
+            .lock()
+            .expect("provider refresh state lock");
+        match &state.last_catalog_probe {
+            Some((completed, previous)) if completed.elapsed() <= PROVIDER_REFRESH_TTL => {
+                provider_inventory::unchanged_acp_instances(previous, settings)
+            }
+            _ => std::collections::HashSet::new(),
+        }
     }
 
     fn start_full_provider_refresh(
@@ -1839,6 +1930,8 @@ impl NativeServerControl {
             let mut owns_refresh = true;
             'refresh: loop {
                 loop {
+                    let started = Instant::now();
+                    let reuse = control.reusable_acp_catalogs(&settings);
                     let probe_sequence = control.begin_provider_probe();
                     let providers = if let FullProviderRefreshTrigger::BackgroundCheck {
                         cancellation,
@@ -1846,11 +1939,11 @@ impl NativeServerControl {
                     {
                         tokio::select! {
                             () = cancellation.cancelled() => break 'refresh,
-                            providers = control.probe_full_provider_snapshots(&settings, None, &cwd) => providers,
+                            providers = control.probe_full_provider_snapshots(&settings, None, &cwd, &reuse) => providers,
                         }
                     } else {
                         control
-                            .probe_full_provider_snapshots(&settings, None, &cwd)
+                            .probe_full_provider_snapshots(&settings, None, &cwd, &reuse)
                             .await
                     };
                     if control
@@ -1865,14 +1958,23 @@ impl NativeServerControl {
                         .await
                         .is_some()
                     {
-                        control.record_full_provider_refresh();
+                        control.record_full_provider_refresh(&settings, reuse.is_empty());
                         #[cfg(test)]
                         control
                             .latest_full_provider_refresh_generation
                             .store(generation, Ordering::Release);
                         break;
                     }
-                    (generation, settings) = control.settings_snapshot().await;
+                    let (latest_generation, latest_settings) = control.settings_snapshot().await;
+                    // A newer full refresh under the same settings already published; probing
+                    // again would repeat it, and each Antigravity probe opens an account session.
+                    if latest_generation == generation
+                        && latest_settings == settings
+                        && control.full_provider_refresh_completed_since(started)
+                    {
+                        break;
+                    }
+                    (generation, settings) = (latest_generation, latest_settings);
                 }
                 control
                     .full_provider_refresh_running
@@ -3016,6 +3118,27 @@ fn apply_settings_defaults(settings: &mut Value) {
             "agentMessaging": { "enabled": false },
         }),
     );
+    // A blank path reads as the default, as the settings contract decodes it.
+    if let Some(antigravity) = settings.pointer_mut("/providers/antigravity")
+        && antigravity["binaryPath"]
+            .as_str()
+            .is_some_and(|path| path.trim().is_empty())
+    {
+        antigravity["binaryPath"] = json!("agy");
+    }
+    for instance in settings
+        .get_mut("providerInstances")
+        .and_then(Value::as_object_mut)
+        .into_iter()
+        .flat_map(|instances| instances.values_mut())
+        .filter(|instance| instance["driver"] == "antigravity")
+    {
+        if let Some(path) = instance.pointer_mut("/config/binaryPath")
+            && path.as_str().is_some_and(|path| path.trim().is_empty())
+        {
+            *path = json!("agy");
+        }
+    }
     let object = settings.as_object_mut().expect("settings object");
     object
         .entry("defaultAgent")
@@ -4408,7 +4531,12 @@ done
         let (_, settings) = control.settings_snapshot().await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
         control
-            .probe_full_provider_snapshots(&settings, Some("cursor-work"), &cwd)
+            .probe_full_provider_snapshots(
+                &settings,
+                Some("cursor-work"),
+                &cwd,
+                &Default::default(),
+            )
             .await;
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -6932,6 +7060,306 @@ done
             // A probe that read no version cannot tell an OpenCode 2 instance.
             assert_eq!(merged["supportsContextWindowUsage"], true);
         }
+    }
+
+    /// A quick refresh starts no Antigravity session, so it keeps the sign-in state and the models
+    /// the last full probe read, while the custom models follow the settings. A full probe after
+    /// sign-in replaces both. Other drivers keep publishing the refreshed sign-in state.
+    #[test]
+    fn antigravity_quick_refresh_keeps_probed_models_and_sign_in_until_a_full_probe() {
+        let sign_in = "Antigravity is not signed in.";
+        let current = json!({
+            "instanceId": "antigravity",
+            "driver": "antigravity",
+            "status": "ready",
+            "auth": { "status": "unauthenticated" },
+            "message": sign_in,
+            "models": [
+                { "slug": "model-alpha", "name": "Model Alpha", "isCustom": false },
+                { "slug": "removed-custom", "name": "removed-custom", "isCustom": true }
+            ]
+        });
+        let quick = |driver: &str| provider_inventory::ProviderProbeResult {
+            snapshot: json!({
+                "instanceId": driver,
+                "driver": driver,
+                "status": "ready",
+                "auth": { "status": "unknown" },
+                "models": [{ "slug": "added-custom", "name": "added-custom", "isCustom": true }]
+            }),
+            rich_metadata: provider_inventory::RichMetadataOutcome::NotRequested,
+            models_authoritative: false,
+        };
+
+        let merged = merge_provider_snapshot(Some(&current), quick("antigravity"));
+        assert_eq!(merged["auth"], json!({ "status": "unauthenticated" }));
+        assert_eq!(merged["message"], sign_in);
+        assert_eq!(
+            merged["models"],
+            json!([
+                { "slug": "model-alpha", "name": "Model Alpha", "isCustom": false },
+                { "slug": "added-custom", "name": "added-custom", "isCustom": true }
+            ])
+        );
+
+        let signed_in = provider_inventory::ProviderProbeResult {
+            snapshot: json!({
+                "instanceId": "antigravity",
+                "driver": "antigravity",
+                "status": "ready",
+                "auth": { "status": "authenticated" },
+                "models": [{ "slug": "model-beta", "name": "Model Beta", "isCustom": false }]
+            }),
+            rich_metadata: provider_inventory::RichMetadataOutcome::Succeeded,
+            models_authoritative: true,
+        };
+        let replaced = merge_provider_snapshot(Some(&merged), signed_in.clone());
+        assert_eq!(replaced, signed_in.snapshot);
+
+        let cursor = json!({
+            "instanceId": "cursor",
+            "driver": "cursor",
+            "status": "ready",
+            "auth": { "status": "authenticated" },
+            "models": []
+        });
+        let merged = merge_provider_snapshot(Some(&cursor), quick("cursor"));
+        assert_eq!(merged["auth"], json!({ "status": "unknown" }));
+    }
+
+    /// A blank Antigravity binary path reads as `agy`, as the settings contract decodes it,
+    /// never as an empty program the inventory would try to resolve.
+    #[test]
+    fn a_blank_antigravity_binary_path_falls_back_to_agy() {
+        for blank in ["", "   "] {
+            let mut settings = json!({
+                "providers": { "antigravity": { "enabled": true, "binaryPath": blank } }
+            });
+            apply_settings_defaults(&mut settings);
+            assert_eq!(
+                settings["providers"]["antigravity"]["binaryPath"], "agy",
+                "{blank:?}"
+            );
+            assert_eq!(settings["providers"]["antigravity"]["enabled"], true);
+        }
+        let mut custom = json!({
+            "providers": { "antigravity": { "binaryPath": "custom-cli" } }
+        });
+        apply_settings_defaults(&mut custom);
+        assert_eq!(
+            custom["providers"]["antigravity"]["binaryPath"],
+            "custom-cli"
+        );
+    }
+
+    /// A configured Antigravity instance with a blank binary path is saved (and loaded) as
+    /// `agy`, the program the refresh then probes. Through the settings RPC that refresh would
+    /// resolve the real `agy`, which the hermetic guard refuses, so the save's normalization
+    /// step is called directly.
+    #[test]
+    fn a_blank_antigravity_instance_binary_path_saves_and_probes_as_agy() {
+        let mut settings = json!({ "providerInstances": {
+            "work": { "driver": "antigravity", "enabled": true, "config": { "binaryPath": "  " } },
+            "other": { "driver": "codex", "enabled": true, "config": { "binaryPath": "  " } }
+        } });
+        apply_settings_defaults(&mut settings);
+        assert_eq!(
+            settings["providerInstances"]["work"]["config"]["binaryPath"],
+            "agy"
+        );
+        // Only Antigravity's default is applied; another driver keeps what it was given.
+        assert_eq!(
+            settings["providerInstances"]["other"]["config"]["binaryPath"],
+            "  "
+        );
+        let target = provider_inventory::maintenance_target(&settings, "antigravity", Some("work"))
+            .expect("the Antigravity instance");
+        assert_eq!(target.binary_path, "agy");
+    }
+
+    /// A disabled, missing or signed-out Antigravity snapshot carries no sign-in state, message
+    /// or probed model from the snapshot before it.
+    #[test]
+    fn antigravity_snapshots_that_are_off_or_missing_carry_nothing_stale() {
+        let probed = json!([
+            { "slug": "model-alpha", "name": "Model Alpha", "isCustom": false }
+        ]);
+        let custom = json!([{ "slug": "custom-one", "name": "custom-one", "isCustom": true }]);
+        for auth in ["authenticated", "unauthenticated"] {
+            let mut current = json!({
+                "instanceId": "antigravity",
+                "driver": "antigravity",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "auth": { "status": auth },
+                "models": probed
+            });
+            if auth == "unauthenticated" {
+                current["message"] = json!("Antigravity is not signed in.");
+            }
+            for (status, enabled, message, rich_metadata) in [
+                (
+                    "disabled",
+                    false,
+                    None,
+                    provider_inventory::RichMetadataOutcome::NotRequested,
+                ),
+                (
+                    "error",
+                    true,
+                    Some("Provider executable was not found."),
+                    provider_inventory::RichMetadataOutcome::Failed,
+                ),
+            ] {
+                let mut snapshot = json!({
+                    "instanceId": "antigravity",
+                    "driver": "antigravity",
+                    "enabled": enabled,
+                    "installed": false,
+                    "status": status,
+                    "auth": { "status": "unknown" },
+                    "models": custom
+                });
+                if let Some(message) = message {
+                    snapshot["message"] = json!(message);
+                }
+                let merged = merge_provider_snapshot(
+                    Some(&current),
+                    provider_inventory::ProviderProbeResult {
+                        snapshot: snapshot.clone(),
+                        rich_metadata,
+                        models_authoritative: false,
+                    },
+                );
+                assert_eq!(
+                    merged["auth"],
+                    json!({ "status": "unknown" }),
+                    "{status} {auth}"
+                );
+                assert_eq!(
+                    merged.get("message"),
+                    snapshot.get("message"),
+                    "{status} {auth}"
+                );
+                assert_eq!(merged["models"], custom, "{status} {auth}");
+            }
+        }
+    }
+
+    /// Counts the `session/new` requests the scripted Antigravity peer has read.
+    #[cfg(unix)]
+    fn antigravity_sessions(requests: &Path) -> usize {
+        provider_inventory::tests::antigravity_requests(requests)
+            .iter()
+            .filter(|request| request["method"] == "session/new")
+            .count()
+    }
+
+    /// A control whose only enabled provider is a scripted Antigravity peer, after the save that
+    /// enabled it has finished its full refresh, with the peer's request log.
+    #[cfg(unix)]
+    async fn antigravity_control(
+        temp: &tempfile::TempDir,
+        sandbox: &crate::test_support::TestSandbox,
+    ) -> (NativeServerControl, PathBuf) {
+        let control = scheduler_control(temp).await;
+        let (binary, requests) = provider_inventory::tests::antigravity_acp_fixture(
+            sandbox,
+            "antigravity-cli-control",
+            "1.5.13",
+            r#""result":{"sessionId":"session-1","models":{"availableModels":[{"modelId":"alpha"}]}}"#,
+        );
+        control
+            .update_settings(json!({ "patch": { "providerInstances": {
+                "antigravity": { "driver": "antigravity", "enabled": true, "config": { "binaryPath": binary } }
+            } } }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        assert_eq!(antigravity_sessions(&requests), 1);
+        (control, requests)
+    }
+
+    /// An automatic full refresh superseded by a manual one under the same settings does not
+    /// probe again: the manual one already published, and each probe opens an account session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_superseded_automatic_refresh_opens_no_extra_antigravity_session() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-superseded");
+        let (control, requests) = antigravity_control(&temp, &sandbox).await;
+        // Outside the catalog reuse window, so the automatic refresh opens its own session.
+        control
+            .provider_refresh_state
+            .lock()
+            .expect("provider refresh state lock")
+            .last_catalog_probe = None;
+        let pause = control.install_next_full_provider_probe_pause().await;
+        let (generation, settings) = control.settings_snapshot().await;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
+        let automatic = control
+            .start_full_provider_refresh(
+                generation,
+                settings,
+                cwd,
+                FullProviderRefreshTrigger::BackgroundCheck {
+                    cancellation: CancellationToken::new(),
+                },
+            )
+            .expect("the automatic refresh starts");
+        pause.wait_until_entered().await;
+        control.refresh_providers(&json!({})).await;
+        assert_eq!(antigravity_sessions(&requests), 2);
+        let probes = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        pause.release();
+        automatic.await.expect("the automatic refresh ends");
+        // Its own, superseded probe, and no second one.
+        assert_eq!(antigravity_sessions(&requests), 3);
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            probes
+        );
+    }
+
+    /// A settings save that leaves Antigravity's settings alone reuses the catalog of a full
+    /// probe within the refresh TTL and opens no session; one that changes them probes again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unrelated_settings_save_opens_no_antigravity_session() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-unrelated-save");
+        let (control, requests) = antigravity_control(&temp, &sandbox).await;
+        let catalog = control.providers.read().await.clone();
+
+        control
+            .update_settings(json!({ "patch": { "enableAssistantStreaming": true } }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        assert_eq!(antigravity_sessions(&requests), 1);
+        let antigravity = |providers: &[Value]| {
+            providers
+                .iter()
+                .find(|provider| provider["instanceId"] == "antigravity")
+                .map(|provider| (provider["auth"].clone(), provider["models"].clone()))
+        };
+        assert_eq!(
+            antigravity(&control.providers.read().await),
+            antigravity(&catalog)
+        );
+
+        let (_, mut instances) = control.settings_snapshot().await;
+        instances["providerInstances"]["antigravity"]["config"]["customModels"] =
+            json!(["custom-one"]);
+        control
+            .update_settings(
+                json!({ "patch": { "providerInstances": instances["providerInstances"] } }),
+            )
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        assert_eq!(antigravity_sessions(&requests), 2);
     }
 
     /// A probe that read the instance's version tells whether its chats report context usage

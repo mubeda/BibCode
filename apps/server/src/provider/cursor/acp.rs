@@ -152,6 +152,8 @@ enum WriterMessage {
         bytes: Vec<u8>,
         written: oneshot::Sender<Result<(), AcpRequestWriteFailure>>,
     },
+    /// Ends the writer task, which owns the agent's stdin.
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -331,6 +333,7 @@ impl AcpJsonRpcConnection {
                         }
                         let _ = written.send(Ok(()));
                     }
+                    WriterMessage::Shutdown => break,
                 }
             }
         });
@@ -375,6 +378,13 @@ impl AcpJsonRpcConnection {
         });
 
         (connection, incoming_rx)
+    }
+
+    /// Ends the writer task and closes the agent's stdin; later writes fail as closed. The
+    /// writer holds this connection's own sender, so without it the task and the pipe outlive
+    /// the agent. The readers end when the agent's output closes. Safe to call from `Drop`.
+    pub fn shutdown(&self) {
+        let _ = self.inner.writer.send(WriterMessage::Shutdown);
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, AcpProtocolError> {
@@ -603,9 +613,13 @@ async fn route_stdout_message(
 
     if let Some(wire_id) = object.get("id") {
         let correlation_id = normalize_request_id(wire_id)?;
-        let pending = inner.pending().remove(&correlation_id);
+        // Outbound ids are numbers: a string id answers none of them, whatever its text.
+        let outbound = wire_id.is_number();
+        let pending = outbound
+            .then(|| inner.pending().remove(&correlation_id))
+            .flatten();
         let Some(pending) = pending else {
-            if is_stale_outbound_response(&correlation_id, inner) {
+            if outbound && is_stale_outbound_response(&correlation_id, inner) {
                 return Ok(());
             }
             return Err(AcpProtocolError::UnknownResponse {
@@ -1037,6 +1051,34 @@ mod tests {
             active.response().await.expect("request B response"),
             json!({"stopReason":"end_turn"})
         );
+    }
+
+    /// Outbound ids are numbers, so a response whose id is the string "1" never answers request
+    /// 1: it is not correlated, and the request never takes its result.
+    #[tokio::test]
+    async fn a_string_response_id_never_answers_a_numeric_request() {
+        let (stdout, mut stdout_peer) = duplex(4096);
+        let (_stdin_peer, stdin) = duplex(4096);
+        let (stderr, _stderr_peer) = duplex(4096);
+        let (connection, _incoming) =
+            AcpJsonRpcConnection::spawn(stdout, stdin, stderr, AcpConnectionConfig::default());
+        let mut receipt = connection
+            .start_request("session/new", json!({}))
+            .await
+            .expect("request receipt");
+        receipt.written().await.expect("request written");
+
+        stdout_peer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"forged\":true}}\n")
+            .await
+            .expect("write string-id response");
+        stdout_peer.flush().await.expect("flush string-id response");
+
+        assert!(matches!(
+            receipt.response().await,
+            Err(AcpProtocolError::Closed { reason })
+                if reason.contains("response for id 1 was not correlated")
+        ));
     }
 
     #[tokio::test]
