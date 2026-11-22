@@ -7130,15 +7130,12 @@ async fn run_supervisor(
                 // the finished delivery has not drained yet, so a newer setting is never applied
                 // before an older one.
                 if let Some(thread_id) = delivery_ordered_command_thread(command.as_ref())
-                    && let Some(generation) =
-                        delivery_sequences.get(thread_id).and_then(|sequence| {
-                            sequence.active_generation.or_else(|| {
-                                deferred_configuration
-                                    .get(thread_id)
-                                    .is_some_and(|queued| !queued.is_empty())
-                                    .then_some(sequence.completed_generation)
-                            })
-                        })
+                    && let Some(generation) = deferral_generation(
+                        delivery_sequences.get(thread_id),
+                        deferred_configuration
+                            .get(thread_id)
+                            .is_some_and(|queued| !queued.is_empty()),
+                    )
                 {
                     let queued = deferred_configuration
                         .entry(thread_id.to_owned())
@@ -7986,6 +7983,15 @@ fn delivery_ordered_command_thread(command: &OrchestrationCommand) -> Option<&st
         } => Some(thread_id),
         _ => None,
     }
+}
+
+/// The delivery generation a configuration command must queue behind, if any: the running
+/// delivery's, or, while older commands still wait for their drain, the finished one's.
+fn deferral_generation(sequence: Option<&ThreadDeliverySequence>, has_queued: bool) -> Option<u64> {
+    let sequence = sequence?;
+    sequence
+        .active_generation
+        .or_else(|| has_queued.then_some(sequence.completed_generation))
 }
 
 fn schedule_deferred_drain(
@@ -39376,6 +39382,284 @@ done
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A configuration command waits behind a running delivery, and also behind older commands
+    /// its finished delivery has not drained yet, so an older mode switch can never land after a
+    /// newer one.
+    #[test]
+    fn a_new_mode_command_waits_behind_older_undrained_commands() {
+        let running = super::ThreadDeliverySequence {
+            active_generation: Some(4),
+            completed_generation: 3,
+        };
+        assert_eq!(super::deferral_generation(Some(&running), false), Some(4));
+        let finished = super::ThreadDeliverySequence {
+            active_generation: None,
+            completed_generation: 4,
+        };
+        assert_eq!(
+            super::deferral_generation(Some(&finished), true),
+            Some(4),
+            "queued behind the older commands, for the same drain"
+        );
+        assert_eq!(super::deferral_generation(Some(&finished), false), None);
+        assert_eq!(super::deferral_generation(None, false), None);
+    }
+
+    /// A scripted `agy` started through a wrapper that sets one fixture switch.
+    #[cfg(unix)]
+    fn antigravity_fixture_with(temp: &TempDir, switch: &str, capture: &std::path::Path) -> String {
+        let fixture = executable_fixture(temp, "agy-fixture", ANTIGRAVITY_FIXTURE);
+        executable_fixture(
+            temp,
+            "agy",
+            &format!(
+                "#!/bin/sh\n{switch} BIBCODE_TEST_REQUEST_CAPTURE='{}' exec '{}' \"$@\"\n",
+                capture.display(),
+                fixture.display()
+            ),
+        )
+        .to_string_lossy()
+        .into_owned()
+    }
+
+    #[cfg(unix)]
+    fn antigravity_turn(id: &str) -> OrchestrationCommand {
+        serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":id, "threadId":"t1",
+            "message":{"messageId":id,"role":"user","text":"hello","attachments":[]},
+            "modelSelection":{"instanceId":"antigravity","model":"auto"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn antigravity_supervisor(
+        engine: &super::OrchestrationEngine,
+        temp: &TempDir,
+    ) -> super::ProviderRuntimeSupervisor {
+        super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(super::NativeProviderDriverFactory::new(
+                temp.path().join("attachments"),
+            )),
+            super::ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions::default(),
+        )
+    }
+
+    /// Through the durable delivery path, a sign-in or version refusal is one final outcome with
+    /// the user's message: one launch, no prompt, nothing to retry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_antigravity_refusals_launch_once_and_are_not_retried() {
+        for (switch, expected) in [
+            ("BIBCODE_TEST_SIGNED_OUT=1", "agy acp --login"),
+            ("BIBCODE_TEST_AGY_VERSION=1.5.3", "1.5.4"),
+        ] {
+            let temp = TempDir::new().expect("provider fixture directory");
+            let capture = temp.path().join("requests.jsonl");
+            let binary = antigravity_fixture_with(&temp, switch, &capture);
+            std::fs::write(
+                temp.path().join("settings.json"),
+                serde_json::to_vec(&json!({
+                    "providerInstances": {
+                        "antigravity": {
+                            "driver": "antigravity", "enabled": true,
+                            "config": { "binaryPath": binary }
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let engine = supervisor_engine().await;
+            for command in [
+                json!({"type":"project.create","commandId":"ag-project","projectId":"ag","title":"Antigravity","workspaceRoot":temp.path(),"createdAt":"2026-07-16T00:00:00Z"}),
+                json!({"type":"thread.create","commandId":"ag-thread","threadId":"ag","projectId":"ag","title":"Thread","kind":"workspace","modelSelection":{"instanceId":"antigravity","model":"auto"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+            ] {
+                engine
+                    .dispatch(serde_json::from_value(command).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let mut command = serde_json::to_value(antigravity_turn("refused")).unwrap();
+            command["threadId"] = json!("ag");
+            let command: OrchestrationCommand = serde_json::from_value(command).unwrap();
+            let mut payload = serde_json::to_value(&command).unwrap();
+            super::freeze_delivery_route(
+                &engine,
+                &temp.path().to_path_buf(),
+                &command,
+                &mut payload,
+            )
+            .await
+            .expect("freeze the Antigravity route");
+            let payload = payload.to_string();
+            engine
+                .repositories()
+                .database()
+                .call(move |connection| {
+                    connection.execute(
+                        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('refused', 'thread', 'ag', '2026-07-16T00:00:00Z', 0, 'accepted', NULL, 'refusal-digest')",
+                        [],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('refused', 'ag', 'refused', 'antigravity', 'antigravity', NULL, 'refused-key', ?, 'sending', 1, NULL, '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z')",
+                        [payload],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("seed the delivery row");
+            let supervisor = antigravity_supervisor(&engine, &temp).await;
+            let outcome = timeout(
+                Duration::from_secs(20),
+                super::deliver_durable_orchestration_turn(
+                    &supervisor,
+                    &engine,
+                    &temp.path().to_path_buf(),
+                    command,
+                    "refused-key".to_owned(),
+                ),
+            )
+            .await
+            .expect("delivery ends in time");
+            let detail = match &outcome {
+                super::ProviderDeliveryOutcome::Rejected { detail } => detail.clone(),
+                other => panic!("{switch}: a final refusal, not {other:?}"),
+            };
+            assert!(detail.contains(expected), "{detail}");
+            let methods = captured_methods(&capture);
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|method| *method == "initialize")
+                    .count(),
+                1,
+                "{switch}: one launch, {methods:?}"
+            );
+            assert!(
+                !methods.contains(&"session/prompt".to_owned()),
+                "{methods:?}"
+            );
+            timeout(Duration::from_secs(10), supervisor.shutdown())
+                .await
+                .expect("shutdown in time")
+                .expect("shutdown");
+            engine.shutdown().await;
+        }
+    }
+
+    /// After a crash the next turn starts a new process with the saved cursor: it reopens the
+    /// saved conversation with `session/resume`, never a new one, and sends the turn once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn after_a_crash_the_next_antigravity_turn_reopens_the_saved_session() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture = temp.path().join("requests.jsonl");
+        let engine = supervisor_engine().await;
+        let supervisor = antigravity_supervisor(&engine, &temp).await;
+        let mut launch = native_launch(&temp, "antigravity");
+        launch.thread_id = "t1".to_owned();
+        launch.runtime_mode = "full-access".to_owned();
+        launch.binary_path = antigravity_fixture_with(&temp, "", &capture);
+        launch.resume_cursor = Some(json!({ "schemaVersion": 1, "sessionId": "saved-session" }));
+        timeout(Duration::from_secs(10), supervisor.launch(launch))
+            .await
+            .expect("launch in time")
+            .expect("reopened");
+        let delivery = timeout(
+            Duration::from_secs(5),
+            supervisor.deliver_turn(antigravity_turn("next"), "next-key".to_owned()),
+        )
+        .await
+        .expect("admitted in time")
+        .expect("admitted");
+        let outcome = timeout(Duration::from_secs(10), delivery.completion())
+            .await
+            .expect("delivered in time");
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        let requests = std::fs::read_to_string(&capture).unwrap_or_default();
+        let methods = captured_methods(&capture);
+        assert!(!methods.contains(&"session/new".to_owned()), "{methods:?}");
+        assert!(
+            requests
+                .lines()
+                .any(|line| line.contains("session/resume") && line.contains("saved-session")),
+            "{requests}"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "session/prompt")
+                .count(),
+            1
+        );
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("shutdown in time")
+            .expect("shutdown");
+        engine.shutdown().await;
+    }
+
+    /// An unsent frozen turn whose saved conversation is gone: the reconciliation launch fails
+    /// with `FrozenConversationLost`, sends nothing, and keeps the saved cursor, so no
+    /// replacement conversation silently takes the turn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unsent_frozen_antigravity_turn_whose_conversation_is_gone_sends_nothing() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture = temp.path().join("requests.jsonl");
+        let engine = supervisor_engine().await;
+        let supervisor = antigravity_supervisor(&engine, &temp).await;
+        let mut launch = native_launch(&temp, "antigravity");
+        launch.thread_id = "t1".to_owned();
+        launch.binary_path =
+            antigravity_fixture_with(&temp, "BIBCODE_TEST_MISSING_SESSION=1", &capture);
+        launch.resume_cursor = Some(json!({ "schemaVersion": 1, "sessionId": "saved-session" }));
+        let error = timeout(
+            Duration::from_secs(10),
+            supervisor.launch_for_reconciliation(launch),
+        )
+        .await
+        .expect("launch in time")
+        .expect_err("the conversation is gone");
+        assert!(
+            matches!(
+                error,
+                super::ProviderRuntimeError::FrozenConversationLost { .. }
+            ),
+            "{error:?}"
+        );
+        assert!(!captured_methods(&capture).contains(&"session/prompt".to_owned()));
+        let runtime = engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .unwrap()
+            .expect("runtime row");
+        assert_eq!(
+            runtime
+                .resume_cursor
+                .as_ref()
+                .and_then(super::resume_string),
+            Some("saved-session".to_owned()),
+            "the saved cursor stays with the lost conversation"
+        );
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("shutdown in time")
+            .expect("shutdown");
+        engine.shutdown().await;
     }
 
     #[test]
