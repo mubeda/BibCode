@@ -21,8 +21,9 @@ use super::{
         acp_turn_state,
     },
     model::{
-        acp_config_option_current_value, resolve_acp_config_updates_with_baseline,
-        resolve_acp_default_model_config,
+        acp_config_option_current_value, acp_model_descriptor, acp_model_values_are_bracketed,
+        resolve_acp_config_updates_with_baseline, resolve_acp_default_model_config,
+        resolve_advertised_model_value, resolve_bracketed_model_options,
     },
 };
 
@@ -325,19 +326,18 @@ impl CursorSessionRuntime {
                     ))
                 })?
         } else {
-            let config_id = self
-                .inner
-                .config_options
-                .lock()
-                .await
-                .iter()
-                .find(|option| option.get("category").and_then(Value::as_str) == Some("model"))
-                .and_then(|option| option.get("id").and_then(Value::as_str))
-                .map(str::to_owned);
-            let Some(config_id) = config_id else {
+            let options = self.inner.config_options.lock().await.clone();
+            let Some(descriptor) = acp_model_descriptor(&options) else {
                 return Ok(());
             };
-            (config_id, json!(model))
+            let Some(config_id) = descriptor.get("id").and_then(Value::as_str) else {
+                return Ok(());
+            };
+            // An option listing no values leaves nothing to check the model against.
+            let value = resolve_advertised_model_value(descriptor, model)
+                .map_err(CursorRuntimeError::UnsupportedOption)?
+                .unwrap_or_else(|| json!(model));
+            (config_id.to_owned(), value)
         };
         let options = self
             .set_config_option(&self.provider_session_id().await?, &config_id, value)
@@ -350,6 +350,9 @@ impl CursorSessionRuntime {
     pub async fn set_options(&self, options: Vec<Value>) -> Result<(), CursorRuntimeError> {
         self.ensure_configuration_certain().await?;
         let mut current = self.inner.config_options.lock().await.clone();
+        if acp_model_values_are_bracketed(&current) {
+            return self.set_bracketed_options(&current, options).await;
+        }
         let baseline = self.inner.baseline_config_options.lock().await.clone();
         let updates = resolve_acp_config_updates_with_baseline(
             &Value::Array(current.clone()),
@@ -392,6 +395,32 @@ impl CursorSessionRuntime {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Options of a session that folds them into its model values: a switch to the advertised
+    /// value of the current model that holds them, or a refusal before anything is sent.
+    async fn set_bracketed_options(
+        &self,
+        current: &[Value],
+        options: Vec<Value>,
+    ) -> Result<(), CursorRuntimeError> {
+        let descriptor = acp_model_descriptor(current)
+            .expect("bracketed model values come from a model config option");
+        let Some(value) = resolve_bracketed_model_options(descriptor, &Value::Array(options))
+            .map_err(CursorRuntimeError::UnsupportedOption)?
+        else {
+            return Ok(());
+        };
+        let config_id = descriptor
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("model")
+            .to_owned();
+        let next = self
+            .set_config_option(&self.provider_session_id().await?, &config_id, value)
+            .await?;
+        *self.inner.config_options.lock().await = next;
         Ok(())
     }
 

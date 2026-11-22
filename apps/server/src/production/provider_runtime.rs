@@ -16115,7 +16115,14 @@ impl ProviderDriver for CursorDriver {
                 .runtime
                 .start()
                 .await
-                .map_err(provider_error("cursor"))?;
+                // A model the session does not advertise is refused with its own sentence.
+                .map_err(|error| {
+                    if error.option_refusal().is_some() {
+                        option_error("cursor", error)
+                    } else {
+                        provider_error("cursor")(error)
+                    }
+                })?;
             Ok(StartedSession {
                 resume_cursor: Some(json!({
                     "schemaVersion": 1,

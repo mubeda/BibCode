@@ -785,6 +785,209 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
     peer_task.await.expect("peer");
 }
 
+fn cursor_model_runtime(model: &str) -> (CursorSessionRuntime, ScriptedPeer) {
+    let (connection, incoming, peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-advertised-model-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: model.to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    (runtime, peer)
+}
+
+/// The model option of `cursor-agent` 2026.11: one bracketed value per model, its options folded
+/// in, and no separate effort, context, fast or thinking option.
+fn bracketed_model_options(current: &str) -> Value {
+    json!([
+        {
+            "id": "mode", "name": "Mode", "category": "mode", "type": "select",
+            "currentValue": "agent",
+            "options": [{ "value": "agent", "name": "Agent" }, { "value": "ask", "name": "Ask" }]
+        },
+        {
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": current,
+            "options": [
+                { "value": "default[]", "name": "Auto" },
+                { "value": "gpt-5.4-nano[reasoning=medium]", "name": "gpt-5.4-nano" },
+                {
+                    "value": "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]",
+                    "name": "claude-opus-5"
+                }
+            ]
+        }
+    ])
+}
+
+#[tokio::test]
+async fn cursor_sends_only_advertised_bracketed_model_values() {
+    const OPUS: &str = "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]";
+    const NANO: &str = "gpt-5.4-nano[reasoning=medium]";
+    let (runtime, mut peer) = cursor_model_runtime("gpt-5.4-nano");
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": bracketed_model_options(OPUS) }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": NANO }))
+        .respond(json!({ "configOptions": bracketed_model_options(NANO) }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": OPUS }))
+        .respond(json!({ "configOptions": bracketed_model_options(OPUS) }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+    let within = Duration::from_secs(5);
+    let refusal = |result: Result<(), cursor::runtime::CursorRuntimeError>| {
+        let error = result.expect_err("refused");
+        error.option_refusal().map(str::to_owned)
+    };
+
+    timeout(within, runtime.start())
+        .await
+        .unwrap()
+        .expect("start");
+    // The options the selected value already holds need no request.
+    timeout(
+        within,
+        runtime.set_options(vec![json!({ "id": "reasoning", "value": "medium" })]),
+    )
+    .await
+    .unwrap()
+    .expect("the advertised reasoning");
+    assert_eq!(
+        refusal(
+            timeout(
+                within,
+                runtime.set_options(vec![json!({ "id": "reasoning", "value": "low" })])
+            )
+            .await
+            .unwrap()
+        )
+        .as_deref(),
+        Some("Reasoning low is not supported by the selected model.")
+    );
+    timeout(within, runtime.set_model("claude-opus-5"))
+        .await
+        .unwrap()
+        .expect("switch by base");
+    timeout(
+        within,
+        runtime.set_options(vec![
+            json!({ "id": "thinking", "value": true }),
+            json!({ "id": "contextWindow", "value": "300k" }),
+            json!({ "id": "reasoning", "value": "high" }),
+            json!({ "id": "fastMode", "value": false }),
+        ]),
+    )
+    .await
+    .unwrap()
+    .expect("the folded-in options");
+    assert_eq!(
+        refusal(
+            timeout(
+                within,
+                runtime.set_options(vec![json!({ "id": "fastMode", "value": true })])
+            )
+            .await
+            .unwrap()
+        )
+        .as_deref(),
+        Some("Fast is not supported by the selected model.")
+    );
+    assert_eq!(
+        refusal(
+            timeout(
+                within,
+                runtime.set_options(vec![json!({ "id": "contextWindow", "value": "1m" })])
+            )
+            .await
+            .unwrap()
+        )
+        .as_deref(),
+        Some("Context 1m is not supported by the selected model.")
+    );
+    assert_eq!(
+        refusal(timeout(within, runtime.set_model("gpt-9")).await.unwrap()).as_deref(),
+        Some("gpt-9 is not available in Cursor.")
+    );
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_sends_only_advertised_plain_model_values() {
+    let plain = |current: &str| {
+        json!([{
+            "id": "model", "category": "model", "type": "select", "currentValue": current,
+            "options": [{ "value": "gpt-5.4" }, { "value": "gpt-5.5" }]
+        }])
+    };
+    let (runtime, mut peer) = cursor_model_runtime("gpt-5.5");
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": plain("gpt-5.4") }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "gpt-5.5" }))
+        .respond(json!({ "configOptions": plain("gpt-5.5") }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "gpt-5.4" }))
+        .respond(json!({ "configOptions": plain("gpt-5.4") }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+    let within = Duration::from_secs(5);
+
+    timeout(within, runtime.start())
+        .await
+        .unwrap()
+        .expect("start");
+    timeout(within, runtime.set_model("gpt-5.4"))
+        .await
+        .unwrap()
+        .expect("switch");
+    let refused = timeout(within, runtime.set_model("gpt-9"))
+        .await
+        .unwrap()
+        .expect_err("the session does not advertise the model");
+    assert_eq!(
+        refused.option_refusal(),
+        Some("gpt-9 is not available in Cursor."),
+        "{refused}"
+    );
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_refuses_an_unadvertised_launch_model_before_any_prompt() {
+    let (runtime, mut peer) = cursor_model_runtime("gpt-5.4");
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new").respond(json!({
+        "sessionId": "s1",
+        "configOptions": bracketed_model_options("gpt-5.4-nano[reasoning=medium]")
+    }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+
+    let refused = timeout(Duration::from_secs(5), runtime.start())
+        .await
+        .unwrap()
+        .expect_err("gpt-5.4 is not advertised");
+    assert_eq!(
+        refused.option_refusal(),
+        Some("gpt-5.4 is not available in Cursor."),
+        "{refused}"
+    );
+    peer_task.await.expect("peer");
+}
+
 #[tokio::test]
 async fn cursor_default_model_restoration_uses_the_advertised_provider_value() {
     let (connection, incoming, mut peer) = scripted_peer();
