@@ -571,15 +571,23 @@ that the window renders:
 - `BIBCODE_SOFTWARE_RENDERING=1` with the setting off sets both;
   `BIBCODE_SOFTWARE_RENDERING=0` with it on sets neither.
 - `WEBKIT_DISABLE_COMPOSITING_MODE=0` exported with the setting on keeps `0`
-  and sets only the other; Settings says GPU compositing is on.
-- Start the binary itself, `usr/bin/bibcode-desktop` of an extracted AppDir,
-  with the setting on: both variables are present. Start it from the AppDir's
-  `usr` folder, as `AppRun` does: the bundled WebKitGTK finds its helper
-  processes relative to the working directory, so from any other folder it
-  aborts before the first window with or without this setting. That also
-  applies to a cold start through the generated
-  `bibcode-desktop-handler.desktop` of an extracted AppDir, whose `Exec` line
-  names the binary and sets no working directory.
+  and sets only `WEBKIT_DISABLE_DMABUF_RENDERER=1`. Settings then says this
+  launch asks WebKit to draw without GPU compositing (either variable other
+  than `0` counts), and names the exported variable as one the switch cannot
+  change. Both variables exported: the switch has no effect, and the row says
+  so.
+- Cold start without `AppRun` (#412): with the app closed, run the `Exec` line
+  of the generated `$XDG_DATA_HOME/applications/bibcode-desktop-handler.desktop`
+  with a `bibcode://` URL from `/` and from the home folder, for an extracted
+  AppDir and for the AppImage, with the setting on and off. The window renders,
+  `readlink /proc/<pid>/exe` of each WebKit child points into the AppDir, and
+  the desktop process's working folder (`readlink /proc/<pid>/cwd`) is the
+  AppDir's `usr`, as under `AppRun`. With the setting on, the WebKit children
+  hold both variables. In a container without FUSE, the AppImage handler needs
+  `APPIMAGE_EXTRACT_AND_RUN=1` in the caller's environment. A system WebKitGTK
+  under `/usr/lib/<triple>` can make a start from `/` look fine on an unfixed
+  build, because the rewritten helper path then resolves to the system's
+  helpers; check the `exe` link.
 - With the setting on, turn it off in Settings and use **Restart now**: the new
   process's WebKit children have neither variable. Under Xvfb, start Xvfb and
   the session bus yourself instead of through `xvfb-run` and
@@ -587,7 +595,10 @@ that the window renders:
   one without a display.
 - A malformed `desktop-settings.json` starts with neither variable, logs
   `could not read the software rendering setting`, and the log line
-  `software rendering start-up decision` records every start.
+  `software rendering start-up decision` records every start, in `server.log`
+  of a release build too (they are written once the in-process server has
+  started). A launch outside `AppRun` from an AppDir also logs `started outside
+  AppRun; working folder moved to the AppDir's usr folder for WebKit`.
 
 Record the bundled WebKitGTK version (the `libwebkit2gtk-4.1.so.0.*` file name
 under `usr/lib`) with the result.

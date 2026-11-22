@@ -160,7 +160,6 @@ pub fn run() {
             linux_theme::configure_theme(&app.state::<linux_theme::LinuxThemeState>());
         }
         shell_path_hydration.record();
-        software_rendering::record_startup();
         window::configure_application_menu(app.handle())?;
         window::restore_main_window_state(app.handle())?;
 
@@ -204,7 +203,11 @@ pub fn run() {
                 .run_exclusive(backend.start_default(app_handle))
                 .await
             {
-                Ok(_config) => {}
+                // A release build's log sink exists only once the in-process server started.
+                Ok(_config) => {
+                    software_rendering::record_startup();
+                    appdir_working_directory::record_startup();
+                }
                 Err(error) => {
                     tracing::error!("failed to start Tauri desktop backend: {error}");
                     backend.record_error(error);
@@ -393,6 +396,9 @@ fn desktop_e2e_logging_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin
         .build()
 }
 
+mod appdir_working_directory;
+#[cfg(target_os = "linux")]
+pub use appdir_working_directory::enter_appdir_usr;
 mod backend;
 mod bridge;
 mod config;

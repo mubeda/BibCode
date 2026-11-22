@@ -31,8 +31,15 @@ fn main() {
         std::process::exit(code);
     }
     // The GUI only, still single-threaded: before any webview, whose web processes inherit it.
+    // SAFETY: no thread exists yet. The crash hook spawns none on Linux, and the open-url and
+    // CLI branches that start a runtime have exited above.
     #[cfg(target_os = "linux")]
-    bibcode_desktop_lib::apply_software_rendering_environment();
+    unsafe {
+        bibcode_desktop_lib::apply_software_rendering_environment()
+    };
+    // An extracted AppDir's `bibcode://` handler skips `AppRun`'s change to `usr` (#412).
+    #[cfg(target_os = "linux")]
+    bibcode_desktop_lib::enter_appdir_usr();
     bibcode_desktop_lib::run();
 }
 

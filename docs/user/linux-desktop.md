@@ -57,7 +57,13 @@ that launch. While either value is set, Settings shows the switch as disabled.
 
 With the setting on, BiBCode sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` and
 `WEBKIT_DISABLE_DMABUF_RENDERER=1` for itself before it opens a window. A
-value you exported yourself for either variable is kept as it is. Programs
+value you exported yourself for either variable is kept as it is, and Settings
+names it: the switch cannot change it until you remove it. Programs
 started from BiBCode's terminals inherit the two variables, so another BiBCode
 started from such a terminal also runs without GPU compositing until you start
 it from elsewhere.
+
+A `bibcode://` link starts BiBCode when it is closed, from the AppImage and
+from an extracted AppDir. Started from an AppDir without its `AppRun`, BiBCode
+moves to the AppDir's `usr` folder first, as `AppRun` does, because the bundled
+WebKitGTK looks for its helper programs from there.

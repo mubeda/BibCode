@@ -72,8 +72,8 @@ a `bibcode://` link starts the binary directly.
     keeps a service-unit launch alive (`relaunch.rs:15-18`,
     `relaunch.rs:39-58`).
   - The update restart (`updates.rs:931-935`) sets that flag and calls
-    `app.restart()` on the main thread, which skips `RunEvent::Exit`, so
-    only Tauri's own spawn runs.
+    `app.restart()` from the async install command, off the main thread, so
+    it also reaches `RunEvent::Exit` (see decision 5).
   - Only the systemd path builds its own child command (`relaunch.rs:52-58`).
 - Child processes inherit the desktop process environment, with
   exceptions. Terminals, providers, Git and other user-facing commands go
@@ -184,7 +184,9 @@ process:
   - when BiBCode set either variable.
     It removes those variables from the command, spawns it and exits, as the
     systemd path already does. Otherwise it returns and Tauri's own restart
-    runs unchanged.
+    runs unchanged. On both paths a WebKit variable the user exported is set
+    on the command again after the AppImage child filter, which drops any
+    value naming the AppDir (`relaunch_overrides`).
 - If that spawn fails, the warning is logged and Tauri's restart runs. The
   new process then inherits the variables and stays in software rendering,
   which fails safe.
@@ -237,8 +239,11 @@ not touch.
 - `main` calls the Linux-only apply step after the open-url and CLI
   branches and immediately before `run()`. The crash hook is still first,
   the process is still single-threaded, and the CLI paths, which create no
-  webview, skip the file read. The result goes into a `OnceLock`, and
-  `setup` logs it with `tracing` beside `shell_path_hydration.record()`.
+  webview, skip the file read. The apply step is an `unsafe fn` whose
+  precondition is that single thread, and `main` states why it holds. The
+  result goes into a `OnceLock`, logged with `tracing` once the in-process
+  server has started, because a release build's log sink exists only from
+  then.
 - Bridge: `getLinuxSoftwareRendering()` and
   `setLinuxSoftwareRendering(enabled)` return
   `{ enabled, override, gpuCompositingDisabled, restartApplies }`:
@@ -259,9 +264,12 @@ not touch.
   `isLinuxPlatform(navigator.platform)` and the bridge has the methods.
   - The switch is labelled "Disable GPU compositing". One line says what
     it is for and that the CPU then renders the window.
-  - A status line says whether GPU compositing is off for this session,
-    from `gpuCompositingDisabled`, so a user's `=0` export never shows as
-    off.
+  - A status line says what this launch asked WebKit for, from
+    `gpuCompositingDisabled` (either variable present and not `0`). It cannot
+    say what WebKit decided: GTK can still disable GL on its own.
+  - `userVariables` lists the WebKit variables the user exported. The row
+    names them and says the switch cannot change them until they are
+    removed.
   - When `override` is set, the switch is disabled and the row names
     `BIBCODE_SOFTWARE_RENDERING` as the reason.
   - When `restartApplies` is true, the row says a restart is needed and
@@ -281,29 +289,69 @@ reads the variables from the environment of the WebKit child processes
 The Linux lab runs the packaged build with the Profiler on and records
 these cases:
 
-| Case                                                    | What is checked                                                                          |
-| ------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Setting on, cold start                                  | Both variables are set in the WebKit children, and the app renders                       |
-| Setting off (default), cold start                       | Neither variable is set                                                                  |
-| On to off through "Restart now"                         | After the restart, the WebKit children of the new process lack both variables            |
-| Cold start through the generated handler's `Exec` line  | With the setting on, both variables are set                                              |
-| User exported `WEBKIT_DISABLE_COMPOSITING_MODE=0`       | The value is kept, the other variable is set, and the UI does not say compositing is off |
-| Override `=0` with the setting on, and `=1` with it off | The override wins                                                                        |
-| Malformed `desktop-settings.json`                       | Off, with a log line, and the other settings survive the next write                      |
-| Write failure (read-only state directory)               | Settings shows the error and changes nothing                                             |
+| Case                                                    | What is checked                                                               |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Setting on, cold start                                  | Both variables are set in the WebKit children, and the app renders            |
+| Setting off (default), cold start                       | Neither variable is set                                                       |
+| On to off through "Restart now"                         | After the restart, the WebKit children of the new process lack both variables |
+| Cold start through the generated handler's `Exec` line  | With the setting on, both variables are set                                   |
+| User exported `WEBKIT_DISABLE_COMPOSITING_MODE=0`       | The value is kept, the other is set, and the row names the exported one       |
+| Override `=0` with the setting on, and `=1` with it off | The override wins                                                             |
+| Malformed `desktop-settings.json`                       | Off, with a log line; saving refuses until the file is valid JSON             |
+| Valid JSON with a bad value or an unknown key           | Saving the setting changes only `linuxSoftwareRendering`                      |
+| Write failure (read-only state directory)               | Settings shows the error and changes nothing                                  |
 
 Unit tests cover the decision function, the decoding of the key, both
 settings loss cases, and the Linux-only UI states. Whether the GPU hang
 itself stops on the affected machine can only be shown there, by the 20
 launches and the 24-hour run named in #411.
 
-Found while verifying, and not changed here: from an extracted AppDir, the
-binary started from any folder other than its `usr` folder aborts before the
-first window, because the bundled WebKitGTK finds its helper processes
-relative to the working directory. The generated `bibcode://` handler of an
-extracted AppDir starts the binary that way, so that cold-start route fails
-with or without this setting. A mounted AppImage's handler starts the
-AppImage, whose `AppRun` changes to `usr` first.
+## Cold start from an extracted AppDir (#412)
+
+The AppImage bundler rewrites the `/usr` prefix in the bundled
+`libwebkit2gtk-4.1.so.0` to `././`, so WebKit looks for
+`././/lib/<triple>/webkit2gtk-4.1/WebKitNetworkProcess` and its injected
+bundle relative to the working folder. `AppRun` changes to `<AppDir>/usr`
+before it starts the binary. The `bibcode://` handler that
+`tauri-plugin-deep-link` writes for an extracted AppDir starts
+`usr/bin/bibcode-desktop` directly, so from the home folder the process
+aborts with "Unable to spawn a new child process" before any window. From `/`
+it can look fine on a host with its own WebKitGTK, because the rewritten path
+then resolves to the system's helpers under `/lib/<triple>`: the wrong
+version. A mounted AppImage's handler starts the AppImage, whose `AppRun`
+changes folder, so that route works.
+
+Measured in the lab: under `AppRun` the desktop process's working folder is
+`<AppDir>/usr`, whatever folder it was started from. The handler route lacks
+the GTK hook's variables (`GSETTINGS_SCHEMA_DIR`, `GDK_PIXBUF_MODULE_FILE`,
+`GIO_EXTRA_MODULES`, `GTK_EXE_PREFIX`, `LD_LIBRARY_PATH` and others); the
+window renders without them.
+
+Fix: `main`, after the software-rendering step and before `run()`, changes the
+working folder to `<AppDir>/usr` when the executable is
+`<AppDir>/usr/bin/<name>` next to an `AppRun`. A pure function of the
+executable path decides it. A system install (`/usr/bin`, no `AppRun`) keeps
+its folder. Child processes then start from the same folder as under
+`AppRun`, so terminals and providers see no change from the menu route.
+
+Alternatives:
+
+- **`WEBKIT_EXEC_PATH` and `WEBKIT_INJECTED_BUNDLE_PATH` from the
+  executable's location.** Rejected: the release WebKitGTK reads them only in
+  developer builds. Set to the bundled folders, the lab start from the home
+  folder still aborted with the same relative path.
+- **Re-execute through `<AppDir>/AppRun`.** It would also give the handler
+  route the GTK hook's variables. Rejected for now: it runs the launcher hooks
+  a second time on every link start (including a D-Bus colour-scheme query
+  with a one-second timeout), needs a loop guard, and no missing variable has
+  shown a defect. Revisit if one does.
+- **Rewrite the handler's `Exec` line to `AppRun`, or add `Path=`.** Rejected:
+  the deep-link plugin rewrites the file on every start, so BiBCode would have
+  to patch it after each registration and race the plugin.
+- **Stop the bundler's path rewrite.** Not in BiBCode's control.
+
+The remaining difference from the menu route is the GTK hook's variables. It
+is a documented residual.
 
 ## Not changed
 
