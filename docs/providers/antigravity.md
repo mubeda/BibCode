@@ -1,7 +1,7 @@
 # Antigravity
 
 Antigravity is a **Preview** provider and is disabled by default. Turn it on in
-**Settings → Agents** when you want it. Until then BiBCode does not probe the CLI
+**Settings → Providers** when you want it. Until then BiBCode does not probe the CLI
 and shows no Antigravity entry in the chat or terminal menus.
 
 BiBCode offers two ways to use it:
@@ -27,7 +27,7 @@ and tell you to sign in first.
 
 ## Settings
 
-Enable the Antigravity card in **Settings → Agents** and, if `agy` is not on the
+Enable the Antigravity card in **Settings → Providers** and, if `agy` is not on the
 server's `PATH`, set **Binary path**. The default is `agy`.
 
 The IDE has shipped a launcher that is also named `agy`. If an old launcher comes
@@ -72,7 +72,7 @@ an Antigravity Terminal once before the first chat.
 
 ## Usage in the status bar
 
-Turn on **Antigravity usage** in **Settings → Status bar** to see the five-hour
+Turn on **Antigravity usage** in the status bar settings to see the five-hour
 and weekly limits the CLI reports, for each model group, with their reset times.
 BiBCode reads them with `agy -p "/usage"`, which sends no prompt, at most every
 five minutes; the refresh button reads at once. It needs CLI version 1.1.11 or
