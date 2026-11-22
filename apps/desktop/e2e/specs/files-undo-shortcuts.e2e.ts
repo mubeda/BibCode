@@ -1,10 +1,15 @@
 // @effect-diagnostics nodeBuiltinImport:off - Packaged UI tests write fixture files, record evidence and send native input.
 // @effect-diagnostics globalTimers:off - The spec waits out the editors' history grouping delay.
+// @effect-diagnostics globalDate:off - Preview waits run on timers while WebDriver cannot see the window.
+// @effect-diagnostics globalFetch:off - The page reports the preview to the spec while WebDriver cannot.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
+import * as NodeHttp from "node:http";
+import type * as NodeNet from "node:net";
 import * as NodePath from "node:path";
 
 import { desktopUiPlatform } from "../support/app-lifecycle.ts";
+import { refreshDesktopUiDocument } from "../support/document-navigation.ts";
 import { openCenterTerminal } from "../support/terminal-input.ts";
 import { desktopUiFixture } from "../support/test-project.ts";
 import {
@@ -934,10 +939,13 @@ async function recordTerminalChord(sent: Chord = "primary+z"): Promise<void> {
   }
 }
 
-/** Clicks the screen point under page coordinates `point` of the main window, as a person does. */
-async function nativeClickAtPagePoint(point: { x: number; y: number }): Promise<void> {
+/** The screen point under page coordinates `point` of the main window. */
+async function screenPointOf(point: {
+  x: number;
+  y: number;
+}): Promise<{ x: number; y: number; scale: number }> {
   // The window's content origin on screen: the frame's position plus its title bar and borders.
-  const screen = await browser.execute(
+  return browser.execute(
     (x: number, y: number) => {
       const border = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
       return {
@@ -949,6 +957,10 @@ async function nativeClickAtPagePoint(point: { x: number; y: number }): Promise<
     point.x,
     point.y,
   );
+}
+
+/** Clicks a screen point from `screenPointOf`, as a person does. */
+function nativeClickAtScreen(screen: { x: number; y: number; scale: number }): void {
   const x = Math.round(screen.x);
   const y = Math.round(screen.y);
   if (platform === "mac") {
@@ -1017,19 +1029,262 @@ async function measureLinkField(path: InputPath): Promise<void> {
   expect({ fieldUndone, files: filesAfter }).toEqual({ fieldUndone: true, files: filesBefore });
 }
 
+// The probe page's field colour, which its native screenshot must show.
+const previewPaint = [255, 0, 170] as const;
+
 // A page for the preview webview: it remembers the longest value its field held, and Return
 // navigates to a sibling page whose name carries the field's value and that peak, which the
-// preview's address bar shows whether or not that page exists.
+// preview's state events report whether or not that page exists.
 const previewProbePage = `<!doctype html>
 <html><head><meta charset="utf-8"><title>Preview probe</title>
 <script>let peak = "";</script></head>
 <body style="margin:0">
-<input aria-label="Preview probe" autofocus style="box-sizing:border-box;width:100vw;height:100vh;border:0;font-size:32px"
+<input aria-label="Preview probe" autofocus style="box-sizing:border-box;width:100vw;height:100vh;border:0;font-size:32px;background:rgb(${previewPaint.join(",")})"
   oninput="if (this.value.length > peak.length) peak = this.value"
   onkeydown="if (event.key === 'Enter') location.href = new URL('echo-' + encodeURIComponent(this.value) + '-peak-' + encodeURIComponent(peak) + '.html', location.href).href">
 </body></html>
 <!-- Hello world -->
 `;
+
+interface TauriTestGlobal {
+  readonly core: { invoke: (command: string, args: Record<string, unknown>) => Promise<unknown> };
+  readonly event: {
+    listen: (
+      name: string,
+      listener: (event: {
+        payload: { tabId: string; state: { navStatus: { kind: string; url?: string } } };
+      }) => void,
+    ) => Promise<() => void>;
+  };
+}
+
+/** What the main page reports about the preview while WebDriver cannot see the window. */
+interface PreviewReport {
+  readonly kind: "painted" | "echo" | "closed";
+  readonly url?: string;
+  /** The native screenshot of the loaded page. */
+  readonly path?: string;
+  readonly error?: string;
+}
+
+/**
+ * A local endpoint for the main page's preview reports. While the preview's child webview shares
+ * the main window, the embedded WebDriver finds no window (Tauri's `webview_windows` leaves out a
+ * window with two webviews), so nothing may call WebDriver until the page closed that webview.
+ */
+async function startPreviewReports() {
+  const reports: PreviewReport[] = [];
+  const server = NodeHttp.createServer((request, response) => {
+    const report = new URL(request.url ?? "/", "http://127.0.0.1").searchParams.get("report");
+    if (report) reports.push(JSON.parse(report) as PreviewReport);
+    response.writeHead(204, { "access-control-allow-origin": "*" });
+    response.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as NodeNet.AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}/`,
+    /** The first report of `kind`, waiting with timers only: WebDriver may be blind. */
+    async next(kind: PreviewReport["kind"], timeoutMs: number): Promise<PreviewReport | undefined> {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const found = reports.find((report) => report.kind === kind);
+        if (found) return found;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      return undefined;
+    },
+    close: () => server.close(),
+  };
+}
+
+/**
+ * Arms the main page before "Open file in preview browser": once `fileName` loads it takes the
+ * preview's native screenshot, then waits for an `echo-` page when `untilEcho`, and closes the
+ * preview's native webview, reporting each step to `reportUrl`. It gives up after 60 s.
+ */
+async function armPreviewObserver(
+  fileName: string,
+  reportUrl: string,
+  untilEcho: boolean,
+): Promise<void> {
+  await browser.execute(
+    async (name: string, url: string, echo: boolean) => {
+      const tauri = (window as unknown as { __TAURI__: TauriTestGlobal }).__TAURI__;
+      const report = (value: PreviewReport) =>
+        void fetch(`${url}?report=${encodeURIComponent(JSON.stringify(value))}`, {
+          mode: "no-cors",
+        }).catch(() => undefined);
+      let tabId: string | null = null;
+      let painted = false;
+      let closed = false;
+      let unlisten = () => {};
+      const close = (reason: string) => {
+        if (closed) return;
+        closed = true;
+        unlisten();
+        if (tabId === null) {
+          report({ kind: "closed", error: `${reason}: no preview opened` });
+          return;
+        }
+        tauri.core.invoke("desktop_preview_close_tab", { tabId }).then(
+          () => report(reason === "done" ? { kind: "closed" } : { kind: "closed", error: reason }),
+          (error) => report({ kind: "closed", error: `${reason}: ${String(error)}` }),
+        );
+      };
+      unlisten = await tauri.event.listen("preview://state", ({ payload }) => {
+        if (closed) return;
+        const nav = payload.state.navStatus;
+        const page = decodeURIComponent(nav.url ?? "");
+        tabId = payload.tabId;
+        if (!painted && nav.kind === "Success" && page.includes(name)) {
+          painted = true;
+          tauri.core.invoke("desktop_preview_capture_screenshot", { tabId }).then(
+            (shot) => {
+              report({ kind: "painted", url: page, path: (shot as { path: string }).path });
+              if (!echo) close("done");
+            },
+            (error) => {
+              report({ kind: "painted", error: String(error) });
+              close("no screenshot");
+            },
+          );
+        }
+        if (echo && page.includes("echo-")) {
+          report({ kind: "echo", url: page });
+          close("done");
+        }
+      });
+      setTimeout(() => close("timeout"), 60_000);
+    },
+    fileName,
+    reportUrl,
+    untilEcho,
+  );
+}
+
+/** Waits for the page to close the preview, then until WebDriver sees the window again. */
+async function awaitPreviewClosed(
+  reports: Awaited<ReturnType<typeof startPreviewReports>>,
+): Promise<PreviewReport | undefined> {
+  const closed = await reports.next("closed", 70_000);
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    try {
+      await browser.execute(() => true);
+      return closed;
+    } catch (error) {
+      if (Date.now() > deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+}
+
+interface PreviewPaint {
+  /** The share of the capture in the probe page's colour. */
+  readonly share: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/**
+ * Reads a preview screenshot: only a painted page shows the probe page's colour, so a webview that
+ * never loaded or stayed blank scores near zero.
+ */
+async function readPreviewPaint(path: string | undefined): Promise<PreviewPaint> {
+  if (!path || !NodeFS.existsSync(path)) return { share: 0, width: 0, height: 0 };
+  const png = NodeFS.readFileSync(path).toString("base64");
+  return browser.execute(
+    async (data: string, [red, green, blue]: readonly number[]) => {
+      const image = new Image();
+      image.src = `data:image/png;base64,${data}`;
+      await image.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = image.width;
+      canvas.height = image.height;
+      const context = canvas.getContext("2d");
+      const empty = { share: 0, width: canvas.width, height: canvas.height };
+      if (!context || canvas.width === 0 || canvas.height === 0) return empty;
+      context.drawImage(image, 0, 0);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let sampled = 0;
+      let painted = 0;
+      // Colour management can shift the capture a little, so the match is loose.
+      for (let index = 0; index < pixels.length; index += 4 * 16) {
+        sampled += 1;
+        if (
+          Math.abs(pixels[index]! - red!) < 40 &&
+          Math.abs(pixels[index + 1]! - green!) < 40 &&
+          Math.abs(pixels[index + 2]! - blue!) < 40
+        ) {
+          painted += 1;
+        }
+      }
+      return { share: painted / sampled, width: canvas.width, height: canvas.height };
+    },
+    png,
+    [...previewPaint],
+  );
+}
+
+/** The visible preview's page area, where the native webview sits, in page coordinates. */
+async function previewSlotRect(): Promise<{ width: number; height: number } | null> {
+  return browser.execute(() => {
+    const visible = [
+      ...document.querySelectorAll<HTMLElement>("[data-thread-key] > div.relative.flex-1"),
+    ].find((candidate) => candidate.getBoundingClientRect().height > 40);
+    const box = visible?.getBoundingClientRect();
+    return box ? { width: box.width, height: box.height } : null;
+  });
+}
+
+/**
+ * Whether the screenshot shows the page painted over the preview's whole slot: a webview never
+ * sized captures a pixel or two. The slot is measured after the close, which keeps the panel.
+ */
+async function checkPreviewPaint(
+  fileName: string,
+  painted: PreviewReport | undefined,
+): Promise<{ painted: boolean; sized: boolean }> {
+  const paint = await readPreviewPaint(painted?.path);
+  const slot = await previewSlotRect();
+  recordEvidence({ cell: "preview-paint", fileName, report: painted, paint, slot });
+  return {
+    painted: paint.share > 0.5,
+    sized: slot !== null && paint.width >= slot.width * 0.9 && paint.height >= slot.height * 0.9,
+  };
+}
+
+/**
+ * Leaves the preview for Files and reloads the page, whose preview bridge still holds the native
+ * webview the observer closed behind its back.
+ */
+async function leaveClosedPreview(): Promise<void> {
+  await openFilesSurface();
+  await refreshDesktopUiDocument();
+}
+
+async function measurePreviewPaint(): Promise<void> {
+  const fileName = await openFreshFile("source", "preview-paint", {
+    extension: "html",
+    content: previewProbePage,
+  });
+  const reports = await startPreviewReports();
+  try {
+    await armPreviewObserver(fileName, reports.url, false);
+    await browser.$('button[aria-label="Open file in preview browser"]').click();
+    const closed = await awaitPreviewClosed(reports);
+    const result = await checkPreviewPaint(fileName, await reports.next("painted", 5_000));
+    await leaveClosedPreview();
+    expect({ ...result, closed: closed?.error ?? "closed" }).toEqual({
+      painted: true,
+      sized: true,
+      closed: "closed",
+    });
+  } finally {
+    reports.close();
+  }
+}
 
 /**
  * Undo in the preview webview, the browser opened by "Open file in preview browser": the host's
@@ -1047,62 +1302,64 @@ async function measurePreviewFallback(path: InputPath): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 800));
   const filesBefore = await readState("source", fileName);
   expect(filesBefore.canUndo).toBe(true);
-  const open = browser.$('button[aria-label="Open file in preview browser"]');
-  await open.waitForDisplayed();
-  await open.click();
-  // The visible preview's address bar, which shows the page's file name.
-  const address = async () =>
-    browser.execute(() => {
-      const input = [
-        ...document.querySelectorAll<HTMLInputElement>('[class*="group/address"] input'),
-      ].find((candidate) => candidate.getBoundingClientRect().height > 0);
-      return input?.value ?? "";
-    });
-  await browser.waitUntil(async () => (await address()).includes(fileName), {
-    timeout: 30_000,
-    timeoutMsg: "The preview browser did not open the probe page.",
-  });
-  // Let the page load before it is clicked.
-  await new Promise((resolve) => setTimeout(resolve, 1_500));
-  // The preview webview takes focus only from a real click; the field fills the page.
-  const slot = await browser.execute(() => {
-    const candidates = [
-      ...document.querySelectorAll<HTMLElement>("[data-thread-key] > div.relative"),
-    ];
-    const visible = candidates.find((candidate) => candidate.getBoundingClientRect().height > 40);
-    const rect = visible?.getBoundingClientRect();
+  // The preview takes the Files surface's place; its field fills the page, so the surface's
+  // centre is in it. Measured now: WebDriver is blind while the preview is open.
+  const centre = await browser.execute((query: string) => {
+    const rect = [...document.querySelectorAll<HTMLElement>(query)]
+      .find((candidate) => candidate.getBoundingClientRect().height > 0)
+      ?.getBoundingClientRect();
     return rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null;
-  });
-  if (!slot) throw new Error("The preview browser's slot was not found.");
-  await nativeClickAtPagePoint(slot);
-  await new Promise((resolve) => setTimeout(resolve, 400));
-  typeNative("Undq");
-  await new Promise((resolve) => setTimeout(resolve, 800));
-  const sent = await sendChord(path, "primary+z", "undo");
-  await new Promise((resolve) => setTimeout(resolve, 800));
-  typeNativeReturn();
-  await browser.waitUntil(async () => (await address()).includes("echo-"), {
-    timeout: 15_000,
-    timeoutMsg: "The preview page never navigated on Return: typing did not reach it.",
-  });
-  const title = decodeURIComponent(await address());
-  await openFilesSurface();
-  const filesAfter = await readState("source", fileName);
-  const typed = title.toLowerCase().includes("-peak-undq");
-  const undone = title.toLowerCase().includes("echo--peak-");
-  recordEvidence({
-    cell: `preview-undo-${path}`,
-    passed: typed && undone && JSON.stringify(filesAfter) === JSON.stringify(filesBefore),
-    title,
-    filesBefore,
-    filesAfter,
-    sent,
-  });
-  expect({ typed, undone, files: filesAfter }).toEqual({
-    typed: true,
-    undone: true,
-    files: filesBefore,
-  });
+  }, fileViewSelector);
+  if (!centre) throw new Error("The Files surface was not found.");
+  const click = await screenPointOf(centre);
+  const reports = await startPreviewReports();
+  try {
+    await armPreviewObserver(fileName, reports.url, true);
+    await browser.$('button[aria-label="Open file in preview browser"]').click();
+    // No WebDriver from here until the observer closed the preview.
+    const painted = await reports.next("painted", 30_000);
+    let sent: Awaited<ReturnType<typeof sendChord>> | null = null;
+    if (painted?.path) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      nativeClickAtScreen(click);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      typeNative("Undq");
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      sent = await sendChord(path, "primary+z", "undo");
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      typeNativeReturn();
+    }
+    const closed = await awaitPreviewClosed(reports);
+    const paint = await checkPreviewPaint(fileName, painted);
+    const title = (await reports.next("echo", 0))?.url ?? "";
+    await openFilesSurface();
+    const filesAfter = await readState("source", fileName);
+    await refreshDesktopUiDocument();
+    const typed = title.toLowerCase().includes("-peak-undq");
+    const undone = title.toLowerCase().includes("echo--peak-");
+    recordEvidence({
+      cell: `preview-undo-${path}`,
+      passed:
+        paint.painted &&
+        typed &&
+        undone &&
+        JSON.stringify(filesAfter) === JSON.stringify(filesBefore),
+      title,
+      closed,
+      filesBefore,
+      filesAfter,
+      sent,
+    });
+    expect({ ...paint, typed, undone, files: filesAfter }).toEqual({
+      painted: true,
+      sized: true,
+      typed: true,
+      undone: true,
+      files: filesBefore,
+    });
+  } finally {
+    reports.close();
+  }
 }
 
 describe("packaged Files undo and redo (#398)", () => {
@@ -1140,6 +1397,10 @@ describe("packaged Files undo and redo (#398)", () => {
 
   it("driver: the undo chord still undoes in the chat composer", async () => {
     await measureTextField("composer", "driver");
+  });
+
+  it("driver: the preview browser paints a local HTML page (#417)", async () => {
+    await measurePreviewPaint();
   });
 
   describe("native input (BIBCODE_E2E_NATIVE_INPUT=1)", function () {
@@ -1224,9 +1485,9 @@ describe("packaged Files undo and redo (#398)", () => {
         if (path === "menu" && platform === "linux") this.skip();
         await measureLinkField(path);
       });
-      // Pending: the probe page never reported on macOS or Windows. The server serves a local
-      // .html with `sandbox allow-scripts` (an opaque origin), where the page's sessionStorage
-      // threw; the page now keeps its peak in memory, which no packaged run has checked yet.
+      // Pending (#417): the preview now opens, loads and paints (the driver cell above checks it),
+      // but on macOS keys typed after the native click never reached its page, so these cells
+      // cannot measure undo there yet.
       it.skip(`${path}: undo in the preview browser stays in its page`, async function () {
         if (path === "menu" && platform === "linux") this.skip();
         await measurePreviewFallback(path);

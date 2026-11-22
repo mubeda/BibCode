@@ -10,7 +10,9 @@
           "webviews": ["main"],
           "permissions": [
             "allow-desktop-bridge",
+            "allow-desktop-preview",
             "core:default",
+            "deep-link:default",
             "wdio:default",
             "allow-desktop-e2e-lifecycle"
           ]
