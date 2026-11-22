@@ -21,9 +21,10 @@ Chat needs CLI version 1.5.4 or later. The terminal works with older versions.
 
 ## Sign in
 
-Sign in inside the CLI itself, by running `agy`. BiBCode never handles your
-credentials. If you are not signed in, Settings and the chat report that state
-and tell you to sign in first.
+Sign in inside the CLI itself: run `agy` in a terminal, for example in an
+Antigravity Terminal. On a server without a browser, run `agy acp --login`
+instead. BiBCode never handles your credentials. If you are not signed in,
+Settings and the chat report that state and tell you to sign in first.
 
 ## Settings
 
@@ -98,8 +99,12 @@ hand, and otherwise at most every five minutes.
 
 ## Why it is Preview
 
-Google was not asked about its terms of use for third-party hosts, so
-Antigravity ships as Preview. BiBCode runs your own unmodified CLI with your own
-sign-in. Read Google's [Antigravity FAQ](https://antigravity.google/docs/faq) and
-the [ACP page](https://antigravity.google/docs/cli/acp) before relying on it, and
-check which plan covers your use.
+Google's position on using the CLI from another application is not settled, and
+Google was not asked about it for BiBCode. The
+[Antigravity FAQ](https://antigravity.google/docs/faq) says that tools that wrap
+`agy` are not supported on consumer plans. A reply written on Google's behalf in
+its forum says the unmodified official ACP server is supported for interactive
+development by one person, which is how BiBCode uses it: your own unmodified CLI
+with your own sign-in. These two statements have not been reconciled. Read the
+FAQ and the [ACP page](https://antigravity.google/docs/cli/acp), check which plan
+covers your use, and decide for yourself before relying on it.
