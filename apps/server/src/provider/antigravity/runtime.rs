@@ -187,6 +187,9 @@ struct RuntimeInner {
     /// lock, and cancel and mode changes take it too, so none can slip between them. It is never
     /// held across a request to the CLI or a barrier.
     gate: Mutex<Gate>,
+    /// Held by each mode confirmation from reading its target to settling its answer, so mode
+    /// writes reach the CLI one at a time and each writes the latest target.
+    mode_writes: Mutex<()>,
     config_options: Mutex<Vec<Value>>,
     legacy_models: AtomicBool,
     /// The start failed because the connection to the child broke, not on a refusal.
@@ -219,8 +222,10 @@ impl Gate {
         mode_for(&self.runtime_mode, &self.interaction_mode)
     }
 
+    /// Also a new generation: a confirmation in flight can no longer clear it.
     fn unconfirm(&mut self) {
         self.mode_unconfirmed = true;
+        self.mode_generation += 1;
     }
 
     /// The approvals of a turn that ended or was cancelled; they can never answer a later one.
@@ -269,6 +274,7 @@ impl AntigravitySessionRuntime {
                 options,
                 connection,
                 gate: Mutex::new(gate),
+                mode_writes: Mutex::new(()),
                 config_options: Mutex::new(Vec::new()),
                 legacy_models: AtomicBool::new(false),
                 start_lost_connection: AtomicBool::new(false),
@@ -664,7 +670,6 @@ impl AntigravitySessionRuntime {
             if let Some(mode) = interaction_mode {
                 gate.interaction_mode = mode.to_owned();
             }
-            gate.mode_generation += 1;
             gate.unconfirm();
         }
         self.confirm_mode().await
@@ -673,8 +678,14 @@ impl AntigravitySessionRuntime {
     /// Writes the mode the thread needs and confirms it from the answer, but only if no mode
     /// change happened meanwhile; otherwise the mode stays unconfirmed for the newer write.
     async fn confirm_mode(&self) -> Result<(), AntigravityRuntimeError> {
+        let _serial = self.inner.mode_writes.lock().await;
         let (target, generation) = {
             let gate = self.inner.gate.lock().await;
+            // A confirmation that held the lock before this one already confirmed the latest
+            // setting.
+            if !gate.mode_unconfirmed {
+                return Ok(());
+            }
             (gate.mode_target(), gate.mode_generation)
         };
         let result = self.apply_mode(target).await;
