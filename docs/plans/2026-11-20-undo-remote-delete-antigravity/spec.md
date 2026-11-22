@@ -79,7 +79,7 @@ Source: https://github.com/mubeda/BibCode/issues/397, https://github.com/mubeda/
 - GIVEN an older `agy` or a peer that answers another protocol version, THEN the chat start fails with a message that names the required version, and the terminal stays available.
 - GIVEN the CLI is not signed in (error `-32000`, "Authentication required"), THEN the thread shows how to sign in (`agy`, or `agy acp --login`); BiBCode never signs the user in and never reads Google credentials.
 - GIVEN a thread with a saved session, WHEN the server restarts, THEN the driver reopens it with `session/resume`, else `session/load`, else a new session, and never replays an already sent prompt.
-- GIVEN approval-required mode, THEN the session runs in the advertised `default` mode and tool requests reach the user; when `default` is not advertised the chat start is refused. Full access and plan mode follow the design note.
+- GIVEN approval-required mode, THEN the session runs in the advertised `default` mode and tool requests reach the user; when `default` is not advertised the chat start is refused. Full access runs the session in the CLI's own `auto` mode and auto-accept-edits in `accept-edits`, each confirmed by the CLI. BiBCode never answers a permission request by itself in any mode: a request that arrives is shown to the user. Plan mode follows the design note.
 - The models and thinking levels offered come from the session's advertised options, never from a hard-coded list.
 - The Settings card marks the chat as Preview. "Open in Antigravity" (`agy --goto`) is unchanged.
 
