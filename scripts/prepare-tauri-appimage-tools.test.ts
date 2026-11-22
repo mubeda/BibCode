@@ -99,6 +99,9 @@ describe("prepare Tauri AppImage tools", () => {
         repositoryRoot,
         platform: "linux",
         ...(cargoTargetDirectory === undefined ? {} : { cargoTargetDirectory }),
+        cargoMetadataTargetDirectory: () => {
+          throw new Error("Cargo is asked only for a set CARGO_TARGET_DIR");
+        },
         plugin: FIXTURE_PIN,
         gstreamerPlugin: FIXTURE_PIN,
         download: async () => FIXTURE_PLUGIN,
@@ -111,38 +114,51 @@ describe("prepare Tauri AppImage tools", () => {
     }
   });
 
+  // Tauri runs Cargo in apps/desktop/src-tauri and reads `<cargo metadata target_directory>/.tauri`.
   it.each([
-    ["an absolute", "absolute"],
-    ["a relative", "out/cargo"],
-  ])("writes the tools where Tauri reads them for %s CARGO_TARGET_DIR %s", async (_name, value) => {
-    const repositoryRoot = makeRepositoryRoot();
-    let cargoTargetDirectory = value;
-    if (value === "absolute") {
-      // A unique directory: the cleanup must never delete a real build folder.
-      cargoTargetDirectory = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "bibcode-cargo-target-"),
+    ["an absolute", "absolute", undefined],
+    ["a relative", "out/cargo", undefined],
+    ["a relative", "out/cargo", "from-cargo"],
+  ])(
+    "writes the tools where Tauri reads them for %s CARGO_TARGET_DIR %s (Cargo reports %s)",
+    async (_name, value, reported) => {
+      const repositoryRoot = makeRepositoryRoot();
+      const cargoWorkingDirectory = NodePath.join(repositoryRoot, "apps/desktop/src-tauri");
+      let cargoTargetDirectory = value;
+      if (value === "absolute") {
+        cargoTargetDirectory = NodeFS.mkdtempSync(
+          NodePath.join(NodeOS.tmpdir(), "bibcode-cargo-target-"),
+        );
+        temporaryDirectories.push(cargoTargetDirectory);
+      }
+      const reportedDirectory =
+        reported === undefined ? undefined : NodePath.join(repositoryRoot, reported);
+      const expectedDirectory = NodePath.join(
+        reportedDirectory ?? NodePath.resolve(cargoWorkingDirectory, cargoTargetDirectory),
+        ".tauri",
       );
-      temporaryDirectories.push(cargoTargetDirectory);
-    }
-    const expectedDirectory = NodePath.join(
-      NodePath.resolve(repositoryRoot, cargoTargetDirectory),
-      ".tauri",
-    );
+      const asked: Array<string> = [];
 
-    const result = await prepareTauriAppImageTools({
-      repositoryRoot,
-      platform: "linux",
-      cargoTargetDirectory,
-      plugin: FIXTURE_PIN,
-      gstreamerPlugin: FIXTURE_PIN,
-      download: async () => FIXTURE_PLUGIN,
-    });
+      const result = await prepareTauriAppImageTools({
+        repositoryRoot,
+        platform: "linux",
+        cargoTargetDirectory,
+        cargoMetadataTargetDirectory: (directory) => {
+          asked.push(directory);
+          return reportedDirectory;
+        },
+        plugin: FIXTURE_PIN,
+        gstreamerPlugin: FIXTURE_PIN,
+        download: async () => FIXTURE_PLUGIN,
+      });
 
-    expect(result).toMatchObject({ status: "prepared", toolsDirectory: expectedDirectory });
-    expect(NodeFS.existsSync(NodePath.join(expectedDirectory, "linuxdeploy-plugin-gtk.sh"))).toBe(
-      true,
-    );
-  });
+      expect(asked).toEqual([cargoWorkingDirectory]);
+      expect(result).toMatchObject({ status: "prepared", toolsDirectory: expectedDirectory });
+      expect(NodeFS.existsSync(NodePath.join(expectedDirectory, "linuxdeploy-plugin-gtk.sh"))).toBe(
+        true,
+      );
+    },
+  );
 
   it("downloads, verifies, and publishes every executable tool", async () => {
     const repositoryRoot = makeRepositoryRoot();
