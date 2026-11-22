@@ -1570,7 +1570,14 @@ export function prepareDesktopUiTestContext(
   }
   if (!realProviders) {
     environment.PATH = `${shimDirectory}${NodePath.delimiter}${environment.PATH ?? ""}`;
-    if (!isWindows) pinShimsInLoginShellPath(fixtureUserHomePath, shimDirectory);
+    if (!isWindows) {
+      // Every shell start-up directory points into the fixture HOME, so no host profile runs.
+      environment.ZDOTDIR = fixtureUserHomePath;
+      environment.XDG_CONFIG_HOME = NodePath.join(fixtureUserHomePath, ".config");
+      delete environment.ENV;
+      delete environment.BASH_ENV;
+      pinShimsInLoginShellPath(fixtureUserHomePath, shimDirectory);
+    }
   }
   environment.RUST_LOG ??= "bibcode=debug";
   environment.BIBCODE_LOG = `${environment.BIBCODE_LOG ?? environment.RUST_LOG},bibcode::desktop_e2e=info`;
@@ -1622,10 +1629,6 @@ export function deferDesktopUiTestContextCleanupUntilExit(
 }
 
 /**
- * Why the run reached no fixture tool, or null. The app probes codegraph at startup; a log
- * without the fixture's version probe means a real codegraph on PATH answered it instead.
- */
-/**
  * The packaged app puts its login shell's PATH ahead of the one it inherited, and a system profile
  * (macOS `path_helper`, a Linux `/etc/profile`) can move real tool directories ahead of the shims.
  * The fixture HOME's own profiles run last, so they put the shims back in front.
@@ -1641,6 +1644,10 @@ function pinShimsInLoginShellPath(home: string, shimDirectory: string): void {
   NodeFS.writeFileSync(NodePath.join(fish, "config.fish"), `set -gx PATH ${quoted} $PATH\n`);
 }
 
+/**
+ * Why the run reached no fixture tool, or null. The app probes codegraph at startup; a log
+ * without the fixture's version probe means a real codegraph on PATH answered it instead.
+ */
 export function fixtureToolProbeProblem(toolProbeLogPath: string): string | null {
   const log = NodeFS.existsSync(toolProbeLogPath)
     ? NodeFS.readFileSync(toolProbeLogPath, "utf8")

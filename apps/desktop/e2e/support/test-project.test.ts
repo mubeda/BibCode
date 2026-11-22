@@ -364,6 +364,14 @@ for (const shell of ["/bin/zsh", "/bin/bash"]) {
   it.runIf(!isNativeWindowsHost && NodeFS.existsSync(shell))(
     `keeps the fixture shims first in the PATH a ${NodePath.basename(shell)} login shell reports`,
     () => {
+      const hostProfiles = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "host-profiles-"));
+      hostTemporaryDirectories.push(hostProfiles);
+      for (const profile of [".zshrc", ".zshenv", ".profile"]) {
+        NodeFS.writeFileSync(
+          NodePath.join(hostProfiles, profile),
+          'PATH="/opt/host-tools:$PATH"\n',
+        );
+      }
       const environment: NodeJS.ProcessEnv = {
         ...process.env,
         BIBCODE_E2E_PLATFORM: "linux",
@@ -371,6 +379,11 @@ for (const shell of ["/bin/zsh", "/bin/bash"]) {
         BIBCODE_E2E_ARTIFACT_DIR: undefined,
         BIBCODE_E2E_REAL_PROVIDERS: undefined,
         PATH: "/usr/bin:/bin",
+        // A host's own shell start-up directories, whose profiles put a real tool first.
+        ZDOTDIR: hostProfiles,
+        XDG_CONFIG_HOME: hostProfiles,
+        ENV: NodePath.join(hostProfiles, ".profile"),
+        BASH_ENV: NodePath.join(hostProfiles, ".profile"),
       };
       const context = prepareDesktopUiTestContext(environment);
       contexts.push(context);
