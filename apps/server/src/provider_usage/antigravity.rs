@@ -265,7 +265,8 @@ fn is_truncated(stream: &crate::process::supervised::SupervisedStreamOutput) -> 
 }
 
 fn executable_identity(executable: &Path) -> Option<VerifiedExecutable> {
-    let path = std::fs::canonicalize(executable).ok()?;
+    // Without Windows' `\\?\` prefix, which a `.cmd` launched through `cmd.exe` does not accept.
+    let path = crate::git::without_verbatim_prefix(std::fs::canonicalize(executable).ok()?);
     let metadata = std::fs::metadata(&path).ok()?;
     Some((path, metadata.modified().ok()?, metadata.len()))
 }
@@ -454,6 +455,16 @@ trait LenientKind: Sized {
     fn from_seq<'de, A: SeqAccess<'de>>(seq: A) -> Result<Option<Self>, A::Error> {
         skip_seq(seq).map(|()| None)
     }
+    fn from_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<Option<Self>, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+}
+
+impl LenientKind for UsageBucket {
+    fn from_map<'de, A: MapAccess<'de>>(map: A) -> Result<Option<Self>, A::Error> {
+        Self::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Some)
+    }
 }
 
 impl LenientKind for String {
@@ -470,9 +481,10 @@ impl LenientKind for f64 {
 
 impl LenientKind for Vec<UsageBucket> {
     fn from_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<Option<Self>, A::Error> {
+        // An entry that is not an object is skipped like a bucket with no usable field.
         let mut buckets = Vec::new();
-        while let Some(bucket) = seq.next_element()? {
-            buckets.push(bucket);
+        while let Some(Lenient(bucket)) = seq.next_element::<Lenient<UsageBucket>>()? {
+            buckets.extend(bucket);
         }
         Ok(Some(buckets))
     }
@@ -524,9 +536,8 @@ impl<'de, T: LenientKind> Deserialize<'de> for Lenient<T> {
                 T::from_seq(seq).map(Lenient)
             }
 
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-                Ok(Lenient(None))
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                T::from_map(map).map(Lenient)
             }
         }
 
@@ -802,6 +813,7 @@ mod tests {
             json!({"name": MARKER, "buckets": "none"}),
             json!({"buckets": {"id": "gemini-5h"}}),
             json!({"buckets": [{"id": 7, "window": ["5h"], "remaining_fraction": {"v": 1}}]}),
+            json!({"buckets": [7, "gemini-5h", null, [MARKER]]}),
         ] {
             let mut value = payload();
             value

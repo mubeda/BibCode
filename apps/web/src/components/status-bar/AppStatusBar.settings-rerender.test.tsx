@@ -190,6 +190,41 @@ describe("AppStatusBar client-settings subscription", () => {
     expect(harness.providerDerivationCount).toBe(1);
   });
 
+  it("shows and hides the Antigravity item when only its setting changes", async () => {
+    const start = DateTime.makeUnsafe("2026-07-22T12:00:00.000Z");
+    const usage = usageFixture(start);
+    const antigravityUsage: ServerProviderUsageResult = { ...usage, providers: [] };
+    const renderView = (showAntigravityUsage: boolean) => (
+      <AppStatusBarView
+        usage={usage}
+        antigravityUsage={antigravityUsage}
+        showAntigravityUsage={showAntigravityUsage}
+        diagnostics={{ diagnostics: null, queryError: null }}
+        localDiagnostics={null}
+        presentationNow={start}
+        terminalCount={0}
+        onRefresh={vi.fn()}
+      />
+    );
+    const shownProviders = () =>
+      harness.providerProps
+        .slice(-3)
+        .map((props) => (props.viewModel as { provider: string }).provider);
+
+    await act(async () => root.render(renderView(false)));
+    expect(
+      harness.providerProps.map((props) => (props.viewModel as { provider: string }).provider),
+    ).not.toContain("antigravity");
+    harness.providerProps.length = 0;
+    await act(async () => root.render(renderView(true)));
+    expect(shownProviders()).toContain("antigravity");
+    harness.providerProps.length = 0;
+    await act(async () => root.render(renderView(false)));
+    expect(
+      harness.providerProps.map((props) => (props.viewModel as { provider: string }).provider),
+    ).not.toContain("antigravity");
+  });
+
   it("rederives when the countdown label bucket or structural inputs change", async () => {
     const start = DateTime.makeUnsafe("2026-07-22T12:00:00.000Z");
     const sameBucket = DateTime.makeUnsafe("2026-07-22T12:00:30.000Z");
