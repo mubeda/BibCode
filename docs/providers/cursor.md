@@ -40,6 +40,13 @@ sent with a message naming it, as is a model the session does not offer.
 Older CLIs that advertise plain values and separate options keep working the
 same way.
 
+A Cursor turn that receives no update at all for five minutes, while it waits
+on neither the user nor a running tool, is cancelled on the CLI as Stop does and
+ends as failed with a message saying that Cursor stopped responding and to send
+the message again or check the Cursor CLI. A turn that keeps streaming text,
+thoughts or tool progress is never cut off, and the session takes the next
+message as usual.
+
 Cursor slash commands, skills, and agents are discovered from the server-side
 workspace environment. Skills include `.cursor/skills`, `.agents/skills`,
 `.claude/skills`, and `.codex/skills` in both the project and effective user home,
