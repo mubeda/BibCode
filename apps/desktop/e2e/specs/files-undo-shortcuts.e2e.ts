@@ -1022,11 +1022,11 @@ async function measureLinkField(path: InputPath): Promise<void> {
 // preview's address bar shows whether or not that page exists.
 const previewProbePage = `<!doctype html>
 <html><head><meta charset="utf-8"><title>Preview probe</title>
-<script>const key = "peak:" + location.pathname;</script></head>
+<script>let peak = "";</script></head>
 <body style="margin:0">
 <input aria-label="Preview probe" autofocus style="box-sizing:border-box;width:100vw;height:100vh;border:0;font-size:32px"
-  oninput="if (this.value.length > (sessionStorage.getItem(key) ?? '').length) sessionStorage.setItem(key, this.value)"
-  onkeydown="if (event.key === 'Enter') location.href = new URL('echo-' + encodeURIComponent(this.value) + '-peak-' + encodeURIComponent(sessionStorage.getItem(key) ?? '') + '.html', location.href).href">
+  oninput="if (this.value.length > peak.length) peak = this.value"
+  onkeydown="if (event.key === 'Enter') location.href = new URL('echo-' + encodeURIComponent(this.value) + '-peak-' + encodeURIComponent(peak) + '.html', location.href).href">
 </body></html>
 <!-- Hello world -->
 `;
@@ -1224,8 +1224,9 @@ describe("packaged Files undo and redo (#398)", () => {
         if (path === "menu" && platform === "linux") this.skip();
         await measureLinkField(path);
       });
-      // Pending: the probe page's field never reported typing from the preview webview on macOS
-      // or Windows (no title, no navigation), so nothing yet shows where its undo went.
+      // Pending: the probe page never reported on macOS or Windows. The server serves a local
+      // .html with `sandbox allow-scripts` (an opaque origin), where the page's sessionStorage
+      // threw; the page now keeps its peak in memory, which no packaged run has checked yet.
       it.skip(`${path}: undo in the preview browser stays in its page`, async function () {
         if (path === "menu" && platform === "linux") this.skip();
         await measurePreviewFallback(path);
