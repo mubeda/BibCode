@@ -964,6 +964,72 @@ async fn cursor_sends_only_advertised_plain_model_values() {
     peer_task.await.expect("peer");
 }
 
+/// Auto is the advertised `default[]` value, never the model the CLI remembers as current.
+#[tokio::test]
+async fn cursor_auto_selects_the_advertised_default_value() {
+    for auto in ["default", ""] {
+        auto_selects_the_advertised_default_value(auto).await;
+    }
+}
+
+async fn auto_selects_the_advertised_default_value(auto: &str) {
+    const NANO: &str = "gpt-5.4-nano[reasoning=medium]";
+    let (runtime, mut peer) = cursor_model_runtime(auto);
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": bracketed_model_options(NANO) }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "default[]" }))
+        .respond(json!({ "configOptions": bracketed_model_options("default[]") }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": NANO }))
+        .respond(json!({ "configOptions": bracketed_model_options(NANO) }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "default[]" }))
+        .respond(json!({ "configOptions": bracketed_model_options("default[]") }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+    let within = Duration::from_secs(5);
+
+    timeout(within, runtime.start())
+        .await
+        .unwrap()
+        .expect("start");
+    timeout(within, runtime.set_model("gpt-5.4-nano"))
+        .await
+        .unwrap()
+        .expect("switch away");
+    timeout(within, runtime.set_model("default"))
+        .await
+        .unwrap()
+        .expect("back to Auto");
+    peer_task.await.expect("peer");
+}
+
+/// A session that advertises no default value leaves Auto to Cursor, as before.
+#[tokio::test]
+async fn cursor_auto_without_an_advertised_default_is_left_to_cursor() {
+    let (runtime, mut peer) = cursor_model_runtime("default");
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new").respond(json!({
+        "sessionId": "s1",
+        "configOptions": [{
+            "id": "model", "category": "model", "type": "select", "currentValue": "gpt-5.4",
+            "options": [{ "value": "gpt-5.4" }, { "value": "gpt-5.5" }]
+        }]
+    }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+
+    timeout(Duration::from_secs(5), runtime.start())
+        .await
+        .unwrap()
+        .expect("start");
+    peer_task.await.expect("peer");
+}
+
 #[tokio::test]
 async fn cursor_refuses_an_unadvertised_launch_model_before_any_prompt() {
     let (runtime, mut peer) = cursor_model_runtime("gpt-5.4");

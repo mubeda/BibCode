@@ -30,8 +30,9 @@ use super::{
     },
     model::{
         acp_config_option_current_value, acp_model_descriptor, acp_model_values_are_bracketed,
-        resolve_acp_config_updates_with_baseline, resolve_acp_default_model_config,
-        resolve_advertised_model_value, resolve_bracketed_model_options,
+        advertised_auto_model_value, resolve_acp_config_updates_with_baseline,
+        resolve_acp_default_model_config, resolve_advertised_model_value,
+        resolve_bracketed_model_options,
     },
 };
 
@@ -365,15 +366,19 @@ impl CursorSessionRuntime {
         *self.inner.config_options.lock().await = config_options.clone();
         *self.inner.baseline_config_options.lock().await = config_options;
         *self.inner.mode_state.lock().await = response.get("modes").cloned();
-        if !self.inner.options.model.trim().is_empty()
-            && !self
-                .inner
-                .options
-                .model
-                .trim()
-                .eq_ignore_ascii_case("default")
-        {
-            self.set_model(&self.inner.options.model).await?;
+        let model = self.inner.options.model.trim();
+        // No model selected is Cursor's Auto as well.
+        if model.is_empty() || model.eq_ignore_ascii_case("default") {
+            // Auto is Cursor's advertised default value; without one it stays Cursor's choice.
+            let options = self.inner.config_options.lock().await.clone();
+            if acp_model_descriptor(&options).is_some_and(|descriptor| {
+                advertised_auto_model_value(descriptor)
+                    .is_some_and(|auto| descriptor.get("currentValue") != Some(&auto))
+            }) {
+                self.set_model("default").await?;
+            }
+        } else {
+            self.set_model(model).await?;
         }
         self.apply_mode().await?;
         self.emit("thread.started", None, None, json!({})).await;

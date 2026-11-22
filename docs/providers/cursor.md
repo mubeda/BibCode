@@ -38,7 +38,10 @@ that advertised value. An option that no advertised value of the model holds,
 which with these CLIs is any non-default option, is refused before the turn is
 sent with a message naming it, as is a model the session does not offer.
 Older CLIs that advertise plain values and separate options keep working the
-same way.
+same way. Auto, and a thread with no model selected, sends the session's
+advertised `default[...]` value, so it never runs the model the CLI last
+remembered; a session that advertises no default value leaves the choice to
+Cursor.
 
 A Cursor turn that receives no update at all for five minutes, while it waits
 on neither the user nor a running tool, is cancelled on the CLI as Stop does and

@@ -635,13 +635,16 @@ pub fn resolve_acp_default_model_config(options: &Value) -> Result<(String, Valu
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| "Cursor model config option is missing an id".to_owned())?;
-    let value = descriptor
-        .get("options")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|option| option.get("isDefault") == Some(&Value::Bool(true)))
-        .and_then(advertised_option_value)
+    let value = advertised_auto_model_value(descriptor)
+        .or_else(|| {
+            descriptor
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|option| option.get("isDefault") == Some(&Value::Bool(true)))
+                .and_then(advertised_option_value)
+        })
         .filter(|value| !value.is_null())
         .or_else(|| {
             descriptor
@@ -655,6 +658,16 @@ pub fn resolve_acp_default_model_config(options: &Value) -> Result<(String, Valu
             )
         })?;
     Ok((config_id, value))
+}
+
+/// Cursor's own Auto model as the session advertises it (`default[]` since 2026.11), so Auto never
+/// means the model the CLI last remembered as current.
+pub fn advertised_auto_model_value(descriptor: &Value) -> Option<Value> {
+    advertised_values(descriptor).into_iter().find(|value| {
+        value
+            .as_str()
+            .is_some_and(|value| resolve_acp_base_model_id(value) == "default")
+    })
 }
 
 /// The session's current value for an option it advertises, or its advertised default. Its
