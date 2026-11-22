@@ -3669,7 +3669,7 @@ done
     /// terminal launch alike when the legacy entry is off or absent (Antigravity's default).
     #[tokio::test]
     async fn an_antigravity_instance_without_enabled_is_off_for_every_launch() {
-        let sandbox = TestSandbox::new("antigravity-enabled-rule");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-enabled-rule");
         let binary = sandbox.executable_script("agy", "exit 0", "");
         let instance = json!({
             "driver": "antigravity",
@@ -3715,7 +3715,7 @@ done
     /// back to the legacy entry, while the typed settings (chat and terminal launches) read on.
     #[tokio::test]
     async fn a_custom_codex_instance_without_enabled_resolves_as_before() {
-        let sandbox = TestSandbox::new("codex-enabled-unchanged");
+        let sandbox = crate::test_support::TestSandbox::new("codex-enabled-unchanged");
         let binary = sandbox.executable_script("codex", "exit 0", "");
         let root = sandbox.path("settings");
         std::fs::create_dir_all(&root).expect("settings root");

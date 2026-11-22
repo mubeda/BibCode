@@ -365,6 +365,8 @@ impl ScratchDirectory {
     fn create() -> std::io::Result<Self> {
         // A random name, as the codebase names its temporary files: never two alike.
         let path = std::env::temp_dir().join(format!("bibcode-agy-usage-{}", uuid::Uuid::new_v4()));
+        // Only the Unix mode call mutates it.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

@@ -7467,6 +7467,7 @@ done
     }
 
     /// The published Antigravity row's sign-in status, message and probed model slugs.
+    #[cfg(unix)]
     async fn antigravity_reads(control: &NativeServerControl) -> (Value, Value, Vec<Value>) {
         let providers = control.providers.read().await;
         let row = providers
