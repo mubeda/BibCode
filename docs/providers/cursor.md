@@ -72,7 +72,8 @@ cancelled and BiBCode stops the Cursor process, as a requested stop rather than
 a crash, so nothing the old prompt still produces can reach the next message;
 the next message starts Cursor again and resumes the session. BiBCode also stops
 the process when Cursor does not take a prompt within 30 seconds; a prompt it
-did not read at all is sent again, one it may have partly read is not.
+did not read at all is sent again, one it may have partly read is not. A prompt
+you stopped is never sent again, even if Cursor never read it.
 
 Cursor slash commands, skills, and agents are discovered from the server-side
 workspace environment. Skills include `.cursor/skills`, `.agents/skills`,
