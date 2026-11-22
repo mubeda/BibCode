@@ -24,6 +24,7 @@ import {
 } from "react";
 
 import { GitManagerDisabledReasonButton } from "../GitManagerDisabledReasonButton";
+import { GUARD_CHECKOUT, GUARD_MERGE } from "../gitManagerGuardOperations";
 import { Input } from "~/components/ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { cn } from "~/lib/utils";
@@ -33,8 +34,10 @@ import {
   useGitManagerStore,
 } from "../../../gitManagerStore";
 import { groupBranches } from "./branchGrouping";
+import { remoteDeleteBlockedReason, splitRemoteBranchRef } from "./remoteBranchRef";
 
 const BRANCH_ROW_HEIGHT = 30;
+const EMPTY_REMOTES: ReadonlyArray<string> = Object.freeze([]);
 const BRANCH_LIST_STYLE: CSSProperties = Object.freeze({ height: "15rem" });
 const KNOWN_BLOCKED_CODES = new Set([
   "worktree-checked-out",
@@ -99,6 +102,8 @@ function branchRowPropsEqual(
     previous.onMergeInto === next.onMergeInto &&
     previous.onRenameBranch === next.onRenameBranch &&
     previous.onDeleteBranch === next.onDeleteBranch &&
+    previous.remoteDeleteDisabledReason === next.remoteDeleteDisabledReason &&
+    previous.onDeleteRemoteBranch === next.onDeleteRemoteBranch &&
     left.name === right.name &&
     left.tipSha === right.tipSha &&
     left.upstream === right.upstream &&
@@ -123,6 +128,9 @@ interface GitManagerBranchRowProps {
   readonly onMergeInto: (ref: GitManagerRefEntry) => void;
   readonly onRenameBranch: (ref: GitManagerRefEntry) => void;
   readonly onDeleteBranch: (ref: GitManagerRefEntry) => void;
+  /** Why a remote row's Delete is off; null when it is available or the row is local. */
+  readonly remoteDeleteDisabledReason: string | null;
+  readonly onDeleteRemoteBranch: ((ref: GitManagerRefEntry) => void) | undefined;
 }
 
 const GitManagerBranchRow = memo(function GitManagerBranchRow({
@@ -137,18 +145,24 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
   onMergeInto,
   onRenameBranch,
   onDeleteBranch,
+  remoteDeleteDisabledReason,
+  onDeleteRemoteBranch,
 }: GitManagerBranchRowProps) {
   const redirectPath =
     refEntry.worktreePath !== null && refEntry.worktreePath !== selectedWorktreeCwd
       ? refEntry.worktreePath
       : null;
   const unknownReason = refEntry.blocked.find((reason) => !KNOWN_BLOCKED_CODES.has(reason.code));
-  const checkoutBlock = refEntry.blocked.find(
-    (reason) =>
-      redirectPath === null &&
-      !(reason.operation === "branch-checkout" && reason.code === "dirty-working-tree"),
-  );
-  const blockedReason = unknownReason ?? checkoutBlock ?? null;
+  // Each row action reads its own reason. A dirty checkout is not blocked: the toolbar
+  // offers Stash or Bring for it.
+  const actionBlock = mergeMode
+    ? refEntry.blocked.find((reason) => reason.operation === GUARD_MERGE)
+    : redirectPath === null
+      ? refEntry.blocked.find(
+          (reason) => reason.operation === GUARD_CHECKOUT && reason.code !== "dirty-working-tree",
+        )
+      : undefined;
+  const blockedReason = unknownReason ?? actionBlock ?? null;
   const capabilityDisabledReason = mergeMode
     ? mergeDisabledReason
     : redirectPath === null
@@ -157,11 +171,7 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
   const currentMergeReason =
     mergeMode && refEntry.current ? "Choose a different branch to merge." : null;
   const displayReason =
-    capabilityDisabledReason ??
-    blockedReason?.message ??
-    currentMergeReason ??
-    refEntry.blocked[0]?.message ??
-    null;
+    capabilityDisabledReason ?? blockedReason?.message ?? currentMergeReason ?? null;
   const descriptionId =
     displayReason === null
       ? undefined
@@ -173,6 +183,11 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
   const disabled =
     capabilityDisabledReason !== null || blockedReason !== null || currentMergeReason !== null;
   const title = displayReason ?? undefined;
+  const rowNote = displayReason ?? remoteDeleteDisabledReason;
+  const remoteDeleteDescriptionId =
+    remoteDeleteDisabledReason === null
+      ? undefined
+      : `git-manager-branch-remote-${encodeURIComponent(refEntry.name)}-delete`;
   const activate = useCallback(() => {
     if (disabled) return;
     if (mergeMode) {
@@ -213,10 +228,8 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
             ) : null}
           </span>
           <span className="min-w-0 shrink truncate font-mono">{refEntry.name}</span>
-          {displayReason === null ? null : (
-            <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-              {displayReason}
-            </span>
+          {rowNote === null ? null : (
+            <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{rowNote}</span>
           )}
           {redirectPath === null ? null : (
             <span className="ml-auto flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
@@ -225,7 +238,21 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
             </span>
           )}
         </button>
-        {isRemote ? null : (
+        {isRemote ? (
+          onDeleteRemoteBranch === undefined ? null : (
+            <button
+              aria-describedby={remoteDeleteDescriptionId}
+              aria-label={`Delete remote branch ${refEntry.name}`}
+              className="pointer-events-none h-full shrink-0 px-1.5 text-xs text-destructive opacity-0 hover:bg-destructive/10 disabled:text-muted-foreground group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+              disabled={remoteDeleteDisabledReason !== null}
+              title={remoteDeleteDisabledReason ?? undefined}
+              type="button"
+              onClick={() => onDeleteRemoteBranch(refEntry)}
+            >
+              Delete
+            </button>
+          )
+        ) : (
           <>
             <button
               aria-describedby={branchActionDescriptionId}
@@ -262,6 +289,11 @@ const GitManagerBranchRow = memo(function GitManagerBranchRow({
           {branchDisabledReason}
         </span>
       )}
+      {remoteDeleteDisabledReason === null ? null : (
+        <span className="sr-only" id={remoteDeleteDescriptionId}>
+          {remoteDeleteDisabledReason}
+        </span>
+      )}
     </>
   );
 }, branchRowPropsEqual);
@@ -284,6 +316,9 @@ export interface GitManagerBranchDropdownProps {
   readonly onMergeInto: (ref: GitManagerRefEntry) => void;
   readonly onRenameBranch?: (ref: GitManagerRefEntry) => void;
   readonly onDeleteBranch?: (ref: GitManagerRefEntry) => void;
+  /** Configured remote names, to split a remote row into its remote and branch. */
+  readonly remotes?: ReadonlyArray<string>;
+  readonly onDeleteRemoteBranch?: (ref: GitManagerRefEntry) => void;
 }
 
 export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
@@ -303,6 +338,8 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
   onMergeInto,
   onRenameBranch,
   onDeleteBranch,
+  remotes = EMPTY_REMOTES,
+  onDeleteRemoteBranch,
 }: GitManagerBranchDropdownProps) {
   const storeKey = projectKey(projectRef);
   const selectFilterText = useCallback(
@@ -405,6 +442,13 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
     },
     [onRenameBranch, onSelectBranch, setOpenDropdown, stableProjectRef],
   );
+  const handleDeleteRemoteBranch = useCallback(
+    (ref: GitManagerRefEntry) => {
+      setOpenDropdown(stableProjectRef, null);
+      onDeleteRemoteBranch?.(ref);
+    },
+    [onDeleteRemoteBranch, setOpenDropdown, stableProjectRef],
+  );
   const handleDeleteBranch = useCallback(
     (ref: GitManagerRefEntry) => {
       setOpenDropdown(stableProjectRef, null);
@@ -428,6 +472,15 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
           isRemote={item.isRemote}
           selectedWorktreeCwd={selectedWorktreeCwd}
           onDeleteBranch={handleDeleteBranch}
+          remoteDeleteDisabledReason={
+            item.isRemote
+              ? (branchDisabledReason ??
+                remoteDeleteBlockedReason(item.ref, splitRemoteBranchRef(item.ref.name, remotes)))
+              : null
+          }
+          onDeleteRemoteBranch={
+            onDeleteRemoteBranch === undefined ? undefined : handleDeleteRemoteBranch
+          }
           onMergeInto={handleMergeInto}
           onRenameBranch={handleRenameBranch}
           onSelectBranch={handleSelectBranch}
@@ -438,11 +491,14 @@ export const GitManagerBranchDropdown = memo(function GitManagerBranchDropdown({
       mergeMode,
       branchDisabledReason,
       handleDeleteBranch,
+      handleDeleteRemoteBranch,
       handleMergeInto,
       handleRenameBranch,
       handleSelectBranch,
       handleSwitchWorktree,
       mergeDisabledReason,
+      onDeleteRemoteBranch,
+      remotes,
       selectedWorktreeCwd,
     ],
   );

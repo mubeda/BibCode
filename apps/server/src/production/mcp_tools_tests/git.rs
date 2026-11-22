@@ -634,6 +634,24 @@ async fn delete_branch_with_delete_remote_removes_both_branches() {
     fixture.harness.shutdown().await;
 }
 
+/// #406: the remote check runs before the local delete, so a refused remote default leaves the
+/// local branch in place.
+#[tokio::test]
+async fn delete_branch_with_delete_remote_checks_the_remote_before_deleting_locally() {
+    let fixture = fixture().await;
+    fixture.git(&["branch", "--track", "mainline", "origin/main"]);
+    let refused = fixture
+        .call(
+            "git_delete_branch",
+            json!({ "name": "mainline", "deleteRemote": true }),
+        )
+        .await;
+    assert_eq!(error(&refused)["code"], "default-branch", "{refused}");
+    assert_eq!(branches(&fixture.repo), "main\nmainline");
+    assert_eq!(branches(&fixture.remote), "main");
+    fixture.harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_refused_remote_delete_is_a_partial_outcome_that_replays_and_recovers() {
     let fixture = fixture().await;
@@ -1087,6 +1105,44 @@ async fn a_remote_delete_that_stops_reporting_keeps_the_local_deletion_and_its_t
         .send_modify(|settings| settings.enabled = true);
     let replayed = fixture.call("git_delete_branch", arguments).await;
     assert_eq!(error(&replayed), &outcome);
+    fixture.harness.shutdown().await;
+}
+
+/// #397 round 2 (Antigravity 4): when the refs cannot be read after a failed delete, whether
+/// either branch was deleted is unknown, and the answer says so instead of "nothing deleted".
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_delete_branch_whose_refs_cannot_be_read_is_an_unknown_outcome() {
+    let fixture = fixture().await;
+    publish_feature(&fixture).await;
+    let git_dir = fixture.repo.join(".git");
+    let moved = fixture.repo.join("git-moved-away");
+    hook(
+        &fixture,
+        &format!(
+            "mv '{}' '{}'\nexit 1",
+            git_dir.to_string_lossy(),
+            moved.to_string_lossy()
+        ),
+    );
+    let failed = fixture
+        .call(
+            "git_delete_branch",
+            json!({ "name": "feature", "deleteRemote": true, "clientRequestId": "del-blind" }),
+        )
+        .await;
+    assert_eq!(error_tag(&failed), "McpPartialOutcomeError", "{failed}");
+    let outcome = error(&failed);
+    assert_eq!(outcome["local"], "unknown");
+    assert_eq!(outcome["remote"], "unknown");
+    assert_eq!(outcome["outcome"], "unknown");
+    assert_eq!(
+        outcome["recovery"]["arguments"],
+        json!({ "remote": "origin", "branch": "feature" })
+    );
+    std::fs::rename(&moved, &git_dir).unwrap();
+    assert_eq!(branches(&fixture.repo), "main");
+    assert_eq!(branches(&fixture.remote), "feature\nmain");
     fixture.harness.shutdown().await;
 }
 

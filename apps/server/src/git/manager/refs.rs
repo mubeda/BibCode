@@ -188,6 +188,8 @@ struct RawRef {
     upstream: Option<String>,
     worktree_path: Option<String>,
     current: bool,
+    /// The target of a symbolic ref, such as `refs/remotes/origin/HEAD`.
+    symref: Option<String>,
 }
 
 pub async fn build_refs_snapshot(
@@ -297,6 +299,31 @@ pub async fn build_refs_snapshot(
         .map(str::to_owned)
         .collect::<Vec<_>>();
 
+    // A symbolic `<name>/HEAD` is not a branch row, even one a removed remote left behind; a
+    // branch such as `origin/release/HEAD` is one (#407). Only a configured remote's own
+    // `<remote>/HEAD` names that remote's default branch (#397).
+    let remote_heads = raw_refs
+        .iter()
+        .filter(|reference| {
+            reference.kind == RawRefKind::RemoteBranch
+                && reference.symref.is_some()
+                && reference.name.ends_with("/HEAD")
+        })
+        .collect::<Vec<_>>();
+    let remote_defaults = remote_heads
+        .iter()
+        .filter(|reference| {
+            reference
+                .name
+                .strip_suffix("/HEAD")
+                .is_some_and(|remote| remote_names.iter().any(|known| known == remote))
+        })
+        .filter_map(|reference| reference.symref.clone())
+        .collect::<HashSet<_>>();
+    let remote_heads = remote_heads
+        .into_iter()
+        .map(|reference| reference.name.clone())
+        .collect::<HashSet<_>>();
     let mut local_branches = Vec::new();
     let mut remote_branches = Vec::new();
     let mut tags = Vec::new();
@@ -312,8 +339,11 @@ pub async fn build_refs_snapshot(
         if !is_tag && !is_remote && reference.worktree_path.is_none() {
             reference.worktree_path = worktree_occupancy.get(&reference.name).cloned();
         }
-        let is_default =
-            !is_tag && !is_remote && default_branch.as_deref() == Some(reference.name.as_str());
+        let is_default = if is_remote {
+            remote_defaults.contains(&reference.name)
+        } else {
+            !is_tag && default_branch.as_deref() == Some(reference.name.as_str())
+        };
         let mut entry = GitManagerRefEntry {
             name: reference.name,
             tip_sha: reference.tip_sha,
@@ -342,7 +372,7 @@ pub async fn build_refs_snapshot(
         if is_tag {
             tags.push(entry);
         } else if is_remote {
-            if !entry.name.ends_with("/HEAD") {
+            if !remote_heads.contains(&entry.name) {
                 remote_branches.push(entry);
             }
         } else {
@@ -385,7 +415,7 @@ fn parse_refs(output: &str) -> Result<Vec<RawRef>, GitManagerRefsError> {
         .lines()
         .map(|line| {
             let fields = line.split('\t').collect::<Vec<_>>();
-            let [name, tip_sha, upstream, worktree_path, head] = fields.as_slice() else {
+            let [name, tip_sha, upstream, worktree_path, head, symref] = fields.as_slice() else {
                 return Err(GitManagerRefsError::MalformedRefs);
             };
             let (kind, name) = parse_ref_name(name).ok_or(GitManagerRefsError::MalformedRefs)?;
@@ -400,6 +430,7 @@ fn parse_refs(output: &str) -> Result<Vec<RawRef>, GitManagerRefsError> {
                 worktree_path: (!worktree_path.is_empty())
                     .then(|| display_path(Path::new(worktree_path))),
                 current: head.trim() == "*",
+                symref: (!symref.is_empty()).then(|| short_ref_name(symref).to_owned()),
             })
         })
         .collect()
@@ -762,6 +793,125 @@ mod tests {
 
         assert_eq!(local_names, ["main", "origin"]);
         assert_eq!(remote_names, ["origin/main"]);
+    }
+
+    /// #397: each remote's `HEAD` marks that remote's default branch, and only that one.
+    #[tokio::test]
+    async fn each_remote_head_marks_its_own_default_branch() {
+        let repository = repository_with_one_commit();
+        let path = repository.path();
+        let url = path.to_str().expect("fixture path should be UTF-8");
+        let head = String::from_utf8(git_output(path, &["rev-parse", "HEAD"]).stdout)
+            .expect("UTF-8 HEAD")
+            .trim()
+            .to_owned();
+        for remote in ["origin", "upstream", "fork"] {
+            git(path, &["remote", "add", remote, url]);
+        }
+        for name in [
+            "origin/main",
+            "origin/feature",
+            "upstream/main",
+            "upstream/trunk",
+            "fork/main",
+        ] {
+            git(
+                path,
+                &["update-ref", &format!("refs/remotes/{name}"), &head],
+            );
+        }
+        for (remote, target) in [("origin", "main"), ("upstream", "trunk")] {
+            git(
+                path,
+                &[
+                    "symbolic-ref",
+                    &format!("refs/remotes/{remote}/HEAD"),
+                    &format!("refs/remotes/{remote}/{target}"),
+                ],
+            );
+        }
+
+        let snapshot = snapshot(&repository).await;
+        let remote_defaults = snapshot
+            .remote_branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.is_default))
+            .collect::<Vec<_>>();
+        let local_defaults = snapshot
+            .local_branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.is_default))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            remote_defaults,
+            [
+                ("fork/main", false),
+                ("origin/feature", false),
+                ("origin/main", true),
+                ("upstream/main", false),
+                ("upstream/trunk", true),
+            ]
+        );
+        assert_eq!(local_defaults, [("main", true)]);
+    }
+
+    /// #407: only a remote's own symbolic `HEAD` is hidden; a branch named `release/HEAD` is
+    /// listed.
+    #[tokio::test]
+    async fn a_remote_branch_named_with_a_head_suffix_is_listed() {
+        let repository = repository_with_one_commit();
+        let path = repository.path();
+        let url = path.to_str().expect("fixture path should be UTF-8");
+        git(path, &["remote", "add", "origin", url]);
+        git(path, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(
+            path,
+            &["update-ref", "refs/remotes/origin/release/HEAD", "HEAD"],
+        );
+        git(
+            path,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        let snapshot = snapshot(&repository).await;
+        let remote_names = snapshot
+            .remote_branches
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(remote_names, ["origin/main", "origin/release/HEAD"]);
+    }
+
+    /// #397 round 2 (Antigravity 9): a symbolic `<name>/HEAD` left behind by a removed remote is
+    /// not a branch row either, and marks no default.
+    #[tokio::test]
+    async fn a_removed_remotes_symbolic_head_is_not_listed() {
+        let repository = repository_with_one_commit();
+        let path = repository.path();
+        git(path, &["update-ref", "refs/remotes/old/main", "HEAD"]);
+        git(
+            path,
+            &[
+                "symbolic-ref",
+                "refs/remotes/old/HEAD",
+                "refs/remotes/old/main",
+            ],
+        );
+
+        let snapshot = snapshot(&repository).await;
+        let remote_rows = snapshot
+            .remote_branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.is_default))
+            .collect::<Vec<_>>();
+
+        assert_eq!(remote_rows, [("old/main", false)]);
     }
 
     #[tokio::test]

@@ -586,6 +586,26 @@ fn upstream(refs: &Value, branch: &str) -> Result<Option<(String, String)>, Valu
         .map(|remote| (remote.to_owned(), upstream[remote.len() + 1..].to_owned())))
 }
 
+/// Whether two remotes both prefix `branch`'s upstream (`team` and `team/fork`): its target is
+/// then unknown here, and the server refuses such a delete before anything is deleted.
+fn upstream_is_ambiguous(refs: &Value, branch: &str) -> bool {
+    let upstream = refs["localBranches"]
+        .as_array()
+        .and_then(|branches| {
+            branches
+                .iter()
+                .find(|entry| entry["name"].as_str() == Some(branch))
+        })
+        .and_then(|entry| entry["upstream"].as_str());
+    upstream.is_some_and(|upstream| {
+        remotes(refs)
+            .into_iter()
+            .filter(|remote| upstream.starts_with(&format!("{remote}/")))
+            .count()
+            > 1
+    })
+}
+
 /// The remote to use: the one named, which the repository must have, else the upstream's,
 /// else `origin`, else the only remote. A remote chosen for the agent passes the same shape
 /// check as a named one: Git accepts a configured remote such as `--all`, which a command
@@ -943,100 +963,151 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
         .recorded("git_delete_branch", &payload, move |owned| async move {
             let (cwd, project_id) = folder(&owned, &thread).await?;
             // The upstream is resolved before anything is deleted: afterwards it is gone.
+            // `None` inside when two remotes could own the upstream: the server then refuses.
             let target = if delete_remote {
                 let refs = refs(&owned, &cwd).await?;
-                Some(upstream(&refs, &name)?.ok_or_else(|| {
+                let resolved = upstream(&refs, &name)?.ok_or_else(|| {
                     let mut refused = typed_tool_failure(
                         "GitOperationFailedError",
                         "Remote deletion is refused because this branch has no upstream; nothing was deleted.",
                     );
                     refused["structuredContent"]["error"]["code"] = "no-upstream".into();
                     refused
-                })?)
+                })?;
+                Some((!upstream_is_ambiguous(&refs, &name)).then_some(resolved))
             } else {
                 None
             };
-            operate(
-                &owned,
-                json!({
-                    "_tag": "branch-delete", "cwd": cwd, "projectId": project_id,
-                    "name": name, "force": force, "deleteRemote": false,
-                }),
-            )
-            .await?;
-            // A label must not name the branch this call deleted: it takes the folder's own.
-            if let Ok(thread_target) = owned.target(&thread).await
-                && thread_target.thread.branch.as_deref() == Some(name.as_str())
-                && let Ok(refs) = refs(&owned, &cwd).await
-                && let Some(head) = refs["headRef"].as_str()
-            {
-                follow_checkout(&owned, &thread, &cwd, &[head]).await;
-            }
-            let Some((remote, remote_branch)) = target else {
-                return Ok(json!({ "branch": name, "local": "deleted", "remote": "not-requested" }));
-            };
+            // One operation: the server checks the remote before it deletes the local branch, and
+            // pushes the remote delete after it (#406).
             let deleted = operate(
                 &owned,
                 json!({
-                    "_tag": "remote-branch-delete", "cwd": cwd, "projectId": project_id,
-                    "remote": remote, "branch": remote_branch,
+                    "_tag": "branch-delete", "cwd": cwd, "projectId": project_id,
+                    "name": name, "force": force, "deleteRemote": target.is_some(),
                 }),
             )
             .await;
+            let after = refs(&owned, &cwd).await.ok();
+            // `None` when the refs cannot be read: whether the local branch is gone is unknown.
+            let local_gone = after.as_ref().map(|refs| {
+                !refs["localBranches"].as_array().is_some_and(|branches| {
+                    branches
+                        .iter()
+                        .any(|entry| entry["name"].as_str() == Some(name.as_str()))
+                })
+            });
+            // A label must not name the branch this call deleted: it takes the folder's own.
+            if local_gone == Some(true)
+                && let Ok(thread_target) = owned.target(&thread).await
+                && thread_target.thread.branch.as_deref() == Some(name.as_str())
+                && let Some(head) = after.as_ref().and_then(|refs| refs["headRef"].as_str())
+            {
+                follow_checkout(&owned, &thread, &cwd, &[head]).await;
+            }
+            let Some(target) = target else {
+                deleted?;
+                return Ok(json!({ "branch": name, "local": "deleted", "remote": "not-requested" }));
+            };
             match deleted {
                 Ok(_) => Ok(json!({ "branch": name, "local": "deleted", "remote": "deleted" })),
-                // Whether a stream that stopped reporting reached the remote is unknown, and is
-                // recorded so, with the known local deletion and the remote target.
+                // Nothing was deleted: the remote check or the local delete refused it.
+                Err(failure) if local_gone == Some(false) => Err(failure),
+                // Unreadable refs leave both deletions unknown; a stream that stopped reporting
+                // leaves the remote one unknown. Either is recorded so, with the remote target.
+                Err(failure) if local_gone.is_none() => Err(outcome_unknown(partial(
+                    target.as_ref(),
+                    &failure,
+                    Outcome::LocalUnknown,
+                ))),
                 Err(failure)
                     if failure["structuredContent"]["error"]["_tag"]
                         == crate::rpc::STREAM_ENDED_TAG =>
                 {
                     Err(outcome_unknown(partial(
-                        &remote,
-                        &remote_branch,
+                        target.as_ref(),
                         &failure,
-                        true,
+                        Outcome::RemoteUnknown,
                     )))
                 }
-                Err(failure) => Err(partial(&remote, &remote_branch, &failure, false)),
+                Err(failure) => Err(partial(
+                    target.as_ref(),
+                    &failure,
+                    Outcome::RemoteFailed,
+                )),
             }
         })
         .await;
     finish(call, &thread_id, result).await
 }
 
-/// The local branch is gone and the remote one is not, or may not be (`unknown`, when the
-/// remote step stopped reporting): the truth, with the call that finishes it. A keyed retry
-/// replays it.
-fn partial(remote: &str, remote_branch: &str, failure: &Value, unknown: bool) -> Value {
+/// What a failed delete with its remote is known to have done.
+#[derive(Clone, Copy, PartialEq)]
+enum Outcome {
+    /// The local branch is gone and the remote push failed.
+    RemoteFailed,
+    /// The local branch is gone; the remote step stopped before it reported.
+    RemoteUnknown,
+    /// The refs could not be read afterwards, so neither deletion is known.
+    LocalUnknown,
+}
+
+/// A delete with its remote that did not fully succeed: the truth, with the call that finishes
+/// it. A keyed retry replays it.
+fn partial(target: Option<&(String, String)>, failure: &Value, outcome: Outcome) -> Value {
     let error = &failure["structuredContent"]["error"];
     let reason = error["message"].as_str().unwrap_or("the remote refused it");
-    let mut partial = typed_tool_failure(
-        PARTIAL_TAG,
-        &if unknown {
-            format!(
-                "The local branch was deleted, but whether the remote branch was deleted is unknown: {reason} Run git_fetch; if {remote}/{remote_branch} is still listed, call git_delete_remote_branch with this remote and branch to finish."
-            )
-        } else {
-            format!(
-                "The local branch was deleted, but deleting the remote branch failed: {reason} Call git_delete_remote_branch with this remote and branch to finish."
-            )
-        },
-    );
+    let what = match outcome {
+        Outcome::LocalUnknown => format!(
+            "The delete failed and the branches could not be read afterwards, so whether the local and the remote branch were deleted is unknown: {reason}"
+        ),
+        Outcome::RemoteUnknown => format!(
+            "The local branch was deleted, but whether the remote branch was deleted is unknown: {reason}"
+        ),
+        Outcome::RemoteFailed => {
+            format!("The local branch was deleted, but deleting the remote branch failed: {reason}")
+        }
+    };
+    // Without a target the server resolved the same way, no destructive call is suggested.
+    let next = match (target, outcome) {
+        (None, _) => " The remote branch could not be determined, so no call is suggested; check it with git_status and git_fetch.".to_owned(),
+        (Some((remote, branch)), Outcome::RemoteFailed) => format!(
+            " Call git_delete_remote_branch with remote {remote} and branch {branch} to finish."
+        ),
+        (Some((remote, branch)), _) => format!(
+            " Run git_status and git_fetch; if {remote}/{branch} is still listed, call git_delete_remote_branch with this remote and branch to finish."
+        ),
+    };
+    let mut partial = typed_tool_failure(PARTIAL_TAG, &format!("{what}{next}"));
     let fields = &mut partial["structuredContent"]["error"];
-    fields["local"] = "deleted".into();
-    fields["remote"] = if unknown { "unknown" } else { "failed" }.into();
-    fields["remoteName"] = remote.into();
-    fields["remoteBranch"] = remote_branch.into();
+    fields["local"] = if outcome == Outcome::LocalUnknown {
+        "unknown"
+    } else {
+        "deleted"
+    }
+    .into();
+    fields["remote"] = if outcome == Outcome::RemoteFailed {
+        "failed"
+    } else {
+        "unknown"
+    }
+    .into();
     fields["reason"] = error
         .get("code")
         .or_else(|| error.get("reason"))
         .cloned()
         .unwrap_or(Value::Null);
-    fields["recovery"] = json!({
-        "tool": "git_delete_remote_branch",
-        "arguments": { "remote": remote, "branch": remote_branch },
+    let (remote, branch) = target.map_or((Value::Null, Value::Null), |(remote, branch)| {
+        (remote.as_str().into(), branch.as_str().into())
     });
+    fields["recovery"] = target.map_or(Value::Null, |_| {
+        json!({
+            "tool": "git_delete_remote_branch",
+            "arguments": { "remote": remote, "branch": branch },
+        })
+    });
+    fields["remoteName"] = remote;
+    fields["remoteBranch"] = branch;
     partial
 }
 
