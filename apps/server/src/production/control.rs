@@ -7555,6 +7555,8 @@ done
     #[tokio::test]
     async fn stored_secrets_reach_only_antigravity_probes_and_no_published_field() {
         const MARKER: &str = "test-marker-secret-4417";
+        // A secret shaped like a release number passes the version parser on its own.
+        const DOTTED: &str = "123.456.789";
         let temp = tempfile::tempdir().expect("state directory");
         let sandbox = crate::test_support::TestSandbox::new("antigravity-secret-echo");
         let control = scheduler_control(&temp).await;
@@ -7605,7 +7607,7 @@ done
                     "environment": sensitive("TEST_ACCOUNT_KEY", "") },
                 "antigravity-three": { "driver": "antigravity", "enabled": true,
                     "config": { "binaryPath": refused },
-                    "environment": sensitive("TEST_ACCOUNT_KEY", MARKER) },
+                    "environment": sensitive("TEST_ACCOUNT_KEY", DOTTED) },
                 "codex": { "driver": "codex", "enabled": true,
                     "config": { "binaryPath": codex },
                     "environment": sensitive("CODEX_KEY", MARKER) }
@@ -7616,6 +7618,10 @@ done
         let providers = control.providers.read().await.clone();
         let published = serde_json::to_string(&providers).expect("providers JSON");
         assert!(!published.contains(MARKER), "a stored secret was published");
+        assert!(
+            !published.contains(DOTTED),
+            "a stored secret was published as a version"
+        );
         let row = |id: &str| {
             providers
                 .iter()

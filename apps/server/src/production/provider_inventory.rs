@@ -93,6 +93,8 @@ struct ProviderDefinition {
     environment: Vec<(OsString, OsString)>,
     /// A sensitive variable is still redacted: its stored value could not be supplied.
     missing_secret: bool,
+    /// The supplied values of sensitive variables: never part of a published version.
+    secret_values: Vec<String>,
 }
 
 struct ProviderSessionDefaults {
@@ -372,6 +374,7 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                             .into_iter()
                             .flatten()
                             .any(|entry| entry["valueRedacted"] == true),
+                        secret_values: secret_values(instance),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -421,6 +424,7 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                 .map(str::to_owned),
             environment: Vec::new(),
             missing_secret: false,
+            secret_values: Vec::new(),
         });
     }
     definitions
@@ -481,6 +485,20 @@ fn string_array(value: Option<&Value>, name: &str) -> Option<Vec<String>> {
             .map(str::to_owned)
             .collect(),
     )
+}
+
+/// The values of the instance's sensitive variables that were supplied (not redacted).
+fn secret_values(instance: &Value) -> Vec<String> {
+    instance
+        .get("environment")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["sensitive"] == true && entry["valueRedacted"] != true)
+        .filter_map(|entry| entry.get("value").and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn provider_environment(instance: &Value) -> Vec<(OsString, OsString)> {
@@ -1122,6 +1140,13 @@ async fn probe_one_snapshot(
         _ => {}
     }
 
+    // A CLI that echoes its environment can print a secret shaped like a release number.
+    let version = version.filter(|version| {
+        !definition
+            .secret_values
+            .iter()
+            .any(|secret| version.contains(secret.as_str()))
+    });
     let mut result = ProviderProbeResult::new(
         snapshot(
             definition,
@@ -5196,6 +5221,7 @@ done
             server_password: None,
             environment: Vec::new(),
             missing_secret: false,
+            secret_values: Vec::new(),
         };
 
         assert_eq!(
