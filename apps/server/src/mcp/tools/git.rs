@@ -988,7 +988,11 @@ async fn delete_branch(call: &ToolCall<'_>) -> ToolResult {
                 }),
             )
             .await;
-            let after = refs(&owned, &cwd).await.ok();
+            // Read even when the off switch cut the delete: what it already did is recorded.
+            let after = owned
+                .invoke_settling("gitManager.getRefs", json!({ "cwd": cwd }))
+                .await
+                .ok();
             // `None` when the refs cannot be read: whether the local branch is gone is unknown.
             let local_gone = after.as_ref().map(|refs| {
                 !refs["localBranches"].as_array().is_some_and(|branches| {

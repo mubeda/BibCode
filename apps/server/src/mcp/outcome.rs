@@ -199,6 +199,21 @@ impl Owned {
             .map_err(|error| rpc_failure(&error))
     }
 
+    /// [`Self::invoke`] for a read that settles what interrupted work already did, such as the
+    /// refs after a cut branch delete: the off switch, read-only and a revocation do not stop
+    /// it, so the recorded outcome keeps what is known; shutdown still does.
+    pub(crate) async fn invoke_settling(&self, tag: &str, payload: Value) -> Result<Value, Value> {
+        self.registry
+            .invoke_local(
+                tag,
+                payload,
+                self.context.clone(),
+                self.control.shutdown_token(),
+            )
+            .await
+            .map_err(|error| rpc_failure(&error))
+    }
+
     /// Runs stream method `tag` to its terminal event (C3). An early end is a failure tagged
     /// `McpStreamEndedError`, which [`ToolCall::recorded`] records as `unknown`.
     pub(crate) async fn invoke_stream(
