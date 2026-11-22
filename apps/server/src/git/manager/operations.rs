@@ -2323,7 +2323,8 @@ fn refuse_unknown_remote_target(
     // With `team` and `team/fork`, `team/fork/x` names two possible targets (#397 round 3).
     if snapshot.remotes.iter().any(|other| {
         other != remote
-            && (other.starts_with(&format!("{remote}/")) || remote.starts_with(&format!("{other}/")))
+            && (other.starts_with(&format!("{remote}/"))
+                || remote.starts_with(&format!("{other}/")))
     }) {
         return Err(operation_error(
             operation,
@@ -2402,7 +2403,14 @@ async fn local_branch_tip(
     cancellation: &CancellationToken,
 ) -> Option<String> {
     let reference = format!("refs/heads/{name}");
-    local_ref_tip(repository, "GitManager.branchDeleteTip", cwd, &reference, cancellation).await
+    local_ref_tip(
+        repository,
+        "GitManager.branchDeleteTip",
+        cwd,
+        &reference,
+        cancellation,
+    )
+    .await
 }
 
 /// #397 round 3: a delete with its remote resumed after a sign-in refuses, before anything is
@@ -7191,7 +7199,13 @@ mod tests {
         git(other.path(), &["init", "-q", "--bare", "-b", "main"]);
         git(
             fixture,
-            &["push", "-q", &other.path().to_string_lossy(), "main", "feature"],
+            &[
+                "push",
+                "-q",
+                &other.path().to_string_lossy(),
+                "main",
+                "feature",
+            ],
         );
         other
     }
@@ -7266,7 +7280,11 @@ mod tests {
         git(fixture.path(), &["branch", "keep", "feature"]);
         git(
             fixture.path(),
-            &["symbolic-ref", "refs/remotes/origin/feature", "refs/heads/keep"],
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/feature",
+                "refs/heads/keep",
+            ],
         );
 
         let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "feature"))
@@ -7315,7 +7333,12 @@ mod tests {
             let failure = delete_on_remote(fixture.path(), &request)
                 .await
                 .expect_err("nested remote names are refused");
-            assert_eq!(failure.code, "remote-name-ambiguous", "{}", request.operation());
+            assert_eq!(
+                failure.code,
+                "remote-name-ambiguous",
+                "{}",
+                request.operation()
+            );
         }
         assert_eq!(local_branches(fixture.path()), "feature\nmain\ntopic");
         assert_eq!(
@@ -7756,9 +7779,13 @@ mod transfer_gate_tests {
         let setup = |harness: &Harness| {
             git(&harness.cwd, &["branch", "topic"]);
             git(&harness.cwd, &["config", "branch.topic.remote", "origin"]);
-            git(&harness.cwd, &["config", "branch.topic.merge", "refs/heads/topic"]);
+            git(
+                &harness.cwd,
+                &["config", "branch.topic.merge", "refs/heads/topic"],
+            );
         };
-        let changes: [(&str, fn(&Harness)); 4] = [
+        type Change = (&'static str, fn(&Harness));
+        let changes: [Change; 4] = [
             ("checked out in another worktree", |harness| {
                 let held = harness.cwd.join("held");
                 git(
@@ -7766,16 +7793,27 @@ mod transfer_gate_tests {
                     &["worktree", "add", "-q", &held.to_string_lossy(), "topic"],
                 );
             }),
-            ("deleted", |harness| git(&harness.cwd, &["branch", "-D", "topic"])),
+            ("deleted", |harness| {
+                git(&harness.cwd, &["branch", "-D", "topic"])
+            }),
             ("recreated with new commits", |harness| {
                 git(&harness.cwd, &["branch", "-D", "topic"]);
-                git(&harness.cwd, &["commit", "-q", "--allow-empty", "-m", "new"]);
+                git(
+                    &harness.cwd,
+                    &["commit", "-q", "--allow-empty", "-m", "new"],
+                );
                 git(&harness.cwd, &["branch", "topic"]);
                 git(&harness.cwd, &["config", "branch.topic.remote", "origin"]);
-                git(&harness.cwd, &["config", "branch.topic.merge", "refs/heads/topic"]);
+                git(
+                    &harness.cwd,
+                    &["config", "branch.topic.merge", "refs/heads/topic"],
+                );
             }),
             ("retargeted", |harness| {
-                git(&harness.cwd, &["config", "branch.topic.merge", "refs/heads/main"]);
+                git(
+                    &harness.cwd,
+                    &["config", "branch.topic.merge", "refs/heads/main"],
+                );
             }),
         ];
         for (change, apply) in changes {
@@ -7784,9 +7822,14 @@ mod transfer_gate_tests {
             let request = resume(&harness);
             apply(&harness);
             let before = tip(&harness.cwd, "refs/heads/topic");
-            let result = start(&harness, request, CancellationToken::new())
-                .await
-                .expect("operation task");
+            // A delete that got past the freeze waits at the held push: fail, never hang.
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                start(&harness, request, CancellationToken::new()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{change}: the resumed delete reached its push"))
+            .expect("operation task");
             let failure = result.expect_err(change);
             if change != "checked out in another worktree" {
                 assert_eq!(failure.code, "branch-changed", "{change}");

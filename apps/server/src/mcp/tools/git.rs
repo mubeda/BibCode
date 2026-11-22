@@ -1064,9 +1064,9 @@ fn partial(target: Option<&(String, String)>, failure: &Value, outcome: Outcome)
         Outcome::RemoteUnknown => format!(
             "The local branch was deleted, but whether the remote branch was deleted is unknown: {reason}"
         ),
-        Outcome::RemoteFailed => format!(
-            "The local branch was deleted, but deleting the remote branch failed: {reason}"
-        ),
+        Outcome::RemoteFailed => {
+            format!("The local branch was deleted, but deleting the remote branch failed: {reason}")
+        }
     };
     // Without a target the server resolved the same way, no destructive call is suggested.
     let next = match (target, outcome) {
