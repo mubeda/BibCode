@@ -161,6 +161,7 @@ vi.mock("../state/entities", async (importOriginal) => ({
 vi.mock("../state/server", () => ({
   primaryServerConfigAtom: { key: "config" },
   primaryServerConfigEventAtom: { key: "configEvent" },
+  primaryServerKeybindingsAtom: { key: "keybindings" },
   primaryServerWelcomeAtom: { key: "welcome" },
 }));
 
