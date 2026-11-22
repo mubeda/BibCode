@@ -15176,9 +15176,11 @@ where
 
 async fn kill_child(child: &SharedChild) {
     let mut child = child.lock().await;
-    if let Some(pid) = child.id() {
-        exits::note_stop_requested(pid);
-    }
+    // Already reaped: its process group id may belong to another process by now.
+    let Some(pid) = child.id() else {
+        return;
+    };
+    exits::note_stop_requested(pid);
     let report = terminate_and_wait(&mut **child).await;
     log_cleanup_failures("provider process", &report);
 }
@@ -16115,10 +16117,11 @@ impl Drop for AntigravityDriver {
         self.runtime.close();
         // The group kill is sent here, synchronously, so it happens even when no task can run
         // any more (a runtime shutting down); only the reap is handed off.
-        if let Ok(mut child) = self.child.try_lock() {
-            if let Some(pid) = child.id() {
-                exits::note_stop_requested(pid);
-            }
+        // Only a child still owned is signalled: a reaped one's group id may be reused.
+        if let Ok(mut child) = self.child.try_lock()
+            && let Some(pid) = child.id()
+        {
+            exits::note_stop_requested(pid);
             let _ = child.start_kill();
         }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
