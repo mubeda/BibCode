@@ -552,40 +552,43 @@ describe("GitManagerBranchDialogs", () => {
     expect(buttonWithText(action).disabled).toBe(true);
   });
 
-  // Round 3 (Codex 8): while a sign-in is pending the submitted options cannot change, so the
-  // dialog never shows options the armed request does not use.
-  it.each(["delete", "delete-remote"] as const)(
-    "locks the %s options while a sign-in is pending",
-    async (kind) => {
-      await act(async () =>
-        root?.render(
-          <GitManagerBranchDialogs
-            busy={false}
-            dialog={
-              kind === "delete"
-                ? { kind, branch: branch("feature"), existsUpstream: true }
-                : {
-                    kind,
-                    branch: branch("origin/feature/a"),
-                    remote: "origin",
-                    remoteBranch: "feature/a",
-                  }
-            }
-            errorMessage={null}
-            refs={[]}
-            remoteRefs={[branch("origin/feature/a")]}
-            signInPrompt={<p>Sign in to example.test?</p>}
-            onClose={() => undefined}
-            onSubmit={() => Promise.resolve()}
-          />,
-        ),
-      );
+  // Round 3 (Codex 8): from submit until the request settles, including a pending sign-in, the
+  // submitted options cannot change, so the dialog never shows options the request does not use.
+  it.each([
+    ["delete", "a sign-in is pending"],
+    ["delete-remote", "a sign-in is pending"],
+    ["delete", "the request is in flight"],
+    ["delete-remote", "the request is in flight"],
+  ] as const)("locks the %s options while %s", async (kind, state) => {
+    const inFlight = state === "the request is in flight";
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={inFlight}
+          dialog={
+            kind === "delete"
+              ? { kind, branch: branch("feature"), existsUpstream: true }
+              : {
+                  kind,
+                  branch: branch("origin/feature/a"),
+                  remote: "origin",
+                  remoteBranch: "feature/a",
+                }
+          }
+          errorMessage={null}
+          refs={[]}
+          remoteRefs={[branch("origin/feature/a")]}
+          signInPrompt={inFlight ? null : <p>Sign in to example.test?</p>}
+          onClose={() => undefined}
+          onSubmit={() => Promise.resolve()}
+        />,
+      ),
+    );
 
-      const boxes = [...document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
-      expect(boxes.length).toBe(kind === "delete" ? 2 : 1);
-      for (const box of boxes) expect(box.disabled).toBe(true);
-    },
-  );
+    const boxes = [...document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+    expect(boxes.length).toBe(kind === "delete" ? 2 : 1);
+    for (const box of boxes) expect(box.disabled).toBe(true);
+  });
 
   // Round 3 (Antigravity 5): a name hint stays a hint while a sign-in prompt shows.
   it("keeps the rename name hint muted while a sign-in prompt shows", async () => {
