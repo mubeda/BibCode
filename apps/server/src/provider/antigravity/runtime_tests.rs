@@ -1083,10 +1083,12 @@ async fn secret_markers_stay_out_of_logs() {
         .write_all(format!("stderr {MARKER}\n").as_bytes())
         .await
         .unwrap();
-    peer.send(json!({ "jsonrpc": "2.0", "method": "x/notice", "params": { "text": MARKER } }))
-        .await;
     peer.send(
-        json!({ "jsonrpc": "2.0", "id": 9, "method": "x/ask", "params": { "text": MARKER } }),
+        json!({ "jsonrpc": "2.0", "method": format!("x/{MARKER}"), "params": { "text": MARKER } }),
+    )
+    .await;
+    peer.send(
+        json!({ "jsonrpc": "2.0", "id": 9, "method": format!("x/ask-{MARKER}"), "params": { "text": MARKER } }),
     )
     .await;
     assert_eq!(peer.next().await["error"]["code"], -32601);
@@ -1100,8 +1102,11 @@ async fn secret_markers_stay_out_of_logs() {
     });
     assert!(set.await.unwrap().is_err());
     let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
-    peer.update(SESSION, json!({ "sessionUpdate": "session_info_update", "title": MARKER, "_meta": { "x": MARKER } }))
-        .await;
+    peer.update(
+        SESSION,
+        json!({ "sessionUpdate": MARKER, "title": MARKER, "_meta": { "x": MARKER } }),
+    )
+    .await;
     peer.fail(&prompt, -32603, &format!("provider failed {MARKER}"))
         .await;
     events_until(&runtime, "turn.completed").await;
@@ -1557,6 +1562,67 @@ async fn the_reader_task_lets_go_of_the_runtime_once_the_connection_closes() {
     })
     .await
     .expect("only the test holds the runtime");
+}
+
+#[tokio::test]
+async fn a_revoke_holds_even_when_the_next_prompt_reconfirms_the_mode() {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    // The supervisor revokes ahead of a queued switch to approval-required.
+    runtime
+        .revoke_auto_answer(Some("approval-required"), None)
+        .await;
+    let send = spawn_send(&runtime).await;
+    let mode = peer.expect("session/set_config_option").await;
+    assert_eq!(mode["params"]["value"], "default", "never `auto` again");
+    peer.reply(
+        &mode,
+        json!({ "configOptions": standard_options("default") }),
+    )
+    .await;
+    let _receipt = send.await.unwrap().expect("sent in default");
+    peer.expect("session/prompt").await;
+    peer.permission(allow_or_deny()).await;
+    opened_request_id(&runtime).await;
+    assert!(peer.silent().await, "the request waits for the user");
+}
+
+#[tokio::test]
+async fn a_partly_written_prompt_is_ambiguous_not_unsent() {
+    let (runtime, peer) = started("full-access", "auto").await;
+    let Peer {
+        requests,
+        output: _output,
+        stderr: _stderr,
+    } = peer;
+    let mut reader = requests.into_inner();
+    let large = "x".repeat(256 * 1024);
+    let send = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .send_turn_with_receipt(Some(&large), Vec::new())
+                .await
+        }
+    });
+    // The CLI reads part of the prompt, then stops reading.
+    let mut start = vec![0_u8; 1024];
+    timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut start),
+    )
+    .await
+    .expect("part of the prompt in time")
+    .expect("read");
+    drop(reader);
+    let receipt = timeout(Duration::from_secs(2), send)
+        .await
+        .expect("in time")
+        .unwrap()
+        .expect("a partial write still returns a receipt");
+    let outcome = timeout(Duration::from_secs(2), receipt.completion())
+        .await
+        .expect("in time");
+    assert!(outcome.is_err(), "{outcome:?}");
 }
 
 #[tokio::test]

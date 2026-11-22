@@ -420,7 +420,11 @@ pub trait ProviderDriver: Send + Sync {
     /// Stops the driver from answering approvals by itself, at once. The supervisor calls it
     /// when a switch away from full access, or into plan, is requested, before that command can
     /// wait behind a running delivery. Bounded: it must not wait on the provider.
-    fn revoke_auto_approval(&self) -> BoxRuntimeFuture<'_, ()> {
+    fn revoke_auto_approval(
+        &self,
+        _runtime_mode: Option<String>,
+        _interaction_mode: Option<String>,
+    ) -> BoxRuntimeFuture<'_, ()> {
         Box::pin(std::future::ready(()))
     }
     fn send(
@@ -7134,10 +7138,14 @@ async fn run_supervisor(
             SupervisorMessage::Handle { command, response } => {
                 // Fail closed: the switch may wait for the running delivery below, but the
                 // driver stops answering approvals by itself now.
-                if let Some(thread_id) = command_revoking_auto_approval(command.as_ref())
+                if let Some((thread_id, runtime_mode, interaction_mode)) =
+                    command_revoking_auto_approval(command.as_ref())
                     && let Some(entry) = sessions.get(thread_id)
                 {
-                    entry.driver.revoke_auto_approval().await;
+                    entry
+                        .driver
+                        .revoke_auto_approval(runtime_mode, interaction_mode)
+                        .await;
                 }
                 if let Some(thread_id) = delivery_ordered_command_thread(command.as_ref())
                     && let Some(generation) = delivery_sequences
@@ -7992,19 +8000,22 @@ fn delivery_ordered_command_thread(command: &OrchestrationCommand) -> Option<&st
     }
 }
 
-/// The thread of a command that takes a session out of full access or into plan.
-fn command_revoking_auto_approval(command: &OrchestrationCommand) -> Option<&str> {
+/// The thread and requested mode of a command that takes a session out of full access or into
+/// plan: (thread, runtime mode, interaction mode).
+fn command_revoking_auto_approval(
+    command: &OrchestrationCommand,
+) -> Option<(&str, Option<String>, Option<String>)> {
     match command {
         OrchestrationCommand::ThreadRuntimeModeSet {
             thread_id,
             runtime_mode,
             ..
-        } if runtime_mode != "full-access" => Some(thread_id),
+        } if runtime_mode != "full-access" => Some((thread_id, Some(runtime_mode.clone()), None)),
         OrchestrationCommand::ThreadInteractionModeSet {
             thread_id,
             interaction_mode,
             ..
-        } if interaction_mode == "plan" => Some(thread_id),
+        } if interaction_mode == "plan" => Some((thread_id, None, Some(interaction_mode.clone()))),
         _ => None,
     }
 }
@@ -16483,8 +16494,16 @@ impl ProviderDriver for AntigravityDriver {
             })
         })
     }
-    fn revoke_auto_approval(&self) -> BoxRuntimeFuture<'_, ()> {
-        Box::pin(self.runtime.revoke_auto_answer())
+    fn revoke_auto_approval(
+        &self,
+        runtime_mode: Option<String>,
+        interaction_mode: Option<String>,
+    ) -> BoxRuntimeFuture<'_, ()> {
+        Box::pin(async move {
+            self.runtime
+                .revoke_auto_answer(runtime_mode.as_deref(), interaction_mode.as_deref())
+                .await;
+        })
     }
     fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
         Box::pin(std::future::ready(exited_child(&self.child)))

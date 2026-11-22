@@ -339,8 +339,22 @@ impl AntigravitySessionRuntime {
 
     /// Stops BiBCode answering approvals by itself at once, ahead of a switch away from full
     /// access that may wait for the running prompt. Only an acknowledged `auto` turns it back on.
-    pub async fn revoke_auto_answer(&self) {
-        self.inner.gate.lock().await.unconfirm();
+    /// The requested mode is recorded at once, so a prompt that reconfirms the mode before the
+    /// switch itself arrives writes the stricter mode, never `auto` again.
+    pub async fn revoke_auto_answer(
+        &self,
+        runtime_mode: Option<&str>,
+        interaction_mode: Option<&str>,
+    ) {
+        let mut gate = self.inner.gate.lock().await;
+        gate.unconfirm();
+        // Only ever tightens: a switch to full access waits for its own acknowledgement.
+        if let Some(mode) = runtime_mode.filter(|mode| *mode != "full-access") {
+            gate.runtime_mode = mode.to_owned();
+        }
+        if let Some(mode) = interaction_mode.filter(|mode| *mode == "plan") {
+            gate.interaction_mode = mode.to_owned();
+        }
     }
 
     async fn start_session(&self) -> Result<String, AntigravityRuntimeError> {
@@ -687,12 +701,11 @@ impl AntigravitySessionRuntime {
                 gate.auto_answer = target == "auto";
                 Ok(())
             }
-            // The thread's modes changed during the write: the next write confirms them.
+            // The thread's modes changed during the write: still unconfirmed, so the change's
+            // own write, or the next prompt, confirms them.
             Ok(()) => {
                 gate.unconfirm();
-                Err(AntigravityRuntimeError::ModeUnavailable {
-                    mode: gate.mode_target().to_owned(),
-                })
+                Ok(())
             }
             Err(error) => {
                 gate.unconfirm();
@@ -736,20 +749,26 @@ impl AntigravitySessionRuntime {
         attachments: Vec<Value>,
     ) -> Result<AntigravityPromptReceipt, AntigravityRuntimeError> {
         let session_id = self.provider_session_id().await?;
-        if self.inner.gate.lock().await.mode_unconfirmed {
-            self.confirm_mode().await?;
-        }
         let turn_id = format!("turn-{}", Uuid::new_v4());
-        {
-            let mut gate = self.inner.gate.lock().await;
-            // A mode change between the confirmation and here sends no prompt.
-            if gate.mode_unconfirmed {
-                return Err(AntigravityRuntimeError::ModeUnavailable {
-                    mode: gate.mode_target().to_owned(),
-                });
+        // A mode change landing during the confirmation gets one more confirmation; a second
+        // one sends no prompt.
+        let mut attempts = 0;
+        loop {
+            {
+                let mut gate = self.inner.gate.lock().await;
+                if !gate.mode_unconfirmed {
+                    gate.active_turn = Some(turn_id.clone());
+                    gate.cancelled_turn = None;
+                    break;
+                }
+                if attempts == 2 {
+                    return Err(AntigravityRuntimeError::ModeUnavailable {
+                        mode: gate.mode_target().to_owned(),
+                    });
+                }
             }
-            gate.active_turn = Some(turn_id.clone());
-            gate.cancelled_turn = None;
+            attempts += 1;
+            self.confirm_mode().await?;
         }
         self.emit("turn.started", Some(turn_id.clone()), None, json!({}));
         let connection = self.inner.connection.clone();
