@@ -22,6 +22,53 @@ pub(crate) fn built_in_provider_defaults() -> Value {
     })
 }
 
+/// Whether provider instance `instance_id` is on, read from a settings document: the instance's
+/// own `enabled`, else its driver's legacy `providers.<driver>.enabled`, else the driver's
+/// built-in default; an instance of a driver without one is on, a missing instance off. The one
+/// rule for the inventory, usage, chat and terminal launches: the typed decode alone would fill a
+/// missing instance `enabled` with true.
+pub(crate) fn provider_instance_enabled(document: &Value, instance_id: &str) -> bool {
+    let instance = document
+        .get("providerInstances")
+        .and_then(|instances| instances.get(instance_id));
+    let driver = instance
+        .and_then(|instance| instance.get("driver"))
+        .and_then(Value::as_str)
+        .unwrap_or(instance_id);
+    instance
+        .and_then(|instance| instance.get("enabled"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            document
+                .get("providers")
+                .and_then(|providers| providers.get(driver))
+                .and_then(|legacy| legacy.get("enabled"))
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| built_in_provider_defaults()[driver]["enabled"].as_bool())
+        .unwrap_or(instance.is_some())
+}
+
+/// Writes the resolved `enabled` into every instance that omits it, before the typed decode.
+fn resolve_instance_enabled(settings: &mut Value) {
+    let resolved = settings
+        .get("providerInstances")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|instances| instances.iter())
+        .filter(|(_, instance)| instance.get("enabled").is_none())
+        .map(|(id, _)| (id.clone(), provider_instance_enabled(settings, id)))
+        .collect::<Vec<_>>();
+    for (id, enabled) in resolved {
+        if let Some(Value::Object(instance)) = settings
+            .get_mut("providerInstances")
+            .and_then(|instances| instances.get_mut(&id))
+        {
+            instance.insert("enabled".to_owned(), Value::Bool(enabled));
+        }
+    }
+}
+
 /// Recursively fills missing keys in `target` from `defaults` without overwriting existing values.
 pub(crate) fn merge_missing(target: &mut Value, defaults: &Value) {
     if let (Some(target), Some(defaults)) = (target.as_object_mut(), defaults.as_object()) {
@@ -335,6 +382,7 @@ impl ProviderSettingsStore {
                 source,
             })?;
         normalize_agent_activity_settings(&mut settings);
+        resolve_instance_enabled(&mut settings);
         if let Some(providers) = settings.get_mut("providers") {
             merge_missing(providers, &built_in_provider_defaults());
         }

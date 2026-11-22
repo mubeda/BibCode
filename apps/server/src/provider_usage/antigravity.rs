@@ -93,21 +93,9 @@ pub(super) fn fetcher(
                 let unreadable =
                     || ProviderUsageFetchError::new("Antigravity settings could not be read.");
                 let cancellation = super::attempt_cancellation();
-                let read = async {
-                    // Whether it is on, from the saved document: decoding fills a missing
-                    // instance `enabled` with true, which would skip the legacy fallback.
-                    let saved = settings.get_document().await.ok()?;
-                    // The environment with its stored secrets, as the chat provider reads it: an
-                    // API-key instance is not read with the host's account.
-                    let mut document = serde_json::to_value(settings.get().await.ok()?).ok()?;
-                    let enabled = Value::Bool(default_instance_enabled(&saved));
-                    for pointer in ["/providerInstances/antigravity", "/providers/antigravity"] {
-                        if let Some(Value::Object(entry)) = document.pointer_mut(pointer) {
-                            entry.insert("enabled".to_owned(), enabled.clone());
-                        }
-                    }
-                    Some(document)
-                };
+                // The environment with its stored secrets, as the chat provider reads it: an
+                // API-key instance is not read with the host's account.
+                let read = async { serde_json::to_value(settings.get().await.ok()?).ok() };
                 let document = tokio::select! {
                     document = read => document.ok_or_else(unreadable)?,
                     () = cancellation.cancelled() => {
@@ -120,20 +108,9 @@ pub(super) fn fetcher(
     }
 }
 
-/// Whether the default Antigravity instance is on, read as the inventory reads it: the explicit
-/// `providerInstances.antigravity` first, the legacy `providers.antigravity` entry as fallback.
+/// Whether the default Antigravity instance is on, by the rule every launch uses.
 pub(super) fn default_instance_enabled(document: &Value) -> bool {
-    let legacy = document
-        .pointer("/providers/antigravity/enabled")
-        .and_then(Value::as_bool);
-    match document.pointer("/providerInstances/antigravity") {
-        Some(instance) => instance
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .or(legacy)
-            .unwrap_or(true),
-        None => legacy.unwrap_or(false),
-    }
+    crate::server_settings::provider_instance_enabled(document, "antigravity")
 }
 
 pub(super) async fn fetch_for_document(
@@ -1179,23 +1156,29 @@ mod tests {
             let path = script(&fixture, "agy", VERSION_OK, &usage_ok());
             let root = fixture.sandbox.path("settings");
             std::fs::create_dir_all(&root).expect("settings root");
-            std::fs::write(
-                root.join("settings.json"),
+            let instance = json!({
+                "driver": "antigravity",
+                "config": {"binaryPath": path.to_string_lossy()}
+            });
+            // Without a legacy entry the built-in default (off) decides, as for the inventory.
+            for document in [
                 json!({
                     "providers": {"antigravity": {"enabled": false}},
-                    "providerInstances": {"antigravity": {
-                        "driver": "antigravity",
-                        "config": {"binaryPath": path.to_string_lossy()}
-                    }}
-                })
-                .to_string(),
-            )
-            .expect("settings");
-            let snapshot = (fetcher(ProviderSettingsStore::new(&root), None).fetch)()
-                .await
-                .expect("fetch");
-            assert_eq!(snapshot.error.as_deref(), Some(MESSAGE_DISABLED));
-            assert!(fixture.calls().is_empty());
+                    "providerInstances": {"antigravity": instance.clone()}
+                }),
+                json!({ "providerInstances": {"antigravity": instance.clone()} }),
+            ] {
+                std::fs::write(root.join("settings.json"), document.to_string()).expect("settings");
+                let snapshot = (fetcher(ProviderSettingsStore::new(&root), None).fetch)()
+                    .await
+                    .expect("fetch");
+                assert_eq!(
+                    snapshot.error.as_deref(),
+                    Some(MESSAGE_DISABLED),
+                    "{document}"
+                );
+                assert!(fixture.calls().is_empty());
+            }
         }
 
         #[tokio::test]

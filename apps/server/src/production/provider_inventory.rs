@@ -322,15 +322,10 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                             .map(str::to_owned),
                         enabled: provider_is_enabled(
                             driver,
-                            instance
-                                .get("enabled")
-                                .and_then(Value::as_bool)
-                                .or_else(|| {
-                                    legacy_settings
-                                        .and_then(|value| value.get("enabled"))
-                                        .and_then(Value::as_bool)
-                                })
-                                .unwrap_or(true),
+                            crate::server_settings::provider_instance_enabled(
+                                settings,
+                                instance_id,
+                            ),
                         ),
                         binary_path: string_setting(config, "binaryPath")
                             .or_else(|| string_setting(legacy_settings, "binaryPath"))
@@ -360,7 +355,6 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
         })
         .unwrap_or_default();
 
-    let built_in_defaults = crate::server_settings::built_in_provider_defaults();
     for driver in [
         "codex",
         "claudeAgent",
@@ -382,14 +376,10 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
             instance_id: driver.to_owned(),
             driver: driver.to_owned(),
             display_name: None,
+            // Raw settings carry no defaults; Antigravity must stay off until enabled.
             enabled: provider_is_enabled(
                 driver,
-                driver_settings
-                    .and_then(|value| value.get("enabled"))
-                    .and_then(Value::as_bool)
-                    // Raw settings carry no defaults; Antigravity must stay off until enabled.
-                    .or_else(|| built_in_defaults[driver]["enabled"].as_bool())
-                    .unwrap_or(true),
+                crate::server_settings::provider_instance_enabled(settings, driver),
             ),
             binary_path: string_setting(driver_settings, "binaryPath")
                 .unwrap_or_else(|| default_provider_binary(driver))
@@ -3608,6 +3598,52 @@ done
             .find(|definition| definition.instance_id == "cursor")
             .expect("explicit Cursor definition");
         assert_eq!(explicit_cursor.binary_path, "cursor-agent");
+    }
+
+    /// An instance saved without `enabled` is off for the inventory, a chat launch and a
+    /// terminal launch alike when the legacy entry is off or absent (Antigravity's default).
+    #[tokio::test]
+    async fn an_antigravity_instance_without_enabled_is_off_for_every_launch() {
+        let sandbox = TestSandbox::new("antigravity-enabled-rule");
+        let binary = sandbox.executable_script("agy", "exit 0", "");
+        let instance = json!({
+            "driver": "antigravity",
+            "config": { "binaryPath": binary.to_string_lossy() }
+        });
+        let root = sandbox.path("settings");
+        std::fs::create_dir_all(&root).expect("settings root");
+        for document in [
+            json!({
+                "providers": { "antigravity": { "enabled": false } },
+                "providerInstances": { "antigravity": instance.clone() }
+            }),
+            json!({ "providerInstances": { "antigravity": instance.clone() } }),
+        ] {
+            std::fs::write(root.join("settings.json"), document.to_string()).expect("settings");
+            let inventory = definitions(&document);
+            let listed = inventory
+                .iter()
+                .find(|definition| definition.instance_id == "antigravity")
+                .expect("the instance");
+            assert!(!listed.enabled, "inventory: {document}");
+            let chat = super::super::provider_runtime::resolve_provider_route_settings(
+                &root,
+                "antigravity",
+                None,
+            )
+            .await;
+            assert!(chat.is_err(), "chat launch: {document}");
+            let typed = crate::server_settings::ProviderSettingsStore::new(&root)
+                .get()
+                .await
+                .expect("typed settings");
+            let terminal =
+                crate::provider_terminal::ProviderTerminalInventory::from_settings(&typed);
+            assert!(
+                !terminal.get("antigravity").expect("terminal entry").enabled,
+                "terminal launch: {document}"
+            );
+        }
     }
 
     #[test]
