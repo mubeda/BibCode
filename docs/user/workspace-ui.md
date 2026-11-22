@@ -1228,9 +1228,11 @@ The toolbar has three segments:
    local name already exists, checkout stops and asks you to select or rename
    that local branch; existing work is never replaced. Remote rows offer
    checkout and **Delete**; before deleting, BiBCode asks the remote for its
-   default branch and refuses to delete it, but the default can change between
-   that check and the delete, so the hosting service's own branch protection is
-   the last line. Use **Fetch** to discover branches added on the remote.
+   default branch and refuses to delete it, but the default, or a branch turned
+   into a pointer to another branch, can change between that check and the
+   delete, so the hosting service's own branch protection is the last line.
+   A remote with custom fetch or push settings is refused; delete its branches
+   with git on the command line. Use **Fetch** to discover branches added on the remote.
    **New branch** starts from the checked-out branch (or the current HEAD
    commit when HEAD is detached), never from the repository default; its
    **From** field shows that source and searches every local and remote branch

@@ -85,6 +85,19 @@ impl GitProcessRunner for RemoteRunner {
                 "refs/heads/topic\torigin\trefs/heads/topic\n".to_owned(),
                 String::new(),
             )
+        } else if request.operation == "GitManager.remoteBranchDeleteCheck.config" {
+            // `git config -z --list`: each URL line as `remote.origin.url`, the standard fetch.
+            let mut list = self
+                .urls
+                .lines()
+                .map(|url| format!("remote.origin.url\n{url}\0"))
+                .collect::<String>();
+            list.push_str("remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0");
+            (0, list, String::new())
+        } else if request.operation == "GitManager.remoteBranchDeleteCheck.trackingSymref" {
+            (1, String::new(), String::new())
+        } else if request.operation == "GitManager.branchDeleteTip" {
+            (0, format!("{TIP}\n"), String::new())
         } else if request.operation == "GitManager.remoteBranchDeleteCheck.trackingRef" {
             let found = !self.tracking_tip.is_empty();
             (i32::from(!found), self.tracking_tip.clone(), String::new())
@@ -233,6 +246,10 @@ async fn each_eligible_operation_reports_sign_in_required_once_without_retrying(
             assert_eq!(sign_in.resume["name"], "topic");
             assert_eq!(sign_in.resume["deleteRemote"], true);
             assert_eq!(sign_in.resume["force"], false);
+            // The approved target is frozen beside the address (#397 round 3).
+            assert_eq!(sign_in.resume["expectedTip"], TIP);
+            assert_eq!(sign_in.resume["expectedRemote"], "origin");
+            assert_eq!(sign_in.resume["expectedRemoteBranch"], "topic");
         }
         // The resume request decodes as an ordinary request.
         serde_json::from_value::<GitManagerOperationRequest>(sign_in.resume).expect("resume");
@@ -329,7 +346,10 @@ async fn a_delete_whose_push_needs_sign_in_resumes_the_remote_delete_only() {
 async fn a_resumed_remote_delete_checks_the_remote_again() {
     let resumed = |tag: &str| {
         let mut value = if tag == "branch-delete" {
-            json!({"_tag": tag, "name": "topic", "force": true, "deleteRemote": true})
+            json!({
+                "_tag": tag, "name": "topic", "force": true, "deleteRemote": true,
+                "expectedTip": TIP, "expectedRemote": "origin", "expectedRemoteBranch": "topic"
+            })
         } else {
             json!({"_tag": tag, "remote": "origin", "branch": "topic"})
         };
