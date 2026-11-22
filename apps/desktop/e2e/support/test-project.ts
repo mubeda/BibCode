@@ -1531,7 +1531,8 @@ export function prepareDesktopUiTestContext(
   }
   NodeFS.writeFileSync(providerInputLogPath, "");
   // A WDIO worker prepares the run again after the app's startup probe; keep what it logged.
-  if (!NodeFS.existsSync(toolProbeLogPath)) {
+  // A new run, even in a reused artifact directory, starts from an empty log.
+  if (environment.BIBCODE_E2E_TOOL_PROBE_LOG !== toolProbeLogPath) {
     NodeFS.writeFileSync(toolProbeLogPath, "");
   }
   initializeGitProject(projectPath);

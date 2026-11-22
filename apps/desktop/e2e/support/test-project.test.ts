@@ -343,6 +343,21 @@ it("keeps the startup probe evidence when a worker prepares the same run again",
   expect(fixtureToolProbeProblem(context.toolProbeLogPath)).toBeNull();
 });
 
+it("starts a new run's probe log empty even in a reused artifact directory", () => {
+  const first = prepareDesktopUiTestContext({ BIBCODE_E2E_PLATFORM: "linux" });
+  contexts.push(first);
+  NodeFS.writeFileSync(first.toolProbeLogPath, "codegraph --version\n");
+
+  // A new launcher run pointed at the same artifact directory, as a lab script does.
+  const next = prepareDesktopUiTestContext({
+    BIBCODE_E2E_PLATFORM: "linux",
+    BIBCODE_E2E_ARTIFACT_DIR: first.artifactDirectory,
+  });
+  contexts.push(next);
+
+  expect(fixtureToolProbeProblem(next.toolProbeLogPath)).toMatch(/real codegraph/);
+});
+
 // The packaged app puts its login shell's PATH first (`shell_environment::hydrate_posix_path`),
 // and a profile such as macOS `path_helper` moves system directories ahead of inherited ones.
 for (const shell of ["/bin/zsh", "/bin/bash"]) {
