@@ -105,6 +105,8 @@ Google was not asked about it for BiBCode. The
 `agy` are not supported on consumer plans. A reply written on Google's behalf in
 its forum says the unmodified official ACP server is supported for interactive
 development by one person, which is how BiBCode uses it: your own unmodified CLI
-with your own sign-in. These two statements have not been reconciled. Read the
-FAQ and the [ACP page](https://antigravity.google/docs/cli/acp), check which plan
-covers your use, and decide for yourself before relying on it.
+with your own sign-in. These two statements have not been reconciled, and whether a desktop app such as
+BiBCode counts is not established. An API key or an enterprise plan is the route
+Google supports officially. Read the FAQ and the
+[ACP page](https://antigravity.google/docs/cli/acp), check which plan covers your
+use, and decide for yourself before relying on it.
