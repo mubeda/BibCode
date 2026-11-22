@@ -91,28 +91,44 @@ describe("prepare Tauri AppImage tools", () => {
     expect(NodeFS.existsSync(NodePath.join(repositoryRoot, "target"))).toBe(false);
   });
 
-  it("writes the tools to <repository>/target when CARGO_TARGET_DIR is unset or empty", async () => {
-    for (const cargoTargetDirectory of [undefined, ""]) {
+  // A `[build] target-dir` in Cargo's config moves the target directory with no CARGO_TARGET_DIR.
+  it.each([
+    [undefined, undefined],
+    ["", undefined],
+    [undefined, "from-config"],
+    ["", "from-config"],
+  ])(
+    "asks Cargo for the target directory when CARGO_TARGET_DIR is %j (Cargo reports %s)",
+    async (cargoTargetDirectory, reported) => {
       const repositoryRoot = makeRepositoryRoot();
+      const cargoWorkingDirectory = NodePath.join(repositoryRoot, "apps/desktop/src-tauri");
+      const reportedDirectory =
+        reported === undefined ? undefined : NodePath.join(repositoryRoot, reported);
+      const asked: Array<[string, string | undefined]> = [];
 
       const result = await prepareTauriAppImageTools({
         repositoryRoot,
         platform: "linux",
         ...(cargoTargetDirectory === undefined ? {} : { cargoTargetDirectory }),
-        cargoMetadataTargetDirectory: () => {
-          throw new Error("Cargo is asked only for a set CARGO_TARGET_DIR");
+        cargoMetadataTargetDirectory: (directory, target) => {
+          asked.push([directory, target]);
+          return reportedDirectory;
         },
         plugin: FIXTURE_PIN,
         gstreamerPlugin: FIXTURE_PIN,
         download: async () => FIXTURE_PLUGIN,
       });
 
+      expect(asked).toEqual([[cargoWorkingDirectory, undefined]]);
       expect(result).toMatchObject({
         status: "prepared",
-        toolsDirectory: NodePath.join(repositoryRoot, "target/.tauri"),
+        toolsDirectory: NodePath.join(
+          reportedDirectory ?? NodePath.join(repositoryRoot, "target"),
+          ".tauri",
+        ),
       });
-    }
-  });
+    },
+  );
 
   // Tauri runs Cargo in apps/desktop/src-tauri and reads `<cargo metadata target_directory>/.tauri`.
   it.each([
