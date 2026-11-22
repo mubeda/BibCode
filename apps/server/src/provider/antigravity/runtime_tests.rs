@@ -1618,7 +1618,10 @@ async fn a_reused_outstanding_id_gets_an_error_and_the_original_stays_bound() {
         assert_eq!(answer["error"]["code"], -32600, "{answer}");
         assert!(answer.get("result").is_none(), "{answer}");
     }
-    assert_eq!(runtime.pending_request_ids().await, [original.clone()]);
+    assert_eq!(
+        runtime.pending_request_ids().await,
+        std::slice::from_ref(&original)
+    );
     runtime
         .respond_to_request(&original, "decline")
         .await
