@@ -2395,8 +2395,8 @@ async fn local_ref_tip(
 /// Whether every `fetch` line of a remote stores each branch it fetches under the same name in
 /// `refs/remotes/<remote>/`. A negative refspec, or a branch source with any other destination
 /// (or none), is not: Git's post-push tracking update or a tracking name could then reach
-/// another ref than the one checked. Sources outside `refs/heads/`, such as pull requests, are
-/// left alone.
+/// another ref than the one checked; so is a glob that covers `refs/heads/` (`refs/*`). Other
+/// sources, such as pull requests, are left alone.
 fn fetch_mapping_is_identity(refspecs: &str, remote: &str) -> bool {
     let tracking = format!("refs/remotes/{remote}/");
     refspecs
@@ -2408,9 +2408,13 @@ fn fetch_mapping_is_identity(refspecs: &str, remote: &str) -> bool {
                 return false;
             }
             let (source, destination) = spec.split_once(':').unwrap_or((spec, ""));
-            source
-                .strip_prefix("refs/heads/")
-                .is_none_or(|branch| destination.strip_prefix(tracking.as_str()) == Some(branch))
+            match source.strip_prefix("refs/heads/") {
+                Some(branch) => destination.strip_prefix(tracking.as_str()) == Some(branch),
+                // A glob such as `refs/*` covers `refs/heads/` without naming it.
+                None => !source
+                    .split_once('*')
+                    .is_some_and(|(head, _)| "refs/heads/".starts_with(head)),
+            }
         })
 }
 
@@ -6885,6 +6889,10 @@ mod tests {
             vec!["+refs/heads/*:refs/remotes/origin/*", "^refs/heads/secret"],
             vec!["+refs/heads/*:refs/remotes/cache/*"],
             vec!["refs/heads/feature"],
+            // A glob that covers `refs/heads/` without naming it: `--mirror=fetch` writes the
+            // first, and Git's post-push update then deletes the local branch (reproduced).
+            vec!["+refs/*:refs/*"],
+            vec!["+refs/*:refs/remotes/origin/*"],
         ] {
             let (remote, fixture) = remote_delete_fixture();
             git(fixture.path(), &["fetch", "-q", "origin"]);
@@ -6909,8 +6917,9 @@ mod tests {
                 let failure = delete_on_remote(fixture.path(), &request)
                     .await
                     .expect_err("a renaming fetch mapping is refused");
-                // A local delete whose upstream Git cannot name stops at `no-upstream`.
-                if failure.code == "no-upstream" {
+                // A refspec with no destination stores no upstream, so Git names none for the
+                // local delete, which stops at `no-upstream` before anything is deleted.
+                if failure.code == "no-upstream" && mapping == ["refs/heads/feature"] {
                     continue;
                 }
                 assert_eq!(
@@ -6935,6 +6944,42 @@ mod tests {
                 "{mapping:?}"
             );
         }
+    }
+
+    /// Round 2 ruling A (Codex 2): the whole delete runs its local guards before its push, so a
+    /// local branch checked out in another worktree keeps the remote branch too.
+    #[tokio::test]
+    async fn a_whole_delete_of_a_branch_held_by_a_worktree_keeps_the_remote_branch() {
+        let (remote, fixture) = remote_delete_fixture();
+        git(
+            fixture.path(),
+            &["branch", "--track", "topic", "origin/feature"],
+        );
+        let held = tempfile::tempdir().expect("worktree");
+        let held_path = held.path().join("topic");
+        git(
+            fixture.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &held_path.to_string_lossy(),
+                "topic",
+            ],
+        );
+
+        delete_on_remote(
+            fixture.path(),
+            &local_delete_with_remote(fixture.path(), "topic"),
+        )
+        .await
+        .expect_err("a branch checked out elsewhere is not deleted");
+
+        assert_eq!(local_branches(fixture.path()), "feature\nmain\ntopic");
+        assert_eq!(
+            remote_refs(remote.path()),
+            "refs/heads/feature\nrefs/heads/main"
+        );
     }
 
     /// Ruling B keeps ordinary clones working: a shallow single-branch clone, and a pull-request
@@ -7080,8 +7125,7 @@ mod tests {
         assert_eq!(failure.code, "remote-branch-changed");
     }
 
-    /// R7: a branch that moved on the remote since the last fetch is refused, and so is a
-    /// tracking name a custom fetch mapping fills from another remote branch.
+    /// R7: a branch that moved on the remote since the last fetch is refused.
     #[tokio::test]
     async fn remote_branch_delete_refuses_a_branch_that_differs_from_its_tracking_ref() {
         let (remote, fixture) = remote_delete_fixture();

@@ -39,6 +39,13 @@ export function useGitManagerSignIn(
   // Cancel and Not now end the offer here at once: a sign-in that still reports success after
   // them (it raced the Cancel) resumes nothing.
   const generationRef = useRef(0);
+  // Unmounting ends the offer too (the shared hook only cancels its handle).
+  useEffect(
+    () => () => {
+      generationRef.current += 1;
+    },
+    [],
+  );
   const { cancel: cancelFlow, decline: declineFlow } = flow;
   const cancel = useCallback(() => {
     generationRef.current += 1;

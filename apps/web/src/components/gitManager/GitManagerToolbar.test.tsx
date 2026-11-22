@@ -1191,6 +1191,33 @@ describe("GitManagerToolbar", () => {
       }
     });
 
+    // The same race through unmount: the panel closing never resumes a delete afterwards.
+    it("resumes nothing when the sign-in finishes after the toolbar unmounted", async () => {
+      let finish: (value: unknown) => void = () => undefined;
+      h.runSignIn.mockImplementation(() => ({
+        cancel: vi.fn(),
+        result: new Promise((resolve) => {
+          finish = resolve;
+        }),
+      }));
+      h.snapshot = { ...refsSnapshot(), remoteBranches: [ref("origin/develop")] };
+      h.events = { "remote-branch-delete": [signInFailure] };
+      await mount();
+      await act(async () =>
+        container
+          .querySelector<HTMLButtonElement>('[aria-label="Delete remote branch origin/develop"]')!
+          .click(),
+      );
+      await submit({ kind: "delete-remote", remote: "origin", branch: "develop" });
+      await clickButton("Sign in");
+      await unmount();
+      await act(async () =>
+        finish({ _tag: "Success", value: { outcome: "signedIn", message: "" } }),
+      );
+
+      expect(sentInputs()).toHaveLength(1);
+    });
+
     // Round 2 (Antigravity 7): a branch dialog opened while a sync sign-in waits shows that
     // prompt, and closing the dialog leaves the sign-in for the toolbar.
     it("keeps a pending sync sign-in reachable from New Branch and never ends it on close", async () => {
