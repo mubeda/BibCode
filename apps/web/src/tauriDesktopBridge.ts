@@ -630,12 +630,12 @@ function createTauriDesktopBridge(
     setWslOnly: (enabled) =>
       tauriInvoke<DesktopWslState>("desktop_bridge_set_wsl_only", { enabled }),
     getLinuxSoftwareRendering: () =>
-      tauriInvoke<DesktopLinuxSoftwareRenderingState>(
+      tauriInvokeDesktop<DesktopLinuxSoftwareRenderingState>(
         "desktop_bridge_get_linux_software_rendering",
         undefined,
       ),
     setLinuxSoftwareRendering: (enabled) =>
-      tauriInvoke<DesktopLinuxSoftwareRenderingState>(
+      tauriInvokeDesktop<DesktopLinuxSoftwareRenderingState>(
         "desktop_bridge_set_linux_software_rendering",
         { enabled },
       ),

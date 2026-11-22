@@ -106,6 +106,47 @@ pub(crate) fn gpu_compositing_disabled(value_of: impl Fn(&str) -> Option<OsStrin
         .any(|name| value_of(name).is_some_and(|value| value != "0"))
 }
 
+/// The WebKit variables present in this process that BiBCode did not set: the user's,
+/// which the switch cannot change.
+pub(crate) fn user_variables(
+    set_by_bibcode: &[&str],
+    value_of: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(&'static str, OsString)> {
+    WEBKIT_VARIABLES
+        .into_iter()
+        .filter(|name| !set_by_bibcode.contains(name))
+        .filter_map(|name| Some((name, value_of(name)?)))
+        .collect()
+}
+
+/// What a relaunch does with each WebKit variable, applied after the AppImage child filter:
+/// remove the ones BiBCode set, and put back the user's, which that filter may have dropped.
+pub(crate) fn relaunch_overrides(
+    set_by_bibcode: &[&str],
+    value_of: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(&'static str, Option<OsString>)> {
+    let removed = set_by_bibcode
+        .iter()
+        .filter_map(|name| WEBKIT_VARIABLES.into_iter().find(|known| known == name))
+        .map(|name| (name, None));
+    let kept = user_variables(set_by_bibcode, value_of)
+        .into_iter()
+        .map(|(name, value)| (name, Some(value)));
+    removed.chain(kept).collect()
+}
+
+/// `desktop-settings.json` with only the setting changed; every other key, valid or not,
+/// known to this version or not, is kept. A missing file starts an empty document.
+pub(crate) fn patch_setting(document: Option<Value>, enabled: bool) -> Result<Value, String> {
+    match document.unwrap_or_else(|| Value::Object(Default::default())) {
+        Value::Object(mut object) => {
+            object.insert(SETTING_KEY.to_owned(), Value::Bool(enabled));
+            Ok(Value::Object(object))
+        }
+        _ => Err("desktop-settings.json is not a JSON object; fix or remove it".to_owned()),
+    }
+}
+
 /// The stored setting from a parsed `desktop-settings.json`; anything but `true` is off.
 pub(crate) fn setting_from_document(document: &Value) -> bool {
     document
@@ -131,10 +172,14 @@ struct Startup {
 
 static STARTUP: OnceLock<Startup> = OnceLock::new();
 
-/// Applies the setting to this process. Call it only while the process is
-/// single-threaded: `main` does, right before `run()`.
+/// Applies the setting to this process.
+///
+/// # Safety
+///
+/// It changes the process environment, so no other thread may exist yet: `main`
+/// calls it before Tauri, Tokio, GTK or WebKit start.
 #[cfg(target_os = "linux")]
-pub fn apply_process_environment() {
+pub unsafe fn apply_process_environment() {
     let (stored, settings_problem) = match crate::config::state_dir_from_environment() {
         Ok(state_dir) => {
             read_stored_setting(&state_dir.join(crate::bridge::DESKTOP_SETTINGS_FILE_NAME))
@@ -148,9 +193,7 @@ pub fn apply_process_environment() {
         true,
     );
     for name in &decision.set {
-        // SAFETY: `main` calls this before Tauri, Tokio, GTK or WebKit start, and the crash
-        // hook attached earlier spawns no thread on Linux, so nothing else can read or write
-        // the environment concurrently.
+        // SAFETY: the caller guarantees the process is still single-threaded.
         unsafe { std::env::set_var(name, "1") };
     }
     let _ = STARTUP.set(Startup {
@@ -333,5 +376,61 @@ mod tests {
         let (stored, problem) = read_stored_setting(&path);
         assert!(!stored);
         assert!(problem.is_some());
+    }
+
+    fn lookup(values: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+        let values = values.to_vec();
+        move |name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn software_rendering_relaunch_removes_only_what_bibcode_set() {
+        // BiBCode set both: both go.
+        assert_eq!(
+            relaunch_overrides(
+                &[COMPOSITING, DMABUF],
+                lookup(&[(COMPOSITING, "1"), (DMABUF, "1")])
+            ),
+            vec![(COMPOSITING, None), (DMABUF, None)]
+        );
+        // The user exported one, even with a value the AppImage filter drops: it is put back.
+        assert_eq!(
+            relaunch_overrides(
+                &[DMABUF],
+                lookup(&[(COMPOSITING, "/opt/app/usr"), (DMABUF, "1")])
+            ),
+            vec![(DMABUF, None), (COMPOSITING, Some("/opt/app/usr".into()))]
+        );
+        // Nothing set by BiBCode and nothing exported: nothing to do.
+        assert!(relaunch_overrides(&[], lookup(&[])).is_empty());
+    }
+
+    #[test]
+    fn software_rendering_lists_only_the_users_variables() {
+        assert_eq!(
+            user_variables(&[DMABUF], lookup(&[(COMPOSITING, "0"), (DMABUF, "1")])),
+            vec![(COMPOSITING, OsString::from("0"))]
+        );
+        assert!(user_variables(&[COMPOSITING, DMABUF], lookup(&[(COMPOSITING, "1")])).is_empty());
+    }
+
+    #[test]
+    fn software_rendering_patch_keeps_every_other_key() {
+        let document = json!({
+            "serverExposureMode": "network-accessible",
+            "wslOnly": "bad",
+            "futureKey": { "nested": [1, 2] },
+            SETTING_KEY: false,
+        });
+        let mut expected = document.clone();
+        expected[SETTING_KEY] = json!(true);
+        assert_eq!(patch_setting(Some(document), true), Ok(expected));
+        assert_eq!(patch_setting(None, true), Ok(json!({ SETTING_KEY: true })));
+        assert!(patch_setting(Some(json!([1])), true).is_err());
     }
 }

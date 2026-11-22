@@ -771,7 +771,9 @@ export interface DesktopLinuxSoftwareRenderingState {
   enabled: boolean;
   /** Set when `BIBCODE_SOFTWARE_RENDERING` decides this launch instead of the setting. */
   override: "on" | "off" | null;
-  /** WebKit runs without GPU compositing in this session, from any source. */
+  /** WebKit variables set where BiBCode was started; BiBCode leaves them alone. */
+  userVariables: readonly { name: string; value: string }[];
+  /** This launch asks WebKit to run without GPU compositing, from any source. */
   gpuCompositingDisabled: boolean;
   /** Restarting from Settings would apply the stored setting. */
   restartApplies: boolean;

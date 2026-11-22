@@ -419,8 +419,8 @@ fn read_desktop_settings<R: Runtime>(app: &AppHandle<R>) -> Result<DesktopSettin
     Ok(desktop_settings_from_value(value))
 }
 
-/// The Linux software rendering key is decoded on its own, so a bad value for it, or for
-/// any other key, cannot reset the rest.
+/// The Linux software rendering key is decoded on its own: a bad value for it cannot reset
+/// the rest, and a bad value elsewhere, which resets the other fields, cannot reset it.
 fn desktop_settings_from_value(value: Value) -> DesktopSettings {
     #[cfg(target_os = "linux")]
     let linux_software_rendering = crate::software_rendering::setting_from_document(&value);
@@ -1556,12 +1556,17 @@ pub async fn desktop_bridge_set_wsl_only(
 #[cfg(target_os = "linux")]
 fn linux_software_rendering_state(enabled: bool) -> Value {
     use crate::software_rendering::{
-        Override, gpu_compositing_disabled, restart_applies, startup_decision,
+        Override, gpu_compositing_disabled, restart_applies, startup_decision, user_variables,
     };
     let decision = startup_decision();
+    let user_variables: Vec<Value> = user_variables(&decision.set, |name| std::env::var_os(name))
+        .into_iter()
+        .map(|(name, value)| json!({ "name": name, "value": value.to_string_lossy() }))
+        .collect();
     json!({
         "enabled": enabled,
         "override": decision.override_value.map(Override::as_str),
+        "userVariables": user_variables,
         "gpuCompositingDisabled": gpu_compositing_disabled(|name| std::env::var_os(name)),
         "restartApplies": restart_applies(enabled, &decision, |name| {
             std::env::var_os(name).is_some()
@@ -1577,6 +1582,19 @@ fn linux_software_rendering_unsupported(method: &str) -> Value {
         "capability": "Linux software rendering",
         "message": format!("{method} is available on Linux only."),
     })
+}
+
+/// Saves the setting into `desktop-settings.json`; returns the stored value.
+#[cfg(target_os = "linux")]
+fn write_linux_software_rendering<R: Runtime>(
+    app: &AppHandle<R>,
+    enabled: bool,
+) -> Result<bool, String> {
+    let path = desktop_settings_path(app)?;
+    // Only the one key changes, so a bad value or a key from another version survives.
+    let document = crate::software_rendering::patch_setting(read_json_file(&path)?, enabled)?;
+    write_json_file(&path, &document)?;
+    Ok(enabled)
 }
 
 #[tauri::command]
@@ -1604,13 +1622,9 @@ pub async fn desktop_bridge_set_linux_software_rendering(
 ) -> Result<Value, Value> {
     #[cfg(target_os = "linux")]
     return coordinator
-        .run_exclusive(async {
-            update_desktop_settings(&app, |settings| {
-                settings.linux_software_rendering = enabled;
-            })
-        })
+        .run_exclusive(async { write_linux_software_rendering(&app, enabled) })
         .await
-        .map(|settings| linux_software_rendering_state(settings.linux_software_rendering))
+        .map(linux_software_rendering_state)
         .map_err(Value::String);
     #[cfg(not(target_os = "linux"))]
     {
@@ -3715,6 +3729,20 @@ mod tests {
         assert!(!settings.linux_software_rendering);
         assert_eq!(settings.server_exposure_mode, "network-accessible");
         assert!(settings.wsl_only);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn software_rendering_save_keeps_bad_and_unknown_keys() {
+        let document = json!({
+            "serverExposureMode": "network-accessible",
+            "wslOnly": "bad",
+            "keyFromANewerVersion": { "kept": true },
+        });
+        let saved = crate::software_rendering::patch_setting(Some(document.clone()), true).unwrap();
+        let mut expected = document;
+        expected["linuxSoftwareRendering"] = json!(true);
+        assert_eq!(saved, expected);
     }
 
     #[cfg(not(target_os = "linux"))]

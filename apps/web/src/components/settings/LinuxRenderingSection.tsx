@@ -45,7 +45,10 @@ function LinuxRenderingRow({
   const [state, setLocalState] = useState<DesktopLinuxSoftwareRenderingState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const overrideId = useId();
+  const userVariablesId = useId();
+  const errorId = useId();
 
   useEffect(() => {
     let cancelled = false;
@@ -54,7 +57,10 @@ function LinuxRenderingRow({
         if (!cancelled) setLocalState(next);
       },
       (cause: unknown) => {
-        if (!cancelled) setError(`Could not read the setting: ${errorMessage(cause)}`);
+        if (!cancelled)
+          setError(
+            `Could not read the setting. Fix or remove desktop-settings.json in BiBCode's data folder, then reopen Settings. (${errorMessage(cause)})`,
+          );
       },
     );
     return () => {
@@ -77,10 +83,16 @@ function LinuxRenderingRow({
   };
 
   const restart = async () => {
+    if (restarting) return;
+    setRestarting(true);
+    setError(null);
     try {
       await restartApp?.();
     } catch (cause) {
-      setError(`Could not restart BiBCode: ${errorMessage(cause)}`);
+      setError(
+        `Could not restart BiBCode. Quit and reopen BiBCode to apply this change. (${errorMessage(cause)})`,
+      );
+      setRestarting(false);
     }
   };
 
@@ -95,6 +107,23 @@ function LinuxRenderingRow({
       </p>
     );
 
+  const userVariables = state?.userVariables ?? [];
+  const userVariablesLine =
+    userVariables.length === 0 ? null : (
+      <p id={userVariablesId}>
+        <span className="font-mono">
+          {userVariables.map(({ name, value }) => `${name}=${value}`).join(" ")}
+        </span>{" "}
+        {userVariables.length === 1
+          ? "is set where BiBCode was started, so this switch cannot change it. Remove it from your environment or launcher to let this switch decide."
+          : "are set where BiBCode was started, so this switch cannot change them. Remove them from your environment or launcher to let this switch decide."}
+      </p>
+    );
+  const describedBy =
+    [overrideLine && overrideId, userVariablesLine && userVariablesId, error && errorId]
+      .filter(Boolean)
+      .join(" ") || undefined;
+
   return (
     <SettingsSection title="Rendering">
       <SettingsRow
@@ -106,25 +135,31 @@ function LinuxRenderingRow({
               {state === null ? null : (
                 <p>
                   {state.gpuCompositingDisabled
-                    ? "GPU compositing is off in this session."
-                    : "GPU compositing is on in this session."}
+                    ? "This launch asks WebKit to draw without GPU compositing."
+                    : "This launch does not ask WebKit to turn off GPU compositing."}
                 </p>
               )}
               {overrideLine}
+              {userVariablesLine}
               {state?.restartApplies ? (
                 restartApp === undefined ? (
                   <p>Quit and reopen BiBCode to apply this change.</p>
                 ) : (
                   <div className="flex flex-wrap items-center gap-2">
                     <p>Restart BiBCode to apply this change.</p>
-                    <Button size="xs" variant="outline" onClick={() => void restart()}>
-                      Restart now
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      disabled={saving || restarting}
+                      onClick={() => void restart()}
+                    >
+                      {restarting ? "Restarting…" : "Restart now"}
                     </Button>
                   </div>
                 )
               ) : null}
               {error === null ? null : (
-                <p role="alert" className="text-destructive">
+                <p id={errorId} role="alert" className="text-destructive">
                   {error}
                 </p>
               )}
@@ -134,10 +169,10 @@ function LinuxRenderingRow({
         control={
           <Switch
             checked={state?.enabled ?? false}
-            disabled={state === null || state.override !== null || saving}
+            disabled={state === null || state.override !== null || saving || restarting}
             onCheckedChange={(checked) => void save(checked)}
             aria-label={TITLE}
-            aria-describedby={overrideLine === null ? undefined : overrideId}
+            aria-describedby={describedBy}
           />
         }
       />

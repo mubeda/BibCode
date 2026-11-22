@@ -10,6 +10,7 @@ import { LinuxRenderingSection, type LinuxRenderingBridge } from "./LinuxRenderi
 const OFF: DesktopLinuxSoftwareRenderingState = {
   enabled: false,
   override: null,
+  userVariables: [],
   gpuCompositingDisabled: false,
   restartApplies: false,
 };
@@ -67,7 +68,7 @@ describe("LinuxRenderingSection", () => {
   it("shows the setting and this session's state on Linux", async () => {
     await render(fakeBridge(OFF));
     expect(toggle()?.getAttribute("aria-checked")).toBe("false");
-    expect(text()).toContain("GPU compositing is on in this session.");
+    expect(text()).toContain("This launch does not ask WebKit to turn off GPU compositing.");
     expect(text()).not.toContain("Restart");
   });
 
@@ -94,10 +95,91 @@ describe("LinuxRenderingSection", () => {
     expect(text()).not.toContain("Restart");
   });
 
-  it("does not claim compositing is off when it is not", async () => {
-    // The setting is on, but the user exported WEBKIT_DISABLE_COMPOSITING_MODE=0.
-    await render(fakeBridge({ ...OFF, enabled: true, gpuCompositingDisabled: false }));
-    expect(text()).toContain("GPU compositing is on in this session.");
+  it("says what this launch asked for, not what WebKit decided", async () => {
+    await render(fakeBridge({ ...OFF, enabled: true, gpuCompositingDisabled: true }));
+    expect(text()).toContain("This launch asks WebKit to draw without GPU compositing.");
+  });
+
+  it("explains that variables the user exported decide, and the switch cannot change them", async () => {
+    await render(
+      fakeBridge({
+        ...OFF,
+        gpuCompositingDisabled: true,
+        userVariables: [
+          { name: "WEBKIT_DISABLE_COMPOSITING_MODE", value: "1" },
+          { name: "WEBKIT_DISABLE_DMABUF_RENDERER", value: "1" },
+        ],
+      }),
+    );
+    expect(text()).toContain("WEBKIT_DISABLE_COMPOSITING_MODE=1");
+    expect(text()).toContain("WEBKIT_DISABLE_DMABUF_RENDERER=1");
+    expect(text()).toContain("this switch cannot change");
+  });
+
+  it("keeps Restart now unavailable while a save is in flight, and restarts once", async () => {
+    let finishSave: (state: DesktopLinuxSoftwareRenderingState) => void = () => {};
+    let finishRestart: () => void = () => {};
+    const initial = { ...OFF, enabled: true, restartApplies: true };
+    const bridge = fakeBridge(initial, {
+      setLinuxSoftwareRendering: vi.fn(
+        () =>
+          new Promise<DesktopLinuxSoftwareRenderingState>((resolve) => {
+            finishSave = resolve;
+          }),
+      ),
+      restartApp: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            finishRestart = resolve;
+          }),
+      ),
+    });
+    await render(bridge);
+    const restartButton = () =>
+      [...container.querySelectorAll("button")].find((button) =>
+        button.textContent?.startsWith("Restart"),
+      );
+    await act(async () => toggle()?.click());
+    expect(restartButton()?.disabled).toBe(true);
+    await act(async () => restartButton()?.click());
+    expect(bridge.restartApp).not.toHaveBeenCalled();
+    await act(async () => finishSave({ ...initial, enabled: false, restartApplies: true }));
+    await act(async () => restartButton()?.click());
+    await act(async () => restartButton()?.click());
+    expect(bridge.restartApp).toHaveBeenCalledOnce();
+    expect(restartButton()?.textContent).toBe("Restarting…");
+    await act(async () => finishRestart());
+  });
+
+  it("says how to apply the change when the restart fails, and clears that on retry", async () => {
+    const restartApp = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("an update is installing"))
+      .mockResolvedValueOnce(undefined);
+    await render(fakeBridge({ ...OFF, enabled: true, restartApplies: true }, { restartApp }));
+    const restartButton = () =>
+      [...container.querySelectorAll("button")].find(
+        (button) => button.textContent === "Restart now",
+      );
+    await act(async () => restartButton()?.click());
+    expect(text()).toContain("Quit and reopen BiBCode to apply this change.");
+    expect(text()).toContain("an update is installing");
+    await act(async () => restartButton()?.click());
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("explains how to recover when the setting cannot be read", async () => {
+    await render(
+      fakeBridge(OFF, {
+        getLinuxSoftwareRendering: vi.fn(async () => {
+          throw new Error("expected value at line 1 column 2");
+        }),
+      }),
+    );
+    expect(text()).toContain("desktop-settings.json");
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert?.id).toBeTruthy();
+    expect(toggle()?.getAttribute("aria-describedby")).toContain(alert?.id ?? "missing");
   });
 
   it("keeps the stored value and says so when saving fails", async () => {
