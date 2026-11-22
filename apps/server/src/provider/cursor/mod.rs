@@ -11,10 +11,10 @@ pub use capabilities::{
 };
 #[cfg_attr(test, allow(unused_imports))]
 pub use model::{
-    CursorAboutResult, CursorProviderModel, CursorProviderSnapshot,
+    CursorAboutResult, CursorProviderModel, CursorProviderSnapshot, advertised_model_values,
     build_capabilities_from_config_options, discover_models_from_list_available_models,
-    parse_about_output, parse_cli_config_channel, parse_version_date, resolve_acp_base_model_id,
-    resolve_acp_config_updates,
+    discover_models_with_advertised_values, parse_about_output, parse_cli_config_channel,
+    parse_version_date, resolve_acp_base_model_id, resolve_acp_config_updates,
 };
 #[cfg_attr(test, allow(unused_imports))]
 pub use runtime::{

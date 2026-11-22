@@ -187,7 +187,8 @@ id. The server stamps the same label as `displayName` in every provider
 snapshot, so the web shows the server's name and never derives its own. The
 field stays optional for older servers, whose unnamed instances then show the
 driver's name. A refusal is its plain
-sentence, such as "Fast Mode is not supported by the selected model." or "gpt-5
+sentence, such as "Fast Mode is not supported by the selected model. Choose another
+option for this model." or "gpt-5
 is not available in Work Codex.", built from shared helpers that name an option
 by the label its descriptor shows, and by its id only for an option the driver
 does not take. A Cursor configuration BiBCode can't work with reads "BiBCode

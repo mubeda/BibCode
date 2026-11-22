@@ -3945,7 +3945,7 @@ async fn durable_claude_turn_with_an_option_the_session_refuses_fails_once_inste
         settled.last_error
     );
     // The undelivered turn states the refusal plainly, without the driver's internal id.
-    let refusal = "contextWindow is not supported by the selected model.";
+    let refusal = "contextWindow is not supported by the selected model. Choose another option for this model.";
     assert_eq!(settled.last_error.as_deref(), Some(refusal));
     // A failed row is terminal: the worker claims only pending rows. Stopping the service drains
     // its in-flight work, so the row read afterwards is final and the check needs no timing bound.
@@ -4214,7 +4214,7 @@ fn cursor_case(fixtures: &TempDir) -> OptionCase {
 async fn codex_option_the_model_does_not_advertise_fails_the_turn_once() {
     let fixtures = TempDir::new().expect("fixture directory");
     assert_option_case_settles_once(OptionCase {
-        refusal: Some("Reasoning Extra High is not supported by the selected model."),
+        refusal: Some("Reasoning Extra High is not supported by the selected model. Choose another option for this model."),
         ..codex_case(&fixtures, None)
     })
     .await;
@@ -4260,7 +4260,9 @@ async fn codex_custom_model_with_an_effort_is_delivered() {
 async fn cursor_option_the_session_does_not_advertise_fails_the_turn_once() {
     let fixtures = TempDir::new().expect("fixture directory");
     assert_option_case_settles_once(OptionCase {
-        refusal: Some("Fast is not supported by the selected model."),
+        refusal: Some(
+            "Fast is not supported by the selected model. Choose another option for this model.",
+        ),
         ..cursor_case(&fixtures)
     })
     .await;
@@ -4336,7 +4338,9 @@ async fn opencode_option_the_model_does_not_advertise_fails_the_turn_once() {
         environment: Vec::new(),
         model: "openai/gpt-5",
         option: json!({"id":"fastMode","value":true}),
-        refusal: Some("Fast is not supported by the selected model."),
+        refusal: Some(
+            "Fast is not supported by the selected model. Choose another option for this model.",
+        ),
     })
     .await;
     server.abort();

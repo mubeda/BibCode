@@ -117,7 +117,7 @@ fn cursor_config_updates_reject_stale_or_malformed_descriptors_before_rpc() {
     };
     assert_eq!(
         refusal(json!([]), json!([{ "id": "fastMode", "value": true }])).as_deref(),
-        Some("Fast is not supported by the selected model.")
+        Some("Fast is not supported by the selected model. Choose another option for this model.")
     );
     assert_eq!(
         refusal(
@@ -125,7 +125,7 @@ fn cursor_config_updates_reject_stale_or_malformed_descriptors_before_rpc() {
             json!([{ "id": "contextWindow", "value": "1m" }]),
         )
         .as_deref(),
-        Some("Context 1m is not supported by the selected model.")
+        Some("Context 1m is not supported by the selected model. Choose another option for this model.")
     );
     assert_eq!(
         refusal(
@@ -770,7 +770,7 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
     // The model does not advertise the option, so a retry of the same turn cannot succeed.
     assert_eq!(
         refused.option_refusal(),
-        Some("Fast is not supported by the selected model."),
+        Some("Fast is not supported by the selected model. Choose another option for this model."),
         "{refused}"
     );
     runtime
@@ -872,7 +872,9 @@ async fn cursor_sends_only_advertised_bracketed_model_values() {
             .unwrap()
         )
         .as_deref(),
-        Some("Reasoning low is not supported by the selected model.")
+        Some(
+            "Reasoning low is not supported by the selected model. Choose another option for this model."
+        )
     );
     timeout(within, runtime.set_model("claude-opus-5"))
         .await
@@ -900,7 +902,7 @@ async fn cursor_sends_only_advertised_bracketed_model_values() {
             .unwrap()
         )
         .as_deref(),
-        Some("Fast is not supported by the selected model.")
+        Some("Fast is not supported by the selected model. Choose another option for this model.")
     );
     assert_eq!(
         refusal(
@@ -912,7 +914,9 @@ async fn cursor_sends_only_advertised_bracketed_model_values() {
             .unwrap()
         )
         .as_deref(),
-        Some("Context 1m is not supported by the selected model.")
+        Some(
+            "Context 1m is not supported by the selected model. Choose another option for this model."
+        )
     );
     assert_eq!(
         refusal(timeout(within, runtime.set_model("gpt-9")).await.unwrap()).as_deref(),

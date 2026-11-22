@@ -175,6 +175,21 @@ pub fn acp_model_descriptor(options: &[Value]) -> Option<&Value> {
         .find(|option| option.get("category").and_then(Value::as_str) == Some("model"))
 }
 
+/// The model values a `session/new` or `session/load` answer advertises.
+pub fn advertised_model_values(session: &Value) -> Vec<String> {
+    session
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| acp_model_descriptor(options))
+        .map(|descriptor| {
+            advertised_values(descriptor)
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether the session folds a model's options into its model values, as Cursor CLIs since
 /// 2026.11 do (`gpt-5.4-nano[reasoning=medium]`), instead of advertising them as options.
 pub fn acp_model_values_are_bracketed(options: &[Value]) -> bool {
@@ -870,10 +885,27 @@ pub fn discover_models_from_list_available_models(
     response: &Value,
     custom_models: &[String],
 ) -> Result<Vec<CursorProviderModel>, String> {
+    discover_models_with_advertised_values(response, custom_models, &[])
+}
+
+/// The models `cursor/list_available_models` lists, narrowed to what a session advertises.
+/// When the session folds options into bracketed model values, a model is published only with
+/// the option values some advertised value of its base carries, so the picker cannot offer a
+/// combination the runtime refuses; a model or custom model the session does not offer is left
+/// out. Plain advertised values, or none (the session could not be read), publish the list as is.
+pub fn discover_models_with_advertised_values(
+    response: &Value,
+    custom_models: &[String],
+    advertised: &[String],
+) -> Result<Vec<CursorProviderModel>, String> {
     let models = response
         .get("models")
         .and_then(Value::as_array)
         .ok_or_else(|| "cursor/list_available_models response missing models".to_owned())?;
+    let bracketed = advertised
+        .iter()
+        .filter_map(|value| bracketed_model_value(value))
+        .collect::<Vec<_>>();
     let mut discovered = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for model in models {
@@ -882,22 +914,43 @@ pub fn discover_models_from_list_available_models(
             .and_then(Value::as_str)
             .ok_or_else(|| "cursor model missing value".to_owned())?;
         let name = model.get("name").and_then(Value::as_str).unwrap_or(slug);
+        let base = resolve_acp_base_model_id(slug);
+        let config_options = model
+            .get("configOptions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let config_options = if bracketed.is_empty() {
+            config_options
+        } else {
+            let carriers = bracketed
+                .iter()
+                .filter(|(carrier, _)| *carrier == base)
+                .map(|(_, params)| params.as_slice())
+                .collect::<Vec<_>>();
+            if carriers.is_empty() {
+                continue;
+            }
+            narrow_config_options(config_options, &carriers)
+        };
         discovered.push(CursorProviderModel {
-            slug: resolve_acp_base_model_id(slug),
+            slug: base.clone(),
             name: name.to_owned(),
             is_custom: false,
-            capabilities: build_capabilities_from_config_options(&json!(
-                model
-                    .get("configOptions")
-                    .cloned()
-                    .unwrap_or(Value::Array(Vec::new()))
-            )),
+            capabilities: build_capabilities_from_config_options(&Value::Array(config_options)),
         });
-        seen.insert(resolve_acp_base_model_id(slug));
+        seen.insert(base);
     }
     for custom in custom_models {
         let trimmed = custom.trim();
         if trimmed.is_empty() || seen.contains(trimmed) {
+            continue;
+        }
+        let offered = bracketed.is_empty()
+            || advertised
+                .iter()
+                .any(|value| value == trimmed || resolve_acp_base_model_id(value) == trimmed);
+        if !offered {
             continue;
         }
         discovered.push(CursorProviderModel {
@@ -908,6 +961,54 @@ pub fn discover_models_from_list_available_models(
         });
     }
     Ok(discovered)
+}
+
+/// A model's listed options, each keeping only the values one of its advertised bracketed values
+/// carries under the option's id (the bracket keys are the CLI's option ids). An option no value
+/// carries is dropped, as is an on/off option left with one state, which a toggle cannot show;
+/// the runtime reads an omitted option as no constraint. A narrowed option's current value is one
+/// it keeps.
+fn narrow_config_options(options: Vec<Value>, carriers: &[&[(&str, &str)]]) -> Vec<Value> {
+    options
+        .into_iter()
+        .filter_map(|mut option| {
+            let id = option.get("id").and_then(Value::as_str)?.to_owned();
+            let carried = |value: &str| {
+                carriers.iter().any(|params| {
+                    params
+                        .iter()
+                        .any(|(key, carried)| *key == id && *carried == value)
+                })
+            };
+            let kept = option
+                .get("options")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter(|choice| {
+                    choice
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .is_some_and(carried)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let on_off = kept.iter().all(|choice| {
+                matches!(
+                    choice.get("value").and_then(Value::as_str),
+                    Some("true" | "false")
+                )
+            });
+            if kept.is_empty() || (on_off && kept.len() < 2) {
+                return None;
+            }
+            let current = option.get("currentValue").and_then(Value::as_str);
+            if !current.is_some_and(carried) {
+                option["currentValue"] = kept[0]["value"].clone();
+            }
+            option["options"] = Value::Array(kept);
+            Some(option)
+        })
+        .collect()
 }
 
 fn select_descriptor(id: &str, label: &str, options: Vec<Value>, current: Option<&str>) -> Value {
@@ -1029,6 +1130,94 @@ mod tests {
         assert_eq!(descriptors[1]["currentValue"], true);
     }
 
+    /// The shapes `cursor-agent` 2026.11 lists and advertises: the picker gets only the option
+    /// values an advertised value carries, never a combination the runtime would refuse.
+    #[test]
+    fn bracketed_sessions_narrow_the_published_options_to_advertised_values() {
+        let select = |id: &str, category: &str, current: &str, values: &[&str]| {
+            json!({
+                "id": id, "category": category, "type": "select", "currentValue": current,
+                "options": values.iter().map(|value| json!({ "value": value, "name": value }))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let list = json!({ "models": [
+            { "value": "default", "name": "Auto", "configOptions": [] },
+            { "value": "grok-4.7", "name": "Grok 4.7", "configOptions": [
+                select("context", "model_config", "256k", &["256k", "500k"]),
+                select("reasoning_effort", "thought_level", "high", &["low", "high", "xhigh"]),
+                select("fast", "model_config", "true", &["false", "true"])
+            ] },
+            { "value": "claude-sonnet-4", "name": "Claude Sonnet 4", "configOptions": [
+                select("thinking", "thought_level", "false", &["false", "true"])
+            ] },
+            { "value": "unadvertised", "name": "Unadvertised", "configOptions": [] }
+        ] });
+        let advertised = [
+            "default[]",
+            "grok-4.7[context=256k,reasoning_effort=high,fast=true]",
+            "grok-4.7[context=256k,reasoning_effort=low,fast=false]",
+            "claude-sonnet-4[thinking=false,context=200k]",
+        ]
+        .map(str::to_owned);
+        let custom = [
+            "claude-sonnet-4".to_owned(),
+            "mine".to_owned(),
+            "grok-4.7".to_owned(),
+        ];
+        let models = discover_models_with_advertised_values(&list, &custom, &advertised).unwrap();
+        let summary = models
+            .iter()
+            .map(|model| {
+                let options = model.capabilities["optionDescriptors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|descriptor| {
+                        let values = descriptor["options"]
+                            .as_array()
+                            .map(|options| {
+                                options
+                                    .iter()
+                                    .map(|option| option["id"].as_str().unwrap().to_owned())
+                                    .collect::<Vec<_>>()
+                                    .join("|")
+                            })
+                            .unwrap_or_else(|| "on/off".to_owned());
+                        format!("{}={values}", descriptor["id"].as_str().unwrap())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{} {options}", model.slug)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                "default ",
+                "grok-4.7 reasoning=low|high contextWindow=256k fastMode=on/off",
+                "claude-sonnet-4 ",
+            ]
+        );
+        // The custom models the session offers are listed models already; `mine` is not offered.
+        assert!(models.iter().all(|model| !model.is_custom));
+
+        // A plain-value session, or none read, publishes the list as before.
+        for advertised in [vec![], vec!["grok-4.7".to_owned(), "mine".to_owned()]] {
+            let models =
+                discover_models_with_advertised_values(&list, &custom, &advertised).unwrap();
+            assert_eq!(models.len(), 5, "{advertised:?}");
+            assert_eq!(
+                models[1].capabilities["optionDescriptors"][0]["options"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                3
+            );
+            assert!(models[4].is_custom);
+        }
+    }
+
     #[test]
     fn a_bracketed_model_option_holds_its_folded_in_options() {
         let descriptor = json!({
@@ -1067,15 +1256,15 @@ mod tests {
             refusal(
                 json!([{ "id": "reasoning", "value": "low" }, { "id": "fastMode", "value": false }])
             ),
-            "Reasoning low is not supported by the selected model."
+            "Reasoning low is not supported by the selected model. Choose another option for this model."
         );
         assert_eq!(
             refusal(json!([{ "id": "thinking", "value": true }])),
-            "Thinking is not supported by the selected model."
+            "Thinking is not supported by the selected model. Choose another option for this model."
         );
         assert_eq!(
             refusal(json!([{ "id": "unknown", "value": true }])),
-            "unknown is not supported by the selected model."
+            "unknown is not supported by the selected model. Choose another option for this model."
         );
         assert_eq!(
             resolve_advertised_model_value(&descriptor, "other").unwrap(),

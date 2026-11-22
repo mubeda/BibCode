@@ -2525,7 +2525,9 @@ async fn opencode_options_use_exact_model_variants_and_reject_conflicts_before_p
         .expect_err("an unknown option is refused");
     assert_eq!(
         unknown.option_refusal(),
-        Some("madeUp is not supported by the selected model.")
+        Some(
+            "madeUp is not supported by the selected model. Choose another option for this model."
+        )
     );
     // The shape checks name each option by the label its descriptor shows.
     for (options, refusal) in [
@@ -2555,7 +2557,9 @@ async fn opencode_options_use_exact_model_variants_and_reject_conflicts_before_p
         .expect_err("a variant the model does not advertise is refused");
     assert_eq!(
         unadvertised.option_refusal(),
-        Some("Variant medium is not supported by the selected model.")
+        Some(
+            "Variant medium is not supported by the selected model. Choose another option for this model."
+        )
     );
     assert!(state.prompt_body.lock().await.is_none());
 

@@ -34,9 +34,14 @@ reasoning, context, fast and thinking options. BiBCode sends the session only a
 model value the session advertises. Cursor CLIs since 2026.11 advertise one
 value per model with its options folded in, such as
 `gpt-5.4-nano[reasoning=medium]`, and reject a plain model name; BiBCode sends
-that advertised value. An option that no advertised value of the model holds,
-which with these CLIs is any non-default option, is refused before the turn is
-sent with a message naming it, as is a model the session does not offer.
+that advertised value. With these CLIs the picker offers each model only the
+option values an advertised value carries, and a custom model only when the CLI
+advertises it: provider inventory opens one empty Cursor session per CLI version
+and model list to read the advertised values (Cursor does not list empty
+sessions). An option that no advertised value of the model holds, such as one
+saved from an older catalog, is refused before the turn is sent with a message
+naming it and saying to choose another option, as is a model the session does
+not offer.
 Older CLIs that advertise plain values and separate options keep working the
 same way. Auto, and a thread with no model selected, sends the session's
 advertised `default[...]` value, so it never runs the model the CLI last

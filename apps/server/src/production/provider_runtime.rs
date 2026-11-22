@@ -2367,7 +2367,7 @@ mod delivery_failure_tests {
         let error = ProviderRuntimeError::InvalidOption {
             provider: "codex".to_owned(),
             detail: "invalid service tier".to_owned(),
-            refusal: "Fast Mode is not supported by the selected model.".to_owned(),
+            refusal: "Fast Mode is not supported by the selected model. Choose another option for this model.".to_owned(),
         };
         let expected = ProviderDeliveryOutcome::Refused {
             detail: delivery_detail(&error, Some("Work Codex")),
@@ -23602,7 +23602,10 @@ mod tests {
             refused.to_string(),
             "claudeAgent provider operation failed: option fastMode is not supported by the selected model/session"
         );
-        assert_eq!(refusal, "Fast Mode is not supported by the selected model.");
+        assert_eq!(
+            refusal,
+            "Fast Mode is not supported by the selected model. Choose another option for this model."
+        );
     }
 
     /// Every error a delivery can meet reads as plain words that name the provider by the
@@ -23616,9 +23619,9 @@ mod tests {
                     provider: "codex".to_owned(),
                     detail: "option madeUp is not supported by the selected model/session"
                         .to_owned(),
-                    refusal: "madeUp is not supported by the selected model.".to_owned(),
+                    refusal: "madeUp is not supported by the selected model. Choose another option for this model.".to_owned(),
                 },
-                "madeUp is not supported by the selected model.",
+                "madeUp is not supported by the selected model. Choose another option for this model.",
             ),
             (
                 Error::Provider {
@@ -23899,7 +23902,7 @@ mod tests {
         assert_eq!(
             super::launch_failure_outcome(&error, "Work Claude"),
             super::ProviderDeliveryOutcome::Refused {
-                detail: "Fast Mode is not supported by the selected model.".to_owned()
+                detail: "Fast Mode is not supported by the selected model. Choose another option for this model.".to_owned()
             }
         );
     }
