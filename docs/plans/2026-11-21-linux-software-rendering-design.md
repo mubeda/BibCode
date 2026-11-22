@@ -331,15 +331,24 @@ opened but its page stayed blank on Wayland and on X11, while the same AppDir
 started through `AppRun` rendered.
 
 Fix: `main`, after the CLI branches and before the software-rendering step,
-restarts the process through `<AppDir>/AppRun` with the same arguments when the
-executable is `<AppDir>/usr/bin/<name>` next to an `AppRun` and `APPDIR` is not
-set. `AppRun` exports `APPDIR`, so the restarted process does not restart
-again, and a link start then matches a menu start exactly. It runs before the
-software-rendering step, so the restarted process does not take BiBCode's own
-variables for the user's. If the restart fails, `main` logs why and changes
-to `<AppDir>/usr` itself, which is enough for WebKit to start. Pure functions
-of the executable path and of `APPDIR` decide both. A system install
-(`/usr/bin`, no `AppRun`) is unchanged.
+hands the launch once to the bundle's `AppRun`, with the same arguments, when
+all of these hold:
+
+- the executable is `<root>/usr/bin/<name>` with a root other than `/` (the
+  layout check mirrors the server's `extracted_appdir`);
+- `<root>/AppRun` is a regular executable file, or a symlink that resolves
+  inside the bundle;
+- `APPDIR` does not name this bundle (compared canonically). An empty value or
+  another application's AppDir, as when a link is clicked inside another
+  AppImage, still leads to the handoff, which drops the inherited `APPDIR`;
+- the one-shot guard `BIBCODE_APPRUN_HANDOFF` is absent. The handoff sets it,
+  and the next start removes it from its own environment while still
+  single-threaded, so a launcher that comes straight back to the binary ends
+  in one handoff and terminals and providers never inherit it.
+
+It runs before the software-rendering step, so the new process does not take
+BiBCode's own variables for the user's. If the exec fails, `main` logs why
+and changes to `<root>/usr` itself, which is enough for WebKit to start.
 
 Alternatives:
 
