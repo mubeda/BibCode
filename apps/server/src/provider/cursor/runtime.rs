@@ -50,6 +50,10 @@ const STOP_CANCEL_GRACE: Duration = Duration::from_secs(10);
 const PROMPT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a stopped process may take to fail the blocked write, which tells how much was sent.
 const RETIRED_WRITE_SETTLE: Duration = Duration::from_secs(10);
+/// How long starting the session (initialize, authenticate, session/new or session/load, and the
+/// initial model and mode) may take before BiBCode stops the process. A CLI waits silently for
+/// an MCP server that never connects; it fires before the shared provider start limit.
+pub const START_TIMEOUT: Duration = Duration::from_secs(60);
 const FIXED_EVENT_TIME: &str = "2026-07-10T00:00:00.000Z";
 
 /// Phrases that mean the saved Cursor session itself is gone. A `session/load`
@@ -174,6 +178,13 @@ pub enum CursorRuntimeError {
     },
     #[error("Cursor session configuration is uncertain: {detail}")]
     ConfigurationUncertain { detail: String },
+    /// The session did not start within [`START_TIMEOUT`]; its process is retired. Nothing was
+    /// sent, so a message waiting on it may be sent again.
+    #[error(
+        "Cursor did not finish starting. One of its MCP servers may not be responding; run \
+         `cursor-agent mcp list` in a terminal to see which one."
+    )]
+    StartTimedOut,
 }
 
 impl OptionRefusal for CursorRuntimeError {
@@ -220,6 +231,7 @@ struct RuntimeInner {
     cancel_grace: std::sync::Mutex<Duration>,
     prompt_write_timeout: std::sync::Mutex<Duration>,
     retired_write_settle: std::sync::Mutex<Duration>,
+    start_timeout: std::sync::Mutex<Duration>,
     /// Tool calls of the active turn Cursor reports `in_progress`: a long command is silent, not
     /// stalled.
     open_tool_calls: std::sync::Mutex<HashSet<String>>,
@@ -288,6 +300,7 @@ impl CursorSessionRuntime {
             cancel_grace: std::sync::Mutex::new(STOP_CANCEL_GRACE),
             prompt_write_timeout: std::sync::Mutex::new(PROMPT_WRITE_TIMEOUT),
             retired_write_settle: std::sync::Mutex::new(RETIRED_WRITE_SETTLE),
+            start_timeout: std::sync::Mutex::new(START_TIMEOUT),
             open_tool_calls: std::sync::Mutex::new(HashSet::new()),
             abandoned: AtomicBool::new(false),
             abandon: Notify::new(),
@@ -384,7 +397,30 @@ impl CursorSessionRuntime {
         });
     }
 
+    /// Replaces [`START_TIMEOUT`], for tests.
+    pub fn set_start_timeout(&self, timeout: Duration) {
+        *lock(&self.inner.start_timeout) = timeout;
+    }
+
+    /// Starts the session within [`START_TIMEOUT`]. On expiry the process is retired, so the
+    /// driver stops it, and the start fails as never sent.
     pub async fn start(&self) -> Result<String, CursorRuntimeError> {
+        let deadline = *lock(&self.inner.start_timeout);
+        match tokio::time::timeout(deadline, self.start_session()).await {
+            Ok(started) => started,
+            Err(_) => {
+                tracing::warn!(
+                    provider = PROVIDER,
+                    deadline_secs = deadline.as_secs(),
+                    "Cursor did not finish starting before its deadline; stopping its process"
+                );
+                self.retire();
+                Err(CursorRuntimeError::StartTimedOut)
+            }
+        }
+    }
+
+    async fn start_session(&self) -> Result<String, CursorRuntimeError> {
         self.emit("session.started", None, None, json!({})).await;
         let connection = self.inner.connection.lock().await.clone();
         connection
@@ -1635,7 +1671,8 @@ fn silence_message(timeout: Duration) -> String {
     };
     format!(
         "Cursor has sent nothing for {quiet}. It may be waiting for you to sign in to Cursor in \
-         your browser; otherwise stop the turn if it seems stuck."
+         your browser, or one of its MCP servers may not be responding; otherwise stop the turn if \
+         it seems stuck."
     )
 }
 
@@ -1939,7 +1976,7 @@ mod tests {
         assert_eq!(events[1].turn_id.as_deref(), Some(receipt.turn_id.as_str()));
         assert_eq!(
             events[1].payload["message"],
-            "Cursor has sent nothing for 0 seconds. It may be waiting for you to sign in to Cursor in your browser; otherwise stop the turn if it seems stuck."
+            "Cursor has sent nothing for 0 seconds. It may be waiting for you to sign in to Cursor in your browser, or one of its MCP servers may not be responding; otherwise stop the turn if it seems stuck."
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
