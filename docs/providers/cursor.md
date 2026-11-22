@@ -49,15 +49,21 @@ remembered; a session that advertises no default value leaves the choice to
 Cursor.
 
 A Cursor turn that receives no update at all for five minutes, while it waits
-on neither the user nor a running tool, is cancelled on the CLI as Stop does and
-ends as failed with a message saying that Cursor stopped responding and to send
-the message again or check the Cursor CLI. If the CLI does not answer that
-cancel within ten seconds either, BiBCode stops the Cursor process, as a
-requested stop rather than a crash, so nothing the old prompt still produces can
-reach the next message; the next message starts Cursor again and resumes the
-session. A turn that keeps streaming text,
-thoughts or tool progress is never cut off, and the session takes the next
-message as usual.
+on neither the user nor a tool Cursor reports running, shows the notice
+"Cursor has sent nothing for 5 minutes. Stop the turn if it seems stuck." The
+turn keeps running; BiBCode never ends it by itself, and the notice clears when
+Cursor sends its next update. A tool Cursor reports only as pending, or as
+finished in any way, does not pause that clock.
+
+After **Stop**, BiBCode drops everything Cursor still sends for that turn: no
+text, plan or to-do update appears, no approval or question opens, and a late
+permission request or question is answered as cancelled, never approved. If
+Cursor does not end the stopped turn within ten seconds, the turn ends as
+cancelled and BiBCode stops the Cursor process, as a requested stop rather than
+a crash, so nothing the old prompt still produces can reach the next message;
+the next message starts Cursor again and resumes the session. BiBCode also stops
+the process when Cursor does not take a prompt within 30 seconds; a prompt it
+did not read at all is sent again, one it may have partly read is not.
 
 Cursor slash commands, skills, and agents are discovered from the server-side
 workspace environment. Skills include `.cursor/skills`, `.agents/skills`,

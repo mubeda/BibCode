@@ -25,7 +25,8 @@ use crate::provider::{
 
 use super::{
     acp::{
-        AcpJsonRpcConnection, AcpProtocolError, IncomingEvent, JsonRpcErrorShape, acp_error_class,
+        AcpJsonRpcConnection, AcpProtocolError, AcpRequestWriteFailure, IncomingEvent,
+        JsonRpcErrorShape, acp_error_class,
         acp_turn_state,
     },
     model::{
@@ -38,14 +39,18 @@ use super::{
 
 const PROVIDER: &str = "cursor";
 
-/// How long a Cursor turn may go without any update before BiBCode ends it. A turn that streams
-/// text, thoughts or tool progress is never cut off, nor one that waits on the user or a running
-/// tool. Five minutes is far longer than Cursor takes to send its first update, so only a stalled
-/// CLI reaches it, and short enough that the user is not left with a pending turn indefinitely.
+/// How long a Cursor turn may go without any update before BiBCode shows a notice on it. The turn
+/// keeps running: the user decides whether to stop it. The clock pauses while the turn waits on
+/// the user or on a tool Cursor reports running, and the notice clears with the next update.
 pub const DEFAULT_SILENCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// How long a silent turn's cancelled prompt may take to be answered before the turn ends anyway.
-const SILENCE_CANCEL_GRACE: Duration = Duration::from_secs(10);
+/// How long a stopped turn's cancelled prompt may take to be answered before BiBCode ends the turn
+/// and stops the process, so nothing the old prompt still produces reaches the next message.
+const STOP_CANCEL_GRACE: Duration = Duration::from_secs(10);
+/// How long writing a prompt to the CLI may block before BiBCode stops the process.
+const PROMPT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a stopped process may take to fail the blocked write, which tells how much was sent.
+const RETIRED_WRITE_SETTLE: Duration = Duration::from_secs(10);
 const FIXED_EVENT_TIME: &str = "2026-07-10T00:00:00.000Z";
 
 /// Phrases that mean the saved Cursor session itself is gone. A `session/load`
@@ -203,14 +208,23 @@ struct RuntimeInner {
     event_counter: Mutex<u64>,
     pending_requests: Mutex<HashMap<String, PendingRequest>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// The stopped turn whose late messages are dropped before any handler runs.
     ignore_turn_output: Mutex<Option<String>>,
-    /// When the CLI last sent anything; a turn silent past `silence_timeout` is ended.
+    /// When the CLI last sent anything; a turn silent past `silence_timeout` gets a notice.
     last_activity: std::sync::Mutex<tokio::time::Instant>,
     silence_timeout: std::sync::Mutex<Duration>,
-    /// Tool calls of the active turn still running: a long command is silent, not stalled.
+    /// Whether the active turn shows the silence notice.
+    silence_notice: AtomicBool,
+    cancel_grace: std::sync::Mutex<Duration>,
+    prompt_write_timeout: std::sync::Mutex<Duration>,
+    /// Tool calls of the active turn Cursor reports `in_progress`: a long command is silent, not
+    /// stalled.
     open_tool_calls: std::sync::Mutex<HashSet<String>>,
-    /// Set once a silent turn's cancel went unanswered: the CLI may still run that prompt, so
-    /// this runtime takes no further prompt and the driver stops the process.
+    /// The turn BiBCode ended itself when it retired the process; its late answer ends nothing.
+    retired_turn: std::sync::Mutex<Option<String>>,
+    /// Set once the process is retired (a stop's cancel went unanswered, or a prompt write
+    /// blocked): the CLI may still run the old prompt, so this runtime takes nothing more and the
+    /// driver stops the process.
     abandoned: AtomicBool,
     abandon: Notify,
 }
@@ -261,7 +275,11 @@ impl CursorSessionRuntime {
             ignore_turn_output: Mutex::new(None),
             last_activity: std::sync::Mutex::new(tokio::time::Instant::now()),
             silence_timeout: std::sync::Mutex::new(DEFAULT_SILENCE_TIMEOUT),
+            silence_notice: AtomicBool::new(false),
+            cancel_grace: std::sync::Mutex::new(STOP_CANCEL_GRACE),
+            prompt_write_timeout: std::sync::Mutex::new(PROMPT_WRITE_TIMEOUT),
             open_tool_calls: std::sync::Mutex::new(HashSet::new()),
+            retired_turn: std::sync::Mutex::new(None),
             abandoned: AtomicBool::new(false),
             abandon: Notify::new(),
         });
@@ -275,37 +293,82 @@ impl CursorSessionRuntime {
         *lock(&self.inner.silence_timeout) = timeout;
     }
 
-    /// Resolves once a silent turn's cancel went unanswered; the driver then stops the process.
+    /// Replaces the stop grace and the prompt write deadline, for tests.
+    pub fn set_stop_deadlines(&self, cancel_grace: Duration, prompt_write: Duration) {
+        *lock(&self.inner.cancel_grace) = cancel_grace;
+        *lock(&self.inner.prompt_write_timeout) = prompt_write;
+    }
+
+    /// Resolves once the process is retired; the driver then stops it.
     pub async fn abandoned(&self) {
         self.inner.abandon.notified().await;
     }
 
-    fn note_activity(&self) {
-        *lock(&self.inner.last_activity) = tokio::time::Instant::now();
+    /// Whether the process is retired: the session takes nothing more and must be launched again.
+    pub fn is_retired(&self) -> bool {
+        self.inner.abandoned.load(Ordering::SeqCst)
     }
 
-    /// Resolves once the active turn has gone the silence timeout without an update while
-    /// waiting on neither the user nor a running tool.
-    async fn silence(&self, turn_id: &str) {
-        loop {
-            let waiting = self
-                .inner
-                .pending_requests
-                .lock()
-                .await
-                .values()
-                .any(|pending| pending.turn_id.as_deref() == Some(turn_id))
-                || !lock(&self.inner.open_tool_calls).is_empty();
-            if waiting {
-                self.note_activity();
-            }
-            let timeout = *lock(&self.inner.silence_timeout);
-            let quiet = lock(&self.inner.last_activity).elapsed();
-            if quiet >= timeout {
-                return;
-            }
-            tokio::time::sleep((timeout - quiet).min(Duration::from_secs(1))).await;
+    /// An update arrived: the silence clock starts again and a shown notice clears.
+    async fn note_activity(&self) {
+        *lock(&self.inner.last_activity) = tokio::time::Instant::now();
+        if self.inner.silence_notice.swap(false, Ordering::SeqCst) {
+            let turn_id = self.inner.active_turn_id.lock().await.clone();
+            self.emit("turn.notice", turn_id, None, json!({ "message": null }))
+                .await;
         }
+    }
+
+    /// Shows a notice on the turn once it has gone the silence timeout without an update while
+    /// waiting on neither the user nor a tool Cursor reports running. It never ends the turn.
+    fn watch_silence(&self, turn_id: String) {
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            loop {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let runtime = Self { inner };
+                if runtime.inner.active_turn_id.lock().await.as_deref() != Some(turn_id.as_str()) {
+                    return;
+                }
+                let waiting = runtime
+                    .inner
+                    .pending_requests
+                    .lock()
+                    .await
+                    .values()
+                    .any(|pending| pending.turn_id.as_deref() == Some(turn_id.as_str()))
+                    || !lock(&runtime.inner.open_tool_calls).is_empty();
+                if waiting {
+                    *lock(&runtime.inner.last_activity) = tokio::time::Instant::now();
+                }
+                let timeout = *lock(&runtime.inner.silence_timeout);
+                let quiet = lock(&runtime.inner.last_activity).elapsed();
+                let pause = if quiet < timeout {
+                    (timeout - quiet).min(Duration::from_secs(1))
+                } else {
+                    if !runtime.inner.silence_notice.swap(true, Ordering::SeqCst) {
+                        tracing::warn!(
+                            provider = PROVIDER,
+                            quiet_secs = timeout.as_secs(),
+                            "Cursor sent no update for the silence timeout; showing a notice"
+                        );
+                        runtime
+                            .emit(
+                                "turn.notice",
+                                Some(turn_id.clone()),
+                                None,
+                                json!({ "message": silence_message(timeout) }),
+                            )
+                            .await;
+                    }
+                    Duration::from_secs(1).min(timeout)
+                };
+                drop(runtime);
+                tokio::time::sleep(pause).await;
+            }
+        });
     }
 
     pub async fn start(&self) -> Result<String, CursorRuntimeError> {
@@ -654,7 +717,28 @@ impl CursorSessionRuntime {
             Ok(request) => request,
             Err(error) => return Err(self.end_unsent_turn(turn_id, error).await),
         };
-        let completion = match request.written().await {
+        let write_deadline = *lock(&self.inner.prompt_write_timeout);
+        let written = match tokio::time::timeout(write_deadline, request.written()).await {
+            Ok(written) => written,
+            Err(_) => {
+                // A CLI that stops reading its input holds the write forever. The process is
+                // stopped, which fails the write with the count of bytes it took: none means
+                // the prompt was never sent.
+                tracing::warn!(
+                    provider = PROVIDER,
+                    "writing a prompt to Cursor blocked past its deadline; stopping its process"
+                );
+                self.retire();
+                tokio::time::timeout(RETIRED_WRITE_SETTLE, request.written())
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(AcpRequestWriteFailure::unconfirmed(
+                            "Cursor did not take the prompt and its process was stopped",
+                        ))
+                    })
+            }
+        };
+        let completion = match written {
             Ok(()) => self.track_prompt_response(connection, turn_id.clone(), request.response()),
             Err(failure) if failure.is_definitely_not_sent() => {
                 return Err(self.end_unsent_turn(turn_id, failure.into_error()).await);
@@ -713,7 +797,8 @@ impl CursorSessionRuntime {
         *self.inner.active_turn_id.lock().await = Some(turn_id.clone());
         *self.inner.ignore_turn_output.lock().await = None;
         lock(&self.inner.open_tool_calls).clear();
-        self.note_activity();
+        self.inner.silence_notice.store(false, Ordering::SeqCst);
+        *lock(&self.inner.last_activity) = tokio::time::Instant::now();
         self.emit(
             "turn.started",
             Some(turn_id.clone()),
@@ -721,6 +806,8 @@ impl CursorSessionRuntime {
             json!({ "model": self.inner.options.model }),
         )
         .await;
+        // Armed when the turn is announced, so a prompt write that blocks is silent too.
+        self.watch_silence(turn_id.clone());
         let connection = self.inner.connection.lock().await.clone();
         let prompt = crate::provider::attachments::prompt_parts(input, attachments);
         Ok((session_id, turn_id, connection, prompt))
@@ -755,18 +842,13 @@ impl CursorSessionRuntime {
         let runtime = self.clone();
         let (completion_tx, completion) = oneshot::channel();
         tokio::spawn(async move {
-            let mut response = std::pin::pin!(response);
-            let result = tokio::select! {
-                result = &mut response => Some(result),
-                () = runtime.silence(&background_turn_id) => None,
-            };
-            let Some(result) = result else {
-                runtime
-                    .end_silent_turn(&connection, background_turn_id, response)
-                    .await;
+            let result = response.await;
+            // A turn BiBCode already ended when it retired the process: its prompt was written,
+            // so the delivery stays accepted, and the closed connection ends nothing twice.
+            if lock(&runtime.inner.retired_turn).as_deref() == Some(background_turn_id.as_str()) {
                 let _ = completion_tx.send(Ok(()));
                 return;
-            };
+            }
             // The response resolves on the reader task, while the chunks the agent wrote before
             // it may still wait in the incoming queue. Handle them first, so they keep this turn
             // and come before its `turn.completed`.
@@ -820,57 +902,39 @@ impl CursorSessionRuntime {
         completion
     }
 
-    /// Ends a turn the CLI stopped answering: cancels its prompt as Stop does, gives the answer
-    /// a short grace, and ends the turn once as failed with a message the user can act on. The
-    /// prompt was written, so its delivery stays accepted; the session takes the next turn.
-    async fn end_silent_turn<F>(
-        &self,
-        connection: &AcpJsonRpcConnection,
-        turn_id: String,
-        response: std::pin::Pin<&mut F>,
-    ) where
-        F: Future<Output = Result<Value, AcpProtocolError>>,
-    {
-        let timeout = *lock(&self.inner.silence_timeout);
+    /// Latches the retirement before anything else, so no next prompt or setting reaches a CLI
+    /// that may still run the old prompt, and asks the driver to stop the process.
+    fn retire(&self) {
+        self.inner.abandoned.store(true, Ordering::SeqCst);
+        self.inner.abandon.notify_one();
+    }
+
+    /// Ends a stopped turn whose cancel the CLI did not answer within the grace: the turn ends
+    /// once, as cancelled, and the process is retired.
+    async fn end_unanswered_stop(&self, turn_id: String) {
+        {
+            let mut active = self.inner.active_turn_id.lock().await;
+            if active.as_deref() != Some(turn_id.as_str()) {
+                return;
+            }
+            *active = None;
+        }
         tracing::warn!(
             provider = PROVIDER,
-            quiet_secs = timeout.as_secs(),
-            "Cursor sent no update for the silence timeout; ending the turn"
+            "Cursor did not answer the cancel of a stopped turn; stopping its process"
         );
-        if let Err(error) = self.interrupt_turn().await {
-            tracing::warn!(provider = PROVIDER, %error, "could not cancel a silent Cursor turn");
-        }
-        let answered = tokio::time::timeout(SILENCE_CANCEL_GRACE.min(timeout), response)
-            .await
-            .is_ok();
-        if !answered {
-            // Latched before the turn ends, so no next prompt reaches a CLI still running this one.
-            self.inner.abandoned.store(true, Ordering::SeqCst);
-        }
-        let _ = connection.barrier().await;
-        if self.inner.active_turn_id.lock().await.as_deref() == Some(turn_id.as_str()) {
-            *self.inner.active_turn_id.lock().await = None;
-        }
+        *lock(&self.inner.retired_turn) = Some(turn_id.clone());
         lock(&self.inner.open_tool_calls).clear();
+        // Retired before the turn ends, so the next message never reaches this process.
+        self.inner.abandoned.store(true, Ordering::SeqCst);
         self.emit(
             "turn.completed",
             Some(turn_id),
             None,
-            json!({
-                "state": "failed",
-                "stopReason": "error",
-                "errorMessage": silence_message(timeout),
-                "errorClass": "provider_error",
-            }),
+            json!({ "state": "cancelled", "stopReason": "cancelled" }),
         )
         .await;
-        if !answered {
-            tracing::warn!(
-                provider = PROVIDER,
-                "Cursor did not answer the cancel of a silent turn; stopping its process"
-            );
-            self.inner.abandon.notify_one();
-        }
+        self.inner.abandon.notify_one();
     }
 
     pub async fn interrupt_turn(&self) -> Result<(), CursorRuntimeError> {
@@ -903,6 +967,12 @@ impl CursorSessionRuntime {
                 json!({ "sessionId": self.provider_session_id().await? }),
             )
             .await?;
+        let runtime = self.clone();
+        let grace = *lock(&self.inner.cancel_grace);
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            runtime.end_unanswered_stop(turn_id).await;
+        });
         Ok(())
     }
 
@@ -1058,9 +1128,30 @@ impl CursorSessionRuntime {
         request_scope: RequestScope,
         event: IncomingEvent,
     ) {
+        // The one gate for a stopped turn's late messages, before any handler runs: none is
+        // projected, none opens an approval or question, none is approved. Held across the
+        // handler, so a stop cannot land between this check and a request being recorded.
+        let ignored = self.inner.ignore_turn_output.lock().await;
+        let late = match ignored.as_deref() {
+            Some(ignored) => {
+                let active = self.inner.active_turn_id.lock().await;
+                active.is_none() || active.as_deref() == Some(ignored)
+            }
+            None => false,
+        };
         match event {
+            IncomingEvent::Notification { .. } if late => {
+                tracing::debug!(provider = PROVIDER, "dropped a stopped turn's late notification");
+            }
+            IncomingEvent::Request {
+                wire_id, method, ..
+            } if late => {
+                if let Err(error) = refuse_late_request(&connection, wire_id, &method).await {
+                    tracing::warn!(provider = PROVIDER, %error, "could not refuse a late request");
+                }
+            }
             IncomingEvent::Notification { method, params } => {
-                self.note_activity();
+                self.note_activity().await;
                 self.handle_notification(method, params).await;
             }
             IncomingEvent::Request {
@@ -1069,7 +1160,7 @@ impl CursorSessionRuntime {
                 method,
                 params,
             } => {
-                self.note_activity();
+                self.note_activity().await;
                 if let Err(error) = self
                     .handle_request(
                         connection,
@@ -1146,12 +1237,6 @@ impl CursorSessionRuntime {
             return;
         }
         let turn_id = self.inner.active_turn_id.lock().await.clone();
-        // A cancelled turn's late output, before or after its end, joins no turn.
-        if let Some(ignored_turn_id) = self.inner.ignore_turn_output.lock().await.clone()
-            && (turn_id.is_none() || turn_id.as_deref() == Some(ignored_turn_id.as_str()))
-        {
-            return;
-        }
         match params
             .get("update")
             .and_then(|value| value.get("sessionUpdate"))
@@ -1186,7 +1271,8 @@ impl CursorSessionRuntime {
                     .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or("pending");
-                // An update without a status leaves the call as it was; a new call is pending.
+                // Only a call Cursor reports running pauses the silence clock; a pending,
+                // finished or unknown status does not. An update without a status leaves it.
                 let reported = update.get("status").and_then(Value::as_str).or_else(|| {
                     (update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call"))
                         .then_some("pending")
@@ -1194,11 +1280,11 @@ impl CursorSessionRuntime {
                 {
                     let mut open = lock(&self.inner.open_tool_calls);
                     match reported {
-                        Some("completed" | "failed") => {
-                            open.remove(tool_call_id);
+                        Some("in_progress") => {
+                            open.insert(tool_call_id.to_owned());
                         }
                         Some(_) => {
-                            open.insert(tool_call_id.to_owned());
+                            open.remove(tool_call_id);
                         }
                         None => {}
                     }
@@ -1496,16 +1582,42 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// What the user sees when a Cursor turn ends for want of any update.
+/// The notice a running Cursor turn shows after the silence timeout without an update.
 fn silence_message(timeout: Duration) -> String {
     let quiet = match timeout.as_secs() {
         seconds if seconds >= 120 => format!("{} minutes", seconds / 60),
         seconds => format!("{seconds} seconds"),
     };
-    format!(
-        "Cursor stopped responding: no update for {quiet}. Send the message again, or check \
-         that the Cursor CLI is signed in and working."
-    )
+    format!("Cursor has sent nothing for {quiet}. Stop the turn if it seems stuck.")
+}
+
+/// A stopped turn's late request gets the refusal a cancel gives, never an approval: a
+/// permission or question is `cancelled` and a plan is not accepted.
+async fn refuse_late_request(
+    connection: &AcpJsonRpcConnection,
+    wire_id: Value,
+    method: &str,
+) -> Result<(), AcpProtocolError> {
+    let refusal = match method {
+        "session/request_permission" => json!({ "outcome": { "outcome": "cancelled" } }),
+        "cursor/ask_question" | "_x.ai/ask_user_question" | "x.ai/ask_user_question" => {
+            json!({ "outcome": "cancelled" })
+        }
+        "cursor/create_plan" => json!({ "accepted": false }),
+        _ => {
+            return connection
+                .respond_error(
+                    wire_id,
+                    JsonRpcErrorShape {
+                        code: -32601,
+                        message: format!("Method not found: {method}"),
+                        data: None,
+                    },
+                )
+                .await;
+        }
+    };
+    connection.respond(wire_id, refusal).await
 }
 
 fn find_option_id(options: &[Value], kind: &str) -> Option<String> {
@@ -1736,10 +1848,32 @@ mod tests {
         })
     }
 
-    /// The measured stall: one `session_info_update`, then nothing. The turn ends once with an
-    /// actionable message, the prompt is cancelled on the CLI, and the next turn still works.
+    fn tool_update(kind: &str, status: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": { "sessionId": "cursor-session", "update": {
+                "sessionUpdate": kind, "toolCallId": "tool-1", "status": status
+            } }
+        })
+    }
+
+    async fn next_of(runtime: &CursorSessionRuntime, wanted: &str) -> CursorRuntimeEvent {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = runtime.next_event().await.expect("event");
+                if event.event_type == wanted {
+                    return event;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {wanted} event"))
+    }
+
+    /// The measured stall: one `session_info_update`, then nothing. The turn shows a notice and
+    /// keeps running, nothing is cancelled, and the next update clears the notice.
     #[tokio::test]
-    async fn a_silent_turn_ends_with_a_message_and_leaves_the_session_usable() {
+    async fn a_silent_turn_shows_a_notice_keeps_running_and_clears_it_on_the_next_update() {
         let (runtime, mut requests, mut responses) = delivery_runtime(Some("cursor-session"));
         runtime.set_silence_timeout(Duration::from_millis(300));
         let receipt = runtime
@@ -1747,158 +1881,231 @@ mod tests {
             .await
             .expect("session prompt should write");
         let prompt = read_request(&mut requests).await;
-        assert_eq!(prompt["method"], "session/prompt");
         write_frame(&mut responses, session_update("session_info_update")).await;
 
-        let cancel = read_request(&mut requests).await;
-        assert_eq!(cancel["method"], "session/cancel");
-        assert_eq!(cancel["params"]["sessionId"], "cursor-session");
-        // The CLI answers the cancel within the grace; output it sends meanwhile joins no turn.
-        write_frame(&mut responses, session_update("agent_message_chunk")).await;
-        write_frame(
-            &mut responses,
-            json!({ "jsonrpc": "2.0", "id": prompt["id"], "result": { "stopReason": "cancelled" } }),
-        )
-        .await;
-        // The prompt was written, so the delivery is accepted, never retried.
-        timeout(Duration::from_secs(5), receipt.completion())
-            .await
-            .expect("the deadline resolves the receipt")
-            .expect("accepted");
-        let events = timeout(Duration::from_secs(2), runtime.collect_events(2))
+        let events = timeout(Duration::from_secs(5), runtime.collect_events(2))
             .await
             .expect("two events");
         assert_eq!(events[0].event_type, "turn.started");
-        assert_eq!(events[1].event_type, "turn.completed");
-        assert_eq!(events[1].payload["state"], "failed");
-        assert!(
-            events[1].payload["errorMessage"]
-                .as_str()
-                .is_some_and(|message| message.starts_with("Cursor stopped responding")),
-            "{:?}",
-            events[1].payload
+        assert_eq!(events[1].event_type, "turn.notice");
+        assert_eq!(events[1].turn_id.as_deref(), Some(receipt.turn_id.as_str()));
+        assert_eq!(
+            events[1].payload["message"],
+            "Cursor has sent nothing for 0 seconds. Stop the turn if it seems stuck."
         );
-        let next = runtime
-            .send_turn_with_receipt(Some("again"), Vec::new())
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            timeout(Duration::from_millis(50), requests.next_line())
+                .await
+                .is_err(),
+            "nothing, a cancel included, is sent"
+        );
+        write_frame(&mut responses, session_update("agent_message_chunk")).await;
+        let events = timeout(Duration::from_secs(2), runtime.collect_events(2))
             .await
-            .expect("the session takes the next prompt");
-        let prompt = read_request(&mut requests).await;
-        assert_eq!(prompt["method"], "session/prompt");
+            .expect("cleared, then the update");
+        assert_eq!(events[0].event_type, "turn.notice");
+        assert!(events[0].payload["message"].is_null());
+        assert_eq!(events[1].event_type, "content.delta");
         write_frame(
             &mut responses,
             json!({ "jsonrpc": "2.0", "id": prompt["id"], "result": { "stopReason": "end_turn" } }),
         )
         .await;
-        timeout(Duration::from_secs(2), next.completion())
+        timeout(Duration::from_secs(2), receipt.completion())
             .await
             .expect("answered")
             .expect("accepted");
-        let events = timeout(Duration::from_secs(2), runtime.collect_events(2))
-            .await
-            .expect("the next turn's events");
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| (event.event_type.as_str(), event.payload["state"].as_str()))
-                .collect::<Vec<_>>(),
-            [
-                ("turn.started", None),
-                ("turn.completed", Some("completed"))
-            ]
-        );
+        let completed = next_of(&runtime, "turn.completed").await;
+        assert_eq!(completed.payload["state"], "completed");
     }
 
-    /// A CLI that ignores the cancel too: after the grace the turn still ends once, the runtime
-    /// asks the driver to stop the process, and takes no further prompt, so nothing the old
-    /// prompt still produces can reach a next turn.
+    /// A tool call that is only pending, or that ended in any status, leaves the clock running;
+    /// only one Cursor reports `in_progress` pauses it.
     #[tokio::test]
-    async fn an_unanswered_cancel_abandons_the_runtime_before_any_next_prompt() {
-        let (runtime, mut requests, mut responses) = delivery_runtime(Some("cursor-session"));
-        runtime.set_silence_timeout(Duration::from_millis(300));
-        let receipt = runtime
-            .send_turn_with_receipt(Some("hello"), Vec::new())
-            .await
-            .expect("session prompt should write");
-        assert_eq!(
-            read_request(&mut requests).await["method"],
-            "session/prompt"
-        );
-        assert_eq!(
-            read_request(&mut requests).await["method"],
-            "session/cancel"
-        );
-        timeout(Duration::from_secs(5), runtime.abandoned())
-            .await
-            .expect("the unanswered cancel abandons the runtime");
-        timeout(Duration::from_secs(2), receipt.completion())
-            .await
-            .expect("resolved")
-            .expect("accepted");
-        let events = timeout(Duration::from_secs(2), runtime.collect_events(2))
-            .await
-            .expect("the turn's events");
-        assert_eq!(events[1].event_type, "turn.completed");
-        assert_eq!(events[1].payload["state"], "failed");
-
-        // Output the old prompt still sends joins no turn, and no next prompt is written.
-        write_frame(&mut responses, session_update("agent_message_chunk")).await;
-        let refused = runtime
-            .send_turn_with_receipt(Some("again"), Vec::new())
-            .await
-            .expect_err("an abandoned runtime takes no prompt");
-        assert!(
-            matches!(refused, CursorRuntimeError::Protocol(_)),
-            "{refused}"
-        );
-        assert!(
-            timeout(Duration::from_millis(200), requests.next_line())
-                .await
-                .is_err(),
-            "nothing was written after the abandon"
-        );
-        assert!(
-            timeout(Duration::from_millis(200), runtime.next_event())
-                .await
-                .is_err(),
-            "no turn.started and no output after the abandon"
-        );
-    }
-
-    /// Stop during a running tool call keeps the silence deadline armed: a CLI that ignores the
-    /// cancel still gets its turn ended.
-    #[tokio::test]
-    async fn stop_during_a_running_tool_call_keeps_the_deadline() {
+    async fn only_a_running_tool_call_pauses_the_silence_clock() {
         let (runtime, mut requests, mut responses) = delivery_runtime(Some("cursor-session"));
         runtime.set_silence_timeout(Duration::from_millis(300));
         let _receipt = runtime
             .send_turn_with_receipt(Some("hello"), Vec::new())
             .await
             .expect("session prompt should write");
-        assert_eq!(
-            read_request(&mut requests).await["method"],
-            "session/prompt"
+        read_request(&mut requests).await;
+        write_frame(&mut responses, tool_update("tool_call", "pending")).await;
+        assert!(
+            next_of(&runtime, "turn.notice").await.payload["message"].is_string(),
+            "a pending call does not pause the clock"
         );
+        write_frame(&mut responses, tool_update("tool_call_update", "in_progress")).await;
+        assert!(next_of(&runtime, "turn.notice").await.payload["message"].is_null());
+        next_of(&runtime, "item.updated").await;
+        assert!(
+            timeout(Duration::from_millis(800), next_of(&runtime, "turn.notice"))
+                .await
+                .is_err(),
+            "a running call pauses the clock"
+        );
+        write_frame(&mut responses, tool_update("tool_call_update", "cancelled")).await;
+        assert!(
+            next_of(&runtime, "turn.notice").await.payload["message"].is_string(),
+            "an ended call, in any status, no longer pauses the clock"
+        );
+    }
+
+    /// After Stop, every late message of the turn stops at one gate: no update is projected, no
+    /// approval or question opens, nothing is approved, and a plan is not accepted.
+    #[tokio::test]
+    async fn a_stopped_turns_late_messages_are_dropped_or_refused() {
+        let (runtime, mut requests, mut responses) = delivery_runtime(Some("cursor-session"));
+        let receipt = runtime
+            .send_turn_with_receipt(Some("hello"), Vec::new())
+            .await
+            .expect("session prompt should write");
+        let prompt = read_request(&mut requests).await;
+        assert_eq!(next_of(&runtime, "turn.started").await.turn_id.as_deref(), Some(receipt.turn_id.as_str()));
+        runtime.interrupt_turn().await.expect("stop");
+        assert_eq!(read_request(&mut requests).await["method"], "session/cancel");
+
+        async fn late(responses: &mut DuplexStream) {
+            let frames = [
+                session_update("agent_message_chunk"),
+                json!({ "jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": "cursor-session",
+                    "update": { "sessionUpdate": "plan", "entries": [{ "content": "x" }] } } }),
+                json!({ "jsonrpc": "2.0", "method": "cursor/update_todos", "params": {
+                    "todos": [{ "content": "late", "status": "pending" }] } }),
+                tool_update("tool_call", "in_progress"),
+                json!({ "jsonrpc": "2.0", "id": 81, "method": "session/request_permission",
+                    "params": { "options": [{ "optionId": "yes", "kind": "allow_once" }] } }),
+                json!({ "jsonrpc": "2.0", "id": 82, "method": "cursor/ask_question",
+                    "params": { "questions": [{ "id": "q", "prompt": "Which?" }] } }),
+                json!({ "jsonrpc": "2.0", "id": 83, "method": "cursor/create_plan",
+                    "params": { "plan": "# Late" } }),
+            ];
+            let text = frames.iter().map(|frame| format!("{frame}\n")).collect::<String>();
+            responses.write_all(text.as_bytes()).await.expect("late write");
+        }
+        late(&mut responses).await;
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let answer = read_request(&mut requests).await;
+            answers.push((answer["id"].clone(), answer["result"].clone()));
+        }
+        assert_eq!(
+            answers,
+            [
+                (json!(81), json!({ "outcome": { "outcome": "cancelled" } })),
+                (json!(82), json!({ "outcome": "cancelled" })),
+                (json!(83), json!({ "accepted": false })),
+            ]
+        );
+        // The prompt's own answer still ends the turn once, as cancelled.
         write_frame(
             &mut responses,
-            json!({
-                "jsonrpc": "2.0", "method": "session/update",
-                "params": { "sessionId": "cursor-session", "update": {
-                    "sessionUpdate": "tool_call", "toolCallId": "tool-1", "status": "in_progress"
-                } }
-            }),
+            json!({ "jsonrpc": "2.0", "id": prompt["id"], "result": { "stopReason": "cancelled" } }),
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let completed = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("an event")
+            .expect("event");
+        assert_eq!(completed.event_type, "turn.completed", "{completed:?}");
+        assert_eq!(completed.payload["state"], "cancelled");
+        // After its end, the stopped turn's messages are still dropped or refused.
+        late(&mut responses).await;
+        for _ in 0..3 {
+            read_request(&mut requests).await;
+        }
+        assert!(
+            timeout(Duration::from_millis(300), runtime.next_event())
+                .await
+                .is_err(),
+            "nothing of the stopped turn was projected"
+        );
+    }
+
+    /// A stop whose cancel the CLI ignores: after the grace the turn ends once, as cancelled, the
+    /// runtime is retired so the driver stops the process, and it takes no further prompt.
+    #[tokio::test]
+    async fn an_unanswered_stop_retires_the_runtime_before_any_next_prompt() {
+        let (runtime, mut requests, mut responses) = delivery_runtime(Some("cursor-session"));
+        runtime.set_stop_deadlines(Duration::from_millis(300), PROMPT_WRITE_TIMEOUT);
+        let receipt = runtime
+            .send_turn_with_receipt(Some("hello"), Vec::new())
+            .await
+            .expect("session prompt should write");
+        assert_eq!(read_request(&mut requests).await["method"], "session/prompt");
         runtime.interrupt_turn().await.expect("stop");
-        assert_eq!(
-            read_request(&mut requests).await["method"],
-            "session/cancel"
+        assert_eq!(read_request(&mut requests).await["method"], "session/cancel");
+        timeout(Duration::from_secs(5), runtime.abandoned())
+            .await
+            .expect("the unanswered cancel retires the runtime");
+        assert!(runtime.is_retired());
+        let events = timeout(Duration::from_secs(2), runtime.collect_events(2))
+            .await
+            .expect("the turn's events");
+        assert_eq!(events[1].event_type, "turn.completed");
+        assert_eq!(events[1].payload["state"], "cancelled");
+
+        write_frame(&mut responses, session_update("agent_message_chunk")).await;
+        let refused = runtime
+            .send_turn_with_receipt(Some("again"), Vec::new())
+            .await
+            .expect_err("a retired runtime takes no prompt");
+        assert!(matches!(refused, CursorRuntimeError::Protocol(_)), "{refused}");
+        assert!(
+            timeout(Duration::from_millis(200), requests.next_line())
+                .await
+                .is_err(),
+            "nothing was written after the retirement"
         );
-        // The deadline's own cancel follows, though the tool call never reported closing.
-        assert_eq!(
-            read_request(&mut requests).await["method"],
-            "session/cancel"
+        // The stopped process closes the connection: the prompt's failed answer ends nothing twice.
+        drop(responses);
+        timeout(Duration::from_secs(2), receipt.completion())
+            .await
+            .expect("resolved")
+            .expect("the written prompt stays accepted");
+        let rest = timeout(Duration::from_secs(1), runtime.collect_events(1)).await;
+        assert!(
+            rest.as_ref()
+                .is_ok_and(|rest| rest.iter().all(|event| event.event_type == "session.exited")),
+            "{rest:?}"
         );
+    }
+
+    /// A CLI that stops reading its input: the prompt write is bounded, the process is retired,
+    /// and a prompt it may have partly read is reported as possibly delivered, not unsent.
+    #[tokio::test]
+    async fn a_blocked_prompt_write_retires_the_runtime_and_keeps_a_partial_write_ambiguous() {
+        let (runtime, requests, _responses) = delivery_runtime(Some("cursor-session"));
+        runtime.set_stop_deadlines(STOP_CANCEL_GRACE, Duration::from_millis(200));
+        let send = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .send_turn_with_receipt(Some(&"x".repeat(64 * 1024)), Vec::new())
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), runtime.abandoned())
+            .await
+            .expect("the blocked write retires the runtime");
+        // The driver stops the process, which closes its input.
+        drop(requests);
+        let receipt = timeout(Duration::from_secs(5), send)
+            .await
+            .expect("the send ends")
+            .unwrap()
+            .expect("part of the prompt was written");
+        let outcome = timeout(Duration::from_secs(2), receipt.completion())
+            .await
+            .expect("resolved");
+        assert!(
+            matches!(outcome, Err(CursorRuntimeError::Protocol(_))),
+            "{outcome:?}"
+        );
+        let completed = next_of(&runtime, "turn.completed").await;
+        assert_eq!(completed.payload["state"], "failed");
     }
 
     /// A turn that keeps sending updates, or waits on the user or a running tool, is never cut
@@ -1965,6 +2172,7 @@ mod tests {
         let completed = timeout(Duration::from_secs(2), async {
             loop {
                 let event = runtime.next_event().await.expect("event");
+                assert_ne!(event.event_type, "turn.notice", "no notice while reporting or waiting");
                 if event.event_type == "turn.completed" {
                     return event;
                 }

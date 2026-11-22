@@ -571,6 +571,11 @@ pub trait ProviderDriver: Send + Sync {
     fn resume_refused(&self) -> bool {
         false
     }
+    /// Whether the driver retired its process, such as a Cursor whose stopped turn ignored the
+    /// cancel: the session takes nothing more, so the next message launches it again.
+    fn retired(&self) -> bool {
+        false
+    }
 }
 
 pub trait ProviderDriverFactory: Send + Sync {
@@ -3202,6 +3207,10 @@ mod workspace_loss_tests {
         /// A mode write waits for `mode_release` while set: a CLI that withholds its answer.
         mode_held: Arc<AtomicBool>,
         mode_release: Arc<Notify>,
+        /// The first launch reports its process retired while set, and refuses settings.
+        first_launch_retired: Arc<AtomicBool>,
+        launches: Arc<AtomicUsize>,
+        launch_index: usize,
     }
 
     type CompactScript = (ProviderCompactionStart, Vec<ProviderEvent>);
@@ -3214,6 +3223,7 @@ mod workspace_loss_tests {
             Box::pin(async move {
                 let mut driver = self.clone();
                 driver.thread_id = request.thread_id;
+                driver.launch_index = self.launches.fetch_add(1, Ordering::SeqCst) + 1;
                 Ok(Arc::new(driver) as Arc<dyn ProviderDriver>)
             })
         }
@@ -3354,7 +3364,20 @@ mod workspace_loss_tests {
         }
 
         fn set_model(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
-            Box::pin(async { Ok(()) })
+            let retired = self.retired();
+            Box::pin(async move {
+                if retired {
+                    return Err(ProviderRuntimeError::Provider {
+                        provider: "codex".to_owned(),
+                        detail: "the retired process is gone".to_owned(),
+                    });
+                }
+                Ok(())
+            })
+        }
+
+        fn retired(&self) -> bool {
+            self.launch_index == 1 && self.first_launch_retired.load(Ordering::SeqCst)
         }
 
         fn set_options(
@@ -3901,6 +3924,93 @@ mod workspace_loss_tests {
             .filter(|(kind, _)| *kind == "delivery.failing")
             .collect();
         assert_eq!(findings.len(), 1, "{findings:?}");
+        service.shutdown().await;
+        supervisor.shutdown().await.unwrap();
+        f.shutdown().await;
+    }
+
+    /// A session whose process was retired (a Cursor stop the CLI ignored) is launched again for
+    /// the next message, even one that changes the model: it never reaches the retired process,
+    /// so it is delivered, not rejected.
+    #[tokio::test]
+    async fn the_next_message_after_a_retired_process_relaunches_the_session() {
+        use crate::production::turn_delivery::TurnDeliveryService;
+        let f = Fixture::new(false).await;
+        let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+            f.engine.clone(),
+            f.driver.clone(),
+            ActivityProjection::new(ActivityRepository::new(
+                f.engine.repositories().database().clone(),
+            )),
+            SupervisorOptions::default(),
+        ));
+        supervisor.launch(f.launch.clone()).await.unwrap();
+        f.project("ready").await;
+        f.driver.first_launch_retired.store(true, Ordering::SeqCst);
+        let command: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"next", "threadId":"t1", "queued":false,
+            "message":{"messageId":"next","role":"user","text":"continue","attachments":[]},
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.5"},
+            "runtimeMode":"full-access", "interactionMode":"default", "createdAt":BEFORE_LOSS,
+        }))
+        .unwrap();
+        let mut payload = serde_json::to_value(&command).unwrap();
+        freeze_delivery_route(&f.engine, &f._root.path().to_path_buf(), &command, &mut payload)
+            .await
+            .unwrap();
+        f.engine
+            .dispatch_with_admission(
+                command.clone(),
+                CommandAdmission {
+                    payload_digest: canonical_command_digest(&command).unwrap(),
+                    attachment_refs: Vec::new(),
+                    provider_turn: Some(NewProviderTurnDelivery {
+                        command_id: "next".into(),
+                        thread_id: "t1".into(),
+                        message_id: "next".into(),
+                        provider_instance_id: "codex".into(),
+                        provider_kind: "codex".into(),
+                        provider_session_id: None,
+                        delivery_key: "next-key".into(),
+                        payload,
+                        state: TurnDeliveryState::Pending,
+                        mode: TurnDeliveryMode::Start,
+                        created_at: BEFORE_LOSS.into(),
+                    }),
+                    agent_message: None,
+                },
+                || {},
+            )
+            .await
+            .unwrap();
+        let service = TurnDeliveryService::start(
+            f.engine.clone(),
+            supervisor.clone(),
+            f._root.path().to_path_buf(),
+        );
+        let state = timeout(Duration::from_secs(10), async {
+            loop {
+                let row = f
+                    .engine
+                    .repositories()
+                    .get_provider_turn_delivery("next".into())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if matches!(
+                    row.state,
+                    TurnDeliveryState::Delivered | TurnDeliveryState::Failed
+                ) {
+                    return row.state;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the message settles");
+        assert_eq!(state, TurnDeliveryState::Delivered);
+        assert_eq!(f.driver.launches.load(Ordering::SeqCst), 2, "launched again");
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 1);
         service.shutdown().await;
         supervisor.shutdown().await.unwrap();
         f.shutdown().await;
@@ -7605,7 +7715,9 @@ async fn run_supervisor(
                         entry.event_cancellation.cancel();
                     }
                     if sessions.get(&thread_id).is_some_and(|entry| {
-                        entry.event_task.is_finished() || entry.event_cancellation.is_cancelled()
+                        entry.event_task.is_finished()
+                            || entry.event_cancellation.is_cancelled()
+                            || entry.driver.retired()
                     }) {
                         let entry = detach_session(&activity, &mut sessions, &thread_id).await?;
                         if let Err(error) = entry.driver.shutdown().await {
@@ -13055,6 +13167,36 @@ async fn project_provider_event(
     {
         return Ok(());
     }
+    // A running turn's notice, such as a Cursor turn silent for minutes, shows on the running
+    // session and clears with a `null` message. It never revives a turn that already ended.
+    if event.event_type == "turn.notice" {
+        let running = engine
+            .repositories()
+            .get_thread_session(launch.thread_id.clone())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+            .is_some_and(|session| {
+                session.status == "running" && session.active_turn_id == event.turn_id
+            });
+        if running {
+            let message = event
+                .payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            dispatch_tagged_session_state(
+                engine,
+                launch,
+                "running",
+                event.turn_id.clone(),
+                (message, None),
+                None,
+                None,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
     // A provider that keeps its asks across restarts (OpenCode) read its pending lists in full:
     // a request BiBCode still shows that they no longer hold cannot be answered (#187).
     if event.event_type == "requests.listed" {
@@ -16366,6 +16508,9 @@ impl ProviderDriver for CursorDriver {
     }
     fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
         Box::pin(std::future::ready(exited_child(&self.child)))
+    }
+    fn retired(&self) -> bool {
+        self.runtime.is_retired()
     }
 
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
@@ -29463,11 +29608,12 @@ done
         ));
     }
 
-    /// A Cursor that stops answering and ignores the cancel too is stopped like a requested
-    /// stop after the cancel grace: the turn is accepted and ended, and the child is reaped.
+    /// A Cursor that ignores the cancel of a stopped turn is stopped like a requested stop after
+    /// the cancel grace: the turn is accepted and ended, the driver is retired, and the child is
+    /// reaped.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_silent_cursor_that_ignores_the_cancel_is_stopped_as_a_requested_stop() {
+    async fn a_cursor_that_ignores_a_stops_cancel_is_stopped_as_a_requested_stop() {
         let captured = crate::diagnostics::profiler::exits::CapturedExits::start();
         let temp = TempDir::new().expect("provider fixture directory");
         // The gate is never opened, so the prompt is never answered and the cancel is ignored.
@@ -29482,22 +29628,37 @@ done
         driver.start().await.expect("the chat starts");
         driver
             .runtime
-            .set_silence_timeout(Duration::from_millis(300));
-        let outcome = timeout(
-            Duration::from_secs(5),
-            driver.deliver(
-                "hello".to_owned(),
-                Vec::new(),
-                "default".to_owned(),
-                "key".to_owned(),
-            ),
+            .set_stop_deadlines(Duration::from_millis(300), Duration::from_secs(30));
+        let delivery = tokio::spawn({
+            let driver = driver.clone();
+            async move {
+                driver
+                    .deliver(
+                        "hello".to_owned(),
+                        Vec::new(),
+                        "default".to_owned(),
+                        "key".to_owned(),
+                    )
+                    .await
+            }
+        });
+        captured_request(
+            ProviderFixtureDeadline::integration(),
+            &temp.path().join("requests.jsonl"),
+            |value| value["method"] == "session/prompt",
         )
         .await
-        .expect("the silence deadline ends the delivery");
+        .expect("the prompt was written");
+        driver.interrupt(None).await.expect("stop");
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("the stop grace ends the delivery")
+            .unwrap();
         assert!(
             matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
             "{outcome:?}"
         );
+        assert!(driver.retired(), "the next message launches Cursor again");
         timeout(Duration::from_secs(5), async {
             while driver.child.lock().await.id().is_some() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
