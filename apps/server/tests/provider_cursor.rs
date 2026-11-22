@@ -416,7 +416,7 @@ async fn cursor_runtime_applies_the_selected_model_after_session_creation() {
         .respond(json!({ "status": "ok" }));
     peer.expect_request("session/new").respond(json!({
         "sessionId": "cursor-model-session",
-        "configOptions": [{ "id": "model", "category": "model" }],
+        "configOptions": [{ "id": "model", "category": "model", "currentValue": "test-model" }],
         "modes": {
             "currentModeId": "ask",
             "availableModes": [
@@ -427,12 +427,12 @@ async fn cursor_runtime_applies_the_selected_model_after_session_creation() {
         }
     }));
     peer.expect_request("session/set_config_option")
-        .respond(json!({ "configOptions": [{ "id": "model", "category": "model" }] }));
+        .respond(json!({ "configOptions": [{ "id": "model", "category": "model", "currentValue": "test-model" }] }));
     peer.expect_request("session/set_mode")
         .expect_params(json!({ "sessionId": "cursor-model-session", "modeId": "code" }))
         .respond(json!({}));
     peer.expect_request("session/set_config_option")
-        .respond(json!({ "configOptions": [{ "id": "model", "category": "model" }] }));
+        .respond(json!({ "configOptions": [{ "id": "model", "category": "model", "currentValue": "test-model" }] }));
     peer.expect_request("session/set_mode")
         .expect_params(json!({ "sessionId": "cursor-model-session", "modeId": "architect" }))
         .respond(json!({}));
@@ -1433,7 +1433,7 @@ async fn cursor_runtime_leaves_the_default_model_to_cursor() {
     peer.expect_request("authenticate").respond(json!({}));
     peer.expect_request("session/new").respond(json!({
         "sessionId": "cursor-default-model-session",
-        "configOptions": [{ "id": "model", "category": "model" }],
+        "configOptions": [{ "id": "model", "category": "model", "currentValue": "test-model" }],
         "modes": { "currentModeId": "ask", "availableModes": [{ "id": "ask", "name": "Ask" }, { "id": "code", "name": "Agent" }] }
     }));
     peer.expect_request("session/set_mode")
@@ -1643,7 +1643,7 @@ async fn cursor_runtime_covers_resume_permission_and_notification_edges() {
     peer.expect_request("session/load")
         .expect_params(json!({ "sessionId": "cursor-resumed" }))
         .respond(json!({
-            "configOptions": [{ "id": "model", "category": "model" }],
+            "configOptions": [{ "id": "model", "category": "model", "currentValue": "test-model" }],
             "modes": {
                 "currentModeId": "code",
                 "availableModes": [

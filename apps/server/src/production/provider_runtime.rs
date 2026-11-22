@@ -24270,7 +24270,7 @@ lines.on("line", (line) => {
     case "session/new":
       result = {
         sessionId: "cursor-session",
-        configOptions: [{ id: "model", category: "model" }],
+        configOptions: [{ id: "model", category: "model", currentValue: "test-model" }],
         modes: {
           currentModeId: "ask",
           availableModes: [
@@ -29223,7 +29223,7 @@ while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
-    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"cursor-session","configOptions":[{"id":"model","category":"model"}],"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"},{"id":"code","name":"Agent"},{"id":"architect","name":"Plan"}]}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"cursor-session","configOptions":[{"id":"model","category":"model","options":[{"value":"test-model"}]}],"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"},{"id":"code","name":"Agent"},{"id":"architect","name":"Plan"}]}}}\n' "$id" ;;
     *'"method":"session/create"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"grok-session","modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Agent"},{"id":"ask","name":"Ask"}]}}}\n' "$id" ;;
     *'"method":"session/set_config_option"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[]}}\n' "$id" ;;
     *'"method":"session/set_mode"'*|*'"method":"session/set_model"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
@@ -29659,7 +29659,7 @@ done
                     Some("initialize" | "authenticate" | "session/set_mode") => json!({}),
                     Some("session/new") => json!({
                         "sessionId": "cursor-session",
-                        "configOptions": [{ "id": "model", "category": "model" }],
+                        "configOptions": [{ "id": "model", "category": "model", "currentValue": "test-model" }],
                         "modes": {
                             "currentModeId": "ask",
                             "availableModes": [
