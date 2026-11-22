@@ -43,7 +43,11 @@ same way.
 A Cursor turn that receives no update at all for five minutes, while it waits
 on neither the user nor a running tool, is cancelled on the CLI as Stop does and
 ends as failed with a message saying that Cursor stopped responding and to send
-the message again or check the Cursor CLI. A turn that keeps streaming text,
+the message again or check the Cursor CLI. If the CLI does not answer that
+cancel within ten seconds either, BiBCode stops the Cursor process, as a
+requested stop rather than a crash, so nothing the old prompt still produces can
+reach the next message; the next message starts Cursor again and resumes the
+session. A turn that keeps streaming text,
 thoughts or tool progress is never cut off, and the session takes the next
 message as usual.
 

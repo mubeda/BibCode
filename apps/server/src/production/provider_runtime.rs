@@ -16087,8 +16087,40 @@ struct CursorDriver {
     runtime: CursorSessionRuntime,
     child: SharedChild,
     attachments: AttachmentMaterializer,
+    /// Stops the child once the runtime abandons it; aborted with the driver.
+    abandon_watch: JoinHandle<()>,
 }
+
+impl Drop for CursorDriver {
+    fn drop(&mut self) {
+        self.abandon_watch.abort();
+    }
+}
+
 impl CursorDriver {
+    fn new(
+        runtime: CursorSessionRuntime,
+        child: SharedChild,
+        attachments: AttachmentMaterializer,
+    ) -> Self {
+        let abandon_watch = tokio::spawn({
+            let runtime = runtime.clone();
+            let child = Arc::downgrade(&child);
+            async move {
+                runtime.abandoned().await;
+                if let Some(child) = child.upgrade() {
+                    kill_child(&child).await;
+                }
+            }
+        });
+        Self {
+            runtime,
+            child,
+            attachments,
+            abandon_watch,
+        }
+    }
+
     async fn spawn(
         request: ProviderLaunchRequest,
         attachments: AttachmentMaterializer,
@@ -16127,11 +16159,7 @@ impl CursorDriver {
             connection,
             incoming,
         );
-        Ok(Self {
-            runtime,
-            child: Arc::new(Mutex::new(child)),
-            attachments,
-        })
+        Ok(Self::new(runtime, Arc::new(Mutex::new(child)), attachments))
     }
 
     async fn prepare_turn_input(
@@ -29432,6 +29460,67 @@ done
         ));
     }
 
+    /// A Cursor that stops answering and ignores the cancel too is stopped like a requested
+    /// stop after the cancel grace: the turn is accepted and ended, and the child is reaped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_cursor_that_ignores_the_cancel_is_stopped_as_a_requested_stop() {
+        let captured = crate::diagnostics::profiler::exits::CapturedExits::start();
+        let temp = TempDir::new().expect("provider fixture directory");
+        // The gate is never opened, so the prompt is never answered and the cancel is ignored.
+        let driver = cursor_delivery_fixture(
+            &temp,
+            &temp.path().join("requests.jsonl"),
+            Some(&temp.path().join("never-opened")),
+            false,
+            false,
+        )
+        .await;
+        driver.start().await.expect("the chat starts");
+        driver
+            .runtime
+            .set_silence_timeout(Duration::from_millis(300));
+        let outcome = timeout(
+            Duration::from_secs(5),
+            driver.deliver(
+                "hello".to_owned(),
+                Vec::new(),
+                "default".to_owned(),
+                "key".to_owned(),
+            ),
+        )
+        .await
+        .expect("the silence deadline ends the delivery");
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        timeout(Duration::from_secs(5), async {
+            while driver.child.lock().await.id().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the child was stopped and reaped");
+        // The stream ends with `session.exited`, which ends the supervised session, so the next
+        // message launches Cursor again and resumes the saved session.
+        timeout(Duration::from_secs(5), async {
+            while let Some(event) = driver.next_event().await {
+                if event.event_type == "session.exited" {
+                    return;
+                }
+            }
+            panic!("the event stream closed without session.exited");
+        })
+        .await
+        .expect("the stopped child ends the session");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert!(
+            captured.take().is_empty(),
+            "a requested stop is not a crash"
+        );
+    }
+
     #[tokio::test]
     async fn cursor_delivery_prompt_write_zero_bytes_is_definitely_not_sent() {
         // Mutation caught: treating a proven zero-byte failure as possibly submitted prevents a
@@ -29593,11 +29682,8 @@ done
             }
             let _ = hold_peer_open.await;
         });
-        let driver = super::CursorDriver {
-            runtime,
-            child: dummy.child.clone(),
-            attachments: dummy.attachments.clone(),
-        };
+        let driver =
+            super::CursorDriver::new(runtime, dummy.child.clone(), dummy.attachments.clone());
         driver.start().await.expect("Cursor fixture should start");
 
         let outcome = timeout(
