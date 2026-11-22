@@ -240,11 +240,13 @@ pub fn resolve_advertised_model_value(
 /// A turn's options checked against a session that folds options into its model values: the
 /// advertised value with the current model's base whose parameters hold every requested option,
 /// the current value first. `Ok(None)` when the current value already holds them, `Ok(Some)` with
-/// the value to switch to otherwise. An option no advertised value of the model holds is refused:
-/// BiBCode never composes a value the CLI did not offer.
+/// the value to switch to otherwise. An option the turn leaves out goes back to the model's
+/// `baseline` value, as a session with separate options resets it. An option no advertised value
+/// of the model holds is refused: BiBCode never composes a value the CLI did not offer.
 pub fn resolve_bracketed_model_options(
     descriptor: &Value,
     updates: &Value,
+    baseline: Option<&str>,
 ) -> Result<Option<Value>, RefusedOption> {
     let Some(updates) = updates.as_array() else {
         return Err(RefusedOption::unusable(
@@ -327,7 +329,11 @@ pub fn resolve_bracketed_model_options(
             };
         wanted.push((keys, label, value));
     }
-    let candidates = std::iter::once(current.to_owned())
+    let baseline = baseline.filter(|baseline| resolve_acp_base_model_id(baseline) == base);
+    let candidates = baseline
+        .into_iter()
+        .map(str::to_owned)
+        .chain(std::iter::once(current.to_owned()))
         .chain(
             advertised_values(descriptor)
                 .into_iter()
@@ -343,9 +349,25 @@ pub fn resolve_bracketed_model_options(
             })
         })
     };
+    // Every option the turn leaves out keeps the baseline's value, when an advertised value can.
+    let keeps_baseline = |value: &str| {
+        let (Some((_, own)), Some((_, base_params))) = (
+            bracketed_model_value(value),
+            baseline.and_then(bracketed_model_value),
+        ) else {
+            return true;
+        };
+        base_params.iter().all(|(key, base_value)| {
+            wanted.iter().any(|(keys, _, _)| keys.contains(key))
+                || own.contains(&(*key, *base_value))
+        })
+    };
+    let holds_all = |value: &&String| wanted.iter().all(|option| holds(value, option));
     if let Some(value) = candidates
         .iter()
-        .find(|value| wanted.iter().all(|option| holds(value, option)))
+        .filter(holds_all)
+        .find(|value| keeps_baseline(value))
+        .or_else(|| candidates.iter().find(holds_all))
     {
         return Ok((value != current).then(|| json!(value)));
     }
@@ -1229,14 +1251,15 @@ mod tests {
             ]
         });
         let refusal = |updates: Value| {
-            resolve_bracketed_model_options(&descriptor, &updates)
+            resolve_bracketed_model_options(&descriptor, &updates, None)
                 .unwrap_err()
                 .refusal
         };
         assert_eq!(
             resolve_bracketed_model_options(
                 &descriptor,
-                &json!([{ "id": "reasoning", "value": "xhigh" }])
+                &json!([{ "id": "reasoning", "value": "xhigh" }]),
+                None
             )
             .unwrap(),
             None
@@ -1245,7 +1268,8 @@ mod tests {
         assert_eq!(
             resolve_bracketed_model_options(
                 &descriptor,
-                &json!([{ "id": "reasoning", "value": "low" }, { "id": "fastMode", "value": true }])
+                &json!([{ "id": "reasoning", "value": "low" }, { "id": "fastMode", "value": true }]),
+                None
             )
             .unwrap(),
             Some(json!("m[effort=low,fast=true]"))

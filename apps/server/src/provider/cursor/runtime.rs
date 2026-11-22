@@ -479,8 +479,13 @@ impl CursorSessionRuntime {
     ) -> Result<(), CursorRuntimeError> {
         let descriptor = acp_model_descriptor(current)
             .expect("bracketed model values come from a model config option");
-        let Some(value) = resolve_bracketed_model_options(descriptor, &Value::Array(options))
-            .map_err(CursorRuntimeError::UnsupportedOption)?
+        let baseline = self.inner.baseline_config_options.lock().await.clone();
+        let baseline = acp_model_descriptor(&baseline)
+            .and_then(|descriptor| descriptor.get("currentValue"))
+            .and_then(Value::as_str);
+        let Some(value) =
+            resolve_bracketed_model_options(descriptor, &Value::Array(options), baseline)
+                .map_err(CursorRuntimeError::UnsupportedOption)?
         else {
             return Ok(());
         };
@@ -489,11 +494,30 @@ impl CursorSessionRuntime {
             .and_then(Value::as_str)
             .unwrap_or("model")
             .to_owned();
-        let next = self
-            .set_config_option(&self.provider_session_id().await?, &config_id, value)
-            .await?;
-        *self.inner.config_options.lock().await = next;
-        Ok(())
+        let previous = descriptor.get("currentValue").cloned().unwrap_or(Value::Null);
+        let session_id = self.provider_session_id().await?;
+        match self.set_config_option(&session_id, &config_id, value).await {
+            Ok(next) => {
+                *self.inner.config_options.lock().await = next;
+                Ok(())
+            }
+            // The switch may have applied: it is written back, and a failed write-back latches
+            // the session as uncertain, so a restore cannot read the stale value as current.
+            Err(error @ CursorRuntimeError::MalformedConfigAcknowledgement) => {
+                let mut current = current.to_vec();
+                let error = self
+                    .compensate_config_updates(
+                        &session_id,
+                        &mut current,
+                        vec![(config_id, previous)],
+                        error,
+                    )
+                    .await;
+                self.latch_failed_compensation(&error).await;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn set_config_option(
@@ -1949,6 +1973,105 @@ mod tests {
         .await
         .expect("the turn completed");
         assert_eq!(completed.payload["state"], "completed");
+    }
+
+    fn bracketed_options(current: &str) -> Vec<Value> {
+        vec![json!({
+            "id": "model", "category": "model", "type": "select", "currentValue": current,
+            "options": [
+                { "value": "m[reasoning=medium,fast=false]" },
+                { "value": "m[reasoning=high,fast=false]" },
+                { "value": "m[reasoning=high,fast=true]" }
+            ]
+        })]
+    }
+
+    async fn bracketed_runtime() -> (
+        CursorSessionRuntime,
+        Lines<BufReader<DuplexStream>>,
+        DuplexStream,
+    ) {
+        let (runtime, requests, responses) = delivery_runtime(Some("cursor-session"));
+        let baseline = bracketed_options("m[reasoning=medium,fast=false]");
+        *runtime.inner.config_options.lock().await = baseline.clone();
+        *runtime.inner.baseline_config_options.lock().await = baseline;
+        (runtime, requests, responses)
+    }
+
+    /// Clearing a bracketed session's options goes back to the model's baseline value, as a
+    /// session with separate options does.
+    #[tokio::test]
+    async fn cleared_bracketed_options_return_to_the_models_baseline() {
+        let (runtime, mut requests, mut responses) = bracketed_runtime().await;
+        let set = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .set_options(vec![json!({ "id": "reasoning", "value": "high" })])
+                    .await
+            }
+        });
+        let write = read_request(&mut requests).await;
+        assert_eq!(write["params"]["value"], "m[reasoning=high,fast=false]");
+        write_frame(
+            &mut responses,
+            json!({ "jsonrpc": "2.0", "id": write["id"], "result": {
+                "configOptions": bracketed_options("m[reasoning=high,fast=false]")
+            } }),
+        )
+        .await;
+        set.await.unwrap().expect("high applied");
+
+        let clear = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.set_options(Vec::new()).await }
+        });
+        let write = read_request(&mut requests).await;
+        assert_eq!(write["params"]["value"], "m[reasoning=medium,fast=false]");
+        write_frame(
+            &mut responses,
+            json!({ "jsonrpc": "2.0", "id": write["id"], "result": {
+                "configOptions": bracketed_options("m[reasoning=medium,fast=false]")
+            } }),
+        )
+        .await;
+        clear.await.unwrap().expect("baseline restored");
+    }
+
+    /// An option switch answered without its options may have applied: it is written back, so
+    /// the runtime's view and the CLI agree before the error reaches the supervisor.
+    #[tokio::test]
+    async fn a_bracketed_switch_answered_without_options_is_rolled_back() {
+        let (runtime, mut requests, mut responses) = bracketed_runtime().await;
+        let set = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .set_options(vec![json!({ "id": "reasoning", "value": "high" })])
+                    .await
+            }
+        });
+        let write = read_request(&mut requests).await;
+        assert_eq!(write["params"]["value"], "m[reasoning=high,fast=false]");
+        write_frame(
+            &mut responses,
+            json!({ "jsonrpc": "2.0", "id": write["id"], "result": {} }),
+        )
+        .await;
+        let rollback = read_request(&mut requests).await;
+        assert_eq!(rollback["params"]["value"], "m[reasoning=medium,fast=false]");
+        write_frame(
+            &mut responses,
+            json!({ "jsonrpc": "2.0", "id": rollback["id"], "result": {
+                "configOptions": bracketed_options("m[reasoning=medium,fast=false]")
+            } }),
+        )
+        .await;
+        let error = set.await.unwrap().expect_err("the switch failed");
+        assert!(
+            matches!(error, CursorRuntimeError::ConfigUpdateRolledBack { .. }),
+            "{error:?}"
+        );
     }
 
     #[test]
