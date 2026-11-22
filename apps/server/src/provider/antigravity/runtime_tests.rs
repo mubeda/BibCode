@@ -1686,3 +1686,62 @@ async fn a_string_id_response_does_not_complete_a_numeric_request() {
         .expect("in time");
     assert!(outcome.is_err(), "{outcome:?}");
 }
+
+/// The options the inventory publishes from uncategorized descriptors reach the session: the
+/// model and the thinking level are written to their config ids, not refused.
+#[tokio::test]
+async fn uncategorized_model_and_level_options_the_inventory_publishes_are_written() {
+    let mut advertised = super::uncategorized_level_options();
+    let mode = standard_options("default")[2].clone();
+    advertised.as_array_mut().expect("options").push(mode);
+    let (runtime, mut peer) = connect(options("approval-required"));
+    let start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    peer.reply(
+        &initialize,
+        initialize_result("1.5.13", 1, all_capabilities()),
+    )
+    .await;
+    let new = peer.expect("session/new").await;
+    peer.reply(&new, session_result(SESSION, advertised.clone()))
+        .await;
+    let confirm = peer.expect("session/set_config_option").await;
+    assert_eq!(confirm["params"]["configId"], "mode");
+    peer.reply(&confirm, json!({ "configOptions": advertised.clone() }))
+        .await;
+    assert_eq!(finish(start).await.expect("start"), SESSION);
+
+    let model = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_model("alpha").await }
+    });
+    let write = peer.expect("session/set_config_option").await;
+    assert_eq!(write["params"]["configId"], "model");
+    assert_eq!(write["params"]["value"], "alpha");
+    peer.reply(&write, json!({ "configOptions": advertised.clone() }))
+        .await;
+    timeout(Duration::from_secs(5), model)
+        .await
+        .expect("model write in time")
+        .unwrap()
+        .expect("model written");
+
+    let level = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .set_options(vec![json!({ "id": "reasoning", "value": "extra-high" })])
+                .await
+        }
+    });
+    let write = peer.expect("session/set_config_option").await;
+    assert_eq!(write["params"]["configId"], "thought_level");
+    assert_eq!(write["params"]["value"], "extra-high");
+    peer.reply(&write, json!({ "configOptions": advertised }))
+        .await;
+    timeout(Duration::from_secs(5), level)
+        .await
+        .expect("level write in time")
+        .unwrap()
+        .expect("level written");
+}

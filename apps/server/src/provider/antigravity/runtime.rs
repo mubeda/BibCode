@@ -1355,10 +1355,16 @@ fn item_type(kind: Option<&str>) -> &'static str {
     }
 }
 
-fn option_by_category<'a>(options: &'a [Value], category: &str) -> Option<&'a Value> {
-    options
-        .iter()
-        .find(|option| option.get("category").and_then(Value::as_str) == Some(category))
+/// The config option for `category` (`model`, `thought_level`, `mode`): the one with that ACP
+/// category, else one whose id is the category name, as the CLI may omit the category. The
+/// inventory reads the session's options through it too, so a chat accepts what it advertised.
+pub(crate) fn option_by_category<'a>(options: &'a [Value], category: &str) -> Option<&'a Value> {
+    let named = |key: &str| {
+        options
+            .iter()
+            .find(|option| option.get(key).and_then(Value::as_str) == Some(category))
+    };
+    named("category").or_else(|| named("id"))
 }
 
 /// The session's effective mode, as a config answer lists it.
@@ -1413,6 +1419,17 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
                 parts.next()?.parse().ok()?,
             ))
         })
+}
+
+/// A `model` and a `thought_level` option without a category, as the inventory's catalog test
+/// reads them; the runtime test selects the level the inventory publishes from them.
+#[cfg(test)]
+pub(crate) fn uncategorized_level_options() -> Value {
+    json!([
+        { "id": "model", "currentValue": "alpha", "options": [{ "value": "alpha" }] },
+        { "id": "thought_level", "name": "Thinking", "currentValue": "low",
+          "options": [{ "value": "extra-high", "name": "Extra High" }, { "value": "low" }] }
+    ])
 }
 
 #[cfg(test)]

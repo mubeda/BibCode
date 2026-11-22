@@ -1982,10 +1982,9 @@ fn antigravity_models(session: &Value, configured_models: &[String]) -> Option<V
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let option = |id: &str| {
-        options
-            .iter()
-            .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
+    // The chat runtime's lookup: what is published here is what a turn can select.
+    let option = |category: &str| {
+        crate::provider::antigravity::runtime::option_by_category(options, category)
     };
     let available = unique(
         session
@@ -4328,16 +4327,10 @@ done
         .expect("a catalog");
         assert_eq!(fallback[0]["slug"], "alpha-high");
 
+        // The chat runtime's test sends a turn with the level published from these options.
         let uncategorized = antigravity_models(
             &json!({
-                "configOptions": [
-                    { "id": "model", "currentValue": "alpha", "options": [{ "value": "alpha" }] },
-                    { "id": "thought_level", "name": "Thinking", "currentValue": "low",
-                      "options": [
-                          { "value": "extra-high", "name": "Extra High" },
-                          { "value": "low" }
-                      ] }
-                ]
+                "configOptions": crate::provider::antigravity::runtime::uncategorized_level_options()
             }),
             &[],
         )
