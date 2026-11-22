@@ -685,13 +685,14 @@ fn crash_model(provider: &str) -> &'static str {
         "claudeAgent" => "claude-sonnet-4-5",
         "opencode" => "openai/gpt-5",
         "cursor" => "cursor-default",
+        "antigravity" => "test-model-a",
         _ => "gpt-5",
     }
 }
 
 fn crash_binary_path(provider: &str, state: &Path) -> String {
     match provider {
-        "cursor" => hermetic_providers::missing_provider_executable(state)
+        "cursor" | "antigravity" => hermetic_providers::missing_provider_executable(state)
             .to_str()
             .expect("crash fixture path is UTF-8")
             .to_owned(),
@@ -739,15 +740,15 @@ fn crash_launch(provider: &str, state: &Path) -> ProviderLaunchRequest {
 }
 
 fn configure_crash_provider(state: &Path, provider: &str) {
-    if provider != "cursor" {
+    if !matches!(provider, "cursor" | "antigravity") {
         return;
     }
     hermetic_providers::write_hermetic_settings(
         state,
         serde_json::json!({
             "providerInstances": {
-                "cursor": {
-                    "driver": "cursor",
+                (provider): {
+                    "driver": provider,
                     "enabled": true,
                     "config": {"binaryPath": crash_binary_path(provider, state)}
                 }
@@ -1132,6 +1133,18 @@ async fn subprocess_crash_truth_table_preserves_exact_delivery_state_and_send_co
             TurnDeliveryState::Uncertain,
             ProviderReconciliationOutcome::Unavailable {
                 detail: "Cursor cannot reconcile exact delivery".to_owned(),
+            },
+            false,
+        ),
+        // An Antigravity prompt already written stays at one send after a restart and becomes
+        // uncertain: ACP has no delivery lookup, so it is never replayed.
+        (
+            "antigravity",
+            "after-provider-write",
+            TurnDeliveryState::Sending,
+            TurnDeliveryState::Uncertain,
+            ProviderReconciliationOutcome::Unavailable {
+                detail: "Antigravity cannot reconcile exact delivery".to_owned(),
             },
             false,
         ),

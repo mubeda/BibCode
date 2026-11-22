@@ -71,6 +71,14 @@ use crate::{
     },
     provider::{
         OptionRefusal,
+        antigravity::{
+            AcpConnectionConfig as AntigravityConnectionConfig,
+            AcpJsonRpcConnection as AntigravityConnection, AntigravityRuntimeError,
+            AntigravitySessionOptions, AntigravitySessionRuntime,
+            DEFAULT_CANCEL_GRACE as ANTIGRAVITY_CANCEL_GRACE,
+            DEFAULT_CONTROL_TIMEOUT as ANTIGRAVITY_CONTROL_TIMEOUT,
+            DEFAULT_START_TIMEOUT as ANTIGRAVITY_START_TIMEOUT,
+        },
         attachments::{
             AttachmentMaterializer, MaterializedAttachment, append_file_references,
             split_native_images_and_file_references,
@@ -2286,7 +2294,7 @@ mod delivery_failure_tests {
     fn transport_line_too_long_rejects_direct_and_nested_launch_errors() {
         use crate::provider::{codex::protocol::ProtocolError, cursor::acp::AcpProtocolError};
 
-        for provider in ["codex", "cursor", "grok"] {
+        for provider in ["codex", "cursor", "grok", "antigravity"] {
             let detail = if provider == "codex" {
                 ProtocolError::LineTooLong {
                     stream: "stdout",
@@ -6811,7 +6819,7 @@ fn validate_frozen_session_identity(
     };
     let cursor_field = match row.provider_kind.as_str() {
         "codex" => "threadId",
-        "claudeAgent" | "cursor" | "opencode" => "sessionId",
+        "claudeAgent" | "cursor" | "antigravity" | "opencode" => "sessionId",
         _ => {
             return Err(ProviderRuntimeError::Provider {
                 provider: row.provider_kind.clone(),
@@ -6979,6 +6987,7 @@ pub(crate) fn canonical_provider_kind(driver: &str) -> Result<&'static str, Prov
         "codex" => Ok("codex"),
         "cursor" => Ok("cursor"),
         "grok" => Ok("grok"),
+        "antigravity" => Ok("antigravity"),
         "opencode" => Ok("opencode"),
         other => Err(ProviderRuntimeError::UnsupportedProvider {
             provider: other.to_owned(),
@@ -6995,6 +7004,7 @@ fn provider_binary_settings(
         "claudeAgent" => providers.claude_agent.clone(),
         "cursor" => providers.cursor.clone(),
         "grok" => providers.grok.clone(),
+        "antigravity" => providers.antigravity.clone(),
         "opencode" => providers.opencode.clone(),
         _ => providers.codex.clone(),
     };
@@ -7116,10 +7126,19 @@ async fn run_supervisor(
                 let _ = response.send(result);
             }
             SupervisorMessage::Handle { command, response } => {
+                // A command waits behind a running delivery, and also behind older commands that
+                // the finished delivery has not drained yet, so a newer setting is never applied
+                // before an older one.
                 if let Some(thread_id) = delivery_ordered_command_thread(command.as_ref())
-                    && let Some(generation) = delivery_sequences
-                        .get(thread_id)
-                        .and_then(|sequence| sequence.active_generation)
+                    && let Some(generation) =
+                        delivery_sequences.get(thread_id).and_then(|sequence| {
+                            sequence.active_generation.or_else(|| {
+                                deferred_configuration
+                                    .get(thread_id)
+                                    .is_some_and(|queued| !queued.is_empty())
+                                    .then_some(sequence.completed_generation)
+                            })
+                        })
                 {
                     let queued = deferred_configuration
                         .entry(thread_id.to_owned())
@@ -11381,6 +11400,8 @@ fn record_option_reconciliation(
         return;
     };
     let accepted = matches!(result, "applied" | "restart-required");
+    // Antigravity's models and levels come from the user's account: no value is recorded (D-A11).
+    let records_values = launch.provider != "antigravity";
     let provider_instance_id = launch
         .provider_instance_id
         .as_deref()
@@ -11389,15 +11410,18 @@ fn record_option_reconciliation(
         let Some(option_id) = option.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let requested_value = option.get("value").and_then(|value| match value {
-            Value::Bool(_) => Some(value),
-            Value::String(_) if accepted => Some(value),
-            _ => None,
-        });
+        let requested_value = option
+            .get("value")
+            .filter(|_| records_values)
+            .and_then(|value| match value {
+                Value::Bool(_) => Some(value),
+                Value::String(_) if accepted => Some(value),
+                _ => None,
+            });
         let _ = log.record_option_reconciliation(
             &launch.thread_id,
             provider_instance_id,
-            launch.model.as_deref(),
+            launch.model.as_deref().filter(|_| records_values),
             if accepted { option_id } else { "unknown" },
             requested_value,
             application_method,
@@ -13632,6 +13656,7 @@ pub(crate) fn native_adapter_key(provider: &str) -> &'static str {
         "claude" | "claudeAgent" => "claude-stream-json",
         "cursor" => "cursor-acp",
         "grok" => "grok-acp",
+        "antigravity" => "antigravity-acp",
         "opencode" => "opencode-http",
         _ => "native-provider",
     }
@@ -14788,6 +14813,14 @@ impl ProviderDriverFactory for NativeProviderDriverFactory {
                 "grok" => Ok(Arc::new(
                     GrokDriver::spawn(request, self.attachments.clone(), self.attribution.clone())
                         .await?,
+                ) as Arc<dyn ProviderDriver>),
+                "antigravity" => Ok(Arc::new(
+                    AntigravityDriver::spawn(
+                        request,
+                        self.attachments.clone(),
+                        self.attribution.clone(),
+                    )
+                    .await?,
                 ) as Arc<dyn ProviderDriver>),
                 "opencode" => Ok(Arc::new(
                     OpenCodeDriver::spawn(
@@ -16043,6 +16076,415 @@ impl ProviderDriver for CursorDriver {
 
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            kill_child(&self.child).await;
+            Ok(())
+        })
+    }
+}
+
+struct AntigravityDriver {
+    runtime: AntigravitySessionRuntime,
+    child: SharedChild,
+    attachments: AttachmentMaterializer,
+    binary_path: String,
+    started: std::time::Instant,
+    /// Stops the child once the runtime abandons it; aborted with the driver.
+    abandon_watch: JoinHandle<()>,
+}
+
+impl Drop for AntigravityDriver {
+    /// A driver dropped without `shutdown`, such as a cancelled start, still kills the child's
+    /// process group and waits for it, off the dropping task.
+    fn drop(&mut self) {
+        self.abandon_watch.abort();
+        self.runtime.close();
+        // The group kill is sent here, synchronously, so it happens even when no task can run
+        // any more (a runtime shutting down); only the reap is handed off.
+        if let Ok(mut child) = self.child.try_lock() {
+            if let Some(pid) = child.id() {
+                exits::note_stop_requested(pid);
+            }
+            let _ = child.start_kill();
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let child = self.child.clone();
+            handle.spawn(async move { kill_child(&child).await });
+        }
+    }
+}
+
+impl AntigravityDriver {
+    /// Spawns `<binary> acp` in the checkout with no flag of its own (D-A5, D-A8). A cancelled
+    /// turn the CLI never ends stops the process; that stop is requested, not a crash.
+    async fn spawn(
+        request: ProviderLaunchRequest,
+        attachments: AttachmentMaterializer,
+        attribution: ProcessAttributionRegistry,
+    ) -> Result<Self, ProviderRuntimeError> {
+        Self::spawn_with_cancel_grace(request, attachments, attribution, ANTIGRAVITY_CANCEL_GRACE)
+            .await
+    }
+
+    async fn spawn_with_cancel_grace(
+        request: ProviderLaunchRequest,
+        attachments: AttachmentMaterializer,
+        attribution: ProcessAttributionRegistry,
+        cancel_grace: Duration,
+    ) -> Result<Self, ProviderRuntimeError> {
+        let started = std::time::Instant::now();
+        let binary_path = request.binary_path.clone();
+        let mut child = spawn_child(&request, &["acp".to_owned()], true, attribution).await?;
+        let stdout = child
+            .stdout()
+            .take()
+            .ok_or_else(|| pipe_error(&request.provider, "stdout"))?;
+        let stdin = child
+            .stdin()
+            .take()
+            .ok_or_else(|| pipe_error(&request.provider, "stdin"))?;
+        let stderr = child
+            .stderr()
+            .take()
+            .ok_or_else(|| pipe_error(&request.provider, "stderr"))?;
+        let (connection, incoming) = AntigravityConnection::spawn(
+            stdout,
+            stdin,
+            stderr,
+            AntigravityConnectionConfig::default(),
+        );
+        let runtime = AntigravitySessionRuntime::new(
+            AntigravitySessionOptions {
+                thread_id: request.thread_id,
+                cwd: request.cwd.to_string_lossy().into_owned(),
+                runtime_mode: request.runtime_mode,
+                interaction_mode: request.interaction_mode,
+                model: request.model,
+                resume_session_id: request.resume_cursor.as_ref().and_then(resume_string),
+                cancel_grace,
+                start_timeout: ANTIGRAVITY_START_TIMEOUT,
+                control_timeout: ANTIGRAVITY_CONTROL_TIMEOUT,
+                initial_options: request.options,
+            },
+            connection,
+            incoming,
+        );
+        let child: SharedChild = Arc::new(Mutex::new(child));
+        let abandon_watch = tokio::spawn({
+            let runtime = runtime.clone();
+            let child = Arc::downgrade(&child);
+            async move {
+                runtime.abandoned().await;
+                if let Some(child) = child.upgrade() {
+                    kill_child(&child).await;
+                }
+            }
+        });
+        Ok(Self {
+            runtime,
+            child,
+            attachments,
+            binary_path,
+            started,
+            abandon_watch,
+        })
+    }
+
+    /// A child that died before the session pump starts is not seen by the pump's exit report,
+    /// so a failed start reports it here, before `shutdown` marks the process as stopped.
+    async fn report_startup_exit(&self) {
+        if !exits::watching() {
+            return;
+        }
+        // Every failure checks once, so a child that answered and then died is reported. Only a
+        // lost connection waits for the exit: a refusal from a live child must not hold the
+        // supervisor. The pipes close a moment before the exit status can be read.
+        let polls = if self.runtime.start_lost_connection() {
+            40
+        } else {
+            1
+        };
+        for attempt in 0..polls {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if let Some((pid, status)) = exited_child(&self.child) {
+                exits::report_exit(
+                    Watch::Failures,
+                    &Exited {
+                        kind: "provider",
+                        label: "antigravity",
+                        exe: &self.binary_path,
+                        pid,
+                        started: self.started,
+                    },
+                    &status,
+                    false,
+                );
+                return;
+            }
+        }
+    }
+
+    async fn prepare_turn_input(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+    ) -> Result<(String, Vec<Value>), ProviderRuntimeError> {
+        let materialized = self
+            .attachments
+            .materialize(attachments)
+            .await
+            .map_err(attachment_error("antigravity"))?;
+        let (images, files) = split_native_images_and_file_references(materialized);
+        let text = append_file_references(text, &files).map_err(attachment_error("antigravity"))?;
+        Ok((text, images.into_iter().map(acp_image).collect()))
+    }
+}
+
+/// Maps a runtime error. Sign-in, version and mode refusals need the user and are refused the
+/// same way on every launch, so they are final for a delivery (D-A8).
+fn antigravity_error(error: AntigravityRuntimeError) -> ProviderRuntimeError {
+    match error {
+        AntigravityRuntimeError::SignInRequired
+        | AntigravityRuntimeError::UnsupportedVersion { .. }
+        | AntigravityRuntimeError::ModeUnavailable { .. } => {
+            ProviderRuntimeError::IncompatibleProvider {
+                provider: "antigravity".to_owned(),
+                detail: error.to_string(),
+            }
+        }
+        // Option values stay out of the Display; only the refusal names them.
+        AntigravityRuntimeError::UnsupportedOption(_) => option_error("antigravity", error),
+        // The CLI's own words reach only the thread's turn error. Logs, delivery details and
+        // launch errors get the method we sent, the code and the class.
+        AntigravityRuntimeError::Protocol(error) => {
+            use crate::provider::antigravity::acp::{AcpProtocolError, acp_error_class};
+            let class = acp_error_class(&error);
+            let line_too_long = match &error {
+                AcpProtocolError::LineTooLong { .. } => true,
+                AcpProtocolError::Closed { reason } => {
+                    reason.starts_with("ACP JSON-RPC read line exceeded ")
+                }
+                _ => false,
+            };
+            let detail = match &error {
+                AcpProtocolError::RemoteRequest { method, code, .. } => {
+                    format!("Antigravity answered {method} with error {code} ({class})")
+                }
+                _ if line_too_long => {
+                    "Antigravity sent a message longer than BiBCode accepts (transport_error)"
+                        .to_owned()
+                }
+                _ => format!("Antigravity connection failed ({class})"),
+            };
+            let provider = "antigravity".to_owned();
+            if line_too_long {
+                ProviderRuntimeError::TransportLineTooLong { provider, detail }
+            } else {
+                ProviderRuntimeError::Provider { provider, detail }
+            }
+        }
+        // BiBCode's own texts.
+        error => ProviderRuntimeError::Provider {
+            provider: "antigravity".to_owned(),
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// A turn the runtime refused before writing it: refusals the user must act on, and a line too
+/// long, are final; anything else may be transient and is retried.
+fn antigravity_unsent_outcome(error: AntigravityRuntimeError) -> ProviderDeliveryOutcome {
+    let error = antigravity_error(error);
+    let detail = delivery_detail(&error, None);
+    match error {
+        ProviderRuntimeError::IncompatibleProvider { .. }
+        | ProviderRuntimeError::TransportLineTooLong { .. } => {
+            ProviderDeliveryOutcome::Rejected { detail }
+        }
+        _ => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
+    }
+}
+
+impl ProviderDriver for AntigravityDriver {
+    fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
+        Box::pin(async move {
+            let session_id = match self.runtime.start().await {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    self.report_startup_exit().await;
+                    return Err(antigravity_error(error));
+                }
+            };
+            Ok(StartedSession {
+                resume_cursor: Some(json!({ "schemaVersion": 1, "sessionId": session_id })),
+                runtime_payload: None,
+                activity_capabilities: ActivityCapabilities::none(),
+            })
+        })
+    }
+    fn send(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        _: String,
+    ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
+        Box::pin(async move {
+            let (text, attachments) = self.prepare_turn_input(text, attachments).await?;
+            self.runtime
+                .send_turn_with_receipt(Some(&text), attachments)
+                .await
+                .map(|receipt| Some(receipt.turn_id))
+                .map_err(antigravity_error)
+        })
+    }
+    fn deliver(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        _: String,
+        _: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
+                Ok(input) => input,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: delivery_detail(&error, None),
+                    };
+                }
+            };
+            let receipt = match self
+                .runtime
+                .send_turn_with_receipt(Some(&text), attachments)
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => return antigravity_unsent_outcome(error),
+            };
+            let turn_id = receipt.turn_id.clone();
+            match receipt.completion().await {
+                Ok(()) => ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn_id),
+                },
+                Err(
+                    error @ (AntigravityRuntimeError::SignInRequired
+                    | AntigravityRuntimeError::Protocol(
+                        crate::provider::antigravity::acp::AcpProtocolError::RemoteRequest {
+                            ..
+                        },
+                    )),
+                ) => ProviderDeliveryOutcome::Rejected {
+                    detail: delivery_detail(&antigravity_error(error), None),
+                },
+                Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: delivery_detail(&antigravity_error(error), None),
+                },
+            }
+        })
+    }
+    fn interrupt(
+        &self,
+        _: Option<String>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .interrupt_turn()
+                .await
+                .map_err(antigravity_error)
+        })
+    }
+    fn approve(
+        &self,
+        request_id: String,
+        decision: String,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .respond_to_request(&request_id, &decision)
+                .await
+                .map_err(antigravity_error)
+        })
+    }
+    fn answer(
+        &self,
+        _: String,
+        _: Value,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        // The client advertises no elicitation, so no question is ever pending (D-A7).
+        unsupported("antigravity", "user input answers")
+    }
+    fn set_mode(&self, mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .set_runtime_mode(&mode)
+                .await
+                .map_err(antigravity_error)
+        })
+    }
+    fn set_interaction_mode(
+        &self,
+        mode: String,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .set_interaction_mode(&mode)
+                .await
+                .map_err(antigravity_error)
+        })
+    }
+    fn set_model(&self, model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .set_model(&model)
+                .await
+                .map_err(antigravity_error)
+        })
+    }
+    fn reapply_options_on_model_change(&self) -> bool {
+        true
+    }
+    fn set_options(
+        &self,
+        options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .set_options(options)
+                .await
+                .map_err(antigravity_error)
+        })
+    }
+    fn rollback(
+        &self,
+        _: i64,
+        _: String,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        unsupported("antigravity", "checkpoint rollback")
+    }
+    fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
+        Box::pin(async move {
+            self.runtime.next_event().await.map(|event| ProviderEvent {
+                native_event_id: None,
+                event_type: event.event_type,
+                thread_id: event.thread_id,
+                turn_id: event.turn_id,
+                item_id: None,
+                request_id: event.request_id,
+                payload: event.payload,
+                activity: Vec::new(),
+                activity_controls: Default::default(),
+            })
+        })
+    }
+    fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
+        Box::pin(std::future::ready(exited_child(&self.child)))
+    }
+    fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            // One call closes the connection; killing the group closes the CLI's output, so the
+            // transport readers and the runtime's reader end too.
+            self.runtime.close();
             kill_child(&self.child).await;
             Ok(())
         })
@@ -21439,7 +21881,7 @@ fn provider_error<E: std::fmt::Display>(
                     || detail.starts_with(
                         "Codex JSON-RPC connection is closed: Codex JSON-RPC read line exceeded ",
                     ),
-                "cursor" | "grok" => {
+                "cursor" | "grok" | "antigravity" => {
                     detail.starts_with("ACP JSON-RPC read line exceeded ")
                         || detail.starts_with(
                             "ACP JSON-RPC connection is closed: ACP JSON-RPC read line exceeded ",
@@ -37712,6 +38154,7 @@ done
             ("claudeAgent", "claude-stream-json"),
             ("cursor", "cursor-acp"),
             ("grok", "grok-acp"),
+            ("antigravity", "antigravity-acp"),
             ("opencode", "opencode-http"),
             ("future-provider", "native-provider"),
         ] {
@@ -38396,6 +38839,648 @@ printf '2.1.0 (Claude Code)\n'
             .expect("PowerShell extension");
 
         assert!(cmd_index < powershell_index);
+    }
+
+    /// A scripted `agy acp`, shaped like CLI 1.5.13 with placeholder ids. Environment switches
+    /// pick the version, a signed-out CLI, a lost session, an exit during `initialize` and the
+    /// prompt outcomes.
+    #[cfg(unix)]
+    const ANTIGRAVITY_FIXTURE: &str = r#"#!/bin/sh
+modes='{"value":"default"},{"value":"accept-edits"},{"value":"auto"},{"value":"plan"}'
+options() { printf '[{"id":"mode","category":"mode","type":"select","currentValue":"%s","options":[%s]}]' "$1" "$modes"; }
+[ -z "$BIBCODE_TEST_ARGV_CAPTURE" ] || { printf '%s\n' "$*" > "$BIBCODE_TEST_ARGV_CAPTURE"; pwd -P >> "$BIBCODE_TEST_ARGV_CAPTURE"; }
+while IFS= read -r line; do
+  [ -z "$BIBCODE_TEST_REQUEST_CAPTURE" ] || printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      [ -z "$BIBCODE_TEST_EXIT_ON_INITIALIZE" ] || exit 7
+      # The answer arrives after the CLI process itself has exited, so the order is fixed.
+      [ -z "$BIBCODE_TEST_REFUSE_THEN_EXIT" ] || { ( sleep 0.3; printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ) & exit 7; }
+      if [ -n "$BIBCODE_TEST_DESCENDANT_PID" ]; then
+        sleep 300 &
+        printf '%s\n' "$!" > "$BIBCODE_TEST_DESCENDANT_PID"
+        continue
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":{}}},"agentInfo":{"name":"fixture","version":"%s"}}}\n' "$id" "${BIBCODE_TEST_AGY_VERSION:-1.5.13}" ;;
+    *'"method":"session/new"'*)
+      [ -z "$BIBCODE_TEST_SIGNED_OUT" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"Authentication required"}}\n' "$id"; continue; }
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"antigravity-session","configOptions":%s}}\n' "$id" "$(options default)" ;;
+    *'"method":"session/resume"'*)
+      [ -z "$BIBCODE_TEST_MISSING_SESSION" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Failed to read session; retry, or load it with session/load"}}\n' "$id"; continue; }
+      sid=$(printf '%s\n' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s","configOptions":%s}}\n' "$id" "$sid" "$(options default)" ;;
+    *'"method":"session/set_config_option"'*)
+      value=$(printf '%s\n' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":%s}}\n' "$id" "$(options "$value")" ;;
+    *'"method":"session/prompt"'*)
+      [ -z "$BIBCODE_TEST_REJECT_PROMPT" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"prompt rejected"}}\n' "$id"; continue; }
+      [ -z "$BIBCODE_TEST_DISCONNECT_AFTER_PROMPT" ] || exit 0
+      [ -z "$BIBCODE_TEST_IGNORE_PROMPT" ] || continue
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    async fn antigravity_fixture_driver(
+        temp: &TempDir,
+        instance: &str,
+        environment: &[(&str, &str)],
+        resume_session: Option<&str>,
+    ) -> Arc<super::AntigravityDriver> {
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(temp, "antigravity");
+        request.provider_instance_id = Some(instance.to_owned());
+        request.binary_path = executable_fixture(temp, "agy", ANTIGRAVITY_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        request.resume_cursor =
+            resume_session.map(|session| json!({ "schemaVersion": 1, "sessionId": session }));
+        for (name, value) in environment {
+            request
+                .environment
+                .insert((*name).to_owned(), (*value).to_owned());
+        }
+        Arc::new(
+            super::AntigravityDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+            )
+            .await
+            .expect("the Antigravity fixture spawns"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn captured_methods(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|message| message["method"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_chat_runs_agy_acp_in_the_checkout_for_any_instance() {
+        assert_eq!(
+            super::canonical_provider_kind("antigravity").unwrap(),
+            "antigravity"
+        );
+        for instance in ["antigravity", "antigravity-work"] {
+            let temp = TempDir::new().expect("provider fixture directory");
+            let argv = temp.path().join("argv");
+            let requests = temp.path().join("requests.jsonl");
+            let driver = antigravity_fixture_driver(
+                &temp,
+                instance,
+                &[
+                    ("BIBCODE_TEST_ARGV_CAPTURE", argv.to_str().unwrap()),
+                    ("BIBCODE_TEST_REQUEST_CAPTURE", requests.to_str().unwrap()),
+                ],
+                None,
+            )
+            .await;
+            let started = driver.start().await.expect("the chat starts");
+            assert_eq!(
+                started.resume_cursor,
+                Some(json!({ "schemaVersion": 1, "sessionId": "antigravity-session" }))
+            );
+            driver.shutdown().await.expect("fixture shutdown");
+
+            let argv = std::fs::read_to_string(&argv).expect("argv captured");
+            let mut lines = argv.lines();
+            assert_eq!(lines.next(), Some("acp"), "no flag besides `acp`");
+            assert_eq!(
+                lines.next().map(std::path::PathBuf::from),
+                Some(temp.path().canonicalize().unwrap()),
+                "the child runs in the checkout"
+            );
+            assert_eq!(
+                captured_methods(&requests),
+                ["initialize", "session/new", "session/set_config_option"],
+                "{instance}: no authenticate, and the approval mode is written"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_version_and_sign_in_refusals_are_final_and_write_no_prompt() {
+        for (environment, expected) in [
+            (vec![("BIBCODE_TEST_AGY_VERSION", "1.5.3")], "1.5.4"),
+            (vec![("BIBCODE_TEST_SIGNED_OUT", "1")], "agy acp --login"),
+        ] {
+            let temp = TempDir::new().expect("provider fixture directory");
+            let requests = temp.path().join("requests.jsonl");
+            let mut environment = environment;
+            environment.push(("BIBCODE_TEST_REQUEST_CAPTURE", requests.to_str().unwrap()));
+            let driver = antigravity_fixture_driver(&temp, "antigravity", &environment, None).await;
+            let error = driver.start().await.expect_err("refused");
+            driver.shutdown().await.expect("fixture shutdown");
+            assert!(
+                matches!(&error, super::ProviderRuntimeError::IncompatibleProvider { detail, .. } if detail.contains(expected)),
+                "{error:?}"
+            );
+            assert!(
+                matches!(
+                    super::launch_failure_outcome(&error, "Antigravity"),
+                    super::ProviderDeliveryOutcome::Rejected { .. }
+                ),
+                "the durable launch path does not retry it"
+            );
+            assert!(!captured_methods(&requests).contains(&"session/prompt".to_owned()));
+        }
+
+        let temp = TempDir::new().expect("provider fixture directory");
+        let driver = antigravity_fixture_driver(
+            &temp,
+            "antigravity",
+            &[("BIBCODE_TEST_AGY_VERSION", "1.5.4")],
+            None,
+        )
+        .await;
+        driver.start().await.expect("1.5.4 is allowed");
+        driver.shutdown().await.expect("fixture shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_child_that_dies_during_initialize_is_an_unrequested_exit() {
+        let captured = crate::diagnostics::profiler::exits::CapturedExits::start();
+        let temp = TempDir::new().expect("provider fixture directory");
+        let driver = antigravity_fixture_driver(
+            &temp,
+            "antigravity",
+            &[("BIBCODE_TEST_EXIT_ON_INITIALIZE", "1")],
+            None,
+        )
+        .await;
+        let error = driver.start().await.expect_err("the child exited");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert!(
+            matches!(&error, super::ProviderRuntimeError::IncompatibleProvider { detail, .. } if detail.contains("1.5.4")),
+            "{error:?}"
+        );
+        let findings = captured.take();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].iter().any(|field| field == "antigravity"),
+            "{findings:?}"
+        );
+
+        // A child that answers `initialize` with an error and then dies is reported too.
+        let temp = TempDir::new().expect("provider fixture directory");
+        let driver = antigravity_fixture_driver(
+            &temp,
+            "antigravity",
+            &[("BIBCODE_TEST_REFUSE_THEN_EXIT", "1")],
+            None,
+        )
+        .await;
+        driver.start().await.expect_err("refused");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert_eq!(
+            captured.take().len(),
+            1,
+            "the exit after a reply is reported"
+        );
+
+        // A session stopped on request is not a crash.
+        let temp = TempDir::new().expect("provider fixture directory");
+        let driver = antigravity_fixture_driver(&temp, "antigravity", &[], None).await;
+        driver.start().await.expect("the chat starts");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert!(captured.take().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_delivery_maps_each_prompt_outcome() {
+        // Not started: no session, so no prompt is written.
+        let temp = TempDir::new().expect("provider fixture directory");
+        let requests = temp.path().join("requests.jsonl");
+        let driver = antigravity_fixture_driver(
+            &temp,
+            "antigravity",
+            &[("BIBCODE_TEST_REQUEST_CAPTURE", requests.to_str().unwrap())],
+            None,
+        )
+        .await;
+        let outcome = driver
+            .deliver(
+                "hello".to_owned(),
+                Vec::new(),
+                "default".to_owned(),
+                "key".to_owned(),
+            )
+            .await;
+        driver.shutdown().await.expect("fixture shutdown");
+        assert!(
+            matches!(
+                outcome,
+                super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ),
+            "{outcome:?}"
+        );
+        assert!(!captured_methods(&requests).contains(&"session/prompt".to_owned()));
+
+        for (switch, expected) in [
+            (None, "accepted"),
+            (Some("BIBCODE_TEST_REJECT_PROMPT"), "rejected"),
+            (Some("BIBCODE_TEST_DISCONNECT_AFTER_PROMPT"), "ambiguous"),
+        ] {
+            let temp = TempDir::new().expect("provider fixture directory");
+            let environment = switch.map(|name| vec![(name, "1")]).unwrap_or_default();
+            let driver = antigravity_fixture_driver(&temp, "antigravity", &environment, None).await;
+            driver.start().await.expect("the chat starts");
+            let outcome = driver
+                .deliver(
+                    "hello".to_owned(),
+                    Vec::new(),
+                    "default".to_owned(),
+                    "key".to_owned(),
+                )
+                .await;
+            driver.shutdown().await.expect("fixture shutdown");
+            let actual = match outcome {
+                super::ProviderDeliveryOutcome::Accepted { .. } => "accepted",
+                super::ProviderDeliveryOutcome::Rejected { .. } => "rejected",
+                super::ProviderDeliveryOutcome::Ambiguous { .. } => "ambiguous",
+                other => panic!("unexpected outcome {other:?}"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_reopens_a_saved_session_and_starts_a_new_one_when_it_is_gone() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let driver =
+            antigravity_fixture_driver(&temp, "antigravity", &[], Some("saved-session")).await;
+        let started = driver.start().await.expect("resumed");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert_eq!(
+            started
+                .resume_cursor
+                .as_ref()
+                .and_then(super::resume_string),
+            Some("saved-session".to_owned())
+        );
+
+        let temp = TempDir::new().expect("provider fixture directory");
+        let driver = antigravity_fixture_driver(
+            &temp,
+            "antigravity",
+            &[("BIBCODE_TEST_MISSING_SESSION", "1")],
+            Some("saved-session"),
+        )
+        .await;
+        let started = driver.start().await.expect("a new session");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert_eq!(
+            started
+                .resume_cursor
+                .as_ref()
+                .and_then(super::resume_string),
+            Some("antigravity-session".to_owned()),
+            "a different id tells the supervisor the resume was lost"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_factory_dispatches_antigravity_to_its_driver() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(&temp, "antigravity");
+        request.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        let driver = factory
+            .create(request)
+            .await
+            .expect("the factory spawns it");
+        let started = driver.start().await.expect("the chat starts");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert_eq!(
+            started
+                .resume_cursor
+                .as_ref()
+                .and_then(super::resume_string),
+            Some("antigravity-session".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unanswered_antigravity_cancel_stops_the_child_as_a_requested_stop() {
+        let captured = crate::diagnostics::profiler::exits::CapturedExits::start();
+        let temp = TempDir::new().expect("provider fixture directory");
+        let requests = temp.path().join("requests.jsonl");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(&temp, "antigravity");
+        request.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        for (name, value) in [
+            ("BIBCODE_TEST_IGNORE_PROMPT", "1"),
+            ("BIBCODE_TEST_REQUEST_CAPTURE", requests.to_str().unwrap()),
+        ] {
+            request
+                .environment
+                .insert(name.to_owned(), value.to_owned());
+        }
+        let driver = Arc::new(
+            super::AntigravityDriver::spawn_with_cancel_grace(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                Duration::from_millis(100),
+            )
+            .await
+            .expect("the Antigravity fixture spawns"),
+        );
+        driver.start().await.expect("the chat starts");
+        let delivery = tokio::spawn({
+            let driver = driver.clone();
+            async move {
+                driver
+                    .deliver(
+                        "hello".to_owned(),
+                        Vec::new(),
+                        "default".to_owned(),
+                        "key".to_owned(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !captured_methods(&requests).contains(&"session/prompt".to_owned()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the prompt is written");
+        driver.interrupt(None).await.expect("cancel sent");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("the delivery ends once the child is stopped")
+            .expect("delivery task");
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Ambiguous { .. }),
+            "{outcome:?}"
+        );
+        // A reaped child has no id any more: the watcher killed and waited for it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while driver.child.lock().await.id().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the child was stopped and reaped");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert!(
+            captured.take().is_empty(),
+            "a requested stop is not a crash"
+        );
+    }
+
+    /// A start cancelled while `initialize` is unanswered (the supervisor drops the driver) kills
+    /// the child's whole process group, descendants included, and its attribution ends with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_antigravity_start_kills_the_process_group_and_ends_attribution() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let descendant = temp.path().join("descendant.pid");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(&temp, "antigravity");
+        request.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_DESCENDANT_PID".to_owned(),
+            descendant.to_str().unwrap().to_owned(),
+        );
+        let driver = Arc::new(
+            super::AntigravityDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+            )
+            .await
+            .expect("the Antigravity fixture spawns"),
+        );
+        let child_pid = driver.child.lock().await.id().expect("child pid");
+        let attributed = |pid: u32| {
+            factory
+                .attribution
+                .registered_kinds()
+                .iter()
+                .any(|(identity, _, kind)| {
+                    identity.pid == pid && kind.as_deref() == Some("antigravity")
+                })
+        };
+        assert!(
+            attributed(child_pid),
+            "the chat child is attributed to Antigravity"
+        );
+        let start = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.start().await.map(|_| ()) }
+        });
+        let pid = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&descendant)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the child started a descendant");
+        start.abort();
+        let _ = start.await;
+        drop(driver);
+        let alive = |pid: u32| {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        timeout(Duration::from_secs(5), async {
+            while alive(pid) || alive(child_pid) || attributed(child_pid) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the group is gone and no longer attributed");
+    }
+
+    /// A driver dropped after its Tokio runtime is gone still signals its whole process group:
+    /// the kill is sent from `Drop` itself, not from a task.
+    #[cfg(unix)]
+    #[test]
+    fn an_antigravity_driver_dropped_outside_its_runtime_kills_the_process_group() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let descendant = temp.path().join("descendant.pid");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let driver = runtime.block_on(async {
+            let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+            let mut request = native_launch(&temp, "antigravity");
+            request.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
+                .to_string_lossy()
+                .into_owned();
+            request.environment.insert(
+                "BIBCODE_TEST_DESCENDANT_PID".to_owned(),
+                descendant.to_str().unwrap().to_owned(),
+            );
+            let driver = super::AntigravityDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+            )
+            .await
+            .expect("the Antigravity fixture spawns");
+            // `initialize` goes unanswered; the fixture starts a descendant instead.
+            let _ = timeout(Duration::from_millis(500), driver.start()).await;
+            driver
+        });
+        let pid = std::fs::read_to_string(&descendant)
+            .expect("the child started a descendant")
+            .trim()
+            .parse::<u32>()
+            .expect("descendant pid");
+        runtime.shutdown_background();
+        drop(driver);
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the descendant survived"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn antigravity_refusals_before_the_prompt_are_final_and_carry_no_provider_text() {
+        use crate::provider::antigravity::{
+            AntigravityRuntimeError as Error, acp::AcpProtocolError,
+        };
+        const MARKER: &str = "SYNTHETIC-PROVIDER-TEXT-91c2";
+        let remote = || {
+            Error::Protocol(AcpProtocolError::RemoteRequest {
+                method: "session/set_config_option".to_owned(),
+                request_id: "4".to_owned(),
+                code: -32603,
+                message: MARKER.to_owned(),
+                data: Some(json!({ "text": MARKER })),
+            })
+        };
+        for (error, rejected) in [
+            (Error::SignInRequired, true),
+            (
+                Error::ModeUnavailable {
+                    mode: "default".to_owned(),
+                },
+                true,
+            ),
+            (
+                Error::Protocol(AcpProtocolError::LineTooLong {
+                    stream: "stdout",
+                    maximum: 128 * 1024,
+                }),
+                true,
+            ),
+            (Error::ControlTimedOut, false),
+            (remote(), false),
+        ] {
+            let outcome = super::antigravity_unsent_outcome(error);
+            let (actual, detail) = match outcome {
+                super::ProviderDeliveryOutcome::Rejected { detail } => (true, detail),
+                super::ProviderDeliveryOutcome::DefinitelyNotSent { detail } => (false, detail),
+                other => panic!("unexpected outcome {other:?}"),
+            };
+            assert_eq!(actual, rejected, "{detail}");
+            assert!(!detail.contains(MARKER), "{detail}");
+        }
+        let launch = super::antigravity_error(remote());
+        assert!(!launch.to_string().contains(MARKER), "{launch}");
+        assert!(
+            launch.to_string().contains("session/set_config_option")
+                && launch.to_string().contains("-32603"),
+            "{launch}"
+        );
+    }
+
+    #[test]
+    fn antigravity_dispatch_tables_name_it_and_never_fall_back_to_codex() {
+        assert_eq!(super::native_adapter_key("antigravity"), "antigravity-acp");
+        let providers = ProvidersState::default();
+        let resolved = super::provider_binary_settings(&providers, "antigravity", None);
+        assert_eq!(resolved.binary_path, "agy");
+        assert!(!resolved.enabled, "disabled by default, unlike Codex");
+        let detail = crate::provider::cursor::acp::AcpProtocolError::LineTooLong {
+            stream: "stdout",
+            maximum: 128 * 1024,
+        };
+        assert!(matches!(
+            super::provider_error("antigravity")(detail),
+            super::ProviderRuntimeError::TransportLineTooLong { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn antigravity_option_logging_records_no_model_or_option_value() {
+        use crate::production::operational_logs::{OperationalLogOptions, ProviderOperationalLog};
+
+        let temp = TempDir::new().expect("provider option log directory");
+        let path = temp.path().join("provider-options.log");
+        let log = ProviderOperationalLog::start(
+            path.clone(),
+            OperationalLogOptions {
+                max_file_bytes: 4096,
+                retained_files: 1,
+                queue_capacity: 4,
+            },
+        )
+        .await
+        .expect("provider option log starts");
+        let mut request = native_launch(&temp, "antigravity");
+        request.model = Some("SYNTHETIC-MODEL-MARKER".to_owned());
+
+        super::record_option_reconciliation(
+            Some(&log),
+            &request,
+            &[json!({ "id": "reasoning", "value": "SYNTHETIC-VALUE-MARKER" })],
+            "live",
+            "applied",
+        );
+        log.shutdown()
+            .await
+            .expect("provider option log shuts down");
+
+        let contents = std::fs::read_to_string(path).expect("read provider option log");
+        assert!(!contents.contains("SYNTHETIC-MODEL-MARKER"), "{contents}");
+        assert!(!contents.contains("SYNTHETIC-VALUE-MARKER"), "{contents}");
+        let record: Value = serde_json::from_str(contents.trim()).expect("provider option record");
+        assert_eq!(record["optionId"], "reasoning");
     }
 }
 

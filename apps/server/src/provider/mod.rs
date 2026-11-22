@@ -1,4 +1,5 @@
 pub(crate) mod acp_mode;
+pub mod antigravity;
 pub(crate) mod attachments;
 pub mod claude;
 pub mod codex;
