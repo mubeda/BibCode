@@ -50,6 +50,8 @@ const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// The close is courtesy: the catalog is already read and the child stops next.
 const ANTIGRAVITY_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// BiBCode's own words: the CLI's error text never reaches the snapshot.
+/// An instance whose stored sensitive value could not be read is not probed.
+const ANTIGRAVITY_MISSING_SECRET_MESSAGE: &str = "A saved environment value of this instance could not be read, so it was not checked. Save the instance's environment again.";
 const ANTIGRAVITY_SIGN_IN_MESSAGE: &str = "Antigravity is not signed in. Open an Antigravity Terminal and run `agy`, or run `agy acp --login`.";
 const CLAUDE_CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(45);
 const CLAUDE_SKILLS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1074,6 +1076,7 @@ async fn probe_one_snapshot(
             // A stored secret that could not be read: probing without it would read another
             // account than the chat launches with (which refuses to start), so nothing is read.
             let catalog = if definition.missing_secret {
+                message = Some(ANTIGRAVITY_MISSING_SECRET_MESSAGE);
                 None
             } else {
                 probe_antigravity_catalog(
@@ -2634,6 +2637,11 @@ fn version_line(driver: &str, output: &CommandOutput) -> Option<String> {
 
 fn normalize_provider_version(driver: &str, version: Option<String>) -> Option<String> {
     let version = version?;
+    // Only a release number is published: a CLI that prints anything else (its environment,
+    // a stored secret among it) publishes no version.
+    if driver == "antigravity" {
+        return release_version(&version);
+    }
     if driver != "codex" {
         return Some(version);
     }
@@ -3701,6 +3709,44 @@ done
                 "terminal launch: {document}"
             );
         }
+    }
+
+    /// Other drivers read a missing instance `enabled` exactly as before: the inventory falls
+    /// back to the legacy entry, while the typed settings (chat and terminal launches) read on.
+    #[tokio::test]
+    async fn a_custom_codex_instance_without_enabled_resolves_as_before() {
+        let sandbox = TestSandbox::new("codex-enabled-unchanged");
+        let binary = sandbox.executable_script("codex", "exit 0", "");
+        let root = sandbox.path("settings");
+        std::fs::create_dir_all(&root).expect("settings root");
+        let document = json!({
+            "providers": { "codex": { "enabled": false } },
+            "providerInstances": { "codex-work": {
+                "driver": "codex",
+                "config": { "binaryPath": binary.to_string_lossy() }
+            } }
+        });
+        std::fs::write(root.join("settings.json"), document.to_string()).expect("settings");
+        let inventory = definitions(&document);
+        let listed = inventory
+            .iter()
+            .find(|definition| definition.instance_id == "codex-work")
+            .expect("the instance");
+        assert!(!listed.enabled, "the inventory reads the legacy entry");
+        let chat = super::super::provider_runtime::resolve_provider_route_settings(
+            &root,
+            "codex-work",
+            None,
+        )
+        .await;
+        assert!(chat.is_ok(), "a chat launch reads it on");
+        let typed = crate::server_settings::ProviderSettingsStore::new(&root)
+            .get()
+            .await
+            .expect("typed settings");
+        assert!(typed.provider_instances["codex-work"].enabled);
+        let terminal = crate::provider_terminal::ProviderTerminalInventory::from_settings(&typed);
+        assert!(terminal.get("codex-work").expect("terminal entry").enabled);
     }
 
     #[test]

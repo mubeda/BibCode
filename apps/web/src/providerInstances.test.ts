@@ -97,6 +97,25 @@ describe("applyProviderInstanceSettings", () => {
     expect(entry?.displayName).toBe("Personal Codex");
   });
 
+  it("reads an Antigravity instance without enabled as the server does, other drivers as on", () => {
+    const entries = deriveProviderInstanceEntries([
+      provider({ provider: ProviderDriverKind.make("antigravity"), instanceId: "antigravity" }),
+      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex-work" }),
+    ]);
+    const [antigravity, codex] = applyProviderInstanceSettings(entries, {
+      providerInstances: {
+        [ProviderInstanceId.make("antigravity")]: {
+          driver: ProviderDriverKind.make("antigravity"),
+        },
+        [ProviderInstanceId.make("codex-work")]: { driver: ProviderDriverKind.make("codex") },
+      },
+      providers: { codex: { enabled: false } } as never,
+    });
+
+    expect(antigravity?.enabled).toBe(false);
+    expect(codex?.enabled).toBe(true);
+  });
+
   it("uses settings when a streamed snapshot still reports a disabled default as enabled", () => {
     const entries = deriveProviderInstanceEntries([
       provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),

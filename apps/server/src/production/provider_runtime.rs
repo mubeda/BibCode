@@ -3193,6 +3193,9 @@ mod workspace_loss_tests {
         compact_hangs: Arc<AtomicBool>,
         interrupts: Arc<AtomicUsize>,
         agent_deliveries: Arc<AtomicUsize>,
+        /// Every runtime mode written, and whether the write fails.
+        mode_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        mode_fails: Arc<AtomicBool>,
     }
 
     type CompactScript = (ProviderCompactionStart, Vec<ProviderEvent>);
@@ -3328,8 +3331,17 @@ mod workspace_loss_tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn set_mode(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
-            Box::pin(async { Ok(()) })
+        fn set_mode(&self, mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async move {
+                self.mode_calls.lock().unwrap().push(mode);
+                if self.mode_fails.load(Ordering::SeqCst) {
+                    return Err(ProviderRuntimeError::Provider {
+                        provider: "antigravity".to_owned(),
+                        detail: "the mode was not confirmed".to_owned(),
+                    });
+                }
+                Ok(())
+            })
         }
 
         fn set_model(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
@@ -4708,6 +4720,75 @@ mod workspace_loss_tests {
                 .is_none()
         );
         assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        f.shutdown().await;
+    }
+
+    /// A turn delivered to a live Antigravity session confirms the turn's own runtime mode
+    /// before the prompt; when the confirmation fails nothing is sent. Other providers' live
+    /// deliveries write no mode, as before.
+    #[tokio::test]
+    async fn a_live_antigravity_turn_confirms_its_mode_before_the_prompt() {
+        let turn_in = |id: &str, mode: &str| {
+            let mut command = serde_json::to_value(turn(id, false)).unwrap();
+            command["runtimeMode"] = json!(mode);
+            serde_json::from_value::<OrchestrationCommand>(command).unwrap()
+        };
+        let codex = Fixture::new(true).await;
+        let delivery = codex
+            .supervisor
+            .deliver_turn(
+                turn_in("codex-turn", "approval-required"),
+                "codex-key".into(),
+            )
+            .await
+            .unwrap();
+        let _ = timeout(Duration::from_secs(5), delivery.completion())
+            .await
+            .unwrap();
+        assert!(codex.driver.mode_calls.lock().unwrap().is_empty());
+        codex.shutdown().await;
+
+        let f = Fixture::new(false).await;
+        let mut launch = f.launch.clone();
+        launch.provider = "antigravity".to_owned();
+        f.supervisor.launch(launch).await.unwrap();
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn_in("strict", "approval-required"), "strict-key".into())
+            .await
+            .unwrap();
+        let outcome = timeout(Duration::from_secs(5), delivery.completion())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(*f.driver.mode_calls.lock().unwrap(), ["approval-required"]);
+        let sent = f.driver.sends.load(Ordering::SeqCst);
+
+        f.driver.mode_fails.store(true, Ordering::SeqCst);
+        let refused = f
+            .supervisor
+            .deliver_turn(
+                turn_in("permissive", "full-access"),
+                "permissive-key".into(),
+            )
+            .await;
+        if let Ok(delivery) = refused {
+            let outcome = timeout(Duration::from_secs(5), delivery.completion())
+                .await
+                .unwrap();
+            assert!(
+                !matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(
+            f.driver.sends.load(Ordering::SeqCst),
+            sent,
+            "no prompt was sent"
+        );
         f.shutdown().await;
     }
 
@@ -7495,6 +7576,28 @@ async fn run_supervisor(
                             true,
                         )
                         .await?;
+                    }
+                    // A live Antigravity session runs the prompt in the mode it last confirmed, so
+                    // the turn's own modes are confirmed first; a failed confirmation refuses the
+                    // delivery before any prompt is written.
+                    if let OrchestrationCommand::ThreadTurnStart {
+                        thread_id,
+                        runtime_mode,
+                        interaction_mode,
+                        ..
+                    } = command.as_ref()
+                        && !frozen_delivery.as_ref().is_some_and(|row| row.mode == TurnDeliveryMode::Steer)
+                        && let Some(entry) = sessions.get_mut(thread_id)
+                        && entry.launch.provider == "antigravity"
+                    {
+                        if entry.launch.runtime_mode != *runtime_mode {
+                            entry.launch.runtime_mode = runtime_mode.clone();
+                            entry.driver.set_mode(runtime_mode.clone()).await?;
+                        }
+                        if entry.launch.interaction_mode != *interaction_mode {
+                            entry.launch.interaction_mode = interaction_mode.clone();
+                            entry.driver.set_interaction_mode(interaction_mode.clone()).await?;
+                        }
                     }
                     next_delivery_generation = next_delivery_generation.checked_add(1).ok_or_else(
                         || ProviderRuntimeError::Provider {

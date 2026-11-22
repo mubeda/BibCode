@@ -2479,6 +2479,16 @@ async fn refuse_unsupported_remote_settings(
     cancellation: &CancellationToken,
 ) -> Result<(), GitManagerOperationError> {
     let refuse = |code: &str, message: &str| Err(operation_error(operation, code, message));
+    // `GIT_CONFIG` redirects `git config` alone, so the read below would check another file
+    // than the push uses. The other configuration variables (`GIT_CONFIG_GLOBAL`,
+    // `GIT_CONFIG_COUNT`, `GIT_DIR`, ...) reach the read and the push alike through the same
+    // runner, so they leave the check sound.
+    if std::env::var_os("GIT_CONFIG").is_some_and(|value| !value.is_empty()) {
+        return refuse(
+            "remote-config-redirected",
+            "BiBCode was started with GIT_CONFIG set, so this remote's settings cannot be checked. Delete the branch from a terminal.",
+        );
+    }
     let Ok(output) = repository
         .run(
             "GitManager.remoteBranchDeleteCheck.config",
@@ -7247,6 +7257,55 @@ mod tests {
                 "refs/heads/feature\nrefs/heads/main"
             );
         }
+    }
+
+    /// `GIT_CONFIG` redirects only `git config`: with it set, the settings read shows another
+    /// file than the push uses, so a remote that pushes elsewhere would pass. It refuses.
+    #[tokio::test]
+    async fn remote_branch_delete_refuses_when_git_config_redirects_the_settings_read() {
+        use crate::test_support::reexec;
+        const NAME: &str = "git::manager::operations::tests::remote_branch_delete_refuses_when_git_config_redirects_the_settings_read";
+        const PHASE: &str = "git-config-view";
+        let Some(isolated) = reexec::enter(NAME, PHASE) else {
+            let directory = tempfile::tempdir().expect("view directory");
+            let view = directory.path().join("view.gitconfig");
+            reexec::run(NAME, PHASE, None, |command| {
+                command.env("GIT_CONFIG", &view);
+            });
+            return;
+        };
+        let (remote, fixture) = remote_delete_fixture();
+        let other = second_remote(fixture.path());
+        git(
+            fixture.path(),
+            &[
+                "config",
+                "remote.origin.pushurl",
+                &other.path().to_string_lossy(),
+            ],
+        );
+        // The redirected view shows only the standard settings, as the reviewer described.
+        std::fs::write(
+            std::env::var_os("GIT_CONFIG").expect("GIT_CONFIG set for this run"),
+            format!(
+                "[remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+                remote.path().to_string_lossy()
+            ),
+        )
+        .expect("view config");
+
+        let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "feature"))
+            .await
+            .expect_err("a redirected settings read is refused");
+
+        assert_eq!(failure.code, "remote-config-redirected");
+        for repository in [remote.path(), other.path()] {
+            assert_eq!(
+                remote_refs(repository),
+                "refs/heads/feature\nrefs/heads/main"
+            );
+        }
+        isolated.complete();
     }
 
     /// A settings read cut at the output limit is not the whole allowlist: a `pushurl` past the
