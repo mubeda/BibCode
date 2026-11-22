@@ -43,6 +43,7 @@ import {
 } from "./statusBarPresentation";
 import {
   antigravityPlaceholderViewModel,
+  NOT_FETCHED_MESSAGE,
   buildProviderUsageViewModels,
   providerUsageRelativeLabelKey,
   type AntigravityPlaceholder,
@@ -405,8 +406,13 @@ export function AppStatusBarView({
   >["onConsumeCodexRateLimitReset"];
 }) {
   const baseSnapshots = usage?.providers ?? EMPTY_PROVIDER_USAGE_SNAPSHOTS;
-  const antigravitySnapshot =
+  const answered =
     antigravityUsage?.providers.find((snapshot) => snapshot.provider === "antigravity") ?? null;
+  // A failed read after the server's not-fetched answer has nothing to show but how to recover.
+  const antigravitySnapshot =
+    answered !== null && !(antigravityUsageError !== null && answered.error === NOT_FETCHED_MESSAGE)
+      ? answered
+      : null;
   // Stable identity: the presentation cache below compares it.
   const snapshots = useMemo(
     () => (antigravitySnapshot === null ? baseSnapshots : [...baseSnapshots, antigravitySnapshot]),
@@ -416,7 +422,7 @@ export function AppStatusBarView({
   const antigravityPlaceholder: AntigravityPlaceholder | null =
     antigravitySnapshot !== null
       ? null
-      : antigravityUsage !== null
+      : antigravityUsage !== null && answered === null
         ? "unsupported"
         : antigravityUsageError !== null
           ? "failed"
@@ -661,9 +667,8 @@ export function AppStatusBar() {
   }, [antigravityServed, environmentId, performAntigravityRefresh, showAntigravityUsage]);
   const refresh = useCallback((): Promise<void> => {
     if (environmentId === null) return Promise.resolve();
-    void refreshAntigravity();
     return joinRefreshFlight(refreshFlightsRef.current, environmentId, () => performRefresh(false));
-  }, [environmentId, performRefresh, refreshAntigravity]);
+  }, [environmentId, performRefresh]);
   const handleRefresh = useCallback(() => {
     if (environmentId === null) return;
     if (showAntigravityUsage && !antigravityManualPendingRef.current.has(environmentId)) {
@@ -805,11 +810,12 @@ export function AppStatusBar() {
     }
   }, [atomRegistry, environmentId, resetUsage, resetUsageAtom, usage.emission]);
 
-  // Turning the item on reads it now, not at the next 30-second poll. A newly selected
-  // environment is read by its auto-refresh start, which includes Antigravity.
+  // Antigravity polls on its own: turning it on reads it now, and neither a pending nor a failed
+  // Claude and Codex read holds it back.
   useEffect(() => {
-    if (showAntigravityUsage) void antigravityRefreshRef.current();
-  }, [showAntigravityUsage]);
+    if (environmentId === null || !showAntigravityUsage) return undefined;
+    return startStatusBarUsageAutoRefresh({ refresh: () => antigravityRefreshRef.current() });
+  }, [environmentId, showAntigravityUsage]);
 
   const refreshControl = statusBarRefreshControl([
     {

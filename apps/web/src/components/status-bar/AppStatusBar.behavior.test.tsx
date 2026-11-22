@@ -706,18 +706,25 @@ describe("AppStatusBar with Antigravity on", () => {
     } as typeof harness.clientSettings;
   });
 
-  it("reads Antigravity as soon as the item is turned on, not at the next poll", () => {
-    harness.queries = [query({ providers: [] }), query(), query(), query()];
+  it("reads and polls Antigravity on its own, even while the Claude and Codex read is pending", async () => {
+    vi.useFakeTimers();
+    harness.queries = [query(null, true), query(), query(), query()];
     renderStatusBar();
     harness.effects[0]?.();
-    harness.effects.at(-1)?.();
-    expect(antigravityCalls()).toHaveLength(1);
-    expect(antigravityCalls()[0]?.[0]).toMatchObject({
-      input: { providers: ["antigravity"], force: false },
-    });
+    const cleanup = harness.effects.at(-1)?.();
+    try {
+      expect(antigravityCalls()).toHaveLength(1);
+      expect(antigravityCalls()[0]?.[0]).toMatchObject({
+        input: { providers: ["antigravity"], force: false },
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(antigravityCalls().length).toBeGreaterThan(1);
+    } finally {
+      if (typeof cleanup === "function") cleanup();
+    }
   });
 
-  it("keeps polling Antigravity with the legacy request on a server that serves it", () => {
+  it("leaves Antigravity out of the Claude and Codex poll", () => {
     harness.queries = [
       query({ providers: [] }),
       query(),
@@ -727,17 +734,16 @@ describe("AppStatusBar with Antigravity on", () => {
     renderStatusBar();
     harness.effects[0]?.();
     invokeRef(1);
-    expect(antigravityCalls()).toHaveLength(1);
-    expect(harness.refreshProviderUsage).toHaveBeenCalledTimes(2);
+    expect(antigravityCalls()).toHaveLength(0);
+    expect(harness.refreshProviderUsage).toHaveBeenCalledTimes(1);
   });
 
   it("stops polling a server whose answer has no Antigravity entry", () => {
     harness.queries = [query({ providers: [] }), query(), query(), query({ providers: [] })];
     renderStatusBar();
     harness.effects[0]?.();
-    harness.effects.at(-1)?.();
-    invokeRef(1);
+    const cleanup = harness.effects.at(-1)?.();
+    if (typeof cleanup === "function") cleanup();
     expect(antigravityCalls()).toHaveLength(0);
-    expect(harness.refreshProviderUsage).toHaveBeenCalledTimes(1);
   });
 });

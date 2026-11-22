@@ -165,6 +165,24 @@ describe("the Antigravity usage item", () => {
     expect(markup).not.toContain("Reading Antigravity usage...");
   });
 
+  it("says how to recover when a read fails after the server's not-fetched answer", () => {
+    const markup = render({
+      showAntigravityUsage: true,
+      antigravityUsage: result(
+        snapshot({
+          status: "unavailable",
+          windowGroups: [],
+          error: "Provider usage has not been fetched yet.",
+        }),
+      ),
+      antigravityUsageError: "The environment is not connected.",
+    });
+    expect(markup).toContain(
+      "Could not load Antigravity usage. Use the refresh button to try again.",
+    );
+    expect(markup).not.toContain("Reading Antigravity usage...");
+  });
+
   it("says the server is too old when its answer has no Antigravity entry", () => {
     const markup = render({ showAntigravityUsage: true, antigravityUsage: result() });
     expect(markup).toContain("This BiBCode server is too old to show Antigravity usage.");
