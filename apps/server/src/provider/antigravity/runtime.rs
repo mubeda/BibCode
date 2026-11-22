@@ -326,6 +326,12 @@ impl AntigravitySessionRuntime {
         result
     }
 
+    /// Closes the connection: the writer task ends and the CLI's stdin closes. The readers, and
+    /// this runtime's reader task, end when the CLI's output closes.
+    pub fn close(&self) {
+        self.inner.connection.shutdown();
+    }
+
     /// Whether a failed start lost its connection, so the child is exiting or gone.
     pub fn start_lost_connection(&self) -> bool {
         self.inner.start_lost_connection.load(Ordering::SeqCst)

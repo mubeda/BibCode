@@ -1560,17 +1560,19 @@ async fn the_reader_task_lets_go_of_the_runtime_once_the_connection_closes() {
 }
 
 #[tokio::test]
-#[ignore = "needs the typed outbound id match in provider/cursor/acp.rs (lane G2)"]
 async fn a_string_id_response_does_not_complete_a_numeric_request() {
     let (runtime, mut peer) = started("full-access", "auto").await;
-    let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
     let id = prompt["id"].as_u64().expect("numeric request id");
+    // The string spelling of the prompt's id answers nothing: the turn is never accepted.
     peer.send(
         json!({ "jsonrpc": "2.0", "id": id.to_string(), "result": { "stopReason": "end_turn" } }),
     )
     .await;
-    peer.reply(&prompt, json!({ "stopReason": "refusal" }))
-        .await;
     let events = events_until(&runtime, "turn.completed").await;
-    assert_eq!(events.last().unwrap().1["stopReason"], "refusal");
+    assert_ne!(events.last().unwrap().1["state"], "completed");
+    let outcome = timeout(Duration::from_secs(2), receipt.completion())
+        .await
+        .expect("in time");
+    assert!(outcome.is_err(), "{outcome:?}");
 }

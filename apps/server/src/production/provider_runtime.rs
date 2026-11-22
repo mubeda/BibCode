@@ -16118,6 +16118,7 @@ impl Drop for AntigravityDriver {
     /// process group and waits for it, off the dropping task.
     fn drop(&mut self) {
         self.abandon_watch.abort();
+        self.runtime.close();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let child = self.child.clone();
             handle.spawn(async move { kill_child(&child).await });
@@ -16490,8 +16491,9 @@ impl ProviderDriver for AntigravityDriver {
     }
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            // Killing the group closes the pipes, so the runtime's reader ends on the close.
-            // TODO(G2): also call the transport's explicit shutdown in provider/cursor/acp.rs.
+            // One call closes the connection; killing the group closes the CLI's output, so the
+            // transport readers and the runtime's reader end too.
+            self.runtime.close();
             kill_child(&self.child).await;
             Ok(())
         })
@@ -39419,7 +39421,9 @@ done
 
     #[test]
     fn antigravity_refusals_before_the_prompt_are_final_and_carry_no_provider_text() {
-        use crate::provider::antigravity::{AntigravityRuntimeError as Error, acp::AcpProtocolError};
+        use crate::provider::antigravity::{
+            AntigravityRuntimeError as Error, acp::AcpProtocolError,
+        };
         const MARKER: &str = "SYNTHETIC-PROVIDER-TEXT-91c2";
         let remote = || {
             Error::Protocol(AcpProtocolError::RemoteRequest {
@@ -39460,7 +39464,8 @@ done
         let launch = super::antigravity_error(remote());
         assert!(!launch.to_string().contains(MARKER), "{launch}");
         assert!(
-            launch.to_string().contains("session/set_config_option") && launch.to_string().contains("-32603"),
+            launch.to_string().contains("session/set_config_option")
+                && launch.to_string().contains("-32603"),
             "{launch}"
         );
     }
