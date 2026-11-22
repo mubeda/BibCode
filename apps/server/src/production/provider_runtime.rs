@@ -417,16 +417,6 @@ pub trait ProviderDriver: Send + Sync {
     fn retired_model(&self) -> Option<&'static str> {
         None
     }
-    /// Stops the driver from answering approvals by itself, at once. The supervisor calls it
-    /// when a switch away from full access, or into plan, is requested, before that command can
-    /// wait behind a running delivery. Bounded: it must not wait on the provider.
-    fn revoke_auto_approval(
-        &self,
-        _runtime_mode: Option<String>,
-        _interaction_mode: Option<String>,
-    ) -> BoxRuntimeFuture<'_, ()> {
-        Box::pin(std::future::ready(()))
-    }
     fn send(
         &self,
         text: String,
@@ -7136,21 +7126,19 @@ async fn run_supervisor(
                 let _ = response.send(result);
             }
             SupervisorMessage::Handle { command, response } => {
-                // Fail closed: the switch may wait for the running delivery below, but the
-                // driver stops answering approvals by itself now.
-                if let Some((thread_id, runtime_mode, interaction_mode)) =
-                    command_revoking_auto_approval(command.as_ref())
-                    && let Some(entry) = sessions.get(thread_id)
-                {
-                    entry
-                        .driver
-                        .revoke_auto_approval(runtime_mode, interaction_mode)
-                        .await;
-                }
+                // A command waits behind a running delivery, and also behind older commands that
+                // the finished delivery has not drained yet, so a newer setting is never applied
+                // before an older one.
                 if let Some(thread_id) = delivery_ordered_command_thread(command.as_ref())
-                    && let Some(generation) = delivery_sequences
-                        .get(thread_id)
-                        .and_then(|sequence| sequence.active_generation)
+                    && let Some(generation) =
+                        delivery_sequences.get(thread_id).and_then(|sequence| {
+                            sequence.active_generation.or_else(|| {
+                                deferred_configuration
+                                    .get(thread_id)
+                                    .is_some_and(|queued| !queued.is_empty())
+                                    .then_some(sequence.completed_generation)
+                            })
+                        })
                 {
                     let queued = deferred_configuration
                         .entry(thread_id.to_owned())
@@ -7996,26 +7984,6 @@ fn delivery_ordered_command_thread(command: &OrchestrationCommand) -> Option<&st
             model_selection: Some(_),
             ..
         } => Some(thread_id),
-        _ => None,
-    }
-}
-
-/// The thread and requested mode of a command that takes a session out of full access or into
-/// plan: (thread, runtime mode, interaction mode).
-fn command_revoking_auto_approval(
-    command: &OrchestrationCommand,
-) -> Option<(&str, Option<String>, Option<String>)> {
-    match command {
-        OrchestrationCommand::ThreadRuntimeModeSet {
-            thread_id,
-            runtime_mode,
-            ..
-        } if runtime_mode != "full-access" => Some((thread_id, Some(runtime_mode.clone()), None)),
-        OrchestrationCommand::ThreadInteractionModeSet {
-            thread_id,
-            interaction_mode,
-            ..
-        } if interaction_mode == "plan" => Some((thread_id, None, Some(interaction_mode.clone()))),
         _ => None,
     }
 }
@@ -16130,6 +16098,14 @@ impl Drop for AntigravityDriver {
     fn drop(&mut self) {
         self.abandon_watch.abort();
         self.runtime.close();
+        // The group kill is sent here, synchronously, so it happens even when no task can run
+        // any more (a runtime shutting down); only the reap is handed off.
+        if let Ok(mut child) = self.child.try_lock() {
+            if let Some(pid) = child.id() {
+                exits::note_stop_requested(pid);
+            }
+            let _ = child.start_kill();
+        }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let child = self.child.clone();
             handle.spawn(async move { kill_child(&child).await });
@@ -16216,13 +16192,21 @@ impl AntigravityDriver {
     /// A child that died before the session pump starts is not seen by the pump's exit report,
     /// so a failed start reports it here, before `shutdown` marks the process as stopped.
     async fn report_startup_exit(&self) {
-        // Only a lost connection means the child is going away; a refusal from a live child
-        // must not hold the supervisor while it polls.
-        if !exits::watching() || !self.runtime.start_lost_connection() {
+        if !exits::watching() {
             return;
         }
-        // The pipes close a moment before the exit status can be read.
-        for _ in 0..40 {
+        // Every failure checks once, so a child that answered and then died is reported. Only a
+        // lost connection waits for the exit: a refusal from a live child must not hold the
+        // supervisor. The pipes close a moment before the exit status can be read.
+        let polls = if self.runtime.start_lost_connection() {
+            40
+        } else {
+            1
+        };
+        for attempt in 0..polls {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
             if let Some((pid, status)) = exited_child(&self.child) {
                 exits::report_exit(
                     Watch::Failures,
@@ -16238,7 +16222,6 @@ impl AntigravityDriver {
                 );
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -16492,17 +16475,6 @@ impl ProviderDriver for AntigravityDriver {
                 activity: Vec::new(),
                 activity_controls: Default::default(),
             })
-        })
-    }
-    fn revoke_auto_approval(
-        &self,
-        runtime_mode: Option<String>,
-        interaction_mode: Option<String>,
-    ) -> BoxRuntimeFuture<'_, ()> {
-        Box::pin(async move {
-            self.runtime
-                .revoke_auto_answer(runtime_mode.as_deref(), interaction_mode.as_deref())
-                .await;
         })
     }
     fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
@@ -38883,6 +38855,8 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
       [ -z "$BIBCODE_TEST_EXIT_ON_INITIALIZE" ] || exit 7
+      # The answer arrives after the CLI process itself has exited, so the order is fixed.
+      [ -z "$BIBCODE_TEST_REFUSE_THEN_EXIT" ] || { ( sleep 0.3; printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ) & exit 7; }
       if [ -n "$BIBCODE_TEST_DESCENDANT_PID" ]; then
         sleep 300 &
         printf '%s\n' "$!" > "$BIBCODE_TEST_DESCENDANT_PID"
@@ -38903,11 +38877,6 @@ while IFS= read -r line; do
       [ -z "$BIBCODE_TEST_REJECT_PROMPT" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"prompt rejected"}}\n' "$id"; continue; }
       [ -z "$BIBCODE_TEST_DISCONNECT_AFTER_PROMPT" ] || exit 0
       [ -z "$BIBCODE_TEST_IGNORE_PROMPT" ] || continue
-      if [ -n "$BIBCODE_TEST_PERMISSION_TRIGGER" ]; then
-        while [ ! -e "$BIBCODE_TEST_PERMISSION_TRIGGER" ]; do sleep 0.05; done
-        printf '{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{"sessionId":"antigravity-session","toolCall":{"toolCallId":"call-1","kind":"execute","title":"Run"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]}}\n'
-        continue
-      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
   esac
 done
@@ -39061,6 +39030,23 @@ done
         assert!(
             findings[0].iter().any(|field| field == "antigravity"),
             "{findings:?}"
+        );
+
+        // A child that answers `initialize` with an error and then dies is reported too.
+        let temp = TempDir::new().expect("provider fixture directory");
+        let driver = antigravity_fixture_driver(
+            &temp,
+            "antigravity",
+            &[("BIBCODE_TEST_REFUSE_THEN_EXIT", "1")],
+            None,
+        )
+        .await;
+        driver.start().await.expect_err("refused");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert_eq!(
+            captured.take().len(),
+            1,
+            "the exit after a reply is reported"
         );
 
         // A session stopped on request is not a crash.
@@ -39337,105 +39323,59 @@ done
         .expect("the group is gone and no longer attributed");
     }
 
-    /// A live switch to approval-required waits for the running prompt, but auto-answering stops
-    /// as soon as the supervisor receives it.
+    /// A driver dropped after its Tokio runtime is gone still signals its whole process group:
+    /// the kill is sent from `Drop` itself, not from a task.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn a_switch_away_from_full_access_during_a_held_antigravity_prompt_stops_auto_answers() {
+    #[test]
+    fn an_antigravity_driver_dropped_outside_its_runtime_kills_the_process_group() {
         let temp = TempDir::new().expect("provider fixture directory");
-        let requests = temp.path().join("requests.jsonl");
-        let trigger = temp.path().join("permission-trigger");
-        let engine = supervisor_engine().await;
-        let activity = super::ActivityProjection::new(ActivityRepository::new(
-            engine.repositories().database().clone(),
-        ));
-        let supervisor = Arc::new(super::ProviderRuntimeSupervisor::start(
-            engine.clone(),
-            Arc::new(super::NativeProviderDriverFactory::new(
-                temp.path().join("attachments"),
-            )),
-            activity,
-            super::SupervisorOptions::default(),
-        ));
-        let mut launch = native_launch(&temp, "antigravity");
-        launch.thread_id = "t1".to_owned();
-        launch.runtime_mode = "full-access".to_owned();
-        launch.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
-            .to_string_lossy()
-            .into_owned();
-        for (name, value) in [
-            ("BIBCODE_TEST_REQUEST_CAPTURE", requests.to_str().unwrap()),
-            ("BIBCODE_TEST_PERMISSION_TRIGGER", trigger.to_str().unwrap()),
-        ] {
-            launch.environment.insert(name.to_owned(), value.to_owned());
-        }
-        timeout(Duration::from_secs(10), supervisor.launch(launch))
+        let descendant = temp.path().join("descendant.pid");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let driver = runtime.block_on(async {
+            let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+            let mut request = native_launch(&temp, "antigravity");
+            request.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
+                .to_string_lossy()
+                .into_owned();
+            request.environment.insert(
+                "BIBCODE_TEST_DESCENDANT_PID".to_owned(),
+                descendant.to_str().unwrap().to_owned(),
+            );
+            let driver = super::AntigravityDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+            )
             .await
-            .expect("launch in time")
-            .expect("the chat starts");
-        let _delivery = timeout(
-            Duration::from_secs(5),
-            supervisor.deliver_turn(
-                serde_json::from_value(json!({
-                    "type":"thread.turn.start", "commandId":"held", "threadId":"t1",
-                    "message":{"messageId":"held","role":"user","text":"hello","attachments":[]},
-                    "runtimeMode":"full-access", "interactionMode":"default",
-                    "createdAt":"2026-07-16T00:00:00Z",
-                }))
-                .unwrap(),
-                "held-key".to_owned(),
-            ),
-        )
-        .await
-        .expect("delivery admitted in time")
-        .expect("delivery admitted");
-        timeout(Duration::from_secs(5), async {
-            while !captured_methods(&requests).contains(&"session/prompt".to_owned()) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the prompt is written and held");
-
-        // Queued behind the held delivery; it does not return until the prompt ends.
-        let switch = tokio::spawn({
-            let supervisor = supervisor.clone();
-            async move {
-                supervisor
-                    .handle_orchestration(OrchestrationCommand::ThreadRuntimeModeSet {
-                        command_id: "to-approval".to_owned(),
-                        thread_id: "t1".to_owned(),
-                        runtime_mode: "approval-required".to_owned(),
-                        created_at: "2026-07-16T00:00:01Z".to_owned(),
-                    })
-                    .await
-            }
+            .expect("the Antigravity fixture spawns");
+            // `initialize` goes unanswered; the fixture starts a descendant instead.
+            let _ = timeout(Duration::from_millis(500), driver.start()).await;
+            driver
         });
-        // The supervisor handles its messages in order: once this answers, it saw the switch.
-        timeout(
-            Duration::from_secs(5),
-            supervisor.capture_session_identity("t1"),
-        )
-        .await
-        .expect("supervisor responsive")
-        .expect("identity");
-        std::fs::write(&trigger, b"go").expect("trigger the permission request");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let answered = std::fs::read_to_string(&requests)
-            .unwrap_or_default()
-            .lines()
-            .any(|line| line.contains("\"perm-1\""));
-        assert!(
-            !answered,
-            "the request waits for the user, not auto-approved"
-        );
-
-        timeout(Duration::from_secs(10), supervisor.shutdown())
-            .await
-            .expect("shutdown in time")
-            .expect("shutdown");
-        let _ = timeout(Duration::from_secs(5), switch).await;
-        engine.shutdown().await;
+        let pid = std::fs::read_to_string(&descendant)
+            .expect("the child started a descendant")
+            .trim()
+            .parse::<u32>()
+            .expect("descendant pid");
+        runtime.shutdown_background();
+        drop(driver);
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the descendant survived"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

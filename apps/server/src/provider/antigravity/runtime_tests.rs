@@ -889,39 +889,43 @@ async fn a_scripted_turn_projects_text_tool_activity_and_one_approval() {
         .expect("accepted");
 }
 
+/// Full access is the CLI's own `auto` mode, which asks nothing (measured): BiBCode writes no
+/// permission reply without the user's decision in any mode, whatever the options offered.
 #[tokio::test]
-async fn full_access_answers_with_allow_once_even_when_allow_always_is_offered() {
-    let (runtime, mut peer) = started("full-access", "auto").await;
-    let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
-    peer.permission(json!([
+async fn no_mode_writes_a_permission_reply_without_the_users_decision() {
+    let mut planning = options("full-access");
+    planning.interaction_mode = "plan".to_owned();
+    let every_option = json!([
         { "optionId": "always", "kind": "allow_always" },
         { "optionId": "once", "kind": "allow_once" },
         { "optionId": "deny", "kind": "reject_once" },
-    ]))
-    .await;
-    let answer = peer.next().await;
-    assert_eq!(answer["id"], json!("1"));
-    assert_eq!(answer["result"]["outcome"]["optionId"], "once");
-}
-
-#[tokio::test]
-async fn outside_full_access_bibcode_never_answers_a_permission_request() {
-    let mut planning = options("approval-required");
-    planning.interaction_mode = "plan".to_owned();
+    ]);
     for (options, mode) in [
+        (options("full-access"), "auto"),
         (options("auto-accept-edits"), "accept-edits"),
+        (options("approval-required"), "default"),
         (planning, "plan"),
     ] {
         let (runtime, mut peer) = started_with(options, mode).await;
         let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
-        peer.permission(allow_or_deny()).await;
-        opened_request_id(&runtime).await;
-        assert!(peer.silent().await, "{mode} leaves the answer to the user");
+        peer.permission(every_option.clone()).await;
+        let request_id = opened_request_id(&runtime).await;
+        assert!(
+            peer.silent().await,
+            "{mode}: nothing until the user answers"
+        );
+        runtime
+            .respond_to_request(&request_id, "accept")
+            .await
+            .expect("the user's answer");
+        let answer = peer.next().await;
+        assert_eq!(answer["id"], json!("1"));
+        assert_eq!(answer["result"]["outcome"]["optionId"], "once", "{mode}");
     }
 }
 
 #[tokio::test]
-async fn a_switch_to_approval_required_stops_auto_answers_before_the_cli_acknowledges() {
+async fn a_switch_to_approval_required_rewrites_the_mode_before_the_next_prompt() {
     let (runtime, mut peer) = started("full-access", "auto").await;
     let switch = tokio::spawn({
         let runtime = runtime.clone();
@@ -1166,7 +1170,7 @@ async fn spawn_send(
 }
 
 #[tokio::test]
-async fn full_access_answers_only_inside_an_active_turn_of_the_open_session() {
+async fn requests_outside_an_active_turn_of_the_open_session_are_refused() {
     // During the open, before the session is accepted.
     let mut resuming = options("full-access");
     resuming.resume_session_id = Some(SESSION.to_owned());
@@ -1208,7 +1212,7 @@ async fn full_access_answers_only_inside_an_active_turn_of_the_open_session() {
 }
 
 #[tokio::test]
-async fn full_access_refuses_after_a_cancel_even_once_the_turn_was_abandoned() {
+async fn requests_after_a_cancel_are_refused_even_once_the_turn_was_abandoned() {
     let mut options = options("full-access");
     options.cancel_grace = Duration::from_millis(50);
     let (runtime, mut peer) = started_with(options, "auto").await;
@@ -1246,29 +1250,64 @@ async fn plan_mode_or_a_missing_allow_once_leaves_full_access_requests_to_the_us
 }
 
 #[tokio::test]
-async fn a_switch_out_of_plan_answers_by_itself_only_once_acknowledged() {
-    let mut planning = options("full-access");
-    planning.interaction_mode = "plan".to_owned();
-    let (runtime, mut peer) = started_with(planning, "plan").await;
+async fn a_failed_switch_keeps_the_new_mode_and_refuses_prompts_until_acknowledged() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
     let switch = tokio::spawn({
         let runtime = runtime.clone();
-        async move { runtime.set_interaction_mode("default").await }
+        async move { runtime.set_runtime_mode("auto-accept-edits").await }
     });
     let mode = peer.expect("session/set_config_option").await;
-    assert_eq!(mode["params"]["value"], "auto");
+    assert_eq!(mode["params"]["value"], "accept-edits");
     peer.fail(&mode, -32603, "Internal error").await;
     assert!(switch.await.unwrap().is_err());
-    // A failed loosening keeps `plan`: the prompt rewrites it, and the request goes to the user.
+    // No rollback to an older mode: the prompt writes the thread's mode and is refused until
+    // the CLI acknowledges it.
     let send = spawn_send(&runtime).await;
     let retry = peer.expect("session/set_config_option").await;
-    assert_eq!(retry["params"]["value"], "plan");
-    peer.reply(&retry, json!({ "configOptions": standard_options("plan") }))
+    assert_eq!(retry["params"]["value"], "accept-edits");
+    peer.reply(
+        &retry,
+        json!({ "configOptions": standard_options("default") }),
+    )
+    .await;
+    assert!(
+        send.await.unwrap().is_err(),
+        "a mismatched mode sends no prompt"
+    );
+    assert!(peer.silent().await);
+}
+
+#[tokio::test]
+async fn an_older_mode_answer_never_confirms_a_newer_switch() {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let to_default = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_runtime_mode("approval-required").await }
+    });
+    let older = peer.expect("session/set_config_option").await;
+    assert_eq!(older["params"]["value"], "default");
+    let to_auto = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_runtime_mode("full-access").await }
+    });
+    let newer = peer.expect("session/set_config_option").await;
+    assert_eq!(newer["params"]["value"], "auto");
+    peer.reply(&newer, json!({ "configOptions": standard_options("auto") }))
         .await;
-    let _receipt = send.await.unwrap().expect("sent in plan");
-    peer.expect("session/prompt").await;
-    peer.permission(allow_or_deny()).await;
-    opened_request_id(&runtime).await;
-    assert!(peer.silent().await, "never answered by itself");
+    to_auto.await.unwrap().expect("newer switch acknowledged");
+    // The older answer lands last and shows `default`: the mode is no longer confirmed.
+    peer.reply(
+        &older,
+        json!({ "configOptions": standard_options("default") }),
+    )
+    .await;
+    let _ = to_default.await.unwrap();
+    let _send = spawn_send(&runtime).await;
+    let rewrite = peer.expect("session/set_config_option").await;
+    assert_eq!(
+        rewrite["params"]["value"], "auto",
+        "the latest setting wins"
+    );
 }
 
 #[tokio::test]
@@ -1321,10 +1360,10 @@ async fn numeric_and_string_ids_stay_apart_and_a_duplicate_is_not_recorded() {
         .await;
     let string = opened_request_id(&runtime).await;
     assert_ne!(numeric, string);
-    // A second outstanding request with the same typed id is neither recorded nor answered.
+    // A second outstanding request with the same typed id is refused with an error.
     peer.permission_as(json!(1), SESSION, "delete", allow_or_deny())
         .await;
-    assert!(peer.silent().await);
+    assert_eq!(peer.next().await["error"]["code"], -32600);
     assert_eq!(runtime.pending_request_ids().await.len(), 2);
 
     runtime
@@ -1565,25 +1604,27 @@ async fn the_reader_task_lets_go_of_the_runtime_once_the_connection_closes() {
 }
 
 #[tokio::test]
-async fn a_revoke_holds_even_when_the_next_prompt_reconfirms_the_mode() {
-    let (runtime, mut peer) = started("full-access", "auto").await;
-    // The supervisor revokes ahead of a queued switch to approval-required.
-    runtime
-        .revoke_auto_answer(Some("approval-required"), None)
-        .await;
-    let send = spawn_send(&runtime).await;
-    let mode = peer.expect("session/set_config_option").await;
-    assert_eq!(mode["params"]["value"], "default", "never `auto` again");
-    peer.reply(
-        &mode,
-        json!({ "configOptions": standard_options("default") }),
-    )
-    .await;
-    let _receipt = send.await.unwrap().expect("sent in default");
-    peer.expect("session/prompt").await;
+async fn a_reused_outstanding_id_gets_an_error_and_the_original_stays_bound() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
     peer.permission(allow_or_deny()).await;
-    opened_request_id(&runtime).await;
-    assert!(peer.silent().await, "the request waits for the user");
+    let original = opened_request_id(&runtime).await;
+    // The same id again, for this session and for another one: an error, never `cancelled`.
+    for session in [SESSION, "other-session"] {
+        peer.permission_as(json!("1"), session, "execute", allow_or_deny())
+            .await;
+        let answer = peer.next().await;
+        assert_eq!(answer["id"], json!("1"));
+        assert_eq!(answer["error"]["code"], -32600, "{answer}");
+        assert!(answer.get("result").is_none(), "{answer}");
+    }
+    assert_eq!(runtime.pending_request_ids().await, [original.clone()]);
+    runtime
+        .respond_to_request(&original, "decline")
+        .await
+        .unwrap();
+    let answer = peer.next().await;
+    assert_eq!(answer["result"]["outcome"]["optionId"], "deny");
 }
 
 #[tokio::test]

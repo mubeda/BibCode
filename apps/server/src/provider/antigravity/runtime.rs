@@ -208,9 +208,9 @@ struct Gate {
     /// The CLI's mode may differ from the one the thread needs: the next prompt writes it first.
     /// True until the first acknowledgement, so a failed start leaves no confirmed mode.
     mode_unconfirmed: bool,
-    /// BiBCode answers approvals by itself only while this is set: after the CLI acknowledged
-    /// `auto` for full access, and until a switch away from it is requested.
-    auto_answer: bool,
+    /// Bumped by every mode change: a mode write's answer counts only for the generation that
+    /// sent it, so an older answer never confirms a newer setting.
+    mode_generation: u64,
     pending: HashMap<String, PendingRequest>,
 }
 
@@ -221,7 +221,6 @@ impl Gate {
 
     fn unconfirm(&mut self) {
         self.mode_unconfirmed = true;
-        self.auto_answer = false;
     }
 
     /// The approvals of a turn that ended or was cancelled; they can never answer a later one.
@@ -262,7 +261,7 @@ impl AntigravitySessionRuntime {
             runtime_mode: options.runtime_mode.clone(),
             interaction_mode: options.interaction_mode.clone(),
             mode_unconfirmed: true,
-            auto_answer: false,
+            mode_generation: 0,
             pending: HashMap::new(),
         };
         let runtime = Self {
@@ -335,26 +334,6 @@ impl AntigravitySessionRuntime {
     /// Whether a failed start lost its connection, so the child is exiting or gone.
     pub fn start_lost_connection(&self) -> bool {
         self.inner.start_lost_connection.load(Ordering::SeqCst)
-    }
-
-    /// Stops BiBCode answering approvals by itself at once, ahead of a switch away from full
-    /// access that may wait for the running prompt. Only an acknowledged `auto` turns it back on.
-    /// The requested mode is recorded at once, so a prompt that reconfirms the mode before the
-    /// switch itself arrives writes the stricter mode, never `auto` again.
-    pub async fn revoke_auto_answer(
-        &self,
-        runtime_mode: Option<&str>,
-        interaction_mode: Option<&str>,
-    ) {
-        let mut gate = self.inner.gate.lock().await;
-        gate.unconfirm();
-        // Only ever tightens: a switch to full access waits for its own acknowledgement.
-        if let Some(mode) = runtime_mode.filter(|mode| *mode != "full-access") {
-            gate.runtime_mode = mode.to_owned();
-        }
-        if let Some(mode) = interaction_mode.filter(|mode| *mode == "plan") {
-            gate.interaction_mode = mode.to_owned();
-        }
     }
 
     async fn start_session(&self) -> Result<String, AntigravityRuntimeError> {
@@ -662,53 +641,54 @@ impl AntigravitySessionRuntime {
     /// Switches the runtime mode. Auto-answering stops before the write and comes back only when
     /// the CLI acknowledges `auto`. A failed switch to full access keeps the previous mode.
     pub async fn set_runtime_mode(&self, mode: &str) -> Result<(), AntigravityRuntimeError> {
-        let previous = {
-            let mut gate = self.inner.gate.lock().await;
-            gate.unconfirm();
-            std::mem::replace(&mut gate.runtime_mode, mode.to_owned())
-        };
-        let result = self.confirm_mode().await;
-        if result.is_err() && mode == "full-access" {
-            self.inner.gate.lock().await.runtime_mode = previous;
-        }
-        result
+        self.change_modes(Some(mode), None).await
     }
 
-    /// Switches the interaction mode, with the same rules as [`Self::set_runtime_mode`].
     pub async fn set_interaction_mode(&self, mode: &str) -> Result<(), AntigravityRuntimeError> {
-        let previous = {
-            let mut gate = self.inner.gate.lock().await;
-            gate.unconfirm();
-            std::mem::replace(&mut gate.interaction_mode, mode.to_owned())
-        };
-        let result = self.confirm_mode().await;
-        if result.is_err() && previous == "plan" {
-            self.inner.gate.lock().await.interaction_mode = previous;
-        }
-        result
+        self.change_modes(None, Some(mode)).await
     }
 
-    /// Writes the mode the thread needs and confirms it from the answer. Auto-answering turns on
-    /// only when the confirmed mode is `auto` and the thread still needs it. On failure the mode
-    /// stays unconfirmed, so the next prompt writes it first and is refused if that fails.
+    /// Records the thread's new mode as the one the CLI must run in, then writes it. There is no
+    /// rollback: a failed write leaves the new mode unconfirmed, so the next prompt writes it
+    /// first and is refused until the CLI acknowledges it.
+    async fn change_modes(
+        &self,
+        runtime_mode: Option<&str>,
+        interaction_mode: Option<&str>,
+    ) -> Result<(), AntigravityRuntimeError> {
+        {
+            let mut gate = self.inner.gate.lock().await;
+            if let Some(mode) = runtime_mode {
+                gate.runtime_mode = mode.to_owned();
+            }
+            if let Some(mode) = interaction_mode {
+                gate.interaction_mode = mode.to_owned();
+            }
+            gate.mode_generation += 1;
+            gate.unconfirm();
+        }
+        self.confirm_mode().await
+    }
+
+    /// Writes the mode the thread needs and confirms it from the answer, but only if no mode
+    /// change happened meanwhile; otherwise the mode stays unconfirmed for the newer write.
     async fn confirm_mode(&self) -> Result<(), AntigravityRuntimeError> {
-        let target = self.inner.gate.lock().await.mode_target();
+        let (target, generation) = {
+            let gate = self.inner.gate.lock().await;
+            (gate.mode_target(), gate.mode_generation)
+        };
         let result = self.apply_mode(target).await;
         let mut gate = self.inner.gate.lock().await;
         match result {
-            Ok(()) if gate.mode_target() == target => {
+            Ok(()) if gate.mode_generation == generation => {
                 gate.mode_unconfirmed = false;
-                gate.auto_answer = target == "auto";
                 Ok(())
             }
-            // The thread's modes changed during the write: still unconfirmed, so the change's
-            // own write, or the next prompt, confirms them.
-            Ok(()) => {
-                gate.unconfirm();
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) => {
-                gate.unconfirm();
+                if gate.mode_generation == generation {
+                    gate.unconfirm();
+                }
                 Err(error)
             }
         }
@@ -1209,9 +1189,33 @@ impl AntigravitySessionRuntime {
                 .await?;
             return Ok(());
         }
-        // The decision and its reply happen under the gate, so a cancel or a mode change is
-        // either fully before or fully after them.
+        // BiBCode never approves by itself, in any mode: full access is the CLI's own `auto`
+        // mode, which asks nothing (measured), and any request that still arrives goes to the
+        // user. Only a cancel, the user's own, answers `cancelled` for them.
         let mut gate = self.inner.gate.lock().await;
+        if gate
+            .pending
+            .values()
+            .any(|pending| pending.wire_id == wire_id)
+        {
+            // Checked first: a reply in this id's name would read as the answer to the
+            // outstanding request, which stays bound to its own operation.
+            tracing::warn!(
+                provider = PROVIDER,
+                "refused a permission request reusing an outstanding id"
+            );
+            connection
+                .respond_error(
+                    wire_id,
+                    JsonRpcErrorShape {
+                        code: -32600,
+                        message: "Invalid Request: id already in use".to_owned(),
+                        data: None,
+                    },
+                )
+                .await?;
+            return Ok(());
+        }
         let open_session = gate.session_id.is_some()
             && params.get("sessionId").and_then(Value::as_str) == gate.session_id.as_deref();
         let turn_id = gate
@@ -1226,39 +1230,12 @@ impl AntigravitySessionRuntime {
                 .await?;
             return Ok(());
         };
-        if gate
-            .pending
-            .values()
-            .any(|pending| pending.wire_id == wire_id)
-        {
-            // Any reply would be read as the answer to the outstanding request with this id.
-            tracing::warn!(
-                provider = PROVIDER,
-                "ignored a permission request reusing an outstanding id"
-            );
-            return Ok(());
-        }
         let options = params
             .get("options")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
         let allow_once = find_option_id(&options, "allow_once");
-        // Full access answers each request with `allow_once`, never `allow_always`, so a later
-        // switch to approval-required applies to the next request. Only an acknowledged `auto`
-        // for full access outside plan answers here; everything else goes to the user.
-        let answers_itself = gate.auto_answer
-            && gate.runtime_mode == "full-access"
-            && gate.interaction_mode != "plan";
-        if answers_itself && let Some(option_id) = allow_once.clone() {
-            connection
-                .respond(
-                    wire_id,
-                    json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-                )
-                .await?;
-            return Ok(());
-        }
         let request_id = format!("approval:{}", Uuid::new_v4());
         let tool_call = params.get("toolCall");
         let request_type = match item_type(
