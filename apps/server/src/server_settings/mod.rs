@@ -508,6 +508,15 @@ impl ProviderSettingsStore {
         Ok(settings)
     }
 
+    /// The stored value of instance `instance_id`'s sensitive variable `name`.
+    pub(crate) async fn stored_secret(
+        &self,
+        instance_id: &str,
+        name: &str,
+    ) -> std::io::Result<String> {
+        fs::read_to_string(self.secret_path(instance_id, name)).await
+    }
+
     fn secret_path(&self, instance_id: &str, name: &str) -> PathBuf {
         self.secrets_dir().join(format!(
             "provider-env-{}-{}",

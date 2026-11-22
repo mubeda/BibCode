@@ -319,29 +319,48 @@ struct ProviderRefreshState {
     manual_refreshes: usize,
 }
 
-/// `settings` with each provider instance's environment as a chat launch reads it: sensitive
-/// values from the secret store, not the redacted copy held and published here. Only probes
-/// use it, so the inventory reads the account a chat runs with. When the store cannot supply a
-/// secret (a chat then refuses to start), the entries stay redacted and no session is probed.
+/// `settings` with each Antigravity instance's sensitive environment values read from the secret
+/// store, as a chat launch reads them, instead of the redacted copy held and published here.
+/// Only probes use it, so the inventory reads the account a chat runs with. Each value is read
+/// on its own: one that cannot be read stays redacted, and only that instance goes unprobed.
+/// Every other driver probes with the settings as they are.
 async fn with_stored_secrets(state_directory: &Path, settings: &Value) -> Value {
+    let store = crate::server_settings::ProviderSettingsStore::new(state_directory);
     let mut probe = settings.clone();
-    let stored = match crate::server_settings::ProviderSettingsStore::new(state_directory)
-        .get()
-        .await
-    {
-        Ok(stored) => stored,
-        Err(error) => {
-            tracing::warn!(%error, "provider secrets could not be read for the inventory probe");
-            return probe;
-        }
+    let Some(instances) = probe
+        .get_mut("providerInstances")
+        .and_then(Value::as_object_mut)
+    else {
+        return probe;
     };
-    for (instance_id, instance) in stored.provider_instances {
-        if let Some(entry) = probe
-            .get_mut("providerInstances")
-            .and_then(|instances| instances.get_mut(&instance_id))
-            && let Ok(environment) = serde_json::to_value(&instance.environment)
-        {
-            entry["environment"] = environment;
+    for (instance_id, instance) in instances.iter_mut() {
+        if instance["driver"] != "antigravity" {
+            continue;
+        }
+        let Some(environment) = instance
+            .get_mut("environment")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for variable in environment {
+            if variable["valueRedacted"] != true {
+                continue;
+            }
+            let Some(name) = variable["name"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            match store.stored_secret(instance_id, &name).await {
+                Ok(value) => {
+                    variable["value"] = Value::String(value);
+                    variable["valueRedacted"] = Value::Bool(false);
+                }
+                Err(error) => tracing::warn!(
+                    instance_id,
+                    kind = ?error.kind(),
+                    "a stored provider secret could not be read for the inventory probe"
+                ),
+            }
         }
     }
     probe
@@ -7525,6 +7544,103 @@ done
         assert_eq!(auth, "unauthenticated");
         assert!(models.is_empty(), "{models:?}");
         assert_eq!(antigravity_sessions(&requests), 2);
+    }
+
+    /// Stored secrets reach Antigravity's probe only, one instance at a time, and never a
+    /// published field: a CLI that echoes its environment publishes no version, an instance
+    /// whose secret cannot be read is reported unprobed without stopping another, and a Codex
+    /// probe keeps the redacted environment it had before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stored_secrets_reach_only_antigravity_probes_and_no_published_field() {
+        const MARKER: &str = "test-marker-secret-4417";
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-secret-echo");
+        let control = scheduler_control(&temp).await;
+        let echo = sandbox.path("agy-echo");
+        // The same CLI answering protocol 2: refused, so no session version replaces the
+        // `--version` line it printed.
+        let refused = sandbox.path("agy-echo-refused");
+        for (binary, protocol) in [(&echo, 1), (&refused, 2)] {
+            let initialize =
+                provider_inventory::tests::antigravity_initialize(protocol, "1.5.13", true);
+            crate::test_support::executable_fixture::write_executable(
+                binary,
+                format!(
+                    r#"#!/bin/sh
+printf '%s\n' "$TEST_ACCOUNT_KEY" >&2
+case "$1" in --version) printf '%s\n' "$TEST_ACCOUNT_KEY"; exit 0 ;; esac
+while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) body='{initialize}' ;;
+    *'"method":"session/new"'*) body='"result":{{"sessionId":"s1","models":{{"availableModels":[{{"modelId":"alpha"}}]}}}}' ;;
+    *) body='"result":{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,%s}}\n' "$id" "$body"
+done
+"#
+                ),
+            );
+        }
+        let codex_seen = sandbox.path("codex-seen");
+        let codex = sandbox.executable_script(
+            "codex-echo",
+            &format!(
+                "printf '%s' \"$CODEX_KEY\" > '{}'\necho 'codex-cli 0.1.0'",
+                codex_seen.display()
+            ),
+            "",
+        );
+        let sensitive =
+            |name: &str, value: &str| json!([{ "name": name, "value": value, "sensitive": true }]);
+        control
+            .update_settings(json!({ "patch": { "providerInstances": {
+                "antigravity": { "driver": "antigravity", "enabled": true,
+                    "config": { "binaryPath": echo },
+                    "environment": sensitive("TEST_ACCOUNT_KEY", MARKER) },
+                "antigravity-two": { "driver": "antigravity", "enabled": true,
+                    "config": { "binaryPath": echo },
+                    "environment": sensitive("TEST_ACCOUNT_KEY", "") },
+                "antigravity-three": { "driver": "antigravity", "enabled": true,
+                    "config": { "binaryPath": refused },
+                    "environment": sensitive("TEST_ACCOUNT_KEY", MARKER) },
+                "codex": { "driver": "codex", "enabled": true,
+                    "config": { "binaryPath": codex },
+                    "environment": sensitive("CODEX_KEY", MARKER) }
+            } } }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        let providers = control.providers.read().await.clone();
+        let published = serde_json::to_string(&providers).expect("providers JSON");
+        assert!(!published.contains(MARKER), "a stored secret was published");
+        let row = |id: &str| {
+            providers
+                .iter()
+                .find(|row| row["instanceId"] == id)
+                .cloned()
+                .expect("row")
+        };
+        let first = row("antigravity");
+        assert_eq!(first["auth"]["status"], "authenticated");
+        assert!(
+            first["version"].is_null() || first["version"] == "1.5.13",
+            "{first}"
+        );
+        let second = row("antigravity-two");
+        assert!(
+            second["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("could not be read")),
+            "{second}"
+        );
+        assert_ne!(second["auth"]["status"], "authenticated");
+        assert_eq!(
+            std::fs::read_to_string(&codex_seen).unwrap_or_default(),
+            "",
+            "a Codex probe keeps the redacted environment"
+        );
     }
 
     /// After the binary changes, or a probe of the same binary fails, the published row keeps
