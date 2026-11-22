@@ -85,6 +85,40 @@ describe("prepare Tauri AppImage tools", () => {
     expect(NodeFS.existsSync(NodePath.join(repositoryRoot, "target"))).toBe(false);
   });
 
+  it.each([
+    ["unset", undefined, (root: string) => NodePath.join(root, "target/.tauri")],
+    ["empty", "", (root: string) => NodePath.join(root, "target/.tauri")],
+    [
+      "absolute",
+      NodePath.join(NodeOS.tmpdir(), "bibcode-cargo-target"),
+      (_root: string) => NodePath.join(NodeOS.tmpdir(), "bibcode-cargo-target/.tauri"),
+    ],
+    ["relative", "out/cargo", (root: string) => NodePath.join(root, "out/cargo/.tauri")],
+  ])(
+    "writes the tools where Tauri reads them for a %s CARGO_TARGET_DIR",
+    async (_name, value, expected) => {
+      const repositoryRoot = makeRepositoryRoot();
+      const expectedDirectory = expected(repositoryRoot);
+      if (value !== undefined && NodePath.isAbsolute(value)) {
+        temporaryDirectories.push(value);
+      }
+
+      const result = await prepareTauriAppImageTools({
+        repositoryRoot,
+        platform: "linux",
+        cargoTargetDirectory: value,
+        plugin: FIXTURE_PIN,
+        gstreamerPlugin: FIXTURE_PIN,
+        download: async () => FIXTURE_PLUGIN,
+      });
+
+      expect(result).toMatchObject({ status: "prepared", toolsDirectory: expectedDirectory });
+      expect(NodeFS.existsSync(NodePath.join(expectedDirectory, "linuxdeploy-plugin-gtk.sh"))).toBe(
+        true,
+      );
+    },
+  );
+
   it("downloads, verifies, and publishes every executable tool", async () => {
     const repositoryRoot = makeRepositoryRoot();
     let downloads = 0;
