@@ -3964,9 +3964,12 @@ sizes. Cover relevant:
   loads and its native screenshot shows the probe page's colour over the whole
   slot. While the preview's child webview is open the embedded WebDriver finds
   no window, so the page reports the preview's events to the spec over a
-  loopback endpoint and closes that webview before WebDriver resumes. The
-  preview undo cells are pending: on macOS keys typed after the native click
-  never reached the preview page, so undo there is checked by hand. Run it alone with
+  loopback endpoint and closes that webview before WebDriver resumes. Native
+  cells then type into the preview page and undo there, and, on macOS, check
+  that with a preview open Edit → Undo still reaches the Files editor and
+  closing the window with an unsaved edit still asks. On macOS these cells click
+  with a window-server mouse event posted through `osascript`, because System
+  Events' accessibility click does not reach the preview webview. Run it alone with
   `BIBCODE_E2E_SPEC=./specs/files-undo-shortcuts.e2e.ts`, once with and once
   without `BIBCODE_E2E_NATIVE_INPUT=1`, both with `BIBCODE_E2E_PROFILER=1`. Each
   cell's result and the events that reached the page are in
