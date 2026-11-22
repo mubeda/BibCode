@@ -62,6 +62,7 @@ import { useAtomCommand } from "../state/use-atom-command";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import {
   primaryServerConfigAtom,
+  primaryServerKeybindingsAtom,
   primaryServerConfigEventAtom,
   primaryServerWelcomeAtom,
 } from "../state/server";
@@ -183,7 +184,7 @@ export const Route = createRootRoute({
 
 function RootRouteView() {
   // The Edit menu reaches every route, /pair and sign-in included, so its listener lives here.
-  useEditMenuActions();
+  useEditMenuActions(useAtomValue(primaryServerKeybindingsAtom));
   const presentation = readCurrentEnvironmentPresentationPolicy();
   const pathname = useLocation({ select: (location) => location.pathname });
   const { authGateState } = Route.useRouteContext();

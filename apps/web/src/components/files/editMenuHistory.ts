@@ -1,4 +1,8 @@
-import { type RefObject, useEffect } from "react";
+import type { ResolvedKeybindingsConfig } from "@bibcode/contracts";
+import { type RefObject, useEffect, useRef } from "react";
+
+import { resolveShortcutCommand } from "../../keybindings";
+import { isTerminalFocused } from "../../lib/terminalFocus";
 
 import { isLinuxPlatform } from "../../lib/utils";
 
@@ -93,31 +97,36 @@ function isEditableTextField(target: EventTarget | undefined): boolean {
   if (target instanceof HTMLTextAreaElement) return !target.readOnly && !target.disabled;
   return (
     target instanceof HTMLInputElement &&
-    textInputTypes.has(target.getAttribute("type")?.toLowerCase() ?? "") &&
+    textInputTypes.has(target.type) &&
     !target.readOnly &&
     !target.disabled
   );
 }
 
 /**
- * Runs once the keydown has reached every listener, so an app shortcut bound to the chord (the
- * command palette's window listener, for one) takes it first. The field has no native undo key to
- * pre-empt, so nothing is lost by waiting.
+ * Runs the native history command at once, during dispatch, unless an app shortcut is bound to the
+ * chord: the app resolves its bindings the same way, so it keeps the key. Cancelling the key stops
+ * the native default action, such as the paste a GTK Emacs key theme binds to Ctrl+Y.
  */
-function runTextFieldHistoryChord(event: KeyboardEvent): void {
-  // Read during dispatch: the event's path is empty once its dispatch has ended.
+function runTextFieldHistoryChord(
+  event: KeyboardEvent,
+  keybindings: ResolvedKeybindingsConfig,
+): void {
   const command = textFieldHistoryChord(event);
   if (!command) return;
-  const field = event.composedPath()[0];
-  setTimeout(() => {
-    if (!event.defaultPrevented && deepActiveElement(document) === field) {
-      document.execCommand(command);
-    }
-  }, 0);
+  const context = { terminalFocus: isTerminalFocused() };
+  if (resolveShortcutCommand(event, keybindings, { context }) !== null) return;
+  event.preventDefault();
+  document.execCommand(command);
 }
 
 /** Listens for the desktop Edit menu actions on every route of the app. */
-export function useEditMenuActions(): void {
+export function useEditMenuActions(keybindings: ResolvedKeybindingsConfig): void {
+  // Read at each key, so a changed binding applies without re-subscribing.
+  const keybindingsRef = useRef(keybindings);
+  useEffect(() => {
+    keybindingsRef.current = keybindings;
+  }, [keybindings]);
   useEffect(() => {
     const onMenuAction = window.desktopBridge?.onMenuAction;
     if (typeof onMenuAction !== "function") return;
@@ -145,19 +154,22 @@ export function useEditMenuActions(): void {
       composingIn !== null &&
       composingHost !== null &&
       composingHost.isConnected &&
+      composingHost.contains(deepActiveElement(document)) &&
       filesRegionOf(deepActiveElement(document)) === composingIn;
     document.addEventListener("compositionstart", start, true);
     document.addEventListener("compositionend", end, true);
     // The Linux desktop has no Edit menu Undo to bind the text fields' chords.
     const linux = isLinuxPlatform(navigator.platform);
-    if (linux) document.addEventListener("keydown", runTextFieldHistoryChord);
+    const onKeyDown = (event: KeyboardEvent) =>
+      runTextFieldHistoryChord(event, keybindingsRef.current);
+    if (linux) document.addEventListener("keydown", onKeyDown);
     const unsubscribe = onMenuAction((action) => {
       if (isEditMenuAction(action)) runEditMenuAction(action, composing());
     });
     return () => {
       document.removeEventListener("compositionstart", start, true);
       document.removeEventListener("compositionend", end, true);
-      if (linux) document.removeEventListener("keydown", runTextFieldHistoryChord);
+      if (linux) document.removeEventListener("keydown", onKeyDown);
       unsubscribe?.();
     };
   }, []);

@@ -13,17 +13,17 @@ import {
 
 export type ChordPlatform = "mac" | "windows" | "linux";
 
-type Chord = "undo" | "redo" | "ctrl+y";
+type Chord = "undo" | "redo" | "ctrl+y" | "cmd+y";
 
 function chordEvent(chord: Chord, mac: boolean): KeyboardEvent {
-  const letter = chord === "ctrl+y" ? "y" : "z";
+  const letter = chord === "ctrl+y" || chord === "cmd+y" ? "y" : "z";
   const shift = chord === "redo";
   return new KeyboardEvent("keydown", {
     key: shift ? letter.toUpperCase() : letter,
     code: `Key${letter.toUpperCase()}`,
     keyCode: letter.toUpperCase().charCodeAt(0),
-    metaKey: mac && chord !== "ctrl+y",
-    ctrlKey: !mac || chord === "ctrl+y",
+    metaKey: (mac && chord !== "ctrl+y") || chord === "cmd+y",
+    ctrlKey: (!mac && chord !== "cmd+y") || chord === "ctrl+y",
     shiftKey: shift,
     bubbles: true,
     cancelable: true,
@@ -231,6 +231,17 @@ export function defineFileUndoChordSuite(platform: ChordPlatform): void {
       press(view, "ctrl+y", mac);
 
       expect(editor.serialize()).toBe(mac ? "Hello one" : "Hello one two");
+    });
+
+    // The macOS Redo tooltip names Cmd+Y for this view.
+    it.runIf(mac)("redoes with Cmd+Y", () => {
+      const { editor, view, tiptap } = openRendered();
+      typeTwoSteps(tiptap);
+      press(view, "undo", mac);
+
+      press(view, "cmd+y", mac);
+
+      expect(editor.serialize()).toBe("Hello one two");
     });
   });
 }

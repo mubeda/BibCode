@@ -4,6 +4,8 @@ import { act, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import type { ResolvedKeybindingsConfig } from "@bibcode/contracts";
+
 import {
   type FilesEditHistory,
   registerFilesEditRegion,
@@ -165,7 +167,7 @@ describe("useEditMenuActions and useFilesEditRegion", () => {
     });
     const files = history();
     function Probe() {
-      useEditMenuActions();
+      useEditMenuActions([]);
       const region = useRef<HTMLDivElement>(null);
       useFilesEditRegion(region, files);
       return (
@@ -206,7 +208,7 @@ describe("useEditMenuActions and useFilesEditRegion", () => {
       },
     });
     function Listener() {
-      useEditMenuActions();
+      useEditMenuActions([]);
       return null;
     }
     const container = document.createElement("div");
@@ -235,6 +237,47 @@ describe("useEditMenuActions and useFilesEditRegion", () => {
 
   // WebKit may start a composition on the text node or child element holding the caret, or on the
   // editing host while a focusable descendant such as a table cell has focus.
+  it("ignores a composition in a text field of the region once focus is in the editor", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const execCommand = vi.fn<(command: string) => boolean>(() => true);
+    document.execCommand = execCommand as unknown as Document["execCommand"];
+    let listener: ((action: string) => void) | null = null;
+    Object.assign(window, {
+      desktopBridge: {
+        onMenuAction: (next: (action: string) => void) => {
+          listener = next;
+          return () => {};
+        },
+      },
+    });
+    function Listener() {
+      useEditMenuActions([]);
+      return null;
+    }
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => root.render(<Listener />));
+    const files = history();
+    const regionElement = document.createElement("div");
+    document.body.append(regionElement);
+    const unregister = registerFilesEditRegion(regionElement, files);
+    const comment = document.createElement("textarea");
+    regionElement.append(comment);
+    comment.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true, composed: true }),
+    );
+    // Its compositionend was lost; the comment form stays open.
+    editable(regionElement).focus();
+
+    (listener as ((action: string) => void) | null)?.("edit-undo");
+
+    expect(files.undo).toHaveBeenCalledTimes(1);
+    expect(execCommand).not.toHaveBeenCalled();
+    unregister();
+    await act(async () => root.unmount());
+  });
+
   for (const [name, arrange] of [
     [
       "a text node inside the editor",
@@ -280,7 +323,7 @@ describe("useEditMenuActions and useFilesEditRegion", () => {
         },
       });
       function Listener() {
-        useEditMenuActions();
+        useEditMenuActions([]);
         return null;
       }
       const container = document.createElement("div");
@@ -376,6 +419,10 @@ describe("Linux text-field undo chords (#408)", () => {
     keydown(area, { key: "z", ctrlKey: true, isComposing: true });
     keydown(area, { key: "z", ctrlKey: true, keyCode: 229 });
     keydown(url, { key: "z", ctrlKey: true });
+    const padded = document.createElement("input");
+    padded.setAttribute("type", " Text ");
+    document.body.append(padded);
+    keydown(padded, { key: "z", ctrlKey: true });
     keydown(checkbox, { key: "z", ctrlKey: true });
     keydown(button, { key: "z", ctrlKey: true });
     keydown(readOnly, { key: "z", ctrlKey: true });
@@ -390,65 +437,88 @@ describe("Linux text-field undo chords (#408)", () => {
     keydown(terminalInput, { key: "Z", ctrlKey: true, shiftKey: true });
 
     document.removeEventListener("keydown", record);
-    expect(seen).toEqual([null, null, "undo", null, null, null, null, null]);
+    expect(seen).toEqual([null, null, "undo", "undo", null, null, null, null, null]);
   });
 
-  it("runs the native undo for an uncancelled chord on the Linux desktop only", async () => {
+  // Mounts the listener on a given platform with a textarea, and returns it with its cleanup.
+  async function mountLinuxListener(
+    platformName: string,
+    keybindings: ResolvedKeybindingsConfig = [],
+  ): Promise<{ field: HTMLTextAreaElement; unmount: () => Promise<void> }> {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const execCommand = vi.fn<(command: string) => boolean>(() => true);
-    document.execCommand = execCommand as unknown as Document["execCommand"];
     Object.assign(window, { desktopBridge: { onMenuAction: () => () => {} } });
-    const platform = vi.spyOn(navigator, "platform", "get");
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue(platformName);
     function Probe() {
-      useEditMenuActions();
-      return <textarea data-testid="field" />;
-    }
-    for (const value of ["Linux x86_64", "Win32"]) {
-      platform.mockReturnValue(value);
-      const container = document.createElement("div");
-      document.body.append(container);
-      const root = createRoot(container);
-      await act(async () => root.render(<Probe />));
-      const field = container.querySelector("textarea")!;
-      field.focus();
-      const event = keydown(field, { key: "z", ctrlKey: true });
-      // As in a browser, the event's path is empty once its dispatch has ended.
-      event.composedPath = () => [];
-      await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
-      await act(async () => root.unmount());
-    }
-    platform.mockRestore();
-
-    expect(execCommand.mock.calls).toEqual([["undo"]]);
-  });
-
-  it("lets an app shortcut bound to the chord take it first", async () => {
-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const execCommand = vi.fn<(command: string) => boolean>(() => true);
-    document.execCommand = execCommand as unknown as Document["execCommand"];
-    Object.assign(window, { desktopBridge: { onMenuAction: () => () => {} } });
-    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
-    function Probe() {
-      useEditMenuActions();
+      useEditMenuActions(keybindings);
       return <textarea data-testid="field" />;
     }
     const container = document.createElement("div");
     document.body.append(container);
     const root = createRoot(container);
     await act(async () => root.render(<Probe />));
-    // Like the command palette: a window listener that resolves a configured `ctrl+z` binding.
-    const shortcut = (event: KeyboardEvent) => {
-      if (!event.defaultPrevented) event.preventDefault();
-    };
-    window.addEventListener("keydown", shortcut);
     const field = container.querySelector("textarea")!;
     field.focus();
-    keydown(field, { key: "z", ctrlKey: true });
-    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
-    window.removeEventListener("keydown", shortcut);
-    await act(async () => root.unmount());
-    platform.mockRestore();
+    return {
+      field,
+      unmount: async () => {
+        await act(async () => root.unmount());
+        platform.mockRestore();
+      },
+    };
+  }
 
+  it("runs the native undo at once and cancels the key, on the Linux desktop only", async () => {
+    const execCommand = vi.fn<(command: string) => boolean>(() => true);
+    document.execCommand = execCommand as unknown as Document["execCommand"];
+    const seen: [string, boolean, number][] = [];
+    for (const value of ["Linux x86_64", "Win32"]) {
+      const { field, unmount } = await mountLinuxListener(value);
+      const event = keydown(field, { key: "z", ctrlKey: true });
+      // Decided during dispatch: nothing is left to run once the handler has returned.
+      seen.push([value, event.defaultPrevented, execCommand.mock.calls.length]);
+      await unmount();
+    }
+
+    expect(seen).toEqual([
+      ["Linux x86_64", true, 1],
+      ["Win32", false, 1],
+    ]);
+    expect(execCommand.mock.calls).toEqual([["undo"]]);
+  });
+
+  it("cancels Ctrl+Y, which a GTK Emacs key theme binds to paste", async () => {
+    const execCommand = vi.fn<(command: string) => boolean>(() => true);
+    document.execCommand = execCommand as unknown as Document["execCommand"];
+    const { field, unmount } = await mountLinuxListener("Linux x86_64");
+    const event = keydown(field, { key: "y", ctrlKey: true });
+    await unmount();
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(execCommand.mock.calls).toEqual([["redo"]]);
+  });
+
+  it("lets an app shortcut bound to the chord take it", async () => {
+    const execCommand = vi.fn<(command: string) => boolean>(() => true);
+    document.execCommand = execCommand as unknown as Document["execCommand"];
+    const keybindings: ResolvedKeybindingsConfig = [
+      {
+        command: "commandPalette.toggle",
+        shortcut: {
+          key: "z",
+          metaKey: false,
+          ctrlKey: false,
+          shiftKey: false,
+          altKey: false,
+          modKey: true,
+        },
+      },
+    ];
+    const { field, unmount } = await mountLinuxListener("Linux x86_64", keybindings);
+    const event = keydown(field, { key: "z", ctrlKey: true });
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    await unmount();
+
+    expect(event.defaultPrevented).toBe(false);
     expect(execCommand).not.toHaveBeenCalled();
   });
 });
