@@ -261,7 +261,6 @@ struct SingleFlight {
 struct RunningAttempt {
     receiver: tokio::sync::watch::Receiver<Option<ProviderUsageSnapshot>>,
     cancel: CancellationToken,
-    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -454,15 +453,13 @@ impl ProviderUsageService {
                     }
                     let (sender, receiver) = tokio::sync::watch::channel(None);
                     let cancel = CancellationToken::new();
-                    let task = tokio::spawn(self.clone().run_single_flight(
-                        provider,
-                        sender,
-                        cancel.clone(),
-                    ));
+                    tokio::spawn(
+                        self.clone()
+                            .run_single_flight(provider, sender, cancel.clone()),
+                    );
                     held.running = Some(RunningAttempt {
                         receiver: receiver.clone(),
                         cancel,
-                        task: Some(task),
                     });
                     receiver
                 }
@@ -478,19 +475,21 @@ impl ProviderUsageService {
     /// Closes Antigravity admission, stops a running attempt through its token and waits for it,
     /// processes reaped included. The runtime calls it before process ownership is frozen.
     pub async fn shutdown(&self) {
-        let tasks: Vec<_> = self
+        // Each call waits on its own receiver until the attempt drops its sender (it ends), so
+        // a shutdown cancelled while waiting leaves a retried one nothing less to wait for.
+        let attempts: Vec<_> = self
             .single_flights
             .values()
             .filter_map(|flight| {
                 let mut held = flight.lock().unwrap_or_else(PoisonError::into_inner);
                 held.closed = true;
-                let running = held.running.as_mut()?;
+                let running = held.running.as_ref()?;
                 running.cancel.cancel();
-                running.task.take()
+                Some(running.receiver.clone())
             })
             .collect();
-        for task in tasks {
-            let _ = task.await;
+        for mut attempt in attempts {
+            while attempt.changed().await.is_ok() {}
         }
     }
 
@@ -3418,6 +3417,36 @@ done"#,
         service.refresh_forced(only_antigravity()).await;
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// A shutdown cancelled while it waits does not let a retried one return early: every
+    /// shutdown waits until the running attempt has stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_shutdown_still_waits_for_the_running_attempt() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let service = ProviderUsageService::new(
+            vec![gated_antigravity(gate.clone(), runs.clone())],
+            Arc::new(OffsetDateTime::now_utc),
+        );
+        let refresh = tokio::spawn({
+            let service = service.clone();
+            async move { service.refresh_forced(only_antigravity()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(service.read().await.is_fetching);
+        let cut = tokio::time::timeout(Duration::from_millis(10), service.shutdown()).await;
+        assert!(
+            cut.is_err(),
+            "the first shutdown was cancelled while it waited"
+        );
+        assert!(service.read().await.is_fetching);
+        service.shutdown().await;
+        assert!(
+            !service.read().await.is_fetching,
+            "the retried shutdown returned before the attempt stopped"
+        );
+        let _ = refresh.await;
     }
 
     #[tokio::test]
