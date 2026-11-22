@@ -3703,6 +3703,44 @@ done
         }
     }
 
+    /// Other drivers read a missing instance `enabled` exactly as before: the inventory falls
+    /// back to the legacy entry, while the typed settings (chat and terminal launches) read on.
+    #[tokio::test]
+    async fn a_custom_codex_instance_without_enabled_resolves_as_before() {
+        let sandbox = TestSandbox::new("codex-enabled-unchanged");
+        let binary = sandbox.executable_script("codex", "exit 0", "");
+        let root = sandbox.path("settings");
+        std::fs::create_dir_all(&root).expect("settings root");
+        let document = json!({
+            "providers": { "codex": { "enabled": false } },
+            "providerInstances": { "codex-work": {
+                "driver": "codex",
+                "config": { "binaryPath": binary.to_string_lossy() }
+            } }
+        });
+        std::fs::write(root.join("settings.json"), document.to_string()).expect("settings");
+        let inventory = definitions(&document);
+        let listed = inventory
+            .iter()
+            .find(|definition| definition.instance_id == "codex-work")
+            .expect("the instance");
+        assert!(!listed.enabled, "the inventory reads the legacy entry");
+        let chat = super::super::provider_runtime::resolve_provider_route_settings(
+            &root,
+            "codex-work",
+            None,
+        )
+        .await;
+        assert!(chat.is_ok(), "a chat launch reads it on");
+        let typed = crate::server_settings::ProviderSettingsStore::new(&root)
+            .get()
+            .await
+            .expect("typed settings");
+        assert!(typed.provider_instances["codex-work"].enabled);
+        let terminal = crate::provider_terminal::ProviderTerminalInventory::from_settings(&typed);
+        assert!(terminal.get("codex-work").expect("terminal entry").enabled);
+    }
+
     #[test]
     fn fresh_antigravity_inventory_is_disabled_and_runs_agy_not_its_slug() {
         let fresh = definitions(&json!({}));

@@ -23,10 +23,10 @@ pub(crate) fn built_in_provider_defaults() -> Value {
 }
 
 /// Whether provider instance `instance_id` is on, read from a settings document: the instance's
-/// own `enabled`, else its driver's legacy `providers.<driver>.enabled`, else the driver's
-/// built-in default; an instance of a driver without one is on, a missing instance off. The one
-/// rule for the inventory, usage, chat and terminal launches: the typed decode alone would fill a
-/// missing instance `enabled` with true.
+/// own `enabled`, else its driver's legacy `providers.<driver>.enabled`. For Antigravity (off by
+/// default) that falls back to its built-in default, a missing instance being off, and it is the
+/// one rule for the inventory, usage, chat and terminal launches. Every other driver keeps the
+/// inventory's earlier reading (on when neither says), and its typed decode is left as it was.
 pub(crate) fn provider_instance_enabled(document: &Value, instance_id: &str) -> bool {
     let instance = document
         .get("providerInstances")
@@ -45,18 +45,27 @@ pub(crate) fn provider_instance_enabled(document: &Value, instance_id: &str) -> 
                 .and_then(|legacy| legacy.get("enabled"))
                 .and_then(Value::as_bool)
         })
-        .or_else(|| built_in_provider_defaults()[driver]["enabled"].as_bool())
+        .or_else(|| {
+            if driver == "antigravity" {
+                built_in_provider_defaults()[driver]["enabled"].as_bool()
+            } else {
+                Some(true)
+            }
+        })
         .unwrap_or(instance.is_some())
 }
 
-/// Writes the resolved `enabled` into every instance that omits it, before the typed decode.
+/// Writes the resolved `enabled` into every Antigravity instance that omits it, before the typed
+/// decode; other drivers' instances decode as before.
 fn resolve_instance_enabled(settings: &mut Value) {
     let resolved = settings
         .get("providerInstances")
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|instances| instances.iter())
-        .filter(|(_, instance)| instance.get("enabled").is_none())
+        .filter(|(_, instance)| {
+            instance.get("enabled").is_none() && instance["driver"] == "antigravity"
+        })
         .map(|(id, _)| (id.clone(), provider_instance_enabled(settings, id)))
         .collect::<Vec<_>>();
     for (id, enabled) in resolved {
