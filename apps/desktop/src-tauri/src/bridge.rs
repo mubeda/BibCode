@@ -3782,30 +3782,26 @@ mod tests {
             wsl_only: Some(false),
         });
 
-        assert_eq!(
-            settings,
-            DesktopSettings {
-                server_exposure_mode: "local-only".to_string(),
-                wsl_backend_enabled: false,
-                wsl_distro: None,
-                wsl_only: false,
-            }
-        );
+        // Every invalid value falls back to its default.
+        assert_eq!(settings, default_desktop_settings());
     }
 
     #[test]
     fn desktop_settings_defaults_and_serialization_are_stable() {
         let settings = default_desktop_settings();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut expected = json!({
+            "serverExposureMode": "local-only",
+            "wslBackendEnabled": false,
+            "wslDistro": null,
+            "wslOnly": false,
+        });
+        #[cfg(target_os = "linux")]
+        {
+            expected["linuxSoftwareRendering"] = json!(false);
+        }
 
-        assert_eq!(
-            desktop_settings_to_value(&settings),
-            json!({
-                "serverExposureMode": "local-only",
-                "wslBackendEnabled": false,
-                "wslDistro": null,
-                "wslOnly": false,
-            })
-        );
+        assert_eq!(desktop_settings_to_value(&settings), expected);
         assert_eq!(normalize_server_exposure_mode(None), "local-only");
     }
 
