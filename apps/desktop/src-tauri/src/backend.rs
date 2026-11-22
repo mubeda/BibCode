@@ -4093,7 +4093,8 @@ exit /b 9
         )
         .expect("isolated desktop test settings should decode");
         assert_eq!(settings["enableProviderUpdateChecks"], false);
-        for provider in ["codex", "claudeAgent", "cursor", "grok", "opencode"] {
+        // Every built-in driver, so a driver added later cannot escape its pin.
+        for provider in crate::test_support::hermetic_providers::BUILTIN_PROVIDER_DRIVERS {
             assert_eq!(
                 settings["providers"][provider]["enabled"], false,
                 "{provider} must not probe the developer host during desktop tests"

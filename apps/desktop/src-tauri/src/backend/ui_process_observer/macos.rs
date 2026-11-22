@@ -204,10 +204,10 @@ async fn collect_webview_pids<R: Runtime>(app: &AppHandle<R>) -> WebKitPidCollec
     for webview in webviews.into_values() {
         let sender = sender.clone();
         let dispatch = webview.with_webview(move |platform| {
-            // SAFETY: on macOS Tauri provides its live WKWebView and executes this
-            // closure on the main/UI thread.
-            let wk: &WKWebView = unsafe { &*platform.inner().cast() };
-            let _ = sender.send(read_webview_pids(wk));
+            // Tauri runs this on the main thread; a missing webview just drops its sender.
+            if let Some(wk) = crate::macos_webview::take_platform_webview(platform) {
+                let _ = sender.send(read_webview_pids(&wk));
+            }
         });
         if dispatch.is_ok() {
             expected_callbacks += 1;

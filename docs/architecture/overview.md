@@ -89,6 +89,19 @@ flowchart TB
     returns `null`, and a failed write rejects with its error text. Only a
     `desktop-e2e` build lets `BIBCODE_E2E_SAVE_TEXT_PATH` replace the picked
     path. The browser keeps its blob link.
+  - **Edit menu Undo and Redo on macOS.** The predefined items send `undo:`,
+    and WebKit's own undo never holds the Files editors' edits, so the host
+    replaces them with custom items (`CmdOrCtrl+Z`, `CmdOrCtrl+Shift+Z`). When
+    the key window is the main window and its first responder is the main
+    `WKWebView` or a view inside it, the host sends `edit-undo` or `edit-redo`
+    on the existing menu action event to the main webview only. Otherwise it
+    sends `undo:` or `redo:` up the responder chain, as the predefined item
+    did, so native panels and the preview webview keep their undo. The web's
+    listener, mounted at the root on every route, runs the history of the
+    focused Files region (the one the toolbar buttons use) when focus is on
+    its editable text and no composition is active, and otherwise runs
+    `document.execCommand`. Windows and Linux keep the predefined items: their
+    chords reach the page as key events.
   - **Asking before leaving.** The main window's close, the BiBCode Quit menu
     item (which replaces the predefined Quit so it can wait), and an update
     install another device requests go through the host's `CloseGuard`. It

@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - WDIO configuration manages host test artifacts.
 // @effect-diagnostics globalConsole:off - WDIO configuration reports the retained artifact path.
+// @effect-diagnostics globalTimers:off - WDIO waits for the packaged app's startup tool probe.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
@@ -20,6 +21,7 @@ import {
 } from "./support/app-lifecycle.ts";
 import {
   deferDesktopUiTestContextCleanupUntilExit,
+  fixtureToolProbeProblem,
   prepareDesktopUiTestContext,
 } from "./support/test-project.ts";
 import { normalizeWebDriverRequest } from "./support/webdriver-request.ts";
@@ -69,6 +71,7 @@ const desktopUiSpecFiles =
         "./specs/mermaid-diagrams.e2e.ts",
         "./specs/files-binary-preview.e2e.ts",
         "./specs/files-rich-markdown.e2e.ts",
+        "./specs/files-undo-shortcuts.e2e.ts",
         "./specs/appearance-themes.e2e.ts",
         "./specs/source-control-review.e2e.ts",
         "./specs/host-dashboard.e2e.ts",
@@ -233,6 +236,16 @@ export const config = {
     if (!pluginReady) {
       throw new Error("The packaged Tauri WebDriver plugin did not initialize.");
     }
+    // The app probes its tools at startup; a real one on PATH must never answer in a test run.
+    if (process.env.BIBCODE_E2E_REAL_PROVIDERS !== "1") {
+      // Up to 30 s for the startup probe to finish.
+      for (let wait = 0; wait < 120; wait += 1) {
+        if (fixtureToolProbeProblem(testContext.toolProbeLogPath) === null) break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      const problem = fixtureToolProbeProblem(testContext.toolProbeLogPath);
+      if (problem !== null) throw new Error(problem);
+    }
   },
   beforeTest: async () => {
     await ensureLiveDesktopUiWebview();
@@ -285,5 +298,11 @@ export const config = {
     // until process exit so the Tauri service has released Windows filesystem handles first.
     deferDesktopUiTestContextCleanupUntilExit(testContext, process);
     console.log(`Desktop UI artifacts: ${testContext.artifactDirectory}`);
+    // A `before` hook error is only logged, so the run fails here when a real tool answered.
+    const probeProblem =
+      process.env.BIBCODE_E2E_REAL_PROVIDERS === "1"
+        ? null
+        : fixtureToolProbeProblem(testContext.toolProbeLogPath);
+    if (probeProblem !== null) throw new Error(probeProblem);
   },
 };

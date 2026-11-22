@@ -84,6 +84,24 @@ terminal, when no rule claims the key, and when no rule names
 `sourceControl.review`; a rule that binds `sourceControl.review` to another key
 replaces it. Mod+Shift+R is left to the browser's hard reload.
 
+### Files editor
+
+The Files editor's source and rendered views have fixed undo and redo keys.
+They belong to the editor, so they are not commands and cannot be rebound.
+
+| Action | macOS       | Windows and Linux      |
+| ------ | ----------- | ---------------------- |
+| Undo   | Cmd+Z       | Ctrl+Z                 |
+| Redo   | Shift+Cmd+Z | Shift+Ctrl+Z or Ctrl+Y |
+| Save   | Cmd+S       | Ctrl+S                 |
+
+Each key moves the same history as the toolbar's Undo and Redo buttons, one
+step at a time. In the macOS and Windows desktop app, **Edit → Undo** and
+**Edit → Redo** do the same while the editor has focus. The Linux desktop app
+has no Undo or Redo item in its Edit menu. A text field inside Files, such as a line
+comment, keeps its own undo. On macOS, Ctrl+Y does nothing in the editor, and
+the rendered view also redoes with Cmd+Y.
+
 The native server validates overrides in
 [`apps/server/src/production/keybindings.rs`](../../apps/server/src/production/keybindings.rs)
 and exposes the resolved file path and configuration issues through
