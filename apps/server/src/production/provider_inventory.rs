@@ -4425,28 +4425,25 @@ done
         assert!(antigravity_models(&json!({ "sessionId": "session-1" }), &[]).is_none());
     }
 
-    /// Reads the catalog of a real, signed-in CLI through the probe's own code path, with no
-    /// prompt. Opt-in: `BIBCODE_ANTIGRAVITY_LIVE_BINARY` names an executable that runs the CLI
-    /// (a wrapper not called `agy`, which the hermetic guard refuses), the session opens in
-    /// `TMPDIR`, and `BIBCODE_ANTIGRAVITY_LIVE_OUT` receives the published models as JSON.
+    /// Only "Authentication required" reads as signed out: another `-32000` leaves the sign-in
+    /// unknown and no sign-in message.
+    #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "needs a signed-in Antigravity CLI"]
-    async fn live_antigravity_inventory() {
-        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
-        let binary = std::path::PathBuf::from(var("BIBCODE_ANTIGRAVITY_LIVE_BINARY"));
-        let catalog = probe_antigravity_catalog("antigravity", &binary, &[], &[], None).await;
-        let Some(AntigravityCatalog::Session {
-            models: Some(models),
-            ..
-        }) = catalog
-        else {
-            panic!("the CLI published no catalog");
-        };
-        std::fs::write(
-            var("BIBCODE_ANTIGRAVITY_LIVE_OUT"),
-            serde_json::to_vec_pretty(&models).expect("models JSON"),
+    async fn another_antigravity_server_error_is_not_read_as_signed_out() {
+        let sandbox = TestSandbox::new("antigravity-other-32000");
+        let (binary, _) = antigravity_acp_fixture(
+            &sandbox,
+            "antigravity-cli-other-32000",
+            "1.5.13",
+            r#""error":{"code":-32000,"message":"Rate limited"}"#,
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
         )
-        .expect("the live catalog file");
+        .await;
+        assert_eq!(snapshot["auth"], json!({ "status": "unknown" }));
+        assert!(snapshot.get("message").is_none(), "{snapshot}");
     }
 
     /// `-32000` "Authentication required" reads as signed out while the instance stays ready,
