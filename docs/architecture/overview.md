@@ -1759,7 +1759,7 @@ See the [AppImage child environment policy](#appimage-child-environments).
 
 The desktop's `beforeBundleCommand` runs
 `scripts/prepare-tauri-appimage-tools.ts`, which prepares the repository GTK
-and GStreamer plugin wrappers in `target/.tauri` alongside the upstream plugins
+and GStreamer plugin wrappers in `$CARGO_TARGET_DIR/.tauri` (`target/.tauri` when unset; a relative value resolves against the repository root) alongside the upstream plugins
 pinned by URL and SHA-256. Tauri runs that hook in both `tauri build` and a
 standalone `tauri bundle`, before linuxdeploy, so the bundler never fetches or
 runs an unpinned plugin copy. Linux Tauri configuration uses that project-local

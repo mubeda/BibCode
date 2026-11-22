@@ -46,6 +46,8 @@ export class TauriAppImageToolPreparationError extends Error {
 export interface PrepareTauriAppImageToolsOptions {
   readonly repositoryRoot?: string;
   readonly platform?: NodeJS.Platform;
+  /** Defaults to `CARGO_TARGET_DIR`; Tauri reads its tools from `<target>/.tauri`. */
+  readonly cargoTargetDirectory?: string;
   readonly download?: (url: string) => Promise<Uint8Array>;
   readonly plugin?: UpstreamGtkPluginPin;
   readonly gstreamerPlugin?: UpstreamGtkPluginPin;
@@ -128,7 +130,15 @@ export async function prepareTauriAppImageTools(
   const repositoryRoot =
     options.repositoryRoot ??
     NodePath.resolve(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "..");
-  const toolsDirectory = NodePath.join(repositoryRoot, "target/.tauri");
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- Standalone CLI samples the actual host environment when not injected.
+  const cargoTargetDirectory = options.cargoTargetDirectory ?? process.env.CARGO_TARGET_DIR;
+  // A relative value resolves against the repository root, where cargo runs.
+  const toolsDirectory = NodePath.join(
+    cargoTargetDirectory
+      ? NodePath.resolve(repositoryRoot, cargoTargetDirectory)
+      : NodePath.join(repositoryRoot, "target"),
+    ".tauri",
+  );
   const upstreamPath = NodePath.join(toolsDirectory, "bibcode-linuxdeploy-gtk-upstream.sh");
   const legacyUpstreamPath = NodePath.join(toolsDirectory, "linuxdeploy-plugin-gtk-upstream.sh");
   const wrapperPath = NodePath.join(toolsDirectory, "linuxdeploy-plugin-gtk.sh");
