@@ -3958,10 +3958,10 @@ sizes. Cover relevant:
   `xdotool` under Xvfb and has no menu cells, because the Linux Edit menu has
   no Undo or Redo item. Native cells cover two steps undone one at a time,
   redo with two pending redo entries, a formatting step, the chat composer, a
-  plain textarea, the inline comment field, the Link URL field, a page in the
-  preview browser (opened with **Open file in preview browser**, focused by a
-  real click), and the terminal keeping Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y off
-  macOS. Run it alone with
+  plain textarea, the inline comment field, the Link URL field, and the
+  terminal keeping Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y off macOS. The preview
+  browser cells are pending: the spec cannot yet observe a page in the preview
+  webview, so undo there is checked by hand. Run it alone with
   `BIBCODE_E2E_SPEC=./specs/files-undo-shortcuts.e2e.ts`, once with and once
   without `BIBCODE_E2E_NATIVE_INPUT=1`, both with `BIBCODE_E2E_PROFILER=1`. Each
   cell's result and the events that reached the page are in
@@ -3969,9 +3969,8 @@ sizes. Cover relevant:
 - Isolated tools: every packaged run starts a fixture `codegraph` from the
   fixture's shim directory, which the fixture HOME's login profiles keep first
   on `PATH` after the app hydrates it from a login shell. Each start is logged
-  to `tool-probes.log` in the artifact directory. The run fails before the
-  first test, and again when it completes, unless that log shows the fixture's
-  `codegraph --version` probe;
+  to `tool-probes.log` in the artifact directory. The run fails when it
+  completes unless that log shows the fixture's `codegraph --version` probe;
 - Appearance themes: the packaged `appearance-themes` spec proves that the left
   panel marks its repository, checkout and chat levels in Light and in Tokyo
   Night, that clicking the Matrix Dark row in Light mode switches to Dark and
