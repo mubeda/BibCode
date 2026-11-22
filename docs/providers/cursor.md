@@ -27,7 +27,9 @@ BiBCode starts `cursor-agent acp` and communicates through the Agent Client
 Protocol (ACP). It initializes the connection, authenticates with the
 `cursor_login` method, and creates or loads a Cursor session for the active
 workspace. Provider inventory uses `cursor-agent about` for installation and
-authentication status and queries ACP for available models.
+authentication status and queries ACP for available models. A Cursor that
+reports itself signed in can still require a browser sign-in when it gets a
+prompt: it opens a Cursor sign-in page and sends nothing until you finish it.
 
 The model picker lists each Cursor model once, by its base name, with its
 reasoning, context, fast and thinking options. BiBCode sends the session only a
@@ -35,10 +37,16 @@ model value the session advertises. Cursor CLIs since 2026.11 advertise one
 value per model with its options folded in, such as
 `gpt-5.4-nano[reasoning=medium]`, and reject a plain model name; BiBCode sends
 that advertised value. With these CLIs the picker offers each model only the
-option values an advertised value carries, and a custom model only when the CLI
-advertises it: provider inventory opens one empty Cursor session per CLI version
-and model list to read the advertised values (Cursor does not list empty
-sessions). An option that no advertised value of the model holds, such as one
+option values an advertised value carries, and only options it can offer
+together: when the CLI advertises some combinations of two options but not
+others, such as High reasoning only with Fast on, the picker shows one of them
+and Cursor's advertised value decides the other. A model the CLI advertises as a
+plain value, such as Auto, keeps its place without options, and a custom model
+appears only when the CLI advertises it. Provider inventory opens one empty
+Cursor session per CLI version, model list and instance environment to read the
+advertised values (Cursor does not list empty sessions); refreshes at the same
+time share that one read, and a read that fails is not tried again for a few
+minutes, while the model list is published without it. An option that no advertised value of the model holds, such as one
 saved from an older catalog, is refused before the turn is sent with a message
 naming it and saying to choose another option, as is a model the session does
 not offer.
@@ -49,15 +57,22 @@ remembered; a session that advertises no default value leaves the choice to
 Cursor.
 
 A Cursor turn that receives no update at all for five minutes, while it waits
-on neither the user nor a running tool, is cancelled on the CLI as Stop does and
-ends as failed with a message saying that Cursor stopped responding and to send
-the message again or check the Cursor CLI. If the CLI does not answer that
-cancel within ten seconds either, BiBCode stops the Cursor process, as a
-requested stop rather than a crash, so nothing the old prompt still produces can
-reach the next message; the next message starts Cursor again and resumes the
-session. A turn that keeps streaming text,
-thoughts or tool progress is never cut off, and the session takes the next
-message as usual.
+on neither the user nor a tool Cursor reports running, shows the notice
+"Cursor has sent nothing for 5 minutes. It may be waiting for you to sign in to
+Cursor in your browser; otherwise stop the turn if it seems stuck." The
+turn keeps running; BiBCode never ends it by itself, and the notice clears when
+Cursor sends its next update. A tool Cursor reports only as pending, or as
+finished in any way, does not pause that clock.
+
+After **Stop**, BiBCode drops everything Cursor still sends for that turn: no
+text, plan or to-do update appears, no approval or question opens, and a late
+permission request or question is answered as cancelled, never approved. If
+Cursor does not end the stopped turn within ten seconds, the turn ends as
+cancelled and BiBCode stops the Cursor process, as a requested stop rather than
+a crash, so nothing the old prompt still produces can reach the next message;
+the next message starts Cursor again and resumes the session. BiBCode also stops
+the process when Cursor does not take a prompt within 30 seconds; a prompt it
+did not read at all is sent again, one it may have partly read is not.
 
 Cursor slash commands, skills, and agents are discovered from the server-side
 workspace environment. Skills include `.cursor/skills`, `.agents/skills`,

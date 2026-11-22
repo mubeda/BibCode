@@ -203,21 +203,21 @@ pub fn acp_model_values_are_bracketed(options: &[Value]) -> bool {
 /// The advertised model value for the chosen `model`: the value itself when advertised, otherwise
 /// the value whose base is `model` (the inventory publishes bases), the session's current one
 /// first. A model the session does not advertise is refused, so BiBCode never sends a value the
-/// CLI did not offer. `None` when the option lists no values to check against.
+/// CLI did not offer; an option listing no values advertises only its current value.
 pub fn resolve_advertised_model_value(
     descriptor: &Value,
     model: &str,
-) -> Result<Option<Value>, RefusedOption> {
-    let advertised = advertised_values(descriptor);
+) -> Result<Value, RefusedOption> {
+    let current = descriptor.get("currentValue");
+    let mut advertised = advertised_values(descriptor);
     if advertised.is_empty() {
-        return Ok(None);
+        advertised.extend(current.cloned());
     }
     let model = model.trim();
     if advertised.iter().any(|value| value.as_str() == Some(model)) {
-        return Ok(Some(json!(model)));
+        return Ok(json!(model));
     }
     let base_of = |value: &Value| value.as_str().map(resolve_acp_base_model_id);
-    let current = descriptor.get("currentValue");
     current
         .filter(|current| {
             advertised.contains(current) && base_of(current).as_deref() == Some(model)
@@ -229,7 +229,6 @@ pub fn resolve_advertised_model_value(
                 .find(|value| base_of(value).as_deref() == Some(model))
                 .cloned()
         })
-        .map(Some)
         .ok_or_else(|| {
             RefusedOption::new(
                 format!("Cursor session does not advertise model {model}"),
@@ -241,11 +240,13 @@ pub fn resolve_advertised_model_value(
 /// A turn's options checked against a session that folds options into its model values: the
 /// advertised value with the current model's base whose parameters hold every requested option,
 /// the current value first. `Ok(None)` when the current value already holds them, `Ok(Some)` with
-/// the value to switch to otherwise. An option no advertised value of the model holds is refused:
-/// BiBCode never composes a value the CLI did not offer.
+/// the value to switch to otherwise. An option the turn leaves out goes back to the model's
+/// `baseline` value, as a session with separate options resets it. An option no advertised value
+/// of the model holds is refused: BiBCode never composes a value the CLI did not offer.
 pub fn resolve_bracketed_model_options(
     descriptor: &Value,
     updates: &Value,
+    baseline: Option<&str>,
 ) -> Result<Option<Value>, RefusedOption> {
     let Some(updates) = updates.as_array() else {
         return Err(RefusedOption::unusable(
@@ -264,7 +265,7 @@ pub fn resolve_bracketed_model_options(
         let (keys, label, value): (&[&str], &str, String) =
             match update.get("id").and_then(Value::as_str) {
                 Some("reasoning") => (
-                    &["reasoning", "effort", "reasoning_effort"],
+                    REASONING_KEYS,
                     REASONING_LABEL,
                     update
                         .get("value")
@@ -328,7 +329,11 @@ pub fn resolve_bracketed_model_options(
             };
         wanted.push((keys, label, value));
     }
-    let candidates = std::iter::once(current.to_owned())
+    let baseline = baseline.filter(|baseline| resolve_acp_base_model_id(baseline) == base);
+    let candidates = baseline
+        .into_iter()
+        .map(str::to_owned)
+        .chain(std::iter::once(current.to_owned()))
         .chain(
             advertised_values(descriptor)
                 .into_iter()
@@ -344,9 +349,25 @@ pub fn resolve_bracketed_model_options(
             })
         })
     };
+    // Every option the turn leaves out keeps the baseline's value, when an advertised value can.
+    let keeps_baseline = |value: &str| {
+        let (Some((_, own)), Some((_, base_params))) = (
+            bracketed_model_value(value),
+            baseline.and_then(bracketed_model_value),
+        ) else {
+            return true;
+        };
+        base_params.iter().all(|(key, base_value)| {
+            wanted.iter().any(|(keys, _, _)| keys.contains(key))
+                || own.contains(&(*key, *base_value))
+        })
+    };
+    let holds_all = |value: &&String| wanted.iter().all(|option| holds(value, option));
     if let Some(value) = candidates
         .iter()
-        .find(|value| wanted.iter().all(|option| holds(value, option)))
+        .filter(holds_all)
+        .find(|value| keeps_baseline(value))
+        .or_else(|| candidates.iter().find(holds_all))
     {
         return Ok((value != current).then(|| json!(value)));
     }
@@ -929,9 +950,15 @@ pub fn discover_models_with_advertised_values(
                 .map(|(_, params)| params.as_slice())
                 .collect::<Vec<_>>();
             if carriers.is_empty() {
-                continue;
+                // A plain advertised value keeps its model, with no option a bracketed session
+                // could apply to it.
+                if !advertised.contains(&base) {
+                    continue;
+                }
+                Vec::new()
+            } else {
+                narrow_config_options(config_options, &carriers)
             }
-            narrow_config_options(config_options, &carriers)
         };
         discovered.push(CursorProviderModel {
             slug: base.clone(),
@@ -963,23 +990,33 @@ pub fn discover_models_with_advertised_values(
     Ok(discovered)
 }
 
+/// Bracket keys that all mean Reasoning, as the runtime reads them.
+const REASONING_KEYS: &[&str] = &["reasoning", "effort", "reasoning_effort"];
+
+/// Whether a bracket parameter carries an option's value, with the aliases the runtime accepts.
+fn carries(params: &[(&str, &str)], id: &str, value: &str) -> bool {
+    params.iter().any(|(key, carried)| {
+        (*key == id || (REASONING_KEYS.contains(key) && REASONING_KEYS.contains(&id)))
+            && (*carried == value
+                || matches!(
+                    (*carried, value),
+                    ("extra-high", "xhigh") | ("xhigh", "extra-high")
+                ))
+    })
+}
+
 /// A model's listed options, each keeping only the values one of its advertised bracketed values
 /// carries under the option's id (the bracket keys are the CLI's option ids). An option no value
-/// carries is dropped, as is an on/off option left with one state, which a toggle cannot show;
-/// the runtime reads an omitted option as no constraint. A narrowed option's current value is one
-/// it keeps.
+/// carries is dropped, as is an on/off option left with one state, which a toggle cannot show.
+/// The picker sets each option on its own, so only the largest set of options whose every
+/// combination some advertised value holds is published; the runtime reads an omitted option as
+/// no constraint. A narrowed option's current value is one it keeps.
 fn narrow_config_options(options: Vec<Value>, carriers: &[&[(&str, &str)]]) -> Vec<Value> {
-    options
+    let narrowed = options
         .into_iter()
         .filter_map(|mut option| {
             let id = option.get("id").and_then(Value::as_str)?.to_owned();
-            let carried = |value: &str| {
-                carriers.iter().any(|params| {
-                    params
-                        .iter()
-                        .any(|(key, carried)| *key == id && *carried == value)
-                })
-            };
+            let carried = |value: &str| carriers.iter().any(|params| carries(params, &id, value));
             let kept = option
                 .get("options")
                 .and_then(Value::as_array)?
@@ -1008,7 +1045,61 @@ fn narrow_config_options(options: Vec<Value>, carriers: &[&[(&str, &str)]]) -> V
             option["options"] = Value::Array(kept);
             Some(option)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let choices = |option: &Value| -> Vec<(String, String)> {
+        let id = option["id"].as_str().unwrap_or_default().to_owned();
+        option["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|choice| choice.get("value").and_then(Value::as_str))
+            .map(|value| (id.clone(), value.to_owned()))
+            .collect()
+    };
+    let every_combination_advertised = |subset: &[&Value]| {
+        let mut combinations = vec![Vec::<(String, String)>::new()];
+        for option in subset {
+            combinations = combinations
+                .into_iter()
+                .flat_map(|combination| {
+                    choices(option).into_iter().map(move |choice| {
+                        let mut next = combination.clone();
+                        next.push(choice);
+                        next
+                    })
+                })
+                .collect();
+        }
+        combinations.iter().all(|combination| {
+            carriers.iter().any(|params| {
+                combination
+                    .iter()
+                    .all(|(id, value)| carries(params, id, value))
+            })
+        })
+    };
+    // Largest first, earlier options first among sets of one size; a model has a handful.
+    let count = narrowed.len();
+    let mut masks = (0..1u32 << count).collect::<Vec<_>>();
+    masks.sort_by_key(|mask| {
+        (
+            std::cmp::Reverse(mask.count_ones()),
+            std::cmp::Reverse(mask.reverse_bits()),
+        )
+    });
+    masks
+        .into_iter()
+        .map(|mask| {
+            narrowed
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, option)| option)
+                .collect::<Vec<_>>()
+        })
+        .find(|subset| every_combination_advertised(subset))
+        .map(|subset| subset.into_iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn select_descriptor(id: &str, label: &str, options: Vec<Value>, current: Option<&str>) -> Value {
@@ -1195,7 +1286,7 @@ mod tests {
             summary,
             [
                 "default ",
-                "grok-4.7 reasoning=low|high contextWindow=256k fastMode=on/off",
+                "grok-4.7 reasoning=low|high contextWindow=256k",
                 "claude-sonnet-4 ",
             ]
         );
@@ -1218,6 +1309,110 @@ mod tests {
         }
     }
 
+    /// Every combination the picker can build from a bracketed catalog is one the runtime sends:
+    /// from any advertised value of the model, each choice resolves to an advertised value.
+    #[test]
+    fn every_published_combination_resolves_to_an_advertised_value() {
+        let select = |id: &str, category: &str, values: &[&str]| {
+            json!({
+                "id": id, "category": category, "type": "select", "currentValue": values[0],
+                "options": values.iter().map(|value| json!({ "value": value })).collect::<Vec<_>>()
+            })
+        };
+        let list = json!({ "models": [
+            { "value": "default", "name": "Auto", "configOptions": [] },
+            { "value": "m", "name": "M", "configOptions": [
+                select("effort", "model_option", &["low", "high", "xhigh"]),
+                select("fast", "model_config", &["false", "true"])
+            ] },
+            { "value": "n", "name": "N", "configOptions": [
+                select("reasoning", "thought_level", &["low", "high"]),
+                select("context", "model_config", &["200k", "1m"])
+            ] }
+        ] });
+        let advertised = [
+            "default",
+            "m[effort=low,fast=false]",
+            "m[effort=high,fast=true]",
+            "m[effort=extra-high,fast=true]",
+            "n[reasoning=low,context=200k]",
+            "n[reasoning=low,context=1m]",
+            "n[reasoning=high,context=200k]",
+            "n[reasoning=high,context=1m]",
+        ]
+        .map(str::to_owned);
+        let models = discover_models_with_advertised_values(&list, &[], &advertised).unwrap();
+        // A mixed catalog keeps its plain model, with no options to refuse.
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "m", "n"]
+        );
+        assert_eq!(models[0].capabilities["optionDescriptors"], json!([]));
+        let descriptor = |current: &str| {
+            json!({
+                "id": "model", "category": "model", "currentValue": current,
+                "options": advertised.iter().map(|value| json!({ "value": value })).collect::<Vec<_>>()
+            })
+        };
+        let mut checked = 0;
+        for model in &models {
+            let mut combinations = vec![Vec::<Value>::new()];
+            for option in model.capabilities["optionDescriptors"].as_array().unwrap() {
+                let values = option["options"].as_array().map_or_else(
+                    || vec![json!(true), json!(false)],
+                    |choices| choices.iter().map(|choice| choice["id"].clone()).collect(),
+                );
+                combinations = combinations
+                    .into_iter()
+                    .flat_map(|combination| {
+                        values.iter().map(move |value| {
+                            let mut next = combination.clone();
+                            next.push(json!({ "id": option["id"], "value": value }));
+                            next
+                        })
+                    })
+                    .collect();
+            }
+            for current in advertised
+                .iter()
+                .filter(|value| resolve_acp_base_model_id(value) == model.slug)
+            {
+                for combination in &combinations {
+                    let resolved = resolve_bracketed_model_options(
+                        &descriptor(current),
+                        &Value::Array(combination.clone()),
+                        None,
+                    );
+                    assert!(
+                        resolved.is_ok(),
+                        "{} from {current}: {combination:?} -> {resolved:?}",
+                        model.slug
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        // m keeps only Reasoning (Fast is not free of it); n keeps both, every pair advertised.
+        assert_eq!(
+            models[1].capabilities["optionDescriptors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            models[2].capabilities["optionDescriptors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(checked > 0);
+    }
+
     #[test]
     fn a_bracketed_model_option_holds_its_folded_in_options() {
         let descriptor = json!({
@@ -1230,14 +1425,15 @@ mod tests {
             ]
         });
         let refusal = |updates: Value| {
-            resolve_bracketed_model_options(&descriptor, &updates)
+            resolve_bracketed_model_options(&descriptor, &updates, None)
                 .unwrap_err()
                 .refusal
         };
         assert_eq!(
             resolve_bracketed_model_options(
                 &descriptor,
-                &json!([{ "id": "reasoning", "value": "xhigh" }])
+                &json!([{ "id": "reasoning", "value": "xhigh" }]),
+                None
             )
             .unwrap(),
             None
@@ -1246,7 +1442,8 @@ mod tests {
         assert_eq!(
             resolve_bracketed_model_options(
                 &descriptor,
-                &json!([{ "id": "reasoning", "value": "low" }, { "id": "fastMode", "value": true }])
+                &json!([{ "id": "reasoning", "value": "low" }, { "id": "fastMode", "value": true }]),
+                None
             )
             .unwrap(),
             Some(json!("m[effort=low,fast=true]"))
@@ -1268,16 +1465,28 @@ mod tests {
         );
         assert_eq!(
             resolve_advertised_model_value(&descriptor, "other").unwrap(),
-            Some(json!("other[]"))
+            json!("other[]")
         );
         assert_eq!(
             resolve_advertised_model_value(&descriptor, "m").unwrap(),
-            Some(json!("m[effort=extra-high,fast=false]"))
+            json!("m[effort=extra-high,fast=false]")
         );
+    }
+
+    /// An option listing no values offers only its current value: any other model is refused,
+    /// never sent as typed.
+    #[test]
+    fn an_option_without_values_refuses_every_model_but_its_current_one() {
+        let descriptor =
+            json!({ "id": "model", "category": "model", "currentValue": "m", "options": [] });
         assert_eq!(
+            resolve_advertised_model_value(&descriptor, "m").unwrap(),
+            json!("m")
+        );
+        assert!(resolve_advertised_model_value(&descriptor, "other").is_err());
+        assert!(
             resolve_advertised_model_value(&json!({ "id": "model", "category": "model" }), "x")
-                .unwrap(),
-            None
+                .is_err()
         );
     }
 }

@@ -168,6 +168,17 @@ impl AcpRequestWriteFailure {
         self.bytes_written == Some(0)
     }
 
+    /// A write whose outcome is unknown: some of it may have reached the agent.
+    #[must_use]
+    pub fn unconfirmed(message: &str) -> Self {
+        Self {
+            error: AcpProtocolError::WriteFailure {
+                message: message.to_owned(),
+            },
+            bytes_written: None,
+        }
+    }
+
     #[must_use]
     pub fn into_error(self) -> AcpProtocolError {
         self.error

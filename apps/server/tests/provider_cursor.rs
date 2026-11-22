@@ -416,7 +416,7 @@ async fn cursor_runtime_applies_the_selected_model_after_session_creation() {
         .respond(json!({ "status": "ok" }));
     peer.expect_request("session/new").respond(json!({
         "sessionId": "cursor-model-session",
-        "configOptions": [{ "id": "model", "category": "model" }],
+        "configOptions": [{ "id": "model", "category": "model", "options": [{ "value": "gpt-5.4" }, { "value": "gpt-5.5" }] }],
         "modes": {
             "currentModeId": "ask",
             "availableModes": [
@@ -427,12 +427,12 @@ async fn cursor_runtime_applies_the_selected_model_after_session_creation() {
         }
     }));
     peer.expect_request("session/set_config_option")
-        .respond(json!({ "configOptions": [{ "id": "model", "category": "model" }] }));
+        .respond(json!({ "configOptions": [{ "id": "model", "category": "model", "options": [{ "value": "gpt-5.4" }, { "value": "gpt-5.5" }] }] }));
     peer.expect_request("session/set_mode")
         .expect_params(json!({ "sessionId": "cursor-model-session", "modeId": "code" }))
         .respond(json!({}));
     peer.expect_request("session/set_config_option")
-        .respond(json!({ "configOptions": [{ "id": "model", "category": "model" }] }));
+        .respond(json!({ "configOptions": [{ "id": "model", "category": "model", "options": [{ "value": "gpt-5.4" }, { "value": "gpt-5.5" }] }] }));
     peer.expect_request("session/set_mode")
         .expect_params(json!({ "sessionId": "cursor-model-session", "modeId": "architect" }))
         .respond(json!({}));
@@ -688,8 +688,10 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
         incoming,
     );
     let config_options = |model: &str, fast: Option<&str>| {
-        let mut options =
-            vec![json!({ "id": "model", "category": "model", "currentValue": model })];
+        let mut options = vec![json!({
+            "id": "model", "category": "model", "currentValue": model,
+            "options": [{ "value": "old" }, { "value": "target" }, { "value": "no-fast" }]
+        })];
         if let Some(fast) = fast {
             options.push(json!({
                 "id": "fast", "category": "model_config", "type": "select",
@@ -701,7 +703,10 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
     let old_baseline = config_options("old", Some("false"));
     let old_active = config_options("old", Some("true"));
     let target_advertisement = vec![
-        json!({ "id": "model", "category": "model", "currentValue": "target" }),
+        json!({
+            "id": "model", "category": "model", "currentValue": "target",
+            "options": [{ "value": "old" }, { "value": "target" }, { "value": "no-fast" }]
+        }),
         json!({
             "id": "fast", "category": "model_config", "type": "select",
             "currentValue": "true",
@@ -1643,7 +1648,7 @@ async fn cursor_runtime_covers_resume_permission_and_notification_edges() {
     peer.expect_request("session/load")
         .expect_params(json!({ "sessionId": "cursor-resumed" }))
         .respond(json!({
-            "configOptions": [{ "id": "model", "category": "model" }],
+            "configOptions": [{ "id": "model", "category": "model", "options": [{ "value": "gpt-edge" }] }],
             "modes": {
                 "currentModeId": "code",
                 "availableModes": [

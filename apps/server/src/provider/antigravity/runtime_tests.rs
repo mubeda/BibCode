@@ -1032,6 +1032,41 @@ async fn an_unanswered_cancel_ends_the_turn_and_abandons_the_process() {
     );
 }
 
+/// Updates a cancelled turn still sends after it ended, answered or abandoned, are dropped:
+/// they never reach the thread as turnless output.
+#[tokio::test]
+async fn a_cancelled_turns_updates_after_its_end_are_dropped() {
+    for answered in [true, false] {
+        let mut options = options("full-access");
+        options.cancel_grace = Duration::from_millis(50);
+        let (runtime, mut peer) = started_with(options, "auto").await;
+        let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+        runtime.interrupt_turn().await.expect("cancel sent");
+        peer.expect("session/cancel").await;
+        if answered {
+            peer.reply(&prompt, json!({ "stopReason": "cancelled" }))
+                .await;
+        }
+        events_until(&runtime, "turn.completed").await;
+        peer.update(
+            SESSION,
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "late" } }),
+        )
+        .await;
+        peer.update(
+            SESSION,
+            json!({ "sessionUpdate": "plan", "entries": [{ "content": "late", "status": "pending" }] }),
+        )
+        .await;
+        assert!(
+            timeout(Duration::from_millis(300), runtime.next_event())
+                .await
+                .is_err(),
+            "answered: {answered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_answered_cancel_does_not_abandon_the_process() {
     let mut options = options("full-access");
@@ -1275,6 +1310,28 @@ async fn a_failed_switch_keeps_the_new_mode_and_refuses_prompts_until_acknowledg
         "a mismatched mode sends no prompt"
     );
     assert!(peer.silent().await);
+}
+
+/// A mode write the CLI answers without listing its options confirms nothing: the switch is
+/// refused as unavailable, final for the delivery, never read as a write that may be retried.
+#[tokio::test]
+async fn an_answered_mode_write_without_its_options_is_refused() {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let switch = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_runtime_mode("approval-required").await }
+    });
+    let mode = peer.expect("session/set_config_option").await;
+    assert_eq!(mode["params"]["value"], "default");
+    peer.reply(&mode, json!({})).await;
+    let error = switch
+        .await
+        .unwrap()
+        .expect_err("an unconfirmed mode refuses");
+    assert!(
+        matches!(error, AntigravityRuntimeError::ModeUnavailable { .. }),
+        "{error:?}"
+    );
 }
 
 /// Mode writes reach the CLI one at a time, and each writes the latest setting: an older

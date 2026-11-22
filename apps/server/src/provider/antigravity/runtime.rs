@@ -723,7 +723,12 @@ impl AntigravitySessionRuntime {
             .await
         {
             Ok(options) => options,
-            Err(AntigravityRuntimeError::Protocol(AcpProtocolError::RemoteRequest { .. })) => {
+            // Answered, but without the options that would confirm the mode: refused like a
+            // mode the answer does not show. Only an unanswered write stays retryable.
+            Err(
+                AntigravityRuntimeError::Protocol(AcpProtocolError::RemoteRequest { .. })
+                | AntigravityRuntimeError::MalformedConfigAcknowledgement,
+            ) => {
                 return Err(unavailable());
             }
             Err(error) => return Err(error),
@@ -1064,9 +1069,13 @@ impl AntigravitySessionRuntime {
                 .active_turn
                 .clone()
                 .filter(|turn| gate.cancelled_turn.as_ref() != Some(turn));
+            // A cancelled turn's updates stay dropped after it ended, until the next prompt.
             (
                 gate.session_id.clone(),
-                (turn_id, gate.active_turn.is_some()),
+                (
+                    turn_id,
+                    gate.active_turn.is_some() || gate.cancelled_turn.is_some(),
+                ),
             )
         };
         if session_id.is_none()

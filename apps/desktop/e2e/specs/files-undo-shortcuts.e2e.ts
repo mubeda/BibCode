@@ -1223,6 +1223,16 @@ async function awaitPreviewClosed(
   }
 }
 
+/** Closes a preview a failed step left open, so the next test finds the main window again. */
+async function closePreviewLeftOpen(
+  reports: Awaited<ReturnType<typeof startPreviewReports>>,
+  open: boolean,
+): Promise<void> {
+  if (!open) return;
+  reports.requestClose();
+  await awaitPreviewClosed(reports).catch(() => undefined);
+}
+
 interface PreviewPaint {
   /** The share of the capture in the probe page's colour. */
   readonly share: number;
@@ -1450,9 +1460,11 @@ async function measureMainWindowAfterPreview(): Promise<void> {
   const fileTab = await onScreen(await centreOf(fileTabXPath(fileName)));
   const editor = await onScreen(editorCentre);
   const reports = await startPreviewReports();
+  let previewOpen = false;
   try {
     await armPreviewObserver(fileName, reports.url, "hold");
     await browser.$('button[aria-label="Open file in preview browser"]').click();
+    previewOpen = true;
     const painted = await reports.next("painted", 30_000);
     let menu: ReturnType<typeof chooseNativeEditItem> | null = null;
     if (painted?.path) {
@@ -1469,6 +1481,7 @@ async function measureMainWindowAfterPreview(): Promise<void> {
     }
     reports.requestClose();
     await awaitPreviewClosed(reports);
+    previewOpen = false;
     const asked = await browser
       .$(
         '//*[@role="alertdialog"][.//*[starts-with(normalize-space(), "Save your changes before")]]',
@@ -1496,6 +1509,7 @@ async function measureMainWindowAfterPreview(): Promise<void> {
       asked,
     }).toEqual({ painted: true, undone: true, asked: true });
   } finally {
+    await closePreviewLeftOpen(reports, previewOpen);
     reports.close();
   }
 }
@@ -1527,9 +1541,11 @@ async function measurePreviewFallback(path: InputPath): Promise<void> {
   }, fileViewSelector);
   if (!centre) throw new Error("The Files surface was not found.");
   const click = await screenPointOf(centre);
+  let previewOpen = false;
   try {
     await armPreviewObserver(fileName, reports.url, "hold");
     await browser.$('button[aria-label="Open file in preview browser"]').click();
+    previewOpen = true;
     // No WebDriver from here until the observer closed the preview.
     const painted = await reports.next("painted", 30_000);
     let sent: Awaited<ReturnType<typeof sendChord>> | null = null;
@@ -1546,6 +1562,7 @@ async function measurePreviewFallback(path: InputPath): Promise<void> {
     const title = (await reports.next("echo", 10_000))?.url ?? "";
     reports.requestClose();
     const closed = await awaitPreviewClosed(reports);
+    previewOpen = false;
     const paint = await checkPreviewPaint(fileName, painted);
     const filesAfter = await readFilesAfterPreview(fileName);
     await refreshDesktopUiDocument();
@@ -1572,6 +1589,7 @@ async function measurePreviewFallback(path: InputPath): Promise<void> {
       files: filesBefore,
     });
   } finally {
+    await closePreviewLeftOpen(reports, previewOpen);
     reports.close();
   }
 }

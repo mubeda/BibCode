@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
+    future::Future,
+    hash::{Hash, Hasher},
     path::Path,
     process::Stdio,
-    sync::PoisonError,
+    sync::{Arc, PoisonError},
     time::Duration,
 };
 
@@ -45,10 +47,16 @@ mod capabilities;
 pub(crate) use capabilities::discover_capabilities;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
 const CURSOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const CURSOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(6);
 /// How long the session that reads Cursor's advertised model values may take; a CLI that does
 /// not answer still publishes its model list.
+#[cfg(not(test))]
 const CURSOR_SESSION_READ_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CURSOR_SESSION_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// The close is courtesy: the catalog is already read and the child stops next.
 const ANTIGRAVITY_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2263,13 +2271,58 @@ fn antigravity_model_levels<'a>(
         .collect()
 }
 
-/// The model values each Cursor CLI advertises in a session, by executable, version, endpoint
-/// and model list. Reading them opens a session in the user's Cursor account that ACP cannot
-/// close (an empty one, which Cursor does not list), so it is read once per CLI and model list,
-/// not on every refresh.
-static CURSOR_ADVERTISED_MODEL_VALUES: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<String, Vec<String>>>,
-> = std::sync::OnceLock::new();
+/// How long a failed read of Cursor's advertised model values is remembered before a refresh
+/// opens another session.
+const CURSOR_SESSION_READ_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// One launch environment's read of the model values Cursor advertises in a session.
+enum CursorSessionRead {
+    Read(Vec<String>),
+    Failed(tokio::time::Instant),
+}
+
+/// The model values each Cursor launch environment advertises in a session, by executable,
+/// version, endpoint, model list and instance environment. Reading them opens a session in the
+/// user's Cursor account that ACP cannot close (an empty one, which Cursor does not list), so it
+/// is read once per key: a refresh that finds a read in flight waits for it, and a failed read is
+/// remembered for [`CURSOR_SESSION_READ_BACKOFF`].
+type CursorSessionReads =
+    std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<Option<CursorSessionRead>>>>>;
+static CURSOR_ADVERTISED_MODEL_VALUES: std::sync::OnceLock<CursorSessionReads> =
+    std::sync::OnceLock::new();
+
+/// The advertised values for `key`, read by `read` at most once per key at a time.
+async fn shared_cursor_session_read<F>(key: u64, read: F) -> Vec<String>
+where
+    F: Future<Output = Option<Vec<String>>>,
+{
+    let slot = CURSOR_ADVERTISED_MODEL_VALUES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_default()
+        .clone();
+    let mut slot = slot.lock().await;
+    match &*slot {
+        Some(CursorSessionRead::Read(advertised)) => return advertised.clone(),
+        Some(CursorSessionRead::Failed(at)) if at.elapsed() < CURSOR_SESSION_READ_BACKOFF => {
+            return Vec::new();
+        }
+        _ => {}
+    }
+    match timeout(CURSOR_SESSION_READ_TIMEOUT, read).await {
+        Ok(Some(advertised)) => {
+            *slot = Some(CursorSessionRead::Read(advertised.clone()));
+            advertised
+        }
+        // A session that cannot be read publishes the list as is.
+        _ => {
+            *slot = Some(CursorSessionRead::Failed(tokio::time::Instant::now()));
+            Vec::new()
+        }
+    }
+}
 
 async fn probe_cursor_models(
     executable: &Path,
@@ -2312,7 +2365,7 @@ async fn probe_cursor_models(
     };
     let transport = AcpProbeTransport::spawn(stdout, stdin, stderr);
     let connection = &transport.0;
-    let response = timeout(CURSOR_DISCOVERY_TIMEOUT, async {
+    let list = timeout(CURSOR_DISCOVERY_TIMEOUT, async {
         connection
             .request(
                 "initialize",
@@ -2331,58 +2384,44 @@ async fn probe_cursor_models(
             .request("authenticate", json!({ "methodId": "cursor_login" }))
             .await
             .ok()?;
-        let list = connection
+        connection
             .request("cursor/list_available_models", json!({}))
             .await
-            .ok()?;
-        let mut listed = list
-            .get("models")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|model| model.get("value").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        listed.sort_unstable();
-        let key = format!(
-            "{}\0{}\0{}\0{}",
-            executable.display(),
-            version.unwrap_or_default(),
-            endpoint.unwrap_or_default(),
-            listed.join("\0")
-        );
-        let memo = CURSOR_ADVERTISED_MODEL_VALUES.get_or_init(Default::default);
-        let known = memo
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .cloned();
-        let advertised = match known {
-            Some(advertised) => advertised,
-            // A session that cannot be read publishes the list as is, and is read again next time.
-            None => match timeout(
-                CURSOR_SESSION_READ_TIMEOUT,
-                connection.request(
-                    "session/new",
-                    json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(session)) => {
-                    let advertised = cursor::advertised_model_values(&session);
-                    memo.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(key, advertised.clone());
-                    advertised
-                }
-                Ok(Err(_)) | Err(_) => Vec::new(),
-            },
-        };
-        Some((list, advertised))
+            .ok()
     })
     .await
     .ok()
     .flatten();
+    // The optional session read starts only once the list is in hand, under its own deadline.
+    let response = match list {
+        Some(list) => {
+            let mut listed = list
+                .get("models")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|model| model.get("value").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            listed.sort_unstable();
+            let mut environment = environment.to_vec();
+            environment.sort();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (executable, version, endpoint, listed, environment).hash(&mut hasher);
+            let advertised = shared_cursor_session_read(hasher.finish(), async {
+                connection
+                    .request(
+                        "session/new",
+                        json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
+                    )
+                    .await
+                    .ok()
+                    .map(|session| cursor::advertised_model_values(&session))
+            })
+            .await;
+            Some((list, advertised))
+        }
+        None => None,
+    };
     drop(transport);
     child.stop().await;
     let (list, advertised) = response?;
@@ -3257,6 +3296,112 @@ done
                 .len(),
             2
         );
+    }
+
+    /// A Cursor fixture whose `session/new` runs `session` (shell) and counts each call.
+    #[cfg(unix)]
+    fn cursor_session_fixture(
+        directory: &Path,
+        list_delay: &str,
+        session: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let sessions = directory.join("sessions");
+        let executable = directory.join("cursor-agent");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=${{line#*\"id\":}}; id=${{id%%[!0-9]*}}
+  case "$line" in
+    *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"method":"cursor/list_available_models"'*) sleep {list_delay}; printf '{{"jsonrpc":"2.0","id":%s,"result":{{"models":[{{"value":"m","name":"M","configOptions":[{{"id":"effort","category":"thought_level","type":"select","currentValue":"low","options":[{{"value":"low"}},{{"value":"high"}}]}}]}}]}}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf 'opened\n' >> '{sessions}'; {session} ;;
+  esac
+done
+"#,
+                sessions = sessions.display(),
+            ),
+        );
+        (executable, sessions)
+    }
+
+    #[cfg(unix)]
+    const ADVERTISE_HIGH: &str = r#"sleep 0.3; printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s","configOptions":[{"id":"model","category":"model","currentValue":"m[effort=high]","options":[{"value":"m[effort=high]"}]}]}}\n' "$id""#;
+
+    #[cfg(unix)]
+    fn opened(sessions: &Path) -> usize {
+        std::fs::read_to_string(sessions).map_or(0, |text| text.lines().count())
+    }
+
+    /// Two refreshes of one Cursor read one session between them; an instance with another
+    /// environment reads its own, and never gets the first one's options.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_session_reads_are_shared_per_launch_environment() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let (executable, sessions) = cursor_session_fixture(temp.path(), "0", ADVERTISE_HIGH);
+        let probe = |environment: Vec<(OsString, OsString)>| {
+            let executable = executable.clone();
+            let cwd = temp.path().to_path_buf();
+            async move {
+                probe_cursor_models(&executable, Some("shared"), None, &[], &cwd, &environment)
+                    .await
+                    .expect("the fixture lists models")
+            }
+        };
+        let account = |name: &str| vec![(OsString::from("CURSOR_ACCOUNT"), OsString::from(name))];
+        let (first, second) = tokio::join!(probe(account("a")), probe(account("a")));
+        assert_eq!(opened(&sessions), 1, "concurrent refreshes share one read");
+        for models in [first, second] {
+            assert_eq!(
+                models[0]["capabilities"]["optionDescriptors"][0]["options"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        probe(account("b")).await;
+        assert_eq!(
+            opened(&sessions),
+            2,
+            "another environment reads its own session"
+        );
+    }
+
+    /// A failed session read is remembered for a while instead of opening a session on every
+    /// refresh; the model list is published meanwhile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_cursor_session_read_is_not_retried_on_every_refresh() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let (executable, sessions) = cursor_session_fixture(
+            temp.path(),
+            "0",
+            r#"printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"no"}}\n' "$id""#,
+        );
+        for _ in 0..2 {
+            let models =
+                probe_cursor_models(&executable, Some("failing"), None, &[], temp.path(), &[])
+                    .await
+                    .expect("the list is published");
+            assert_eq!(models.len(), 1);
+        }
+        assert_eq!(opened(&sessions), 1);
+    }
+
+    /// A model list that arrives late is kept even when the session read then hangs: the read
+    /// starts only once the list is in hand, under its own deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hung_cursor_session_read_never_discards_a_late_model_list() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let (executable, _sessions) = cursor_session_fixture(temp.path(), "4.5", ":");
+        let models = probe_cursor_models(&executable, Some("late"), None, &[], temp.path(), &[])
+            .await
+            .expect("the late list is published");
+        assert_eq!(models.len(), 1);
     }
 
     #[cfg(unix)]

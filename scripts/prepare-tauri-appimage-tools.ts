@@ -52,7 +52,7 @@ export interface PrepareTauriAppImageToolsOptions {
   /** Cargo's `target_directory` when run in the given directory; `undefined` when unknown. */
   readonly cargoMetadataTargetDirectory?: (
     cargoWorkingDirectory: string,
-    cargoTargetDirectory: string,
+    cargoTargetDirectory: string | undefined,
   ) => string | undefined;
   readonly download?: (url: string) => Promise<Uint8Array>;
   readonly plugin?: UpstreamGtkPluginPin;
@@ -113,17 +113,21 @@ async function publishVerifiedDownload(
   publishExecutableAtomically(targetPath, downloadedBytes);
 }
 
-// Tauri reads its tools directory from this same query, run where it runs Cargo.
+// Tauri reads its tools directory from this same query, run where it runs Cargo, so a
+// `target-dir` in Cargo's config counts as well as CARGO_TARGET_DIR.
 function cargoMetadataTargetDirectory(
   cargoWorkingDirectory: string,
-  cargoTargetDirectory: string,
+  cargoTargetDirectory: string | undefined,
 ): string | undefined {
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- Cargo needs the host environment plus the resolved target directory.
+  const { CARGO_TARGET_DIR: _ignored, ...hostEnvironment } = process.env;
   try {
     const metadata: unknown = JSON.parse(
       NodeChildProcess.execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
         cwd: cargoWorkingDirectory,
-        // oxlint-disable-next-line bibcode/no-global-process-runtime -- Cargo needs the host environment plus the resolved target directory.
-        env: { ...process.env, CARGO_TARGET_DIR: cargoTargetDirectory },
+        env: cargoTargetDirectory
+          ? { ...hostEnvironment, CARGO_TARGET_DIR: cargoTargetDirectory }
+          : hostEnvironment,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       }),
@@ -166,12 +170,13 @@ export async function prepareTauriAppImageTools(
   // Tauri runs Cargo in the desktop crate, so a relative value resolves there, not here.
   const cargoWorkingDirectory = NodePath.join(repositoryRoot, "apps/desktop/src-tauri");
   const toolsDirectory = NodePath.join(
-    cargoTargetDirectory
-      ? ((options.cargoMetadataTargetDirectory ?? cargoMetadataTargetDirectory)(
-          cargoWorkingDirectory,
-          cargoTargetDirectory,
-        ) ?? NodePath.resolve(cargoWorkingDirectory, cargoTargetDirectory))
-      : NodePath.join(repositoryRoot, "target"),
+    (options.cargoMetadataTargetDirectory ?? cargoMetadataTargetDirectory)(
+      cargoWorkingDirectory,
+      cargoTargetDirectory || undefined,
+    ) ??
+      (cargoTargetDirectory
+        ? NodePath.resolve(cargoWorkingDirectory, cargoTargetDirectory)
+        : NodePath.join(repositoryRoot, "target")),
     ".tauri",
   );
   const upstreamPath = NodePath.join(toolsDirectory, "bibcode-linuxdeploy-gtk-upstream.sh");

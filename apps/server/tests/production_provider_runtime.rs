@@ -159,7 +159,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   switch ([string]$request.method) {
     "initialize" { $response = '{"jsonrpc":"2.0","id":' + $id + ',"result":{}}' }
     "authenticate" { $response = '{"jsonrpc":"2.0","id":' + $id + ',"result":{}}' }
-    "session/new" { $response = '{"jsonrpc":"2.0","id":' + $id + ',"result":{"sessionId":"cursor-session","configOptions":[{"id":"model","category":"model"}],"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"},{"id":"code","name":"Agent"},{"id":"architect","name":"Plan"}]}}}' }
+    "session/new" { $response = '{"jsonrpc":"2.0","id":' + $id + ',"result":{"sessionId":"cursor-session","configOptions":[{"id":"model","category":"model","options":[{"value":"test-model"},{"value":"gpt-5"}]}],"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"},{"id":"code","name":"Agent"},{"id":"architect","name":"Plan"}]}}}' }
     "session/create" { $response = '{"jsonrpc":"2.0","id":' + $id + ',"result":{"sessionId":"grok-session","modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Agent"},{"id":"ask","name":"Ask"}]}}}' }
     "session/set_config_option" { $response = '{"jsonrpc":"2.0","id":' + $id + ',"result":{"configOptions":[]}}' }
     "session/set_mode" { $response = '{"jsonrpc":"2.0","id":' + $id + ',"result":{}}' }
@@ -4139,9 +4139,9 @@ done
 #[cfg(unix)]
 const REFUSING_CURSOR_FIXTURE: &str = r#"#!/bin/sh
 if [ -n "$BIBCODE_TEST_FAST_WRONG_CATEGORY" ]; then
-  options='[{"id":"model","category":"model"},{"id":"fast","category":"model","type":"select","options":[{"value":"false"},{"value":"true"}]}]'
+  options='[{"id":"model","category":"model","options":[{"value":"test-model"},{"value":"gpt-5"}]},{"id":"fast","category":"model","type":"select","options":[{"value":"false"},{"value":"true"}]}]'
 else
-  options='[{"id":"model","category":"model"}]'
+  options='[{"id":"model","category":"model","options":[{"value":"test-model"},{"value":"gpt-5"}]}]'
 fi
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -19862,7 +19862,7 @@ while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
-    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"cursor-session","configOptions":[{"id":"model","category":"model"}],"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"},{"id":"code","name":"Agent"},{"id":"architect","name":"Plan"}]}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"cursor-session","configOptions":[{"id":"model","category":"model","options":[{"value":"test-model"},{"value":"gpt-5"}]}],"modes":{"currentModeId":"ask","availableModes":[{"id":"ask","name":"Ask"},{"id":"code","name":"Agent"},{"id":"architect","name":"Plan"}]}}}\n' "$id" ;;
     *'"method":"session/create"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"grok-session","modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Agent"},{"id":"ask","name":"Ask"}]}}}\n' "$id" ;;
     *'"method":"session/set_config_option"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[]}}\n' "$id" ;;
     *'"method":"session/set_mode"'*|*'"method":"session/set_model"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
