@@ -1435,7 +1435,7 @@
     "stream-shapes/gitManager__runOperation-00.json": "c1f9918a07677336aff337b94269e79d877688bc988cfdc9dba61d54763e3dd2",
     "stream-shapes/gitManager__runOperation-01.json": "4f9236c62b23a808d62413ab50b8ffe50f5e8f65e32c09b59143179cf29abfed",
     "stream-shapes/gitManager__runOperation-02.json": "19050474605806cd947e070840331e04de899353ef2638e92377d9df3aad46a7",
-    "stream-shapes/gitManager__runOperation-03.json": "37c8e691262bf26f56754856ade6c481ce0b337172966c9d5b1a38d33fe5e2ec",
+    "stream-shapes/gitManager__runOperation-03.json": "8bfeb0165d748f44018b4e64172948682124072f8a6ee48a3b5a79b7db1c6851",
     "typed-failures/gitManager__stagePartial-00.json": "d5a39daf7ea7879fb6386bc2c2639a790ab6a9d69b9dcf4c24aa162ef4b6c3af",
     "typed-failures/gitManager__undoCommit-00.json": "d5a39daf7ea7879fb6386bc2c2639a790ab6a9d69b9dcf4c24aa162ef4b6c3af",
     "typed-failures/gitManager__unstagePartial-00.json": "d5a39daf7ea7879fb6386bc2c2639a790ab6a9d69b9dcf4c24aa162ef4b6c3af",
