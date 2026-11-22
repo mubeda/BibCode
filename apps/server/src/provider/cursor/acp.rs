@@ -152,6 +152,8 @@ enum WriterMessage {
         bytes: Vec<u8>,
         written: oneshot::Sender<Result<(), AcpRequestWriteFailure>>,
     },
+    /// Ends the writer task, which owns the agent's stdin.
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -331,6 +333,7 @@ impl AcpJsonRpcConnection {
                         }
                         let _ = written.send(Ok(()));
                     }
+                    WriterMessage::Shutdown => break,
                 }
             }
         });
@@ -375,6 +378,13 @@ impl AcpJsonRpcConnection {
         });
 
         (connection, incoming_rx)
+    }
+
+    /// Ends the writer task and closes the agent's stdin; later writes fail as closed. The
+    /// writer holds this connection's own sender, so without it the task and the pipe outlive
+    /// the agent. The readers end when the agent's output closes. Safe to call from `Drop`.
+    pub fn shutdown(&self) {
+        let _ = self.inner.writer.send(WriterMessage::Shutdown);
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, AcpProtocolError> {

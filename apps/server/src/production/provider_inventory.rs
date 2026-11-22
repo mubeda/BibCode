@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     path::Path,
     process::Stdio,
+    sync::PoisonError,
     time::Duration,
 };
 
@@ -16,6 +17,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    diagnostics::profiler::exits::{self, Exited, Watch},
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
         ProcessRegistration, ProcessRegistrationMetadata, RegistrationSource,
@@ -23,7 +25,10 @@ use crate::{
     git::{OutputPolicy, ProcessRequest, ProcessRunner},
     process::{
         Platform, configure_supervised_background_command_wrap,
-        supervised::{log_cleanup_failures, terminate_and_wait},
+        supervised::{
+            StopPolicy, SupervisedOverflow, SupervisedRunRequest, log_cleanup_failures,
+            run_supervised_with_spawn_observer, terminate_and_wait,
+        },
     },
     production::provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
     production::provider_runtime::{
@@ -42,6 +47,8 @@ pub(crate) use capabilities::discover_capabilities;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CURSOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+/// The close is courtesy: the catalog is already read and the child stops next.
+const ANTIGRAVITY_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// BiBCode's own words: the CLI's error text never reaches the snapshot.
 const ANTIGRAVITY_SIGN_IN_MESSAGE: &str = "Antigravity is not signed in. Open an Antigravity Terminal and run `agy`, or run `agy acp --login`.";
 const CLAUDE_CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(45);
@@ -67,7 +74,7 @@ const LOCAL_OPENCODE_STARTUP_ATTEMPTS: usize = 50;
 const OPENCODE_2_CATALOG_UNREADABLE: &str = "BiBCode couldn't read this OpenCode server's models, agents and commands, so chats use its default model. They are read again at the next provider check.";
 const PROBE_OUTPUT_LIMIT: usize = 256 * 1024;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct ProviderDefinition {
     instance_id: String,
     driver: String,
@@ -145,7 +152,16 @@ pub(crate) async fn probe(
     cwd: &Path,
     maintenance: &ProviderMaintenance,
 ) -> Vec<ProviderProbeResult> {
-    probe_inner(settings, selected, cwd, false, maintenance, None).await
+    probe_inner(
+        settings,
+        selected,
+        cwd,
+        false,
+        maintenance,
+        None,
+        &HashSet::new(),
+    )
+    .await
 }
 
 /// Probes with the slow capabilities too. `attribution` attributes the processes the probe
@@ -157,7 +173,51 @@ pub(crate) async fn probe_full(
     maintenance: &ProviderMaintenance,
     attribution: Option<&ProcessAttributionRegistry>,
 ) -> Vec<ProviderProbeResult> {
-    probe_inner(settings, selected, cwd, true, maintenance, attribution).await
+    probe_full_reusing(
+        settings,
+        selected,
+        cwd,
+        maintenance,
+        attribution,
+        &HashSet::new(),
+    )
+    .await
+}
+
+/// [`probe_full`] that keeps the last ACP catalog of the instances in `reuse` instead of
+/// probing it again (see [`unchanged_acp_instances`]).
+pub(crate) async fn probe_full_reusing(
+    settings: &Value,
+    selected: Option<&str>,
+    cwd: &Path,
+    maintenance: &ProviderMaintenance,
+    attribution: Option<&ProcessAttributionRegistry>,
+    reuse: &HashSet<String>,
+) -> Vec<ProviderProbeResult> {
+    probe_inner(
+        settings,
+        selected,
+        cwd,
+        true,
+        maintenance,
+        attribution,
+        reuse,
+    )
+    .await
+}
+
+/// The instances whose catalog an ACP connection reads (Cursor's model list, Antigravity's
+/// session) and whose definition is the same in `previous` and `next`. A full refresh within
+/// the refresh TTL of the probe that read `previous` reuses their catalog: an Antigravity
+/// probe opens a session in the user's account.
+pub(crate) fn unchanged_acp_instances(previous: &Value, next: &Value) -> HashSet<String> {
+    let previous = definitions(previous);
+    definitions(next)
+        .into_iter()
+        .filter(|definition| matches!(definition.driver.as_str(), "cursor" | "antigravity"))
+        .filter(|definition| previous.contains(definition))
+        .map(|definition| definition.instance_id)
+        .collect()
 }
 
 async fn probe_inner(
@@ -167,6 +227,7 @@ async fn probe_inner(
     include_slow_capabilities: bool,
     maintenance: &ProviderMaintenance,
     attribution: Option<&ProcessAttributionRegistry>,
+    reuse: &HashSet<String>,
 ) -> Vec<ProviderProbeResult> {
     let checks_enabled = settings
         .get("enableProviderUpdateChecks")
@@ -177,6 +238,7 @@ async fn probe_inner(
             .into_iter()
             .filter(|definition| selected.is_none_or(|id| id == definition.instance_id))
             .map(|definition| {
+                let reuse_catalog = reuse.contains(&definition.instance_id);
                 probe_one(
                     definition,
                     cwd,
@@ -184,6 +246,7 @@ async fn probe_inner(
                     checks_enabled,
                     maintenance,
                     attribution,
+                    reuse_catalog,
                 )
             }),
     )
@@ -438,14 +501,21 @@ async fn probe_one(
     checks_enabled: bool,
     maintenance: &ProviderMaintenance,
     attribution: Option<&ProcessAttributionRegistry>,
+    reuse_catalog: bool,
 ) -> ProviderProbeResult {
     // A driver this build does not ship has no binary to look up or version to advise on.
     if !definition.available {
         return unavailable_result(&definition);
     }
     let target = maintenance_target_from_definition(&definition);
-    let mut result =
-        probe_one_snapshot(&definition, cwd, include_slow_capabilities, attribution).await;
+    let mut result = probe_one_snapshot(
+        &definition,
+        cwd,
+        include_slow_capabilities,
+        attribution,
+        reuse_catalog,
+    )
+    .await;
     maintenance
         .enrich_snapshot(&target, &mut result.snapshot, checks_enabled)
         .await;
@@ -543,11 +613,14 @@ pub(crate) fn unsupported_instances(settings: &Value) -> Vec<ProviderProbeResult
         .collect()
 }
 
+/// `reuse_catalog` skips the ACP catalog probe (Cursor's model list, Antigravity's session):
+/// the last one stays through the merge.
 async fn probe_one_snapshot(
     definition: &ProviderDefinition,
     cwd: &Path,
     include_slow_capabilities: bool,
     attribution: Option<&ProcessAttributionRegistry>,
+    reuse_catalog: bool,
 ) -> ProviderProbeResult {
     if !definition.available {
         return unavailable_result(definition);
@@ -754,12 +827,17 @@ async fn probe_one_snapshot(
         );
     }
 
-    let version_output =
-        run_command(&executable, &["--version"], cwd, &definition.environment).await;
+    let version_output = if definition.driver == "antigravity" {
+        run_antigravity_version(&executable, cwd, &definition.environment, attribution).await
+    } else {
+        run_command(&executable, &["--version"], cwd, &definition.environment).await
+    };
     let version = version_output
         .as_ref()
+        // A failed Antigravity `--version` may print anything, an account included.
+        .filter(|output| output.success || definition.driver != "antigravity")
         .and_then(|output| version_line(&definition.driver, output));
-    let version = normalize_provider_version(&definition.driver, version);
+    let mut version = normalize_provider_version(&definition.driver, version);
     let mut installed = version_output.is_some();
     let mut status = match version_output.as_ref() {
         Some(output) if output.success => "ready",
@@ -826,6 +904,7 @@ async fn probe_one_snapshot(
                 capabilities.skills = workspace_capabilities.skills;
                 capabilities.agents = workspace_capabilities.agents;
                 if include_slow_capabilities
+                    && !reuse_catalog
                     && let Some(discovered) = probe_cursor_models(
                         &executable,
                         definition.endpoint.as_deref(),
@@ -944,6 +1023,7 @@ async fn probe_one_snapshot(
         }
         "antigravity"
             if include_slow_capabilities
+                && !reuse_catalog
                 && version_output.as_ref().is_some_and(|output| output.success) =>
         {
             match probe_antigravity_catalog(
@@ -955,15 +1035,26 @@ async fn probe_one_snapshot(
             )
             .await
             {
-                Some(AntigravityCatalog::Models(discovered)) => {
-                    models = discovered;
+                Some(AntigravityCatalog::Session {
+                    models: discovered,
+                    version: agent_version,
+                }) => {
                     auth = json!({ "status": "authenticated" });
-                    rich_metadata = RichMetadataOutcome::Succeeded;
+                    if agent_version.is_some() {
+                        version = agent_version;
+                    }
+                    // A reply that listed no model keeps the last catalog until the next probe.
+                    if let Some(discovered) = discovered {
+                        models = discovered;
+                        rich_metadata = RichMetadataOutcome::Succeeded;
+                    }
                 }
                 Some(AntigravityCatalog::SignInRequired) => {
                     // Still ready: the terminal is where the user signs in.
                     auth = json!({ "status": "unauthenticated" });
                     message = Some(ANTIGRAVITY_SIGN_IN_MESSAGE);
+                    // The signed-out account's catalog is gone with it.
+                    versioned_model_catalog = true;
                 }
                 None => {}
             }
@@ -1534,12 +1625,19 @@ async fn probe_codex(
 }
 
 enum AntigravityCatalog {
-    Models(Vec<Value>),
+    /// A session opened, so the CLI is signed in. `models` is `None` when the reply listed no
+    /// model; `version` is the handshake's validated `agentInfo.version`.
+    Session {
+        models: Option<Vec<Value>>,
+        version: Option<String>,
+    },
     SignInRequired,
 }
 
-/// An inventory probe's child, stopped and reaped however the probe ends. A refresh that drops
-/// the probe future hands the stop to the runtime, and the attribution ends after it.
+/// An inventory probe's child, stopped and reaped however the probe ends. A probe dropped
+/// mid-way signals the whole process group at once and hands only the reap to the runtime, so
+/// a reap task dropped unpolled, or no runtime at all, leaves no descendant running. The
+/// attribution ends after the reap.
 struct ProbeChild {
     child: Option<Box<dyn ChildWrapper>>,
     registration: Option<ProcessRegistration>,
@@ -1547,8 +1645,26 @@ struct ProbeChild {
 
 impl ProbeChild {
     async fn stop(mut self) {
-        if let Some(mut child) = self.child.take() {
-            stop_supervised_child(&mut *child).await;
+        // Kept in place while it stops: a cancelled stop leaves the reap to `Drop`.
+        if let Some(child) = self.child.as_mut() {
+            stop_supervised_child(&mut **child).await;
+        }
+        self.child = None;
+    }
+
+    /// The exit status of a child that ended on its own, waiting up to a second for it; `None`
+    /// while it runs.
+    async fn exited_on_its_own(&self) -> Option<std::process::ExitStatus> {
+        let child = self.child.as_deref()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(status) = crate::process::exited_status(child) {
+                return Some(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            sleep(Duration::from_millis(20)).await;
         }
     }
 }
@@ -1558,14 +1674,45 @@ impl Drop for ProbeChild {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        // The group kill, sent here rather than from a task that may never run.
+        let _ = child.start_kill();
         let registration = self.registration.take();
-        // Without a runtime, `KillOnDrop` still stops the root.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 stop_supervised_child(&mut *child).await;
                 drop(registration);
             });
         }
+    }
+}
+
+/// Ends an ACP probe's transport however the probe ends: the writer task, which owns the
+/// agent's stdin, stops at once, and the readers end when the agent's output closes.
+struct AcpProbeTransport(cursor::AcpJsonRpcConnection);
+
+impl AcpProbeTransport {
+    /// Spawns the transport and discards the agent's notifications, requests and stderr as
+    /// they arrive: the probe reads only responses.
+    fn spawn<R, W, E>(stdout: R, stdin: W, stderr: E) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+        E: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let (connection, mut incoming) = cursor::AcpJsonRpcConnection::spawn(
+            stdout,
+            stdin,
+            stderr,
+            cursor::AcpConnectionConfig::default(),
+        );
+        tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+        Self(connection)
+    }
+}
+
+impl Drop for AcpProbeTransport {
+    fn drop(&mut self) {
+        self.0.shutdown();
     }
 }
 
@@ -1578,8 +1725,78 @@ fn warn_antigravity_probe(instance_id: &str, step: &str, failure: &str) {
     );
 }
 
-/// Opens and closes one empty ACP session to read the models, thinking levels and sign-in
-/// state. No prompt is sent. Logs carry the step and the error code, never the CLI's text.
+/// The process attribution of an Antigravity inventory child, `None` when the registry refuses.
+fn register_antigravity_probe(
+    registry: &ProcessAttributionRegistry,
+    pid: u32,
+    label: &str,
+) -> Option<ProcessRegistration> {
+    let identity = NativeProcessSampler::process_identity(pid).ok()?;
+    registry
+        .register_identity(
+            identity,
+            ProcessRegistrationMetadata {
+                scope: AttributionScope::External,
+                kind: AttributionKind::Provider,
+                label: label.to_owned(),
+                source: RegistrationSource::Provider,
+                driver: Some("antigravity".to_owned()),
+                survives_shutdown: false,
+            },
+        )
+        .ok()
+}
+
+/// `agy --version`, supervised and attributed while it runs.
+async fn run_antigravity_version(
+    executable: &Path,
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+    attribution: Option<&ProcessAttributionRegistry>,
+) -> Option<CommandOutput> {
+    let launch = prepare_provider_launch(executable, ["--version"]).ok()?;
+    let mut command = Command::new(launch.program);
+    command
+        .args(launch.args)
+        .current_dir(cwd)
+        .envs(environment.iter().cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    sanitize_provider_subprocess_environment(&mut command);
+    let registration = std::sync::Mutex::new(None);
+    let output = run_supervised_with_spawn_observer(
+        SupervisedRunRequest {
+            command,
+            stdin: None,
+            timeout: PROBE_TIMEOUT,
+            cleanup_timeout: Duration::from_secs(2),
+            max_output_bytes: PROBE_OUTPUT_LIMIT,
+            overflow: SupervisedOverflow::Truncate,
+            stop_policy: StopPolicy::Force,
+        },
+        &CancellationToken::new(),
+        |pid| {
+            if let (Some(registry), Some(pid)) = (attribution, pid) {
+                *registration.lock().unwrap_or_else(PoisonError::into_inner) =
+                    register_antigravity_probe(registry, pid, "Antigravity version check");
+            }
+        },
+    )
+    .await
+    .ok()?;
+    let code = output.status.code().unwrap_or(-1);
+    Some(CommandOutput {
+        success: output.status.success(),
+        code,
+        stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr.bytes).into_owned(),
+    })
+}
+
+/// Opens and closes one empty ACP session to read the models, thinking levels, sign-in state
+/// and version. No prompt is sent. A peer that answers another protocol version than 1 gets no
+/// session. Logs carry the step and the error code, never the CLI's text.
 async fn probe_antigravity_catalog(
     instance_id: &str,
     executable: &Path,
@@ -1603,6 +1820,8 @@ async fn probe_antigravity_catalog(
         warn_antigravity_probe(instance_id, "launch", "could not start");
         return None;
     };
+    let started = std::time::Instant::now();
+    let pid = spawned.id();
     let pipes = (
         spawned.stdout().take(),
         spawned.stdin().take(),
@@ -1610,24 +1829,9 @@ async fn probe_antigravity_catalog(
     );
     let registration = match attribution {
         Some(registry) => {
-            let registration = spawned
-                .id()
-                .and_then(|pid| NativeProcessSampler::process_identity(pid).ok())
-                .and_then(|identity| {
-                    registry
-                        .register_identity(
-                            identity,
-                            ProcessRegistrationMetadata {
-                                scope: AttributionScope::External,
-                                kind: AttributionKind::Provider,
-                                label: "Antigravity inventory probe".to_owned(),
-                                source: RegistrationSource::Provider,
-                                driver: Some("antigravity".to_owned()),
-                                survives_shutdown: false,
-                            },
-                        )
-                        .ok()
-                });
+            let registration = pid.and_then(|pid| {
+                register_antigravity_probe(registry, pid, "Antigravity inventory probe")
+            });
             if registration.is_none() {
                 stop_supervised_child(&mut *spawned).await;
                 warn_antigravity_probe(instance_id, "launch", "could not attribute the process");
@@ -1645,14 +1849,10 @@ async fn probe_antigravity_catalog(
         child.stop().await;
         return None;
     };
-    let (connection, _incoming) = cursor::AcpJsonRpcConnection::spawn(
-        stdout,
-        stdin,
-        stderr,
-        cursor::AcpConnectionConfig::default(),
-    );
-    let outcome = timeout(ANTIGRAVITY_DISCOVERY_TIMEOUT, async {
-        connection
+    let transport = AcpProbeTransport::spawn(stdout, stdin, stderr);
+    let connection = &transport.0;
+    let handshake = timeout(ANTIGRAVITY_DISCOVERY_TIMEOUT, async {
+        let initialize = connection
             .request(
                 "initialize",
                 json!({
@@ -1665,29 +1865,44 @@ async fn probe_antigravity_catalog(
                 }),
             )
             .await?;
+        if initialize.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+            return Ok(None);
+        }
         let session = connection
             .request(
                 "session/new",
                 json!({ "cwd": session_cwd.to_string_lossy(), "mcpServers": [] }),
             )
             .await?;
-        if let Some(session_id) = session.get("sessionId").and_then(Value::as_str) {
-            // Best effort: the session never ran a turn, and the child stops next.
-            let _ = connection
-                .request("session/close", json!({ "sessionId": session_id }))
-                .await;
-        }
-        Ok::<_, cursor::acp::AcpProtocolError>(session)
+        Ok::<_, cursor::acp::AcpProtocolError>(Some((initialize, session)))
     })
     .await;
-    child.stop().await;
-    match outcome {
-        Ok(Ok(session)) => {
+    let catalog = match handshake {
+        Ok(Ok(Some((initialize, session)))) => {
+            // The catalog is read; the close gets its own short step and never costs it.
+            if let Some(session_id) = session.get("sessionId").and_then(Value::as_str)
+                && antigravity_advertises_close(&initialize)
+            {
+                let close = connection.request("session/close", json!({ "sessionId": session_id }));
+                if timeout(ANTIGRAVITY_CLOSE_TIMEOUT, close).await.is_err() {
+                    warn_antigravity_probe(instance_id, "session/close", "timed out");
+                }
+            }
             let models = antigravity_models(&session, configured_models);
             if models.is_none() {
                 warn_antigravity_probe(instance_id, "session/new", "no models in the reply");
             }
-            models.map(AntigravityCatalog::Models)
+            Some(AntigravityCatalog::Session {
+                models,
+                version: initialize
+                    .pointer("/agentInfo/version")
+                    .and_then(Value::as_str)
+                    .and_then(release_version),
+            })
+        }
+        Ok(Ok(None)) => {
+            warn_antigravity_probe(instance_id, "initialize", "unsupported protocol version");
+            None
         }
         Ok(Err(cursor::acp::AcpProtocolError::RemoteRequest {
             code: -32000,
@@ -1705,21 +1920,62 @@ async fn probe_antigravity_catalog(
         }
         Ok(Err(_)) => {
             warn_antigravity_probe(instance_id, "probe", "connection failed");
+            // The connection fails when the child dies; one that died on its own is a crash.
+            if exits::watching()
+                && let (Some(pid), Some(status)) = (pid, child.exited_on_its_own().await)
+            {
+                exits::report_exit(
+                    Watch::Failures,
+                    &Exited {
+                        kind: "provider",
+                        label: "antigravity",
+                        exe: &executable.to_string_lossy(),
+                        pid,
+                        started,
+                    },
+                    &status,
+                    false,
+                );
+            }
             None
         }
         Err(_) => {
             warn_antigravity_probe(instance_id, "probe", "timed out");
             None
         }
-    }
+    };
+    drop(transport);
+    child.stop().await;
+    catalog
+}
+
+/// Whether `initialize` advertises `session/close`, under either key spelling the CLI writes.
+fn antigravity_advertises_close(initialize: &Value) -> bool {
+    let capabilities = initialize
+        .get("agentCapabilities")
+        .or_else(|| initialize.get("agent_capabilities"));
+    ["sessionCapabilities", "session_capabilities"]
+        .iter()
+        .filter_map(|key| capabilities?.get(key)?.get("close"))
+        .any(|close| !close.is_null() && close != &Value::Bool(false))
+}
+
+/// The first `major.minor.patch` in peer text, `None` when it holds none.
+fn release_version(text: &str) -> Option<String> {
+    text.split(|character: char| !character.is_ascii_digit() && character != '.')
+        .find_map(|token| {
+            let parts = token.split('.').take(3).collect::<Vec<_>>();
+            (parts.len() == 3 && parts.iter().all(|part| !part.is_empty())).then(|| parts.join("."))
+        })
 }
 
 /// The models a `session/new` answer advertises, in the CLI's order with its current model
 /// first (the web picker's default is the first model), then the configured custom models it
 /// does not list. Each model carries its own `reasoning` options: the current model's from the
 /// `thought_level` option, the others' from their effort-suffixed `availableModels` ids, with a
-/// default only where the CLI names one. Without `configOptions` the `availableModels` ids are
-/// published unchanged. `None` when the answer lists no model.
+/// default only where the CLI names one. Without model options the `availableModels` ids are
+/// published unchanged. Repeated models and levels are listed once. `None` when the answer
+/// lists no model.
 fn antigravity_models(session: &Value, configured_models: &[String]) -> Option<Vec<Value>> {
     let options = session
         .get("configOptions")
@@ -1731,62 +1987,82 @@ fn antigravity_models(session: &Value, configured_models: &[String]) -> Option<V
             .iter()
             .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
     };
-    let available = session
-        .pointer("/models/availableModels")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let (mut models, current) = match option("model") {
-        Some(model) => {
-            let values = model
-                .get("options")
+    let available = unique(
+        session
+            .pointer("/models/availableModels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|model| {
+                let id = model.get("modelId")?.as_str()?;
+                Some((id, model.get("name").and_then(Value::as_str).unwrap_or(id)))
+            }),
+    );
+    let model = option("model");
+    let values = unique(
+        model
+            .and_then(|model| model.get("options"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|option| {
+                let value = option.get("value")?.as_str()?;
+                Some((
+                    value,
+                    option.get("name").and_then(Value::as_str).unwrap_or(value),
+                ))
+            }),
+    );
+    let (mut models, current) = if values.is_empty() {
+        (
+            available
+                .iter()
+                .map(|&(id, name)| antigravity_model(id, name, None, &[]))
+                .collect::<Vec<_>>(),
+            session
+                .pointer("/models/currentModelId")
+                .and_then(Value::as_str),
+        )
+    } else {
+        let thought = option("thought_level");
+        let label = thought
+            .and_then(|thought| thought.get("name"))
+            .and_then(Value::as_str);
+        let known = unique(
+            thought
+                .and_then(|thought| thought.get("options"))
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
                 .filter_map(|option| {
                     let value = option.get("value")?.as_str()?;
-                    let name = option.get("name").and_then(Value::as_str).unwrap_or(value);
-                    Some((value, name))
-                })
-                .collect::<Vec<_>>();
-            let thought = option("thought_level");
-            let current = model.get("currentValue").and_then(Value::as_str);
-            let models = values
-                .iter()
-                .map(|&(value, name)| {
-                    let levels = match thought {
-                        Some(thought) if Some(value) == current => Some(thought.clone()),
-                        _ => antigravity_model_levels(value, &values, available, thought),
-                    };
-                    json!({
-                        "slug": value,
-                        "name": name,
-                        "isCustom": false,
-                        "capabilities": cursor::model::build_capabilities_from_config_options(
-                            &Value::Array(levels.into_iter().collect()),
-                        ),
-                    })
-                })
-                .collect::<Vec<_>>();
-            (models, current)
-        }
-        None => (
-            available
-                .iter()
-                .filter_map(|model| {
-                    let id = model.get("modelId")?.as_str()?;
-                    Some(json!({
-                        "slug": id,
-                        "name": model.get("name").and_then(Value::as_str).unwrap_or(id),
-                        "isCustom": false,
-                        "capabilities": { "optionDescriptors": [] },
-                    }))
-                })
-                .collect(),
-            session
-                .pointer("/models/currentModelId")
-                .and_then(Value::as_str),
-        ),
+                    Some((
+                        value,
+                        option.get("name").and_then(Value::as_str).unwrap_or(value),
+                    ))
+                }),
+        );
+        let current_level = thought
+            .and_then(|thought| thought.get("currentValue"))
+            .and_then(Value::as_str);
+        let current = model
+            .and_then(|model| model.get("currentValue"))
+            .and_then(Value::as_str);
+        let models = values
+            .iter()
+            .map(|&(value, name)| {
+                let levels = if Some(value) == current && !known.is_empty() {
+                    known
+                        .iter()
+                        .map(|&(level, label)| (level, label, Some(level) == current_level))
+                        .collect()
+                } else {
+                    antigravity_model_levels(value, &values, &available, &known)
+                };
+                antigravity_model(value, name, label, &levels)
+            })
+            .collect();
+        (models, current)
     };
     if models.is_empty() {
         return None;
@@ -1810,63 +2086,81 @@ fn antigravity_models(session: &Value, configured_models: &[String]) -> Option<V
     Some(models)
 }
 
-/// A model's thinking levels, read from the `availableModels` ids made of its value, `-` and a
-/// level. Each id belongs to the longest model value it extends, so `alpha-pro-high` is a level
-/// of `alpha-pro`, not of `alpha`. Levels the `thought_level` option lists keep its order and
-/// names; others follow in the CLI's order under their own id.
-fn antigravity_model_levels(
-    value: &str,
-    values: &[(&str, &str)],
-    available: &[Value],
-    thought: Option<&Value>,
-) -> Option<Value> {
-    let known = thought
-        .and_then(|thought| thought.get("options"))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let known_index = |level: &str| {
-        known
-            .iter()
-            .position(|option| option.get("value").and_then(Value::as_str) == Some(level))
+/// The `(id, name)` pairs in order, each id once.
+fn unique<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(&'a str, &'a str)> {
+    let mut seen = HashSet::new();
+    pairs.filter(|(id, _)| seen.insert(*id)).collect()
+}
+
+/// One catalog model, its thinking levels published as the `reasoning` option under the CLI's
+/// own ids, which a chat sends back as ACP `thought_level` unchanged.
+fn antigravity_model(
+    slug: &str,
+    name: &str,
+    label: Option<&str>,
+    levels: &[(&str, &str, bool)],
+) -> Value {
+    let descriptors = if levels.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({
+            "id": "reasoning",
+            "label": label.unwrap_or(cursor::model::REASONING_LABEL),
+            "type": "select",
+            "options": levels.iter().map(|&(id, label, default)| if default {
+                json!({ "id": id, "label": label, "isDefault": true })
+            } else {
+                json!({ "id": id, "label": label })
+            }).collect::<Vec<_>>(),
+        })]
     };
+    json!({
+        "slug": slug,
+        "name": name,
+        "isCustom": false,
+        "capabilities": { "optionDescriptors": descriptors },
+    })
+}
+
+/// A model's thinking levels, read from the `availableModels` ids made of its value, `-` and a
+/// level. An id that is itself a model value is that model, never a level. Any other id belongs
+/// to the longest model value it extends, so `alpha-pro-high` is a level of `alpha-pro`, not of
+/// `alpha`. Levels the `thought_level` option lists keep its order and names; others follow in
+/// the CLI's order under their own id. No level is a default.
+fn antigravity_model_levels<'a>(
+    value: &str,
+    values: &[(&'a str, &'a str)],
+    available: &[(&'a str, &'a str)],
+    known: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str, bool)> {
     let owner = |id: &str| {
+        if values.iter().any(|&(value, _)| value == id) {
+            return None;
+        }
         values
             .iter()
-            .map(|(value, _)| *value)
+            .map(|&(value, _)| value)
             .filter(|value| {
                 id.strip_prefix(value)
                     .is_some_and(|rest| rest.len() > 1 && rest.starts_with('-'))
             })
             .max_by_key(|value| value.len())
     };
+    let known_index = |level: &str| known.iter().position(|&(known, _)| known == level);
     let mut levels = available
         .iter()
-        .filter_map(|model| model.get("modelId")?.as_str())
+        .map(|&(id, _)| id)
         .filter(|id| owner(id) == Some(value))
         .map(|id| &id[value.len() + 1..])
         .collect::<Vec<_>>();
-    if levels.is_empty() {
-        return None;
-    }
     levels.sort_by_key(|level| known_index(level).unwrap_or(usize::MAX));
-    let options = levels
-        .iter()
+    levels
+        .into_iter()
         .map(|level| {
-            let name = known_index(level)
-                .and_then(|index| known[index].get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or(level);
-            json!({ "value": level, "name": name })
+            let name = known_index(level).map_or(level, |index| known[index].1);
+            (level, name, false)
         })
-        .collect::<Vec<_>>();
-    Some(json!({
-        "id": "thought_level",
-        "category": "thought_level",
-        "type": "select",
-        "name": thought.and_then(|thought| thought.get("name")),
-        "options": options,
-    }))
+        .collect()
 }
 
 async fn probe_cursor_models(
@@ -1896,12 +2190,8 @@ async fn probe_cursor_models(
     let stdout = child.stdout().take()?;
     let stdin = child.stdin().take()?;
     let stderr = child.stderr().take()?;
-    let (connection, _incoming) = cursor::AcpJsonRpcConnection::spawn(
-        stdout,
-        stdin,
-        stderr,
-        cursor::AcpConnectionConfig::default(),
-    );
+    let transport = AcpProbeTransport::spawn(stdout, stdin, stderr);
+    let connection = &transport.0;
     let response = timeout(CURSOR_DISCOVERY_TIMEOUT, async {
         connection
             .request(
@@ -1929,6 +2219,7 @@ async fn probe_cursor_models(
     .await
     .ok()
     .flatten();
+    drop(transport);
     stop_supervised_child(&mut *child).await;
     let models =
         cursor::discover_models_from_list_available_models(&response?, custom_models).ok()?;
@@ -2466,7 +2757,7 @@ fn is_builtin_driver(driver: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[cfg(unix)]
@@ -3343,7 +3634,10 @@ done
     }
 
     #[cfg(unix)]
-    async fn probe_antigravity(sandbox: &TestSandbox, settings: &Value) -> Value {
+    async fn probe_antigravity_result(
+        sandbox: &TestSandbox,
+        settings: &Value,
+    ) -> ProviderProbeResult {
         probe_full(
             settings,
             Some("antigravity"),
@@ -3355,7 +3649,11 @@ done
         .into_iter()
         .next()
         .expect("the Antigravity snapshot")
-        .snapshot
+    }
+
+    #[cfg(unix)]
+    async fn probe_antigravity(sandbox: &TestSandbox, settings: &Value) -> Value {
+        probe_antigravity_result(sandbox, settings).await.snapshot
     }
 
     #[cfg(unix)]
@@ -3421,7 +3719,7 @@ done
         let failing = sandbox.path("antigravity-cli-failing");
         crate::test_support::executable_fixture::write_executable(
             &failing,
-            "#!/bin/sh\nprintf '%s\\n' 'not the cli'\nexit 3\n",
+            format!("#!/bin/sh\nprintf '%s\\n' 'account-{ANTIGRAVITY_MARKER}'\nexit 3\n"),
         );
         let failing_snapshot = probe_antigravity(
             &sandbox,
@@ -3431,6 +3729,9 @@ done
         assert_eq!(failing_snapshot["driver"], "antigravity");
         assert_eq!(failing_snapshot["installed"], true);
         assert_eq!(failing_snapshot["status"], "warning");
+        // A failed `--version` printed no version, whatever its output says.
+        assert_eq!(failing_snapshot["version"], Value::Null);
+        assert!(!failing_snapshot.to_string().contains(ANTIGRAVITY_MARKER));
 
         let inert = sandbox.path("antigravity-cli-inert");
         std::fs::write(&inert, "not executable").expect("inert fixture");
@@ -3449,8 +3750,9 @@ done
 
     /// A `session/new` answer shaped like the one measured on CLI 1.5.13, with made-up models:
     /// a model value that is a prefix of another (`alpha`, `alpha-pro`), effort suffixes out of
-    /// order, a model with no suffixed variant, a model value that ends in a level word, and an
-    /// unknown level. The current model is not listed first.
+    /// order, a model with no suffixed variant, a model value that ends in a level word, an
+    /// unknown level, a model whose own id reads as another model's level (`epsilon-high`), and
+    /// a repeated model and level. The current model is not listed first.
     fn antigravity_session() -> Value {
         json!({
             "sessionId": "session-1",
@@ -3466,7 +3768,10 @@ done
                     { "modelId": "beta-orchestrator", "name": "Beta Orchestrator" },
                     { "modelId": "gamma-120b-medium", "name": "Gamma 120B (Medium)" },
                     { "modelId": "delta-max", "name": "Delta (Max)" },
-                    { "modelId": "delta-low", "name": "Delta (Low)" }
+                    { "modelId": "delta-low", "name": "Delta (Low)" },
+                    { "modelId": "delta-low", "name": "Delta (Low)" },
+                    { "modelId": "epsilon-high", "name": "Epsilon High" },
+                    { "modelId": "epsilon-low", "name": "Epsilon (Low)" }
                 ],
                 "currentModelId": "alpha-pro-high"
             },
@@ -3483,7 +3788,10 @@ done
                         { "value": "alpha-pro", "name": "Alpha Pro" },
                         { "value": "beta-orchestrator", "name": "Beta Orchestrator" },
                         { "value": "gamma-120b-medium", "name": "Gamma 120B (Medium)" },
-                        { "value": "delta", "name": "Delta" }
+                        { "value": "delta", "name": "Delta" },
+                        { "value": "delta", "name": "Delta" },
+                        { "value": "epsilon", "name": "Epsilon" },
+                        { "value": "epsilon-high", "name": "Epsilon High" }
                     ]
                 },
                 {
@@ -3539,21 +3847,76 @@ done
                     { "id": "low", "label": "Low" },
                     { "id": "max", "label": "max" }
                 ])) }),
+            json!({ "slug": "epsilon", "name": "Epsilon", "isCustom": false,
+                "capabilities": reasoning(json!([{ "id": "low", "label": "Low" }])) }),
+            json!({ "slug": "epsilon-high", "name": "Epsilon High", "isCustom": false,
+                "capabilities": none }),
         ]
     }
 
     /// A scripted `agy`: `--version` prints `version` with a marker on stderr, and `acp` answers
-    /// `initialize`, then `session/new` with the JSON-RPC member `session_new` (a `result` or an
+    /// `initialize` as measured on 1.5.13 (protocol 1, `session/close` advertised under both key
+    /// spellings), then `session/new` with the JSON-RPC member `session_new` (a `result` or an
     /// `error`), and every other request with an empty result. It logs each request it reads.
     #[cfg(unix)]
-    fn antigravity_acp_fixture(
+    pub(crate) fn antigravity_acp_fixture(
         sandbox: &TestSandbox,
         name: &str,
         version: &str,
         session_new: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
+        antigravity_acp_peer(
+            sandbox,
+            name,
+            version,
+            &antigravity_initialize(1, "1.5.13", true),
+            session_new,
+            r#""result":{}"#,
+        )
+    }
+
+    /// The JSON-RPC member of an `initialize` answer: `protocol`, `agent_version` as
+    /// `agentInfo.version`, and `session/close` advertised only when `close` is set.
+    fn antigravity_initialize(protocol: u64, agent_version: &str, close: bool) -> String {
+        let session_capabilities = if close {
+            json!({ "close": {}, "resume": {} })
+        } else {
+            json!({ "resume": {} })
+        };
+        format!(
+            r#""result":{}"#,
+            json!({
+                "protocolVersion": protocol,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "sessionCapabilities": session_capabilities,
+                    "session_capabilities": session_capabilities,
+                },
+                "agentInfo": { "name": "antigravity", "version": agent_version },
+                "authMethods": [],
+                "_meta": { "tier": format!("plan-{ANTIGRAVITY_MARKER}") }
+            })
+        )
+    }
+
+    /// [`antigravity_acp_fixture`] with its `initialize` and `session/close` answers given; an
+    /// empty `close` never answers `session/close`.
+    #[cfg(unix)]
+    fn antigravity_acp_peer(
+        sandbox: &TestSandbox,
+        name: &str,
+        version: &str,
+        initialize: &str,
+        session_new: &str,
+        close: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let binary = sandbox.path(name);
         let requests = sandbox.path(format!("{name}.requests"));
+        let close = if close.is_empty() {
+            "sleep 30".to_owned()
+        } else {
+            format!("body='{close}'")
+        };
         crate::test_support::executable_fixture::write_executable(
             &binary,
             format!(
@@ -3566,8 +3929,9 @@ while IFS= read -r request; do
   printf '%s\n' "$request" >> '{requests}'
   id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$request" in
-    *'"method":"initialize"'*) body='"result":{{"protocolVersion":1,"agentInfo":{{"name":"antigravity","version":"1.5.13"}},"authMethods":[],"_meta":{{"tier":"plan-{ANTIGRAVITY_MARKER}"}}}}' ;;
-    *'"method":"session/new"'*) body='{session_new}' ;;
+    *'"method":"initialize"'*) body='{initialize}' ;;
+    *'"method":"session/new"'*) printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":"{ANTIGRAVITY_MARKER}"}}}}'; body='{session_new}' ;;
+    *'"method":"session/close"'*) {close} ;;
     *) body='"result":{{}}' ;;
   esac
   printf '{{"jsonrpc":"2.0","id":%s,%s}}\n' "$id" "$body"
@@ -3580,12 +3944,368 @@ done
     }
 
     #[cfg(unix)]
-    fn antigravity_requests(requests: &Path) -> Vec<Value> {
+    pub(crate) fn antigravity_requests(requests: &Path) -> Vec<Value> {
         std::fs::read_to_string(requests)
             .unwrap_or_default()
             .lines()
             .map(|line| serde_json::from_str(line).expect("a JSON-RPC request"))
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn antigravity_methods(requests: &Path) -> Vec<String> {
+        antigravity_requests(requests)
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// Each ACP probe ends its transport with it: the writer task that owns the agent's stdin,
+    /// the readers and the drain of unused messages. Cursor's probe uses the same transport.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_acp_probes_leave_no_transport_task_behind() {
+        let sandbox = TestSandbox::new("antigravity-transport");
+        let (binary, _) = antigravity_acp_fixture(
+            &sandbox,
+            "antigravity-cli-transport",
+            "1.5.13",
+            &format!(r#""result":{}"#, antigravity_session()),
+        );
+        let settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        for _ in 0..5 {
+            let snapshot = probe_antigravity(&sandbox, &settings).await;
+            assert_eq!(snapshot["auth"], json!({ "status": "authenticated" }));
+            let _ = probe_cursor_models(&binary, None, &[], sandbox.root(), &[]).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while metrics.num_alive_tasks() > baseline {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} tasks alive after the probes, {baseline} before",
+                metrics.num_alive_tasks()
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A probe child dropped where no runtime runs still has its whole process group stopped:
+    /// `Drop` signals the group itself and hands off only the reap.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_child_dropped_outside_a_runtime_leaves_no_descendant() {
+        let sandbox = TestSandbox::new("antigravity-drop-outside");
+        let pids = sandbox.path("pids");
+        let script = sandbox.path("antigravity-cli-hangs");
+        crate::test_support::executable_fixture::write_executable(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
+                pids.display()
+            ),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let (child, grandchild) = runtime.block_on(async {
+            let mut command = Command::new(&script);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let spawned = supervised_command(command)
+                .spawn()
+                .expect("the fixture starts");
+            let grandchild = loop {
+                if let Ok(text) = std::fs::read_to_string(&pids)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                sleep(Duration::from_millis(20)).await;
+            };
+            (
+                ProbeChild {
+                    child: Some(spawned),
+                    registration: None,
+                },
+                grandchild,
+            )
+        });
+        std::thread::spawn(move || drop(child))
+            .join()
+            .expect("the drop thread");
+        let gone = || {
+            // SAFETY: signal 0 only checks that the pid exists.
+            let result = unsafe { libc::kill(grandchild as libc::pid_t, 0) };
+            result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !gone() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the descendant {grandchild} outlived the dropped probe"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A `session/close` that never answers does not cost the catalog or the sign-in it read:
+    /// the close has its own short step.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stalled_session_close_keeps_the_catalog_and_the_sign_in() {
+        let sandbox = TestSandbox::new("antigravity-close-stalls");
+        let (binary, requests) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-close-stalls",
+            "1.5.13",
+            &antigravity_initialize(1, "1.5.13", true),
+            &format!(r#""result":{}"#, antigravity_session()),
+            "",
+        );
+        let started = tokio::time::Instant::now();
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
+        assert!(started.elapsed() < ANTIGRAVITY_DISCOVERY_TIMEOUT);
+        assert_eq!(snapshot["auth"], json!({ "status": "authenticated" }));
+        assert_eq!(
+            snapshot["models"],
+            Value::Array(expected_antigravity_models())
+        );
+        assert_eq!(
+            antigravity_methods(&requests),
+            ["initialize", "session/new", "session/close"]
+        );
+    }
+
+    /// `session/close` is sent only when `initialize` advertises it, and a session that lists no
+    /// model still proves the CLI is signed in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_close_is_sent_only_when_advertised() {
+        let sandbox = TestSandbox::new("antigravity-close-unadvertised");
+        let (binary, requests) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-no-close",
+            "1.5.13",
+            &antigravity_initialize(1, "1.5.13", false),
+            r#""result":{"sessionId":"session-1"}"#,
+            r#""result":{}"#,
+        );
+        let mut settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        settings["providerInstances"]["antigravity"]["config"]["customModels"] =
+            json!(["custom-one"]);
+        let snapshot = probe_antigravity(&sandbox, &settings).await;
+        assert_eq!(
+            antigravity_methods(&requests),
+            ["initialize", "session/new"]
+        );
+        assert_eq!(snapshot["auth"], json!({ "status": "authenticated" }));
+        assert_eq!(
+            snapshot["models"],
+            Value::Array(custom_models(&["custom-one".to_owned()]))
+        );
+    }
+
+    /// A peer that answers another ACP version gets no session; the instance stays ready for
+    /// the terminal and keeps the version its `--version` printed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_refuses_another_acp_version_and_keeps_the_terminal() {
+        let sandbox = TestSandbox::new("antigravity-protocol-2");
+        let (binary, requests) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-protocol-2",
+            "1.5.13",
+            &antigravity_initialize(2, "1.5.20", true),
+            &format!(r#""result":{}"#, antigravity_session()),
+            r#""result":{}"#,
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
+        assert_eq!(antigravity_methods(&requests), ["initialize"]);
+        assert_eq!(snapshot["status"], "ready");
+        assert_eq!(snapshot["auth"], json!({ "status": "unknown" }));
+        assert_eq!(snapshot["version"], "1.5.13");
+        assert_eq!(snapshot["models"], json!([]));
+    }
+
+    /// The version published is the validated `agentInfo.version` of a protocol 1 handshake;
+    /// text there that is no version leaves the `--version` line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_publishes_the_validated_agent_version() {
+        let sandbox = TestSandbox::new("antigravity-agent-version");
+        let session = format!(r#""result":{}"#, antigravity_session());
+        let (newer, _) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-agent-version",
+            "1.5.13",
+            &antigravity_initialize(1, "1.5.20", true),
+            &session,
+            r#""result":{}"#,
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &newer, true),
+        )
+        .await;
+        assert_eq!(snapshot["version"], "1.5.20");
+
+        let (junk, _) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-agent-junk",
+            "1.5.13",
+            &antigravity_initialize(1, &format!("build-{ANTIGRAVITY_MARKER}"), true),
+            &session,
+            r#""result":{}"#,
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &junk, true),
+        )
+        .await;
+        assert_eq!(snapshot["version"], "1.5.13");
+        assert!(!snapshot.to_string().contains(ANTIGRAVITY_MARKER));
+    }
+
+    /// An ACP child that dies on its own during the handshake is reported to the Profiler.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_acp_probe_child_that_dies_on_its_own_is_reported() {
+        let captured = crate::diagnostics::profiler::exits::CapturedExits::start();
+        let sandbox = TestSandbox::new("antigravity-child-dies");
+        let binary = sandbox.path("antigravity-cli-dies");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            "#!/bin/sh\ncase \"$1\" in --version) printf '%s\\n' 1.5.13; exit 0 ;; esac\nread -r request\nexit 17\n",
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
+        assert_eq!(snapshot["status"], "ready");
+        let findings = captured.take();
+        assert!(
+            findings.iter().any(
+                |fields| fields.first().map(String::as_str) == Some("provider")
+                    && fields.iter().any(|field| field == "antigravity")
+            ),
+            "{findings:?}"
+        );
+    }
+
+    /// The `--version` child of a full probe is attributed while it runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_antigravity_version_check_is_attributed() {
+        let sandbox = TestSandbox::new("antigravity-version-attributed");
+        let pid = sandbox.path("pid");
+        let binary = sandbox.path("antigravity-cli-slow-version");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) printf '%s\\n' \"$$\" > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 1; printf '%s\\n' 1.5.13; exit 0 ;; esac\nexit 0\n",
+                pid.display()
+            ),
+        );
+        let settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        let maintenance = ProviderMaintenance::new();
+        let registry = ProcessAttributionRegistry::new();
+        let watch = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline {
+                if let Ok(text) = std::fs::read_to_string(&pid)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                    && registry
+                        .registered_sources()
+                        .iter()
+                        .any(|(identity, _)| identity.pid == pid)
+                {
+                    return true;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+            false
+        };
+        let (_, attributed) = tokio::join!(
+            probe_full(
+                &settings,
+                Some("antigravity"),
+                sandbox.root(),
+                &maintenance,
+                Some(&registry),
+            ),
+            watch
+        );
+        assert!(attributed, "the version check was not attributed");
+    }
+
+    /// Catalog edge cases outside the measured shape: model options that list nothing fall back
+    /// to `availableModels`; a `thought_level` without a category, or with no options, still
+    /// gives the current model its levels; level ids stay the CLI's own.
+    #[test]
+    fn antigravity_catalog_edge_cases_follow_the_cli() {
+        let fallback = antigravity_models(
+            &json!({
+                "configOptions": [{ "id": "model", "options": [] }],
+                "models": { "availableModels": [{ "modelId": "alpha-high" }],
+                    "currentModelId": "alpha-high" }
+            }),
+            &[],
+        )
+        .expect("a catalog");
+        assert_eq!(fallback[0]["slug"], "alpha-high");
+
+        let uncategorized = antigravity_models(
+            &json!({
+                "configOptions": [
+                    { "id": "model", "currentValue": "alpha", "options": [{ "value": "alpha" }] },
+                    { "id": "thought_level", "name": "Thinking", "currentValue": "low",
+                      "options": [
+                          { "value": "extra-high", "name": "Extra High" },
+                          { "value": "low" }
+                      ] }
+                ]
+            }),
+            &[],
+        )
+        .expect("a catalog");
+        assert_eq!(
+            uncategorized[0]["capabilities"],
+            json!({ "optionDescriptors": [{ "id": "reasoning", "label": "Thinking", "type": "select",
+                "options": [
+                    { "id": "extra-high", "label": "Extra High" },
+                    { "id": "low", "label": "low", "isDefault": true }
+                ] }] })
+        );
+
+        let empty_levels = antigravity_models(
+            &json!({
+                "configOptions": [
+                    { "id": "model", "currentValue": "alpha", "options": [{ "value": "alpha" }] },
+                    { "id": "thought_level", "category": "thought_level", "options": [] }
+                ],
+                "models": { "availableModels": [{ "modelId": "alpha-low" }] }
+            }),
+            &[],
+        )
+        .expect("a catalog");
+        assert_eq!(
+            empty_levels[0]["capabilities"]["optionDescriptors"][0]["options"],
+            json!([{ "id": "low", "label": "low" }])
+        );
     }
 
     #[cfg(unix)]
@@ -3692,7 +4412,9 @@ done
                 "alpha-pro",
                 "beta-orchestrator",
                 "gamma-120b-medium",
-                "delta"
+                "delta",
+                "epsilon",
+                "epsilon-high"
             ]
         );
         // `alpha` is now the current model: its levels and default come from `thought_level`.
@@ -3713,7 +4435,11 @@ done
         let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
         let binary = std::path::PathBuf::from(var("BIBCODE_ANTIGRAVITY_LIVE_BINARY"));
         let catalog = probe_antigravity_catalog("antigravity", &binary, &[], &[], None).await;
-        let Some(AntigravityCatalog::Models(models)) = catalog else {
+        let Some(AntigravityCatalog::Session {
+            models: Some(models),
+            ..
+        }) = catalog
+        else {
             panic!("the CLI published no catalog");
         };
         std::fs::write(
@@ -3741,7 +4467,10 @@ done
         settings["providerInstances"]["antigravity"]["config"]["customModels"] =
             json!(["custom-one"]);
 
-        let snapshot = probe_antigravity(&sandbox, &settings).await;
+        let result = probe_antigravity_result(&sandbox, &settings).await;
+        // The signed-out account's catalog is gone: the merge must not keep the last one.
+        assert!(result.models_authoritative);
+        let snapshot = result.snapshot;
 
         assert_eq!(snapshot["status"], "ready");
         assert_eq!(snapshot["auth"], json!({ "status": "unauthenticated" }));
