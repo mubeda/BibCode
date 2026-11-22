@@ -1277,6 +1277,25 @@ async fn a_failed_switch_keeps_the_new_mode_and_refuses_prompts_until_acknowledg
     assert!(peer.silent().await);
 }
 
+/// A mode write the CLI answers without listing its options confirms nothing: the switch is
+/// refused as unavailable, final for the delivery, never read as a write that may be retried.
+#[tokio::test]
+async fn an_answered_mode_write_without_its_options_is_refused() {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let switch = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_runtime_mode("approval-required").await }
+    });
+    let mode = peer.expect("session/set_config_option").await;
+    assert_eq!(mode["params"]["value"], "default");
+    peer.reply(&mode, json!({})).await;
+    let error = switch.await.unwrap().expect_err("an unconfirmed mode refuses");
+    assert!(
+        matches!(error, AntigravityRuntimeError::ModeUnavailable { .. }),
+        "{error:?}"
+    );
+}
+
 /// Mode writes reach the CLI one at a time, and each writes the latest setting: an older
 /// switch's answer never confirms a newer one, and a newer switch waits for the older write.
 #[tokio::test]
