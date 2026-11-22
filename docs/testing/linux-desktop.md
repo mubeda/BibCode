@@ -572,11 +572,19 @@ that the window renders:
   `BIBCODE_SOFTWARE_RENDERING=0` with it on sets neither.
 - `WEBKIT_DISABLE_COMPOSITING_MODE=0` exported with the setting on keeps `0`
   and sets only the other; Settings says GPU compositing is on.
-- Start the binary itself (the `Exec` line of the generated
-  `bibcode-desktop-handler.desktop` from an extracted AppDir) with the setting
-  on: both variables are present.
+- Start the binary itself, `usr/bin/bibcode-desktop` of an extracted AppDir,
+  with the setting on: both variables are present. Start it from the AppDir's
+  `usr` folder, as `AppRun` does: the bundled WebKitGTK finds its helper
+  processes relative to the working directory, so from any other folder it
+  aborts before the first window with or without this setting. That also
+  applies to a cold start through the generated
+  `bibcode-desktop-handler.desktop` of an extracted AppDir, whose `Exec` line
+  names the binary and sets no working directory.
 - With the setting on, turn it off in Settings and use **Restart now**: the new
-  process's WebKit children have neither variable.
+  process's WebKit children have neither variable. Under Xvfb, start Xvfb and
+  the session bus yourself instead of through `xvfb-run` and
+  `dbus-run-session`, which end with the first process and leave the restarted
+  one without a display.
 - A malformed `desktop-settings.json` starts with neither variable, logs
   `could not read the software rendering setting`, and the log line
   `software rendering start-up decision` records every start.
