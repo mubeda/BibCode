@@ -76,6 +76,7 @@ use crate::{
             AcpJsonRpcConnection as AntigravityConnection, AntigravityRuntimeError,
             AntigravitySessionOptions, AntigravitySessionRuntime,
             DEFAULT_CANCEL_GRACE as ANTIGRAVITY_CANCEL_GRACE,
+            DEFAULT_CONTROL_TIMEOUT as ANTIGRAVITY_CONTROL_TIMEOUT,
             DEFAULT_START_TIMEOUT as ANTIGRAVITY_START_TIMEOUT,
         },
         attachments::{
@@ -415,6 +416,12 @@ pub trait ProviderDriver: Send + Sync {
     /// provider's default instead, and the thread stops naming the retired model.
     fn retired_model(&self) -> Option<&'static str> {
         None
+    }
+    /// Stops the driver from answering approvals by itself, at once. The supervisor calls it
+    /// when a switch away from full access, or into plan, is requested, before that command can
+    /// wait behind a running delivery. Bounded: it must not wait on the provider.
+    fn revoke_auto_approval(&self) -> BoxRuntimeFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
     }
     fn send(
         &self,
@@ -7125,6 +7132,13 @@ async fn run_supervisor(
                 let _ = response.send(result);
             }
             SupervisorMessage::Handle { command, response } => {
+                // Fail closed: the switch may wait for the running delivery below, but the
+                // driver stops answering approvals by itself now.
+                if let Some(thread_id) = command_revoking_auto_approval(command.as_ref())
+                    && let Some(entry) = sessions.get(thread_id)
+                {
+                    entry.driver.revoke_auto_approval().await;
+                }
                 if let Some(thread_id) = delivery_ordered_command_thread(command.as_ref())
                     && let Some(generation) = delivery_sequences
                         .get(thread_id)
@@ -7974,6 +7988,23 @@ fn delivery_ordered_command_thread(command: &OrchestrationCommand) -> Option<&st
             model_selection: Some(_),
             ..
         } => Some(thread_id),
+        _ => None,
+    }
+}
+
+/// The thread of a command that takes a session out of full access or into plan.
+fn command_revoking_auto_approval(command: &OrchestrationCommand) -> Option<&str> {
+    match command {
+        OrchestrationCommand::ThreadRuntimeModeSet {
+            thread_id,
+            runtime_mode,
+            ..
+        } if runtime_mode != "full-access" => Some(thread_id),
+        OrchestrationCommand::ThreadInteractionModeSet {
+            thread_id,
+            interaction_mode,
+            ..
+        } if interaction_mode == "plan" => Some(thread_id),
         _ => None,
     }
 }
@@ -16083,8 +16114,14 @@ struct AntigravityDriver {
 }
 
 impl Drop for AntigravityDriver {
+    /// A driver dropped without `shutdown`, such as a cancelled start, still kills the child's
+    /// process group and waits for it, off the dropping task.
     fn drop(&mut self) {
         self.abandon_watch.abort();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let child = self.child.clone();
+            handle.spawn(async move { kill_child(&child).await });
+        }
     }
 }
 
@@ -16137,6 +16174,8 @@ impl AntigravityDriver {
                 resume_session_id: request.resume_cursor.as_ref().and_then(resume_string),
                 cancel_grace,
                 start_timeout: ANTIGRAVITY_START_TIMEOUT,
+                control_timeout: ANTIGRAVITY_CONTROL_TIMEOUT,
+                initial_options: request.options,
             },
             connection,
             incoming,
@@ -16165,7 +16204,9 @@ impl AntigravityDriver {
     /// A child that died before the session pump starts is not seen by the pump's exit report,
     /// so a failed start reports it here, before `shutdown` marks the process as stopped.
     async fn report_startup_exit(&self) {
-        if !exits::watching() {
+        // Only a lost connection means the child is going away; a refusal from a live child
+        // must not hold the supervisor while it polls.
+        if !exits::watching() || !self.runtime.start_lost_connection() {
             return;
         }
         // The pipes close a moment before the exit status can be read.
@@ -16219,7 +16260,54 @@ fn antigravity_error(error: AntigravityRuntimeError) -> ProviderRuntimeError {
         }
         // Option values stay out of the Display; only the refusal names them.
         AntigravityRuntimeError::UnsupportedOption(_) => option_error("antigravity", error),
-        error => provider_error("antigravity")(error),
+        // The CLI's own words reach only the thread's turn error. Logs, delivery details and
+        // launch errors get the method we sent, the code and the class.
+        AntigravityRuntimeError::Protocol(error) => {
+            use crate::provider::antigravity::acp::{AcpProtocolError, acp_error_class};
+            let class = acp_error_class(&error);
+            let line_too_long = match &error {
+                AcpProtocolError::LineTooLong { .. } => true,
+                AcpProtocolError::Closed { reason } => {
+                    reason.starts_with("ACP JSON-RPC read line exceeded ")
+                }
+                _ => false,
+            };
+            let detail = match &error {
+                AcpProtocolError::RemoteRequest { method, code, .. } => {
+                    format!("Antigravity answered {method} with error {code} ({class})")
+                }
+                _ if line_too_long => {
+                    "Antigravity sent a message longer than BiBCode accepts (transport_error)"
+                        .to_owned()
+                }
+                _ => format!("Antigravity connection failed ({class})"),
+            };
+            let provider = "antigravity".to_owned();
+            if line_too_long {
+                ProviderRuntimeError::TransportLineTooLong { provider, detail }
+            } else {
+                ProviderRuntimeError::Provider { provider, detail }
+            }
+        }
+        // BiBCode's own texts.
+        error => ProviderRuntimeError::Provider {
+            provider: "antigravity".to_owned(),
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// A turn the runtime refused before writing it: refusals the user must act on, and a line too
+/// long, are final; anything else may be transient and is retried.
+fn antigravity_unsent_outcome(error: AntigravityRuntimeError) -> ProviderDeliveryOutcome {
+    let error = antigravity_error(error);
+    let detail = delivery_detail(&error, None);
+    match error {
+        ProviderRuntimeError::IncompatibleProvider { .. }
+        | ProviderRuntimeError::TransportLineTooLong { .. } => {
+            ProviderDeliveryOutcome::Rejected { detail }
+        }
+        _ => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
     }
 }
 
@@ -16277,11 +16365,7 @@ impl ProviderDriver for AntigravityDriver {
                 .await
             {
                 Ok(receipt) => receipt,
-                Err(error) => {
-                    return ProviderDeliveryOutcome::DefinitelyNotSent {
-                        detail: delivery_detail(&antigravity_error(error), None),
-                    };
-                }
+                Err(error) => return antigravity_unsent_outcome(error),
             };
             let turn_id = receipt.turn_id.clone();
             match receipt.completion().await {
@@ -16398,11 +16482,16 @@ impl ProviderDriver for AntigravityDriver {
             })
         })
     }
+    fn revoke_auto_approval(&self) -> BoxRuntimeFuture<'_, ()> {
+        Box::pin(self.runtime.revoke_auto_answer())
+    }
     fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
         Box::pin(std::future::ready(exited_child(&self.child)))
     }
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            // Killing the group closes the pipes, so the runtime's reader ends on the close.
+            // TODO(G2): also call the transport's explicit shutdown in provider/cursor/acp.rs.
             kill_child(&self.child).await;
             Ok(())
         })
@@ -38773,6 +38862,11 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
       [ -z "$BIBCODE_TEST_EXIT_ON_INITIALIZE" ] || exit 7
+      if [ -n "$BIBCODE_TEST_DESCENDANT_PID" ]; then
+        sleep 300 &
+        printf '%s\n' "$!" > "$BIBCODE_TEST_DESCENDANT_PID"
+        continue
+      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":{}}},"agentInfo":{"name":"fixture","version":"%s"}}}\n' "$id" "${BIBCODE_TEST_AGY_VERSION:-1.5.13}" ;;
     *'"method":"session/new"'*)
       [ -z "$BIBCODE_TEST_SIGNED_OUT" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"Authentication required"}}\n' "$id"; continue; }
@@ -38788,6 +38882,11 @@ while IFS= read -r line; do
       [ -z "$BIBCODE_TEST_REJECT_PROMPT" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"prompt rejected"}}\n' "$id"; continue; }
       [ -z "$BIBCODE_TEST_DISCONNECT_AFTER_PROMPT" ] || exit 0
       [ -z "$BIBCODE_TEST_IGNORE_PROMPT" ] || continue
+      if [ -n "$BIBCODE_TEST_PERMISSION_TRIGGER" ]; then
+        while [ ! -e "$BIBCODE_TEST_PERMISSION_TRIGGER" ]; do sleep 0.05; done
+        printf '{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{"sessionId":"antigravity-session","toolCall":{"toolCallId":"call-1","kind":"execute","title":"Run"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]}}\n'
+        continue
+      fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
   esac
 done
@@ -39142,6 +39241,180 @@ done
             captured.take().is_empty(),
             "a requested stop is not a crash"
         );
+    }
+
+    /// A start cancelled while `initialize` is unanswered (the supervisor drops the driver) kills
+    /// the child's whole process group, descendants included, and its attribution ends with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_antigravity_start_kills_the_process_group_and_ends_attribution() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let descendant = temp.path().join("descendant.pid");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(&temp, "antigravity");
+        request.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_DESCENDANT_PID".to_owned(),
+            descendant.to_str().unwrap().to_owned(),
+        );
+        let driver = Arc::new(
+            super::AntigravityDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+            )
+            .await
+            .expect("the Antigravity fixture spawns"),
+        );
+        let child_pid = driver.child.lock().await.id().expect("child pid");
+        let attributed = |pid: u32| {
+            factory
+                .attribution
+                .registered_kinds()
+                .iter()
+                .any(|(identity, _, kind)| {
+                    identity.pid == pid && kind.as_deref() == Some("antigravity")
+                })
+        };
+        assert!(
+            attributed(child_pid),
+            "the chat child is attributed to Antigravity"
+        );
+        let start = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.start().await.map(|_| ()) }
+        });
+        let pid = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&descendant)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the child started a descendant");
+        start.abort();
+        let _ = start.await;
+        drop(driver);
+        let alive = |pid: u32| {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        timeout(Duration::from_secs(5), async {
+            while alive(pid) || alive(child_pid) || attributed(child_pid) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the group is gone and no longer attributed");
+    }
+
+    /// A live switch to approval-required waits for the running prompt, but auto-answering stops
+    /// as soon as the supervisor receives it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_switch_away_from_full_access_during_a_held_antigravity_prompt_stops_auto_answers() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let requests = temp.path().join("requests.jsonl");
+        let trigger = temp.path().join("permission-trigger");
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let supervisor = Arc::new(super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(super::NativeProviderDriverFactory::new(
+                temp.path().join("attachments"),
+            )),
+            activity,
+            super::SupervisorOptions::default(),
+        ));
+        let mut launch = native_launch(&temp, "antigravity");
+        launch.thread_id = "t1".to_owned();
+        launch.runtime_mode = "full-access".to_owned();
+        launch.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        for (name, value) in [
+            ("BIBCODE_TEST_REQUEST_CAPTURE", requests.to_str().unwrap()),
+            ("BIBCODE_TEST_PERMISSION_TRIGGER", trigger.to_str().unwrap()),
+        ] {
+            launch.environment.insert(name.to_owned(), value.to_owned());
+        }
+        timeout(Duration::from_secs(10), supervisor.launch(launch))
+            .await
+            .expect("launch in time")
+            .expect("the chat starts");
+        let _delivery = timeout(
+            Duration::from_secs(5),
+            supervisor.deliver_turn(
+                serde_json::from_value(json!({
+                    "type":"thread.turn.start", "commandId":"held", "threadId":"t1",
+                    "message":{"messageId":"held","role":"user","text":"hello","attachments":[]},
+                    "runtimeMode":"full-access", "interactionMode":"default",
+                    "createdAt":"2026-07-16T00:00:00Z",
+                }))
+                .unwrap(),
+                "held-key".to_owned(),
+            ),
+        )
+        .await
+        .expect("delivery admitted in time")
+        .expect("delivery admitted");
+        timeout(Duration::from_secs(5), async {
+            while !captured_methods(&requests).contains(&"session/prompt".to_owned()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the prompt is written and held");
+
+        // Queued behind the held delivery; it does not return until the prompt ends.
+        let switch = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move {
+                supervisor
+                    .handle_orchestration(OrchestrationCommand::ThreadRuntimeModeSet {
+                        command_id: "to-approval".to_owned(),
+                        thread_id: "t1".to_owned(),
+                        runtime_mode: "approval-required".to_owned(),
+                        created_at: "2026-07-16T00:00:01Z".to_owned(),
+                    })
+                    .await
+            }
+        });
+        // The supervisor handles its messages in order: once this answers, it saw the switch.
+        timeout(
+            Duration::from_secs(5),
+            supervisor.capture_session_identity("t1"),
+        )
+        .await
+        .expect("supervisor responsive")
+        .expect("identity");
+        std::fs::write(&trigger, b"go").expect("trigger the permission request");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let answered = std::fs::read_to_string(&requests)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains("\"perm-1\""));
+        assert!(
+            !answered,
+            "the request waits for the user, not auto-approved"
+        );
+
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("shutdown in time")
+            .expect("shutdown");
+        let _ = timeout(Duration::from_secs(5), switch).await;
+        engine.shutdown().await;
     }
 
     #[test]

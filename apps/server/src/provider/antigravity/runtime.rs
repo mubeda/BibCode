@@ -29,8 +29,8 @@ use super::acp::{
     acp_turn_state,
 };
 use crate::provider::{
-    OptionRefusal, RefusedOption, RequestScope, model_unavailable_refusal,
-    option_needs_value_refusal, option_without_id_refusal, unsupported_option_refusal,
+    OptionRefusal, RefusedOption, model_unavailable_refusal, option_needs_value_refusal,
+    option_without_id_refusal, unsupported_option_refusal,
 };
 
 const PROVIDER: &str = "antigravity";
@@ -47,6 +47,10 @@ pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(10);
 /// How long the handshake and session open may take. A live open answered in a few seconds.
 pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a configuration write on a running session may take. The CLI answers them at once
+/// (measured); the bound keeps a wedged CLI from holding the shared provider supervisor.
+pub const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub struct AntigravitySessionOptions {
     pub thread_id: String,
@@ -58,6 +62,10 @@ pub struct AntigravitySessionOptions {
     pub cancel_grace: Duration,
     /// Bounds the whole start, so a silent or wedged CLI cannot hold the launch forever.
     pub start_timeout: Duration,
+    /// Bounds each configuration request (model, thinking level, mode).
+    pub control_timeout: Duration,
+    /// The thread's options (the thinking level), written during the start, inside its deadline.
+    pub initial_options: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +99,16 @@ pub enum AntigravityRuntimeError {
         "Antigravity did not answer while the chat was starting. Send the message again; if it keeps happening, check that `agy acp` runs in a terminal."
     )]
     StartTimedOut,
+    /// A configuration request went unanswered; the CLI's mode is unknown until rewritten.
+    #[error(
+        "Antigravity did not answer a settings change in time. Send the message again; if it keeps happening, stop the chat and start it again."
+    )]
+    ControlTimedOut,
+    /// A resume or load answer named another conversation than the one asked for.
+    #[error(
+        "Antigravity reopened a different conversation than this chat's, so BiBCode stopped. Send the message again."
+    )]
+    SessionMismatch,
     #[error("Antigravity runtime has not started a provider session")]
     MissingProviderSessionId,
     #[error("Unknown pending request id {request_id}")]
@@ -111,6 +129,8 @@ impl AntigravityRuntimeError {
             Self::UnsupportedVersion { .. } => "unsupported_version",
             Self::ModeUnavailable { .. } => "mode_unavailable",
             Self::StartTimedOut => "start_timeout",
+            Self::ControlTimedOut => "control_timeout",
+            Self::SessionMismatch => "session_mismatch",
             Self::UnsupportedOption(_) => "unsupported_option",
             Self::MissingProviderSessionId
             | Self::PendingRequestNotFound { .. }
@@ -163,27 +183,66 @@ pub struct AntigravitySessionRuntime {
 struct RuntimeInner {
     options: AntigravitySessionOptions,
     connection: AcpJsonRpcConnection,
-    /// `None` until the open call and every update queued before its answer are handled, so a
-    /// replayed history is dropped.
-    provider_session_id: Mutex<Option<String>>,
+    /// Everything a permission decision reads. A decision and its reply are made under this
+    /// lock, and cancel and mode changes take it too, so none can slip between them. It is never
+    /// held across a request to the CLI or a barrier.
+    gate: Mutex<Gate>,
     config_options: Mutex<Vec<Value>>,
     legacy_models: AtomicBool,
-    /// A live mode switch the CLI did not acknowledge: the next prompt writes the mode first.
-    mode_unconfirmed: AtomicBool,
-    /// (runtime mode, interaction mode).
-    modes: Mutex<(String, String)>,
-    active_turn_id: Mutex<Option<String>>,
-    ignored_turn_id: Mutex<Option<String>>,
+    /// The start failed because the connection to the child broke, not on a refusal.
+    start_lost_connection: AtomicBool,
     abandoned_turns: Mutex<HashSet<String>>,
-    pending_requests: Mutex<HashMap<String, PendingRequest>>,
     events_tx: mpsc::UnboundedSender<AntigravityRuntimeEvent>,
     events_rx: Mutex<mpsc::UnboundedReceiver<AntigravityRuntimeEvent>>,
     abandon: Notify,
 }
 
+struct Gate {
+    /// `None` until the open call and every update queued before its answer are handled, so a
+    /// replayed history is dropped and no request during the open is answered.
+    session_id: Option<String>,
+    active_turn: Option<String>,
+    cancelled_turn: Option<String>,
+    runtime_mode: String,
+    interaction_mode: String,
+    /// The CLI's mode may differ from the one the thread needs: the next prompt writes it first.
+    /// True until the first acknowledgement, so a failed start leaves no confirmed mode.
+    mode_unconfirmed: bool,
+    /// BiBCode answers approvals by itself only while this is set: after the CLI acknowledged
+    /// `auto` for full access, and until a switch away from it is requested.
+    auto_answer: bool,
+    pending: HashMap<String, PendingRequest>,
+}
+
+impl Gate {
+    fn mode_target(&self) -> &'static str {
+        mode_for(&self.runtime_mode, &self.interaction_mode)
+    }
+
+    fn unconfirm(&mut self) {
+        self.mode_unconfirmed = true;
+        self.auto_answer = false;
+    }
+
+    /// The approvals of a turn that ended or was cancelled; they can never answer a later one.
+    fn take_pending(&mut self, turn_id: &str) -> Vec<(String, PendingRequest)> {
+        let ids = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.turn_id == turn_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| self.pending.remove(&id).map(|pending| (id, pending)))
+            .collect()
+    }
+}
+
 struct PendingRequest {
+    /// The id exactly as the CLI sent it: numeric 1 and string "1" are different requests.
     wire_id: Value,
-    turn_id: Option<String>,
+    turn_id: String,
+    request_type: &'static str,
     allow_once: Option<String>,
     allow_always: Option<String>,
     reject_once: Option<String>,
@@ -196,42 +255,48 @@ impl AntigravitySessionRuntime {
         mut incoming: mpsc::UnboundedReceiver<IncomingEvent>,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let modes = (
-            options.runtime_mode.clone(),
-            options.interaction_mode.clone(),
-        );
+        let gate = Gate {
+            session_id: None,
+            active_turn: None,
+            cancelled_turn: None,
+            runtime_mode: options.runtime_mode.clone(),
+            interaction_mode: options.interaction_mode.clone(),
+            mode_unconfirmed: true,
+            auto_answer: false,
+            pending: HashMap::new(),
+        };
         let runtime = Self {
             inner: Arc::new(RuntimeInner {
                 options,
                 connection,
-                provider_session_id: Mutex::new(None),
+                gate: Mutex::new(gate),
                 config_options: Mutex::new(Vec::new()),
                 legacy_models: AtomicBool::new(false),
-                mode_unconfirmed: AtomicBool::new(false),
-                modes: Mutex::new(modes),
-                active_turn_id: Mutex::new(None),
-                ignored_turn_id: Mutex::new(None),
+                start_lost_connection: AtomicBool::new(false),
                 abandoned_turns: Mutex::new(HashSet::new()),
-                pending_requests: Mutex::new(HashMap::new()),
                 events_tx,
                 events_rx: Mutex::new(events_rx),
                 abandon: Notify::new(),
             }),
         };
         let reader = runtime.clone();
-        let scope = RequestScope::new();
         tokio::spawn(async move {
             while let Some(event) = incoming.recv().await {
-                reader.handle_incoming(scope, event).await;
+                let closed = matches!(event, IncomingEvent::Closed { .. });
+                reader.handle_incoming(event).await;
+                // Nothing follows a close, and the transport may keep the channel open.
+                if closed {
+                    break;
+                }
             }
         });
         runtime
     }
 
     /// Initializes, checks the CLI, opens the session (resume, else load, else new), then
-    /// writes the model and the mode. Returns the ACP session id.
+    /// writes the model, the thinking level and the mode. Returns the ACP session id.
     pub async fn start(&self) -> Result<String, AntigravityRuntimeError> {
-        tokio::time::timeout(self.inner.options.start_timeout, self.start_session())
+        let result = tokio::time::timeout(self.inner.options.start_timeout, self.start_session())
             .await
             .unwrap_or_else(|_| {
                 tracing::warn!(
@@ -239,7 +304,37 @@ impl AntigravitySessionRuntime {
                     "the provider did not finish starting in time"
                 );
                 Err(AntigravityRuntimeError::StartTimedOut)
-            })
+            });
+        if let Err(error) = &result {
+            if matches!(
+                error,
+                AntigravityRuntimeError::Protocol(
+                    AcpProtocolError::Closed { .. }
+                        | AcpProtocolError::ReadFailure { .. }
+                        | AcpProtocolError::WriteFailure { .. }
+                )
+            ) {
+                self.inner
+                    .start_lost_connection
+                    .store(true, Ordering::SeqCst);
+            }
+            // The timeout drops the start mid-way: no session id may survive it.
+            let mut gate = self.inner.gate.lock().await;
+            gate.session_id = None;
+            gate.unconfirm();
+        }
+        result
+    }
+
+    /// Whether a failed start lost its connection, so the child is exiting or gone.
+    pub fn start_lost_connection(&self) -> bool {
+        self.inner.start_lost_connection.load(Ordering::SeqCst)
+    }
+
+    /// Stops BiBCode answering approvals by itself at once, ahead of a switch away from full
+    /// access that may wait for the running prompt. Only an acknowledged `auto` turns it back on.
+    pub async fn revoke_auto_answer(&self) {
+        self.inner.gate.lock().await.unconfirm();
     }
 
     async fn start_session(&self) -> Result<String, AntigravityRuntimeError> {
@@ -257,25 +352,36 @@ impl AntigravitySessionRuntime {
             Ok(initialized) => initialized,
             // No working `agy acp`: the command is unknown, or the child exited before answering.
             Err(AntigravityRuntimeError::Protocol(
-                AcpProtocolError::RemoteRequest { code: -32601, .. }
-                | AcpProtocolError::Closed { .. }
+                AcpProtocolError::RemoteRequest { code: -32601, .. },
+            )) => return Err(AntigravityRuntimeError::UnsupportedVersion { version: None }),
+            Err(AntigravityRuntimeError::Protocol(
+                AcpProtocolError::Closed { .. }
                 | AcpProtocolError::WriteFailure { .. }
                 | AcpProtocolError::ReadFailure { .. },
-            )) => return Err(AntigravityRuntimeError::UnsupportedVersion { version: None }),
+            )) => {
+                self.inner
+                    .start_lost_connection
+                    .store(true, Ordering::SeqCst);
+                return Err(AntigravityRuntimeError::UnsupportedVersion { version: None });
+            }
             Err(error) => return Err(error),
         };
         if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(PROTOCOL_VERSION) {
             return Err(AntigravityRuntimeError::UnsupportedVersion { version: None });
         }
-        let version = initialized
+        // A version that cannot be established is refused like an old one. Only the parsed
+        // numbers reach the message, never the CLI's text.
+        let Some(version) = initialized
             .pointer("/agentInfo/version")
-            .and_then(Value::as_str);
-        if version
+            .and_then(Value::as_str)
             .and_then(parse_version)
-            .is_some_and(|parsed| parsed < MINIMUM_VERSION)
-        {
+        else {
+            return Err(AntigravityRuntimeError::UnsupportedVersion { version: None });
+        };
+        if version < MINIMUM_VERSION {
+            let (major, minor, patch) = version;
             return Err(AntigravityRuntimeError::UnsupportedVersion {
-                version: version.map(str::to_owned),
+                version: Some(format!("{major}.{minor}.{patch}")),
             });
         }
         let capabilities = initialized.get("agentCapabilities");
@@ -298,11 +404,18 @@ impl AntigravitySessionRuntime {
             == Some(true);
         let session_id = self.open(can_resume, can_load).await?;
         // A resumed session is back at the CLI's defaults (measured), so every open writes the
-        // model and the mode again; the supervisor's `set_options` writes the thinking level.
+        // model, the thinking level and, last, the mode again, all inside the start deadline.
         self.apply_model(self.inner.options.model.as_deref())
             .await?;
-        let (runtime_mode, interaction_mode) = self.inner.modes.lock().await.clone();
-        self.apply_mode(&runtime_mode, &interaction_mode).await?;
+        match self
+            .set_options(self.inner.options.initial_options.clone())
+            .await
+        {
+            // A refused level writes nothing; the supervisor's `set_options` reports it.
+            Ok(()) | Err(AntigravityRuntimeError::UnsupportedOption(_)) => {}
+            Err(error) => return Err(error),
+        }
+        self.confirm_mode().await?;
         self.emit("session.started", None, None, json!({}));
         self.emit("thread.started", None, None, json!({}));
         Ok(session_id)
@@ -343,12 +456,18 @@ impl AntigravitySessionRuntime {
             }
             _ => (None, self.request("session/new", new_session).await?),
         };
-        let session_id = response
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or(requested)
-            .ok_or(AntigravityRuntimeError::MissingProviderSessionId)?;
+        let answered = response.get("sessionId").and_then(Value::as_str);
+        let session_id = match (requested, answered) {
+            // A reopen must come back as the conversation asked for; only `session/new`
+            // creates a replacement.
+            (Some(requested), Some(answered)) if answered != requested => {
+                return Err(AntigravityRuntimeError::SessionMismatch);
+            }
+            (Some(requested), _) => requested,
+            (None, answered) => answered
+                .map(str::to_owned)
+                .ok_or(AntigravityRuntimeError::MissingProviderSessionId)?,
+        };
         // The answer resolves on the reader task while replayed updates may still wait in the
         // incoming queue; drain them while no session is accepted.
         let _ = self.inner.connection.barrier().await;
@@ -361,7 +480,7 @@ impl AntigravitySessionRuntime {
             response.pointer("/models/availableModels").is_some(),
             Ordering::SeqCst,
         );
-        *self.inner.provider_session_id.lock().await = Some(session_id.clone());
+        self.inner.gate.lock().await.session_id = Some(session_id.clone());
         Ok(session_id)
     }
 
@@ -391,14 +510,39 @@ impl AntigravitySessionRuntime {
             self.write_config(&session_id, option_id(descriptor), json!(model))
                 .await?;
         } else if self.inner.legacy_models.load(Ordering::SeqCst) {
-            // Only the combined model-and-effort ids exist: they go out unchanged.
-            self.request(
-                "session/set_model",
-                json!({ "sessionId": session_id, "modelId": model }),
-            )
-            .await?;
+            // Only the combined model-and-effort ids exist: they go out unchanged. The answer is
+            // `{}`, so it cannot show the mode; the next prompt writes it again.
+            let result = self
+                .control(
+                    "session/set_model",
+                    json!({ "sessionId": session_id, "modelId": model }),
+                )
+                .await;
+            self.inner.gate.lock().await.unconfirm();
+            result?;
         }
         Ok(())
+    }
+
+    /// A configuration request on a running session, bounded so a silent CLI cannot hold it.
+    async fn control(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value, AntigravityRuntimeError> {
+        tokio::time::timeout(
+            self.inner.options.control_timeout,
+            self.request(method, params),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                provider = PROVIDER,
+                method,
+                "the provider did not answer a settings change in time"
+            );
+            Err(AntigravityRuntimeError::ControlTimedOut)
+        })
     }
 
     /// Writes the turn's options. Only the thinking level (`reasoning`) exists, written to the
@@ -449,6 +593,11 @@ impl AntigravitySessionRuntime {
                     ),
                 ));
             }
+            // The level the start wrote is already current: the supervisor's write after the
+            // start sends nothing.
+            if descriptor.get("currentValue").and_then(Value::as_str) == Some(value) {
+                continue;
+            }
             let session_id = self.provider_session_id().await?;
             self.write_config(&session_id, option_id(descriptor), json!(value))
                 .await?;
@@ -456,6 +605,8 @@ impl AntigravitySessionRuntime {
         Ok(())
     }
 
+    /// Writes one config option. Every answer lists the session's effective mode; one that is not
+    /// the mode the thread needs leaves the mode unconfirmed, and so does an unanswered write.
     async fn write_config(
         &self,
         session_id: &str,
@@ -463,67 +614,90 @@ impl AntigravitySessionRuntime {
         value: Value,
     ) -> Result<Vec<Value>, AntigravityRuntimeError> {
         let response = self
-            .request(
+            .control(
                 "session/set_config_option",
                 json!({ "sessionId": session_id, "configId": config_id, "value": value }),
             )
-            .await?;
-        let options = response
-            .get("configOptions")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or(AntigravityRuntimeError::MalformedConfigAcknowledgement)?;
+            .await;
+        let options = response.and_then(|response| {
+            response
+                .get("configOptions")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or(AntigravityRuntimeError::MalformedConfigAcknowledgement)
+        });
+        let mut gate = self.inner.gate.lock().await;
+        let Ok(options) = options else {
+            gate.unconfirm();
+            return options;
+        };
+        if current_mode(&options) != Some(gate.mode_target()) {
+            gate.unconfirm();
+        }
+        drop(gate);
         *self.inner.config_options.lock().await = options.clone();
         Ok(options)
     }
 
-    /// Switches the runtime mode. A switch away from full access takes effect locally before the
-    /// CLI acknowledges it, so BiBCode stops answering approvals at once even if the write fails;
-    /// a switch to full access takes effect only once acknowledged.
+    /// Switches the runtime mode. Auto-answering stops before the write and comes back only when
+    /// the CLI acknowledges `auto`. A failed switch to full access keeps the previous mode.
     pub async fn set_runtime_mode(&self, mode: &str) -> Result<(), AntigravityRuntimeError> {
-        let interaction_mode = self.inner.modes.lock().await.1.clone();
-        let loosens = mode == "full-access";
-        if !loosens {
-            self.inner.modes.lock().await.0 = mode.to_owned();
-        }
-        self.apply_live_mode(mode, &interaction_mode).await?;
-        if loosens {
-            self.inner.modes.lock().await.0 = mode.to_owned();
-        }
-        Ok(())
-    }
-
-    pub async fn set_interaction_mode(&self, mode: &str) -> Result<(), AntigravityRuntimeError> {
-        let runtime_mode = {
-            let mut modes = self.inner.modes.lock().await;
-            modes.1 = mode.to_owned();
-            modes.0.clone()
+        let previous = {
+            let mut gate = self.inner.gate.lock().await;
+            gate.unconfirm();
+            std::mem::replace(&mut gate.runtime_mode, mode.to_owned())
         };
-        self.apply_live_mode(&runtime_mode, mode).await
+        let result = self.confirm_mode().await;
+        if result.is_err() && mode == "full-access" {
+            self.inner.gate.lock().await.runtime_mode = previous;
+        }
+        result
     }
 
-    /// [`Self::apply_mode`] on a running session, which keeps running when the write fails: the
-    /// CLI may still be in the old mode, so the next prompt writes the recorded mode first.
-    async fn apply_live_mode(
-        &self,
-        runtime_mode: &str,
-        interaction_mode: &str,
-    ) -> Result<(), AntigravityRuntimeError> {
-        let result = self.apply_mode(runtime_mode, interaction_mode).await;
-        self.inner
-            .mode_unconfirmed
-            .store(result.is_err(), Ordering::SeqCst);
+    /// Switches the interaction mode, with the same rules as [`Self::set_runtime_mode`].
+    pub async fn set_interaction_mode(&self, mode: &str) -> Result<(), AntigravityRuntimeError> {
+        let previous = {
+            let mut gate = self.inner.gate.lock().await;
+            gate.unconfirm();
+            std::mem::replace(&mut gate.interaction_mode, mode.to_owned())
+        };
+        let result = self.confirm_mode().await;
+        if result.is_err() && previous == "plan" {
+            self.inner.gate.lock().await.interaction_mode = previous;
+        }
         result
+    }
+
+    /// Writes the mode the thread needs and confirms it from the answer. Auto-answering turns on
+    /// only when the confirmed mode is `auto` and the thread still needs it. On failure the mode
+    /// stays unconfirmed, so the next prompt writes it first and is refused if that fails.
+    async fn confirm_mode(&self) -> Result<(), AntigravityRuntimeError> {
+        let target = self.inner.gate.lock().await.mode_target();
+        let result = self.apply_mode(target).await;
+        let mut gate = self.inner.gate.lock().await;
+        match result {
+            Ok(()) if gate.mode_target() == target => {
+                gate.mode_unconfirmed = false;
+                gate.auto_answer = target == "auto";
+                Ok(())
+            }
+            // The thread's modes changed during the write: the next write confirms them.
+            Ok(()) => {
+                gate.unconfirm();
+                Err(AntigravityRuntimeError::ModeUnavailable {
+                    mode: gate.mode_target().to_owned(),
+                })
+            }
+            Err(error) => {
+                gate.unconfirm();
+                Err(error)
+            }
+        }
     }
 
     /// Writes the advertised `mode` option and requires the answer to show it. No fallback to
     /// another mode or to `session/set_mode`: a missing or refused mode refuses (D-A5).
-    async fn apply_mode(
-        &self,
-        runtime_mode: &str,
-        interaction_mode: &str,
-    ) -> Result<(), AntigravityRuntimeError> {
-        let target = mode_for(runtime_mode, interaction_mode);
+    async fn apply_mode(&self, target: &'static str) -> Result<(), AntigravityRuntimeError> {
         let unavailable = || AntigravityRuntimeError::ModeUnavailable {
             mode: target.to_owned(),
         };
@@ -544,11 +718,7 @@ impl AntigravitySessionRuntime {
             }
             Err(error) => return Err(error),
         };
-        if option_by_category(&acknowledged, "mode")
-            .and_then(|descriptor| descriptor.get("currentValue"))
-            .and_then(Value::as_str)
-            != Some(target)
-        {
+        if current_mode(&acknowledged) != Some(target) {
             return Err(unavailable());
         }
         Ok(())
@@ -560,27 +730,38 @@ impl AntigravitySessionRuntime {
         attachments: Vec<Value>,
     ) -> Result<AntigravityPromptReceipt, AntigravityRuntimeError> {
         let session_id = self.provider_session_id().await?;
-        if self.inner.mode_unconfirmed.load(Ordering::SeqCst) {
-            let (runtime_mode, interaction_mode) = self.inner.modes.lock().await.clone();
-            self.apply_live_mode(&runtime_mode, &interaction_mode)
-                .await?;
+        if self.inner.gate.lock().await.mode_unconfirmed {
+            self.confirm_mode().await?;
         }
         let turn_id = format!("turn-{}", Uuid::new_v4());
-        *self.inner.active_turn_id.lock().await = Some(turn_id.clone());
-        *self.inner.ignored_turn_id.lock().await = None;
+        {
+            let mut gate = self.inner.gate.lock().await;
+            // A mode change between the confirmation and here sends no prompt.
+            if gate.mode_unconfirmed {
+                return Err(AntigravityRuntimeError::ModeUnavailable {
+                    mode: gate.mode_target().to_owned(),
+                });
+            }
+            gate.active_turn = Some(turn_id.clone());
+            gate.cancelled_turn = None;
+        }
         self.emit("turn.started", Some(turn_id.clone()), None, json!({}));
         let connection = self.inner.connection.clone();
         let prompt = crate::provider::attachments::prompt_parts(input, attachments);
-        let mut request = connection
+        let mut request = match connection
             .start_request(
                 "session/prompt",
                 json!({ "sessionId": session_id, "prompt": prompt }),
             )
-            .await?;
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => return Err(self.end_unsent_turn(&turn_id, error).await),
+        };
         let completion = match request.written().await {
             Ok(()) => self.track_prompt_response(turn_id.clone(), request.response()),
             Err(failure) if failure.is_definitely_not_sent() => {
-                return Err(failure.into_error().into());
+                return Err(self.end_unsent_turn(&turn_id, failure.into_error()).await);
             }
             Err(failure) => self.track_prompt_response(
                 turn_id.clone(),
@@ -591,6 +772,47 @@ impl AntigravitySessionRuntime {
             turn_id,
             completion,
         })
+    }
+
+    /// A prompt that never reached the CLI: its turn is no longer active and ends as failed.
+    async fn end_unsent_turn(
+        &self,
+        turn_id: &str,
+        error: AcpProtocolError,
+    ) -> AntigravityRuntimeError {
+        let error = classify(error);
+        self.finish_turn(turn_id).await;
+        self.emit(
+            "turn.completed",
+            Some(turn_id.to_owned()),
+            None,
+            json!({
+                "state": "failed",
+                "stopReason": "error",
+                "errorMessage": error.to_string(),
+                "errorClass": error.class(),
+            }),
+        );
+        error
+    }
+
+    /// Clears the turn if it is still the active one and closes the approvals it left open.
+    async fn finish_turn(&self, turn_id: &str) {
+        let pending = {
+            let mut gate = self.inner.gate.lock().await;
+            if gate.active_turn.as_deref() == Some(turn_id) {
+                gate.active_turn = None;
+            }
+            gate.take_pending(turn_id)
+        };
+        for (request_id, pending) in pending {
+            self.emit(
+                "request.resolved",
+                Some(pending.turn_id),
+                Some(request_id),
+                json!({ "requestType": pending.request_type, "decision": "cancel" }),
+            );
+        }
     }
 
     fn track_prompt_response<F>(
@@ -607,12 +829,7 @@ impl AntigravitySessionRuntime {
             let result = response.await;
             // Chunks the agent wrote before its answer may still wait in the incoming queue.
             let _ = runtime.inner.connection.barrier().await;
-            {
-                let mut active = runtime.inner.active_turn_id.lock().await;
-                if active.as_deref() == Some(turn_id.as_str()) {
-                    *active = None;
-                }
-            }
+            runtime.finish_turn(&turn_id).await;
             // An abandoned turn already completed as cancelled.
             let abandoned = runtime.inner.abandoned_turns.lock().await.remove(&turn_id);
             let outcome = match result {
@@ -659,38 +876,35 @@ impl AntigravitySessionRuntime {
     /// completes the turn as cancelled and signals [`Self::abandoned`] so the driver stops the
     /// process (D-A10).
     pub async fn interrupt_turn(&self) -> Result<(), AntigravityRuntimeError> {
-        let Some(turn_id) = self.inner.active_turn_id.lock().await.clone() else {
-            return Ok(());
+        let (turn_id, session_id) = {
+            let mut gate = self.inner.gate.lock().await;
+            let Some(turn_id) = gate.active_turn.clone() else {
+                return Ok(());
+            };
+            // From here no request of this turn is answered with anything but `cancelled`.
+            gate.cancelled_turn = Some(turn_id.clone());
+            for (request_id, pending) in gate.take_pending(&turn_id) {
+                let _ = self
+                    .inner
+                    .connection
+                    .respond(
+                        pending.wire_id,
+                        json!({ "outcome": { "outcome": "cancelled" } }),
+                    )
+                    .await;
+                self.emit(
+                    "request.resolved",
+                    Some(pending.turn_id),
+                    Some(request_id),
+                    json!({ "requestType": pending.request_type, "decision": "cancel" }),
+                );
+            }
+            let session_id = gate
+                .session_id
+                .clone()
+                .ok_or(AntigravityRuntimeError::MissingProviderSessionId)?;
+            (turn_id, session_id)
         };
-        *self.inner.ignored_turn_id.lock().await = Some(turn_id.clone());
-        let pending = {
-            let mut requests = self.inner.pending_requests.lock().await;
-            let ids = requests
-                .iter()
-                .filter(|(_, pending)| pending.turn_id.as_deref() == Some(turn_id.as_str()))
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| requests.remove(&id).map(|pending| (id, pending)))
-                .collect::<Vec<_>>()
-        };
-        for (request_id, pending) in pending {
-            let _ = self
-                .inner
-                .connection
-                .respond(
-                    pending.wire_id,
-                    json!({ "outcome": { "outcome": "cancelled" } }),
-                )
-                .await;
-            self.emit(
-                "request.resolved",
-                pending.turn_id,
-                Some(request_id),
-                json!({ "requestType": "exec_command_approval", "decision": "cancel" }),
-            );
-        }
-        let session_id = self.provider_session_id().await?;
         self.inner
             .connection
             .notify("session/cancel", json!({ "sessionId": session_id }))
@@ -701,11 +915,11 @@ impl AntigravitySessionRuntime {
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
             {
-                let mut active = runtime.inner.active_turn_id.lock().await;
-                if active.as_deref() != Some(turn_id.as_str()) {
+                let mut gate = runtime.inner.gate.lock().await;
+                if gate.active_turn.as_deref() != Some(turn_id.as_str()) {
                     return;
                 }
-                *active = None;
+                gate.active_turn = None;
                 runtime
                     .inner
                     .abandoned_turns
@@ -738,15 +952,12 @@ impl AntigravitySessionRuntime {
         request_id: &str,
         decision: &str,
     ) -> Result<(), AntigravityRuntimeError> {
-        let pending = self
-            .inner
-            .pending_requests
-            .lock()
-            .await
-            .remove(request_id)
-            .ok_or_else(|| AntigravityRuntimeError::PendingRequestNotFound {
+        let mut gate = self.inner.gate.lock().await;
+        let pending = gate.pending.remove(request_id).ok_or_else(|| {
+            AntigravityRuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
-            })?;
+            }
+        })?;
         let selected = match decision {
             "acceptForSession" => pending.allow_always.or(pending.allow_once),
             "accept" => pending.allow_once,
@@ -762,11 +973,12 @@ impl AntigravitySessionRuntime {
             .respond(pending.wire_id, json!({ "outcome": outcome }))
             .await
             .map_err(classify)?;
+        drop(gate);
         self.emit(
             "request.resolved",
-            pending.turn_id,
+            Some(pending.turn_id),
             Some(request_id.to_owned()),
-            json!({ "requestType": "exec_command_approval", "decision": decision }),
+            json!({ "requestType": pending.request_type, "decision": decision }),
         );
         Ok(())
     }
@@ -778,32 +990,30 @@ impl AntigravitySessionRuntime {
     #[cfg(test)]
     async fn pending_request_ids(&self) -> Vec<String> {
         self.inner
-            .pending_requests
+            .gate
             .lock()
             .await
+            .pending
             .keys()
             .cloned()
             .collect()
     }
 
-    async fn handle_incoming(&self, scope: RequestScope, event: IncomingEvent) {
+    async fn handle_incoming(&self, event: IncomingEvent) {
         match event {
             IncomingEvent::Notification { method, params } => {
                 self.handle_notification(&method, params).await;
             }
             IncomingEvent::Request {
-                correlation_id,
                 wire_id,
                 method,
                 params,
+                ..
             } => {
-                if let Err(error) = self
-                    .handle_request(scope, correlation_id, wire_id, &method, params)
-                    .await
-                {
+                if let Err(error) = self.handle_request(wire_id, &method, params).await {
                     tracing::warn!(
                         provider = PROVIDER,
-                        method = %method,
+                        method = request_label(&method),
                         class = error.class(),
                         "failed to answer an ACP request"
                     );
@@ -828,10 +1038,21 @@ impl AntigravitySessionRuntime {
 
     async fn handle_notification(&self, method: &str, params: Value) {
         if method != "session/update" {
-            tracing::debug!(provider = PROVIDER, method = %method, "dropped an unhandled ACP notification");
+            // The method name comes from the CLI, so it stays out of the log.
+            tracing::debug!(provider = PROVIDER, "dropped an unhandled ACP notification");
             return;
         }
-        let session_id = self.inner.provider_session_id.lock().await.clone();
+        let (session_id, turn_id) = {
+            let gate = self.inner.gate.lock().await;
+            let turn_id = gate
+                .active_turn
+                .clone()
+                .filter(|turn| gate.cancelled_turn.as_ref() != Some(turn));
+            (
+                gate.session_id.clone(),
+                (turn_id, gate.active_turn.is_some()),
+            )
+        };
         if session_id.is_none()
             || params.get("sessionId").and_then(Value::as_str) != session_id.as_deref()
         {
@@ -846,8 +1067,9 @@ impl AntigravitySessionRuntime {
             }
             return;
         }
-        let turn_id = self.inner.active_turn_id.lock().await.clone();
-        if turn_id.is_some() && *self.inner.ignored_turn_id.lock().await == turn_id {
+        // Updates of a cancelled turn are dropped; between turns they carry no turn.
+        let (turn_id, has_active_turn) = turn_id;
+        if has_active_turn && turn_id.is_none() {
             return;
         }
         match kind {
@@ -931,10 +1153,9 @@ impl AntigravitySessionRuntime {
                     json!({ "entries": entries }),
                 );
             }
-            other => {
+            _ => {
                 tracing::debug!(
                     provider = PROVIDER,
-                    session_update = other.unwrap_or("<absent>"),
                     "dropped an unhandled ACP session update"
                 );
             }
@@ -943,8 +1164,6 @@ impl AntigravitySessionRuntime {
 
     async fn handle_request(
         &self,
-        scope: RequestScope,
-        correlation_id: String,
         wire_id: Value,
         method: &str,
         params: Value,
@@ -952,7 +1171,7 @@ impl AntigravitySessionRuntime {
         let connection = &self.inner.connection;
         if method != "session/request_permission" {
             // No elicitation or other client method is offered (D-A7).
-            tracing::debug!(provider = PROVIDER, method = %method, "answered an unknown ACP request");
+            tracing::debug!(provider = PROVIDER, "answered an unknown ACP request");
             connection
                 .respond_error(
                     wire_id,
@@ -965,11 +1184,33 @@ impl AntigravitySessionRuntime {
                 .await?;
             return Ok(());
         }
-        let turn_id = self.inner.active_turn_id.lock().await.clone();
-        if turn_id.is_some() && *self.inner.ignored_turn_id.lock().await == turn_id {
+        // The decision and its reply happen under the gate, so a cancel or a mode change is
+        // either fully before or fully after them.
+        let mut gate = self.inner.gate.lock().await;
+        let open_session = gate.session_id.is_some()
+            && params.get("sessionId").and_then(Value::as_str) == gate.session_id.as_deref();
+        let turn_id = gate
+            .active_turn
+            .clone()
+            .filter(|turn| gate.cancelled_turn.as_ref() != Some(turn));
+        let Some(turn_id) = turn_id.filter(|_| open_session) else {
+            // Not this session's running turn: during the open, between turns, after a cancel,
+            // or another session. Refused, never approved and never shown.
             connection
                 .respond(wire_id, json!({ "outcome": { "outcome": "cancelled" } }))
                 .await?;
+            return Ok(());
+        };
+        if gate
+            .pending
+            .values()
+            .any(|pending| pending.wire_id == wire_id)
+        {
+            // Any reply would be read as the answer to the outstanding request with this id.
+            tracing::warn!(
+                provider = PROVIDER,
+                "ignored a permission request reusing an outstanding id"
+            );
             return Ok(());
         }
         let options = params
@@ -979,9 +1220,12 @@ impl AntigravitySessionRuntime {
             .unwrap_or_default();
         let allow_once = find_option_id(&options, "allow_once");
         // Full access answers each request with `allow_once`, never `allow_always`, so a later
-        // switch to approval-required applies to the next request. Nothing else is answered here.
-        let full_access = self.inner.modes.lock().await.0 == "full-access";
-        if full_access && let Some(option_id) = allow_once.clone() {
+        // switch to approval-required applies to the next request. Only an acknowledged `auto`
+        // for full access outside plan answers here; everything else goes to the user.
+        let answers_itself = gate.auto_answer
+            && gate.runtime_mode == "full-access"
+            && gate.interaction_mode != "plan";
+        if answers_itself && let Some(option_id) = allow_once.clone() {
             connection
                 .respond(
                     wire_id,
@@ -990,7 +1234,7 @@ impl AntigravitySessionRuntime {
                 .await?;
             return Ok(());
         }
-        let request_id = scope.approval_id(&correlation_id);
+        let request_id = format!("approval:{}", Uuid::new_v4());
         let tool_call = params.get("toolCall");
         let request_type = match item_type(
             tool_call
@@ -1005,19 +1249,21 @@ impl AntigravitySessionRuntime {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        self.inner.pending_requests.lock().await.insert(
+        gate.pending.insert(
             request_id.clone(),
             PendingRequest {
                 wire_id,
                 turn_id: turn_id.clone(),
+                request_type,
                 allow_once,
                 allow_always: find_option_id(&options, "allow_always"),
                 reject_once: find_option_id(&options, "reject_once"),
             },
         );
+        // Emitted under the gate, so a cancel cannot resolve the request before it opens.
         self.emit(
             "request.opened",
-            turn_id,
+            Some(turn_id),
             Some(request_id),
             json!({ "requestType": request_type, "detail": detail }),
         );
@@ -1034,9 +1280,10 @@ impl AntigravitySessionRuntime {
 
     async fn provider_session_id(&self) -> Result<String, AntigravityRuntimeError> {
         self.inner
-            .provider_session_id
+            .gate
             .lock()
             .await
+            .session_id
             .clone()
             .ok_or(AntigravityRuntimeError::MissingProviderSessionId)
     }
@@ -1110,6 +1357,22 @@ fn option_by_category<'a>(options: &'a [Value], category: &str) -> Option<&'a Va
     options
         .iter()
         .find(|option| option.get("category").and_then(Value::as_str) == Some(category))
+}
+
+/// The session's effective mode, as a config answer lists it.
+fn current_mode(options: &[Value]) -> Option<&str> {
+    option_by_category(options, "mode")
+        .and_then(|descriptor| descriptor.get("currentValue"))
+        .and_then(Value::as_str)
+}
+
+/// A fixed name for a request method from the CLI, safe to log.
+fn request_label(method: &str) -> &'static str {
+    if method == "session/request_permission" {
+        "session/request_permission"
+    } else {
+        "unknown"
+    }
 }
 
 fn option_id(descriptor: &Value) -> &str {

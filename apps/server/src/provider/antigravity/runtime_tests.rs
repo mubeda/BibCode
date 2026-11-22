@@ -67,16 +67,21 @@ impl Peer {
     }
 
     async fn permission(&mut self, options: Value) {
+        self.permission_as(json!("1"), SESSION, "edit", options)
+            .await;
+    }
+
+    async fn permission_as(&mut self, id: Value, session: &str, kind: &str, options: Value) {
         self.send(json!({
             "jsonrpc": "2.0",
-            "id": "1",
+            "id": id,
             "method": "session/request_permission",
             "params": {
-                "sessionId": SESSION,
+                "sessionId": session,
                 "toolCall": {
                     "toolCallId": "call-1",
                     "status": "pending",
-                    "kind": "edit",
+                    "kind": kind,
                     "title": "File notes.txt",
                     "_meta": { "marker": MARKER },
                 },
@@ -110,6 +115,8 @@ fn options(runtime_mode: &str) -> AntigravitySessionOptions {
         resume_session_id: None,
         cancel_grace: Duration::from_secs(5),
         start_timeout: Duration::from_secs(3),
+        control_timeout: Duration::from_secs(3),
+        initial_options: Vec::new(),
     }
 }
 
@@ -404,7 +411,37 @@ async fn the_cli_version_from_initialize_gates_the_chat_at_1_5_4() {
     );
     assert!(peer.silent().await);
 
-    for version in ["1.5.4", "1.6.0-preview", "unknown"] {
+    // A version that cannot be established is refused too, naming the minimum.
+    for version in [Some("unknown"), None] {
+        let (runtime, mut peer) = connect(options("full-access"));
+        let start = spawn_start(&runtime);
+        let initialize = peer.expect("initialize").await;
+        let mut result = initialize_result("1.5.13", 1, all_capabilities());
+        match version {
+            Some(version) => result["agentInfo"]["version"] = json!(version),
+            None => {
+                result["agentInfo"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("version");
+            }
+        }
+        peer.reply(&initialize, result).await;
+        let error = finish(start)
+            .await
+            .expect_err("an unverified version is refused");
+        assert!(
+            matches!(
+                error,
+                AntigravityRuntimeError::UnsupportedVersion { version: None }
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("1.5.4"), "{error}");
+        assert!(peer.silent().await, "{version:?} opens no session");
+    }
+
+    for version in ["1.5.4", "1.6.0-preview"] {
         let (runtime, mut peer) = connect(options("full-access"));
         let _start = spawn_start(&runtime);
         let initialize = peer.expect("initialize").await;
@@ -833,6 +870,10 @@ async fn a_scripted_turn_projects_text_tool_activity_and_one_approval() {
         json!({ "usage": { "usedTokens": 1, "maxTokens": 2 } }),
         "usage_update feeds the context window meter"
     );
+    assert_eq!(
+        events[4].1["requestType"], "file_change_approval",
+        "the resolved event names the kind the opened one did"
+    );
     assert_eq!(events[1].1["itemType"], "file_change");
     assert_eq!(events[1].1["itemId"], "call-1");
     assert_eq!(events[1].1["detail"], "File notes.txt");
@@ -1096,4 +1137,440 @@ fn versions_parse_from_the_first_three_part_number() {
     assert_eq!(parse_version("v1.5.4-beta"), Some((1, 5, 4)));
     assert_eq!(parse_version("1.5"), None);
     assert_eq!(parse_version(""), None);
+}
+
+async fn expect_refused_permission(peer: &mut Peer, id: Value) {
+    let answer = peer.next().await;
+    assert_eq!(answer["id"], id, "{answer}");
+    assert_eq!(
+        answer["result"],
+        json!({ "outcome": { "outcome": "cancelled" } }),
+        "BiBCode refuses instead of approving: {answer}"
+    );
+}
+
+async fn spawn_send(
+    runtime: &AntigravitySessionRuntime,
+) -> JoinHandle<Result<AntigravityPromptReceipt, AntigravityRuntimeError>> {
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        runtime
+            .send_turn_with_receipt(Some("hello"), Vec::new())
+            .await
+    })
+}
+
+#[tokio::test]
+async fn full_access_answers_only_inside_an_active_turn_of_the_open_session() {
+    // During the open, before the session is accepted.
+    let mut resuming = options("full-access");
+    resuming.resume_session_id = Some(SESSION.to_owned());
+    let (runtime, mut peer) = connect(resuming);
+    let start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    peer.reply(
+        &initialize,
+        initialize_result("1.5.13", 1, all_capabilities()),
+    )
+    .await;
+    let resume = peer.expect("session/resume").await;
+    peer.permission(allow_or_deny()).await;
+    expect_refused_permission(&mut peer, json!("1")).await;
+    peer.reply(
+        &resume,
+        session_result(SESSION, standard_options("default")),
+    )
+    .await;
+    answer_mode(&mut peer, "auto").await;
+    finish(start).await.expect("start");
+
+    // Between turns.
+    peer.permission(allow_or_deny()).await;
+    expect_refused_permission(&mut peer, json!("1")).await;
+
+    // For another session, during a turn.
+    let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+    peer.permission_as(json!("2"), "other-session", "edit", allow_or_deny())
+        .await;
+    expect_refused_permission(&mut peer, json!("2")).await;
+
+    // After the turn ended.
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    events_until(&runtime, "turn.completed").await;
+    peer.permission(allow_or_deny()).await;
+    expect_refused_permission(&mut peer, json!("1")).await;
+}
+
+#[tokio::test]
+async fn full_access_refuses_after_a_cancel_even_once_the_turn_was_abandoned() {
+    let mut options = options("full-access");
+    options.cancel_grace = Duration::from_millis(50);
+    let (runtime, mut peer) = started_with(options, "auto").await;
+    let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
+    runtime.interrupt_turn().await.expect("cancel sent");
+    peer.expect("session/cancel").await;
+    peer.permission(allow_or_deny()).await;
+    expect_refused_permission(&mut peer, json!("1")).await;
+    timeout(Duration::from_secs(2), runtime.abandoned())
+        .await
+        .expect("abandoned");
+    peer.permission(allow_or_deny()).await;
+    expect_refused_permission(&mut peer, json!("1")).await;
+}
+
+#[tokio::test]
+async fn plan_mode_or_a_missing_allow_once_leaves_full_access_requests_to_the_user() {
+    let mut planning = options("full-access");
+    planning.interaction_mode = "plan".to_owned();
+    let (runtime, mut peer) = started_with(planning, "plan").await;
+    let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
+    peer.permission(allow_or_deny()).await;
+    opened_request_id(&runtime).await;
+    assert!(peer.silent().await, "plan never answers by itself");
+
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
+    peer.permission(json!([
+        { "optionId": "always", "kind": "allow_always" },
+        { "optionId": "deny", "kind": "reject_once" },
+    ]))
+    .await;
+    opened_request_id(&runtime).await;
+    assert!(peer.silent().await, "no allow_once, no automatic answer");
+}
+
+#[tokio::test]
+async fn a_switch_out_of_plan_answers_by_itself_only_once_acknowledged() {
+    let mut planning = options("full-access");
+    planning.interaction_mode = "plan".to_owned();
+    let (runtime, mut peer) = started_with(planning, "plan").await;
+    let switch = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_interaction_mode("default").await }
+    });
+    let mode = peer.expect("session/set_config_option").await;
+    assert_eq!(mode["params"]["value"], "auto");
+    peer.fail(&mode, -32603, "Internal error").await;
+    assert!(switch.await.unwrap().is_err());
+    // A failed loosening keeps `plan`: the prompt rewrites it, and the request goes to the user.
+    let send = spawn_send(&runtime).await;
+    let retry = peer.expect("session/set_config_option").await;
+    assert_eq!(retry["params"]["value"], "plan");
+    peer.reply(&retry, json!({ "configOptions": standard_options("plan") }))
+        .await;
+    let _receipt = send.await.unwrap().expect("sent in plan");
+    peer.expect("session/prompt").await;
+    peer.permission(allow_or_deny()).await;
+    opened_request_id(&runtime).await;
+    assert!(peer.silent().await, "never answered by itself");
+}
+
+#[tokio::test]
+async fn every_approval_gets_a_fresh_id_and_ends_with_its_turn() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+    peer.permission(allow_or_deny()).await;
+    let first = opened_request_id(&runtime).await;
+    // The CLI ends the turn without waiting for the answer: the approval closes with it.
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    let events = events_until(&runtime, "turn.completed").await;
+    assert!(
+        events
+            .iter()
+            .any(|(kind, payload)| kind == "request.resolved"
+                && payload["requestType"] == "file_change_approval"),
+        "{events:?}"
+    );
+    assert!(runtime.pending_request_ids().await.is_empty());
+
+    // The next turn reuses wire id "1" for another tool: the old card cannot answer it.
+    let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
+    peer.permission_as(json!("1"), SESSION, "execute", allow_or_deny())
+        .await;
+    let second = opened_request_id(&runtime).await;
+    assert_ne!(first, second);
+    let stale = runtime
+        .respond_to_request(&first, "accept")
+        .await
+        .expect_err("a closed approval answers nothing");
+    assert!(
+        matches!(
+            stale,
+            AntigravityRuntimeError::PendingRequestNotFound { .. }
+        ),
+        "{stale:?}"
+    );
+    assert!(peer.silent().await);
+}
+
+#[tokio::test]
+async fn numeric_and_string_ids_stay_apart_and_a_duplicate_is_not_recorded() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
+    peer.permission_as(json!(1), SESSION, "execute", allow_or_deny())
+        .await;
+    let numeric = opened_request_id(&runtime).await;
+    peer.permission_as(json!("1"), SESSION, "edit", allow_or_deny())
+        .await;
+    let string = opened_request_id(&runtime).await;
+    assert_ne!(numeric, string);
+    // A second outstanding request with the same typed id is neither recorded nor answered.
+    peer.permission_as(json!(1), SESSION, "delete", allow_or_deny())
+        .await;
+    assert!(peer.silent().await);
+    assert_eq!(runtime.pending_request_ids().await.len(), 2);
+
+    runtime
+        .respond_to_request(&string, "decline")
+        .await
+        .unwrap();
+    let answer = peer.next().await;
+    assert_eq!(answer["id"], json!("1"));
+    assert_eq!(answer["result"]["outcome"]["optionId"], "deny");
+    runtime
+        .respond_to_request(&numeric, "accept")
+        .await
+        .unwrap();
+    let answer = peer.next().await;
+    assert_eq!(answer["id"], json!(1));
+    assert_eq!(answer["result"]["outcome"]["optionId"], "allow");
+}
+
+#[tokio::test]
+async fn a_config_answer_showing_another_mode_blocks_the_next_prompt_until_reconfirmed() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let set = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .set_options(vec![json!({ "id": "reasoning", "value": "low" })])
+                .await
+        }
+    });
+    let level = peer.expect("session/set_config_option").await;
+    assert_eq!(level["params"]["configId"], "thought_level");
+    peer.reply(&level, json!({ "configOptions": standard_options("auto") }))
+        .await;
+    set.await.unwrap().expect("level written");
+
+    let send = spawn_send(&runtime).await;
+    let mode = peer.expect("session/set_config_option").await;
+    assert_eq!(
+        mode["params"]["value"], "default",
+        "the mode is written first"
+    );
+    peer.reply(
+        &mode,
+        json!({ "configOptions": standard_options("default") }),
+    )
+    .await;
+    send.await.unwrap().expect("sent once reconfirmed");
+    peer.expect("session/prompt").await;
+}
+
+#[tokio::test]
+async fn a_failed_start_leaves_nothing_a_prompt_could_use() {
+    let (runtime, mut peer) = connect(options("approval-required"));
+    let start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    peer.reply(
+        &initialize,
+        initialize_result("1.5.13", 1, all_capabilities()),
+    )
+    .await;
+    let new = peer.expect("session/new").await;
+    peer.reply(&new, session_result(SESSION, standard_options("auto")))
+        .await;
+    let mode = peer.expect("session/set_config_option").await;
+    peer.fail(&mode, -32602, "Unknown mode: default").await;
+    finish(start).await.expect_err("refused");
+    let refused = timeout(
+        Duration::from_secs(2),
+        runtime.send_turn_with_receipt(Some("hello"), Vec::new()),
+    )
+    .await
+    .expect("refused in time");
+    assert!(refused.is_err());
+    assert!(peer.silent().await, "no prompt after a failed start");
+}
+
+#[tokio::test]
+async fn a_reopen_answer_naming_another_session_is_a_failure() {
+    for capabilities in [all_capabilities(), json!({ "loadSession": true })] {
+        let mut resuming = options("full-access");
+        resuming.resume_session_id = Some(SAVED.to_owned());
+        let (runtime, mut peer) = connect(resuming);
+        let start = spawn_start(&runtime);
+        let initialize = peer.expect("initialize").await;
+        peer.reply(&initialize, initialize_result("1.5.13", 1, capabilities))
+            .await;
+        let open = peer.next().await;
+        peer.reply(
+            &open,
+            session_result("another-session", standard_options("default")),
+        )
+        .await;
+        let error = finish(start).await.expect_err("a mismatched id");
+        assert!(
+            matches!(error, AntigravityRuntimeError::SessionMismatch),
+            "{error:?}"
+        );
+        assert!(peer.silent().await, "no new session and no mode write");
+    }
+}
+
+#[tokio::test]
+async fn a_silent_control_request_ends_in_time_and_unconfirms_the_mode() {
+    let mut options = options("approval-required");
+    options.control_timeout = Duration::from_millis(100);
+    let (runtime, mut peer) = started_with(options, "default").await;
+    let set = timeout(
+        Duration::from_secs(2),
+        runtime.set_options(vec![json!({ "id": "reasoning", "value": "low" })]),
+    );
+    let (result, _) = tokio::join!(set, peer.expect("session/set_config_option"));
+    let error = result.expect("bounded").expect_err("no answer");
+    assert!(
+        matches!(error, AntigravityRuntimeError::ControlTimedOut),
+        "{error:?}"
+    );
+    // The CLI's configuration is unknown now: the next prompt writes the mode first.
+    let _send = spawn_send(&runtime).await;
+    let mode = peer.expect("session/set_config_option").await;
+    assert_eq!(mode["params"]["configId"], "mode");
+}
+
+#[tokio::test]
+async fn the_initial_thinking_level_is_written_inside_the_start_deadline() {
+    let level_low = || vec![json!({ "id": "reasoning", "value": "low" })];
+    let mut withheld = options("full-access");
+    withheld.start_timeout = Duration::from_millis(300);
+    withheld.initial_options = level_low();
+    let (runtime, mut peer) = connect(withheld);
+    let start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    peer.reply(
+        &initialize,
+        initialize_result("1.5.13", 1, all_capabilities()),
+    )
+    .await;
+    let new = peer.expect("session/new").await;
+    peer.reply(&new, session_result(SESSION, standard_options("default")))
+        .await;
+    let level = peer.expect("session/set_config_option").await;
+    assert_eq!(level["params"]["configId"], "thought_level");
+    // Withheld: the start deadline, not the supervisor, ends the wait.
+    let error = finish(start).await.expect_err("a silent level write");
+    assert!(
+        matches!(error, AntigravityRuntimeError::StartTimedOut),
+        "{error:?}"
+    );
+
+    // Acknowledged: the supervisor's later write of the same level writes nothing.
+    let mut acknowledged = options("full-access");
+    acknowledged.initial_options = level_low();
+    let (runtime, mut peer) = connect(acknowledged);
+    let start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    peer.reply(
+        &initialize,
+        initialize_result("1.5.13", 1, all_capabilities()),
+    )
+    .await;
+    let new = peer.expect("session/new").await;
+    peer.reply(&new, session_result(SESSION, standard_options("default")))
+        .await;
+    let level = peer.expect("session/set_config_option").await;
+    let low = config_options(
+        "test-model-a",
+        &["low", "medium", "high"],
+        "low",
+        "default",
+        ALL_MODES,
+    );
+    peer.reply(&level, json!({ "configOptions": low })).await;
+    let mode = peer.expect("session/set_config_option").await;
+    assert_eq!(mode["params"]["configId"], "mode");
+    let auto_at_low = config_options(
+        "test-model-a",
+        &["low", "medium", "high"],
+        "low",
+        "auto",
+        ALL_MODES,
+    );
+    peer.reply(&mode, json!({ "configOptions": auto_at_low }))
+        .await;
+    finish(start).await.expect("start");
+    timeout(Duration::from_secs(2), runtime.set_options(level_low()))
+        .await
+        .expect("in time")
+        .expect("already applied");
+    assert!(peer.silent().await);
+}
+
+#[tokio::test]
+async fn a_prompt_that_was_never_written_ends_its_turn() {
+    let (runtime, peer) = started("full-access", "auto").await;
+    let Peer {
+        requests,
+        output: _output,
+        stderr: _stderr,
+    } = peer;
+    // The CLI stopped reading but its stdout stays open: zero bytes of the prompt are written.
+    drop(requests);
+    let error = timeout(
+        Duration::from_secs(2),
+        runtime.send_turn_with_receipt(Some("hello"), Vec::new()),
+    )
+    .await
+    .expect("in time")
+    .expect_err("not written");
+    assert!(
+        matches!(error, AntigravityRuntimeError::Protocol(_)),
+        "{error:?}"
+    );
+    let events = events_until(&runtime, "turn.completed").await;
+    assert_eq!(events.last().unwrap().1["state"], "failed");
+    timeout(Duration::from_secs(1), runtime.interrupt_turn())
+        .await
+        .expect("in time")
+        .expect("nothing to cancel");
+    assert!(
+        timeout(Duration::from_millis(200), runtime.abandoned())
+            .await
+            .is_err(),
+        "no active turn is left to cancel or abandon"
+    );
+}
+
+#[tokio::test]
+async fn the_reader_task_lets_go_of_the_runtime_once_the_connection_closes() {
+    let (runtime, peer) = started("full-access", "auto").await;
+    drop(peer);
+    events_until(&runtime, "session.exited").await;
+    timeout(Duration::from_secs(2), async {
+        while Arc::strong_count(&runtime.inner) > 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("only the test holds the runtime");
+}
+
+#[tokio::test]
+#[ignore = "needs the typed outbound id match in provider/cursor/acp.rs (lane G2)"]
+async fn a_string_id_response_does_not_complete_a_numeric_request() {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+    let id = prompt["id"].as_u64().expect("numeric request id");
+    peer.send(
+        json!({ "jsonrpc": "2.0", "id": id.to_string(), "result": { "stopReason": "end_turn" } }),
+    )
+    .await;
+    peer.reply(&prompt, json!({ "stopReason": "refusal" }))
+        .await;
+    let events = events_until(&runtime, "turn.completed").await;
+    assert_eq!(events.last().unwrap().1["stopReason"], "refusal");
 }
