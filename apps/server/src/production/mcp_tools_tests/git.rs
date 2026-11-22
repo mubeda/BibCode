@@ -1112,7 +1112,7 @@ async fn a_remote_delete_that_stops_reporting_keeps_the_local_deletion_and_its_t
 /// either branch was deleted is unknown, and the answer says so instead of "nothing deleted".
 #[cfg(unix)]
 #[tokio::test]
-async fn a_failed_delete_whose_refs_cannot_be_read_is_an_unknown_outcome() {
+async fn a_failed_delete_branch_whose_refs_cannot_be_read_is_an_unknown_outcome() {
     let fixture = fixture().await;
     publish_feature(&fixture).await;
     let git_dir = fixture.repo.join(".git");

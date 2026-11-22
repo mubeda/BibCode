@@ -1253,9 +1253,12 @@ async fn network_step(
 )> {
     use GitManagerOperationRequest as Request;
     match request {
-        Request::Fetch { remote, .. } | Request::Pull { remote, .. } => {
-            Some((remote.clone(), SignInDirection::Fetch, request.clone(), None))
-        }
+        Request::Fetch { remote, .. } | Request::Pull { remote, .. } => Some((
+            remote.clone(),
+            SignInDirection::Fetch,
+            request.clone(),
+            None,
+        )),
         Request::Push { remote, .. }
         | Request::PublishBranch { remote, .. }
         | Request::ForcePush { remote, .. }
@@ -1381,7 +1384,11 @@ async fn execute_branch_or_sync_operation(
     )
     .await;
     let result = match (result, network, prompt) {
-        (Err(error), Some((remote, direction, whole, after_local)), CredentialPrompt::OfferSignIn) => {
+        (
+            Err(error),
+            Some((remote, direction, whole, after_local)),
+            CredentialPrompt::OfferSignIn,
+        ) => {
             let resume = match after_local {
                 Some(remote_only) if local_branch_deleted => remote_only,
                 _ => whole,
@@ -2392,16 +2399,19 @@ async fn local_ref_tip(
 /// left alone.
 fn fetch_mapping_is_identity(refspecs: &str, remote: &str) -> bool {
     let tracking = format!("refs/remotes/{remote}/");
-    refspecs.lines().filter(|spec| !spec.is_empty()).all(|spec| {
-        let spec = spec.strip_prefix('+').unwrap_or(spec);
-        if spec.starts_with('^') {
-            return false;
-        }
-        let (source, destination) = spec.split_once(':').unwrap_or((spec, ""));
-        source
-            .strip_prefix("refs/heads/")
-            .is_none_or(|branch| destination.strip_prefix(tracking.as_str()) == Some(branch))
-    })
+    refspecs
+        .lines()
+        .filter(|spec| !spec.is_empty())
+        .all(|spec| {
+            let spec = spec.strip_prefix('+').unwrap_or(spec);
+            if spec.starts_with('^') {
+                return false;
+            }
+            let (source, destination) = spec.split_once(':').unwrap_or((spec, ""));
+            source
+                .strip_prefix("refs/heads/")
+                .is_none_or(|branch| destination.strip_prefix(tracking.as_str()) == Some(branch))
+        })
 }
 
 /// R7 (#397, #404): the server decides every remote branch delete, and returns the commit it
@@ -2520,13 +2530,14 @@ async fn check_remote_branch_delete(
         );
     }
     let tracking = format!("refs/remotes/{remote}/{branch}");
-    if let Some(tracking_tip) = local_ref_tip(repository, cwd, &tracking, cancellation).await {
-        if tracking_tip != remote_tip {
-            return refuse(
-                "remote-branch-changed",
-                "This branch changed on the remote since the last fetch. Fetch, then delete it.",
-            );
-        }
+    if local_ref_tip(repository, cwd, &tracking, cancellation)
+        .await
+        .is_some_and(|tracking_tip| tracking_tip != remote_tip)
+    {
+        return refuse(
+            "remote-branch-changed",
+            "This branch changed on the remote since the last fetch. Fetch, then delete it.",
+        );
     }
     Ok(remote_tip.to_owned())
 }
@@ -6867,7 +6878,10 @@ mod tests {
     #[tokio::test]
     async fn every_delete_refuses_a_fetch_mapping_that_renames_branches() {
         for mapping in [
-            vec!["+refs/heads/feature:refs/heads/feature", "+refs/heads/*:refs/remotes/origin/*"],
+            vec![
+                "+refs/heads/feature:refs/heads/feature",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
             vec!["+refs/heads/*:refs/remotes/origin/*", "^refs/heads/secret"],
             vec!["+refs/heads/*:refs/remotes/cache/*"],
             vec!["refs/heads/feature"],
@@ -6878,9 +6892,15 @@ mod tests {
                 fixture.path(),
                 &["branch", "--track", "topic", "origin/feature"],
             );
-            git(fixture.path(), &["config", "--unset-all", "remote.origin.fetch"]);
+            git(
+                fixture.path(),
+                &["config", "--unset-all", "remote.origin.fetch"],
+            );
             for spec in &mapping {
-                git(fixture.path(), &["config", "--add", "remote.origin.fetch", spec]);
+                git(
+                    fixture.path(),
+                    &["config", "--add", "remote.origin.fetch", spec],
+                );
             }
             for request in [
                 remote_delete(fixture.path(), "feature"),
@@ -6894,7 +6914,8 @@ mod tests {
                     continue;
                 }
                 assert_eq!(
-                    failure.code, "remote-fetch-mapping-unsupported",
+                    failure.code,
+                    "remote-fetch-mapping-unsupported",
                     "{mapping:?} {}",
                     request.operation()
                 );
@@ -6903,7 +6924,11 @@ mod tests {
                     "This remote's fetch settings store branches under other names, so the branch cannot be checked. Delete it with git on the command line."
                 );
             }
-            assert_eq!(local_branches(fixture.path()), "feature\nmain\ntopic", "{mapping:?}");
+            assert_eq!(
+                local_branches(fixture.path()),
+                "feature\nmain\ntopic",
+                "{mapping:?}"
+            );
             assert_eq!(
                 remote_refs(remote.path()),
                 "refs/heads/feature\nrefs/heads/main",

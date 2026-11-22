@@ -35,12 +35,7 @@ impl RemoteRunner {
         Self::checked(urls, stderr, None, "")
     }
 
-    fn checked(
-        urls: &str,
-        stderr: &str,
-        ls_remote: Option<&str>,
-        tracking_tip: &str,
-    ) -> Arc<Self> {
+    fn checked(urls: &str, stderr: &str, ls_remote: Option<&str>, tracking_tip: &str) -> Arc<Self> {
         Arc::new(Self {
             urls: urls.to_owned(),
             stderr: stderr.to_owned(),
@@ -305,12 +300,7 @@ fn advertised(head: &str, topic_tip: &str) -> String {
 /// sign-in the push needs resumes the remote delete only, frozen to the approved destination.
 #[tokio::test]
 async fn a_delete_whose_push_needs_sign_in_resumes_the_remote_delete_only() {
-    let runner = RemoteRunner::checked(
-        DESTINATION,
-        GCM_STDERR,
-        Some(&advertised("main", TIP)),
-        "",
-    );
+    let runner = RemoteRunner::checked(DESTINATION, GCM_STDERR, Some(&advertised("main", TIP)), "");
     let request = request(json!({
         "_tag": "branch-delete", "name": "topic", "force": false, "deleteRemote": true
     }));

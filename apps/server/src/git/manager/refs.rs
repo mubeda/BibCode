@@ -897,7 +897,11 @@ mod tests {
         git(path, &["update-ref", "refs/remotes/old/main", "HEAD"]);
         git(
             path,
-            &["symbolic-ref", "refs/remotes/old/HEAD", "refs/remotes/old/main"],
+            &[
+                "symbolic-ref",
+                "refs/remotes/old/HEAD",
+                "refs/remotes/old/main",
+            ],
         );
 
         let snapshot = snapshot(&repository).await;
