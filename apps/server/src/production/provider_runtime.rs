@@ -8461,10 +8461,9 @@ async fn spawn_delivery(
         }
         .await
         .err();
+        // A refused mode is final; an unanswered write may be transient and is retried.
         let freeze_failure = if let Some(error) = mode_failure {
-            Some(ProviderDeliveryOutcome::DefinitelyNotSent {
-                detail: delivery_detail(&error, None),
-            })
+            Some(unsent_outcome(error))
         } else if let Some((row, provider_session_id)) = frozen_session {
             match repositories
                 .freeze_provider_turn_session(
@@ -16553,7 +16552,11 @@ fn antigravity_error(error: AntigravityRuntimeError) -> ProviderRuntimeError {
 /// A turn the runtime refused before writing it: refusals the user must act on, and a line too
 /// long, are final; anything else may be transient and is retried.
 fn antigravity_unsent_outcome(error: AntigravityRuntimeError) -> ProviderDeliveryOutcome {
-    let error = antigravity_error(error);
+    unsent_outcome(antigravity_error(error))
+}
+
+/// [`antigravity_unsent_outcome`] for an error already mapped, such as a refused mode write.
+fn unsent_outcome(error: ProviderRuntimeError) -> ProviderDeliveryOutcome {
     let detail = delivery_detail(&error, None);
     match error {
         ProviderRuntimeError::IncompatibleProvider { .. }
@@ -39956,8 +39959,9 @@ done
     }
 
     /// A turn asking for full access plus Plan in an approval-required Chat session: when the
-    /// CLI never answers the first `auto` write, the retry writes both modes again, so Plan is
-    /// acknowledged before the prompt; a refusal of either mode sends no prompt.
+    /// CLI never answers the first `auto` write (retryable), the retry writes both modes again,
+    /// so Plan is acknowledged before the prompt; a refusal of either mode is final and sends no
+    /// prompt.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_antigravity_retry_confirms_every_unconfirmed_mode_before_the_prompt() {
@@ -40064,8 +40068,13 @@ done
             )
             .await;
             let outcome = deliver(&supervisor).await;
+            // A refusal cannot succeed on retry: it is final, with the reason the user sees.
             assert!(
-                !matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+                matches!(
+                    &outcome,
+                    super::ProviderDeliveryOutcome::Rejected { detail }
+                        if detail.contains("did not switch to its")
+                ),
                 "{refused}: {outcome:?}"
             );
             assert!(
