@@ -1851,8 +1851,20 @@ impl NativeServerControl {
         if result.snapshot["installed"] == false || result.snapshot["status"] == "disabled" {
             result.session_reads = SessionReads::Lost;
         }
+        // A session that listed no model, read with other launch inputs than the last reads,
+        // must not carry those reads' models over.
+        if result.session_reads == SessionReads::Read
+            && !result.models_authoritative
+            && state.session_read_inputs.get(instance_id) != Some(&result.launch_inputs)
+        {
+            result.session_reads = SessionReads::Lost;
+        }
         match result.session_reads {
-            SessionReads::Read if result.snapshot["auth"]["status"] == "authenticated" => {
+            // Only a signed-in read that listed models starts a reuse window.
+            SessionReads::Read
+                if result.snapshot["auth"]["status"] == "authenticated"
+                    && result.models_authoritative =>
+            {
                 state.catalog_reads.insert(
                     instance_id.to_owned(),
                     (Instant::now(), result.catalog_inputs),
@@ -7675,6 +7687,36 @@ done
             "agy-signed-out-save",
             "1.5.13",
             r#""error":{"code":-32000,"message":"Authentication required"}"#,
+        );
+        control
+            .update_settings(json!({ "patch": { "providerInstances": {
+                "antigravity": { "driver": "antigravity", "enabled": true, "config": { "binaryPath": binary } }
+            } } }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        assert_eq!(antigravity_sessions(&requests), 1);
+        control
+            .update_settings(json!({ "patch": { "enableAssistantStreaming": true } }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+        assert_eq!(antigravity_sessions(&requests), 2);
+    }
+
+    /// A signed-in session that listed no model starts no reuse window either: the next save
+    /// reads the session again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_read_without_models_is_read_again_on_the_next_save() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-no-models-save");
+        let control = scheduler_control(&temp).await;
+        let (binary, requests) = provider_inventory::tests::antigravity_acp_fixture(
+            &sandbox,
+            "agy-no-models-save",
+            "1.5.13",
+            r#""result":{"sessionId":"session-1"}"#,
         );
         control
             .update_settings(json!({ "patch": { "providerInstances": {
