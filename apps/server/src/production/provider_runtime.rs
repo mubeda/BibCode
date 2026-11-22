@@ -13918,14 +13918,17 @@ pub(crate) fn session_holds_a_turn(session: &ProjectionThreadSession) -> bool {
 
 /// Whether every `turn.started` the driver emits is a turn the provider reported running. Codex
 /// emits it for each `turn/started` notification, and Claude for a turn it starts itself (its
-/// delivered turns begin on their replay). Antigravity announces each prompt as it writes it and
-/// ends every announced turn, an unsent one included, with `turn.completed`; ACP answers the
-/// prompt only when the turn ends, so its delivery is accepted too late to mark it running.
-/// Cursor, OpenCode, and Grok announce a turn before BiBCode sends it, so a send that then fails
+/// delivered turns begin on their replay). Antigravity and Cursor announce each prompt as they
+/// write it and end every announced turn, an unsent one included, with `turn.completed`; ACP
+/// answers the prompt only when the turn ends, so their delivery is accepted too late to mark it
+/// running. OpenCode and Grok announce a turn before BiBCode sends it, so a send that then fails
 /// would leave the thread reading running; such a driver marks a turn the provider started itself
 /// with `providerStarted: true` instead.
 fn provider_reports_its_turns(provider: &str) -> bool {
-    matches!(provider, "codex" | "claude" | "claudeAgent" | "antigravity")
+    matches!(
+        provider,
+        "codex" | "claude" | "claudeAgent" | "antigravity" | "cursor"
+    )
 }
 
 /// Whether BiBCode can see the session's work outside a turn, so its absence means idle. Claude
@@ -29565,6 +29568,20 @@ done
         )
         .await
         .expect("writer failure should resolve delivery");
+        // Every announced turn ends exactly once, an unsent one included, so the projection can
+        // mark Cursor turns running from their announcement.
+        let mut turn_events = Vec::new();
+        while let Ok(Some(event)) =
+            timeout(std::time::Duration::from_millis(300), driver.next_event()).await
+        {
+            if event.event_type.starts_with("turn.") {
+                turn_events.push((event.event_type, event.turn_id));
+            }
+        }
+        assert_eq!(turn_events.len(), 2, "{failure:?}: {turn_events:?}");
+        assert_eq!(turn_events[0].0, "turn.started", "{failure:?}");
+        assert_eq!(turn_events[1].0, "turn.completed", "{failure:?}");
+        assert_eq!(turn_events[0].1, turn_events[1].1, "{failure:?}");
         let pending_request_count = pending_connection.pending_request_count().await;
         let _ = release_peer.send(());
         timeout(std::time::Duration::from_secs(2), driver.shutdown())
@@ -29584,7 +29601,7 @@ done
         )
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum PromptWriteFailure {
         BeforeFirstByte,
         AfterPrefix,
@@ -33671,26 +33688,26 @@ done
         fixture.close().await;
     }
 
-    /// Cursor announces a turn before BiBCode sends it. If that send fails no `turn.completed`
+    /// OpenCode announces a turn before BiBCode sends it. If that send fails no `turn.completed`
     /// follows, so the announcement must not leave the thread reading running.
     #[tokio::test(start_paused = true)]
     async fn a_turn_announced_before_its_send_does_not_mark_the_thread_running() {
         let _clock = keep_idle_clock_paused();
         let fixture =
-            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "cursor").await;
+            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "opencode").await;
         fixture.emit("turn.started", "announced", "unused").await;
         fixture.stream("announced", "assistant-announced").await;
         fixture.assert_projection("ready", None).await;
         fixture.close().await;
     }
 
-    /// A stop after Cursor announced a turn and streamed part of its reply, but before the send
+    /// A stop after OpenCode announced a turn and streamed part of its reply, but before the send
     /// was accepted, leaves that turn failed at start-up, never completed.
     #[tokio::test(start_paused = true)]
     async fn startup_recovery_fails_a_turn_cut_off_before_its_send_was_accepted() {
         let _clock = keep_idle_clock_paused();
         let fixture =
-            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "cursor").await;
+            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "opencode").await;
         fixture.emit("turn.started", "announced", "unused").await;
         fixture.stream("announced", "assistant-announced").await;
         fixture.assert_projection("ready", None).await;
@@ -33716,7 +33733,7 @@ done
     async fn startup_recovery_fails_a_turn_cut_off_before_its_send_was_accepted_after_a_shutdown() {
         let _clock = keep_idle_clock_paused();
         let fixture =
-            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "cursor").await;
+            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "opencode").await;
         fixture.emit("turn.started", "announced", "unused").await;
         fixture.stream("announced", "assistant-announced").await;
         fixture.assert_projection("ready", None).await;
@@ -40056,6 +40073,89 @@ done
             !text.contains("a turn ended before this delivery was accepted"),
             "{text}"
         );
+    }
+
+    /// Cursor's delivery, too, is accepted only when ACP answers the prompt at the end of the
+    /// turn, so the thread must read running from the prompt on, until the answer ends it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cursor_turn_reads_running_until_its_prompt_is_answered() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let gate = temp.path().join("answer-gate");
+        let engine = supervisor_engine().await;
+        let supervisor = antigravity_supervisor(&engine, &temp).await;
+        let mut launch = native_launch(&temp, "cursor");
+        launch.thread_id = "t1".to_owned();
+        launch.runtime_mode = "full-access".to_owned();
+        launch.binary_path = executable_fixture(&temp, "cursor-agent", ACP_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        launch.environment.insert(
+            "BIBCODE_TEST_ACK_GATE".to_owned(),
+            gate.to_string_lossy().into_owned(),
+        );
+        timeout(Duration::from_secs(10), supervisor.launch(launch))
+            .await
+            .expect("launch in time")
+            .expect("started");
+        let turn = serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"hello", "threadId":"t1",
+            "message":{"messageId":"hello","role":"user","text":"hello","attachments":[]},
+            "modelSelection":{"instanceId":"cursor","model":"test-model"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:00Z",
+        }))
+        .unwrap();
+        let delivery = timeout(
+            Duration::from_secs(5),
+            supervisor.deliver_turn(turn, "hello-key".to_owned()),
+        )
+        .await
+        .expect("admitted in time")
+        .expect("admitted");
+        let repositories = engine.repositories();
+        let session = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(session) = repositories
+                    .get_thread_session("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .filter(|session| session.status == "running")
+                {
+                    return session;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the thread reads running while Cursor holds the prompt answer");
+        assert!(session.active_turn_id.is_some(), "{session:?}");
+
+        std::fs::write(&gate, b"").expect("open the answer gate");
+        let outcome = timeout(Duration::from_secs(10), delivery.completion())
+            .await
+            .expect("delivered in time");
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        timeout(Duration::from_secs(10), async {
+            while repositories
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .is_some_and(|session| session.status == "running")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the answer ended the turn");
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("shutdown in time")
+            .expect("shutdown");
+        engine.shutdown().await;
     }
 
     /// An unsent frozen turn whose saved conversation is gone: the reconciliation launch fails

@@ -600,7 +600,7 @@ impl CursorSessionRuntime {
     ) -> Result<CursorPromptReceipt, CursorRuntimeError> {
         let (session_id, turn_id, connection, prompt) =
             self.prepare_prompt(input, attachments).await?;
-        let mut request = connection
+        let mut request = match connection
             .start_request(
                 "session/prompt",
                 json!({
@@ -608,11 +608,15 @@ impl CursorSessionRuntime {
                     "prompt": prompt,
                 }),
             )
-            .await?;
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => return Err(self.end_unsent_turn(turn_id, error).await),
+        };
         let completion = match request.written().await {
             Ok(()) => self.track_prompt_response(connection, turn_id.clone(), request.response()),
             Err(failure) if failure.is_definitely_not_sent() => {
-                return Err(failure.into_error().into());
+                return Err(self.end_unsent_turn(turn_id, failure.into_error()).await);
             }
             Err(failure) => self.track_prompt_response(
                 connection,
@@ -624,6 +628,31 @@ impl CursorSessionRuntime {
             turn_id,
             completion,
         })
+    }
+
+    /// A prompt that never reached the CLI: its announced turn is no longer active and ends once,
+    /// as failed, so every `turn.started` has its `turn.completed`.
+    async fn end_unsent_turn(
+        &self,
+        turn_id: String,
+        error: AcpProtocolError,
+    ) -> CursorRuntimeError {
+        if self.inner.active_turn_id.lock().await.as_deref() == Some(turn_id.as_str()) {
+            *self.inner.active_turn_id.lock().await = None;
+        }
+        self.emit(
+            "turn.completed",
+            Some(turn_id),
+            None,
+            json!({
+                "state": "failed",
+                "stopReason": "error",
+                "errorMessage": error.to_string(),
+                "errorClass": acp_error_class(&error),
+            }),
+        )
+        .await;
+        error.into()
     }
 
     async fn prepare_prompt(
