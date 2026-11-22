@@ -204,6 +204,16 @@ vi.mock("../state/threads", () => ({
   },
 }));
 
+// Only the real ChatHeaderPanelMenu reads closed chats; the menu test needs none.
+vi.mock("../lib/archivedThreadsState", () => ({
+  useArchivedThreadSnapshots: () => ({
+    snapshots: [],
+    isLoading: false,
+    error: null,
+    refresh: () => undefined,
+  }),
+}));
+
 vi.mock("../state/terminal", () => ({
   terminalEnvironment: {
     open: { key: "terminal.open" },
@@ -886,6 +896,7 @@ import { newDraftId } from "../lib/utils";
 import type { ProviderInstanceEntry } from "../providerInstances";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+import { ChatHeaderPanelMenu } from "./chat/ChatHeaderPanelMenu";
 import { FileEditingSessionRegistry } from "./files/fileEditingSessionRegistry";
 import { toastManager } from "./ui/toast";
 import type {
@@ -6057,6 +6068,120 @@ describe("ChatView handlers (captured from mocked children)", () => {
         expect(capturedProps<Record<string, unknown>>("planSidebar")["label"]).toBe("Plan");
       } finally {
         await view.unmount();
+      }
+    });
+  });
+
+  describe("Antigravity from the AI Terminal menu (R12, R13)", () => {
+    const antigravityInstanceId = ProviderInstanceId.make("antigravity_work");
+    const antigravityProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: antigravityInstanceId,
+      driver: ProviderDriverKind.make("antigravity"),
+      displayName: "Antigravity",
+      models: [{ slug: "model-alpha", name: "Model Alpha", isCustom: false, capabilities: null }],
+    };
+
+    it("opens the selected instance's Antigravity Terminal in the thread checkout", async () => {
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: { providers: [codexProvider, antigravityProvider] },
+        } as never),
+      );
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({ branch: "feature", worktreePath: "X:/demo-worktrees/feature" }),
+      );
+      seedGitStatus(true);
+      h.settings = {
+        ...h.settings,
+        providerInstances: {
+          [antigravityInstanceId]: {
+            driver: ProviderDriverKind.make("antigravity"),
+            displayName: "Antigravity",
+            enabled: true,
+            config: { binaryPath: "custom-agy" },
+          },
+        },
+      };
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const menuContainer = document.createElement("div");
+      document.body.append(menuContainer);
+      const menuRoot = createRoot(menuContainer);
+      try {
+        await act(async () => {
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          );
+          await Promise.resolve();
+        });
+        // ChatHeaderActions is mocked here, so the real menu renders from the props ChatView gave it.
+        const header =
+          capturedProps<
+            Pick<
+              ComponentProps<typeof ChatHeaderPanelMenu>,
+              | "providerStatuses"
+              | "settings"
+              | "canCreatePanel"
+              | "onCreateChatPanel"
+              | "onCreateSideChat"
+              | "sideChatUnavailableReason"
+              | "onReopenChatPanel"
+              | "onOpenTerminalPanel"
+              | "onOpenProviderTerminalPanel"
+            >
+          >("chatHeaderActions");
+        await act(async () =>
+          menuRoot.render(
+            <ChatHeaderPanelMenu
+              {...header}
+              environmentId={environmentId}
+              hostThreadId={threadId}
+              onAddCustomAction={() => undefined}
+            />,
+          ),
+        );
+        const trigger = menuContainer.querySelector<HTMLButtonElement>(
+          'button[aria-label="New panel"]',
+        )!;
+        await act(async () => {
+          trigger.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+          trigger.click();
+        });
+        const items = await vi.waitFor(() => {
+          const found = Array.from(document.querySelectorAll<HTMLElement>("[role='menuitem']"));
+          expect(found.map((item) => item.textContent)).toEqual(
+            expect.arrayContaining(["Antigravity", "Antigravity Terminal"]),
+          );
+          return found;
+        });
+        await act(async () =>
+          items.find((item) => item.textContent === "Antigravity Terminal")!.click(),
+        );
+        await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
+        const opened = commandCallsFor("terminal.open")[0]!.input as {
+          input: { cwd: string; command: unknown };
+        };
+        expect(opened.input.cwd).toBe("X:/demo-worktrees/feature");
+        expect(opened.input.command).toEqual({
+          executable: "custom-agy",
+          args: ["--dangerously-skip-permissions"],
+          label: "Antigravity Terminal",
+          activity: {
+            driverKind: ProviderDriverKind.make("antigravity"),
+            providerInstanceId: antigravityInstanceId,
+          },
+        });
+        expect(JSON.stringify(opened)).not.toMatch(/observer/i);
+      } finally {
+        await act(async () => menuRoot.unmount());
+        await act(async () => root.unmount());
+        container.remove();
+        menuContainer.remove();
       }
     });
   });

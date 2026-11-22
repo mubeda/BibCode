@@ -85,6 +85,36 @@ describe("buildProviderAgentActions", () => {
     expect(actions.map(({ value }) => value)).toEqual(["chat:codex", "terminal:codex"]);
   });
 
+  it("lists Antigravity chat and Antigravity Terminal only once the instance is enabled (R11, R13)", () => {
+    const antigravity = provider({
+      instanceId: "antigravity",
+      driver: "antigravity",
+      displayName: "Antigravity",
+    });
+    const antigravityId = ProviderInstanceId.make("antigravity");
+
+    expect(
+      buildProviderAgentActions([readyCodex, antigravity], DEFAULT_SERVER_SETTINGS).map(
+        ({ value }) => value,
+      ),
+    ).toEqual(["chat:codex", "terminal:codex"]);
+
+    const actions = buildProviderAgentActions([readyCodex, antigravity], {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [antigravityId]: { driver: ProviderDriverKind.make("antigravity"), enabled: true },
+      },
+    });
+    expect(
+      actions
+        .filter((action) => action.entry.instanceId === antigravityId)
+        .map(({ value, label, disabled }) => ({ value, label, disabled })),
+    ).toEqual([
+      { value: "chat:antigravity", label: "Antigravity", disabled: false },
+      { value: "terminal:antigravity", label: "Antigravity Terminal", disabled: false },
+    ]);
+  });
+
   it("keeps visible but unready providers disabled", () => {
     const [chat, terminal] = buildProviderAgentActions([unreadyCodex], settings);
 

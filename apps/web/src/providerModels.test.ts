@@ -44,6 +44,22 @@ describe("getProviderModelCapabilities", () => {
 });
 
 describe("getProviderInteractionModeToggle", () => {
+  it("offers plan mode on an Antigravity chat (R13)", () => {
+    const antigravity = {
+      ...provider("antigravity"),
+      driver: ProviderDriverKind.make("antigravity"),
+    };
+
+    expect(
+      getProviderInteractionModeToggle(
+        [antigravity],
+        antigravity.driver,
+        antigravity.instanceId,
+        true,
+      ),
+    ).toEqual({ state: "supported" });
+  });
+
   it("does not borrow the default instance state for a missing explicit instance", () => {
     expect(
       getProviderInteractionModeToggle(

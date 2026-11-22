@@ -2539,6 +2539,7 @@ pub(crate) fn provider_display_name(provider_kind: &str) -> &str {
         "cursor" => "Cursor",
         "grok" => "Grok",
         "opencode" => "OpenCode",
+        "antigravity" => "Antigravity",
         other => other,
     }
 }
@@ -23013,7 +23014,14 @@ mod tests {
                 Some((kinds[constant], name))
             })
             .collect::<Vec<_>>();
-        for kind in ["claudeAgent", "codex", "cursor", "grok", "opencode"] {
+        for kind in [
+            "claudeAgent",
+            "codex",
+            "cursor",
+            "grok",
+            "opencode",
+            "antigravity",
+        ] {
             assert!(
                 names.iter().any(|(listed, _)| *listed == kind),
                 "contracts name {kind}"

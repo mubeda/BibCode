@@ -1,7 +1,8 @@
-import type {
-  ProviderDriverKind,
-  ProviderSessionDefault,
-  ServerProviderModel,
+import {
+  DEFAULT_MODEL_BY_PROVIDER,
+  type ProviderDriverKind,
+  type ProviderSessionDefault,
+  type ServerProviderModel,
 } from "@bibcode/contracts";
 import { useEffect, useId, useRef, useState } from "react";
 import {
@@ -61,10 +62,15 @@ export function ProviderSessionDefaultsControls({
   useEffect(() => {
     latestValueRef.current = value;
   }, [value]);
-  const modelLabel =
-    selectedServerModel?.name ??
-    modelLabelsByDriver.get(driver)?.get(selectedModel) ??
-    selectedModel;
+  // A driver with no built-in default model (Antigravity) starts on the CLI's own model until
+  // the user saves one; the shared fallback would otherwise name another vendor's model.
+  const cliPicksModel =
+    value === undefined && !modelSupported && DEFAULT_MODEL_BY_PROVIDER[driver] === undefined;
+  const modelLabel = cliPicksModel
+    ? "CLI default"
+    : (selectedServerModel?.name ??
+      modelLabelsByDriver.get(driver)?.get(selectedModel) ??
+      selectedModel);
 
   const change = (next: ProviderSessionDefaultChange) => {
     const latestValue = latestValueRef.current;
@@ -98,7 +104,7 @@ export function ProviderSessionDefaultsControls({
             <SelectValue>{modelLabel}</SelectValue>
           </SelectTrigger>
           <SelectPopup>
-            {!controls.modelAvailable ? (
+            {!controls.modelAvailable && !cliPicksModel ? (
               <SelectItem disabled value={controls.configuredModel}>
                 {controls.configuredModel}
               </SelectItem>
@@ -113,9 +119,14 @@ export function ProviderSessionDefaultsControls({
             ))}
           </SelectPopup>
         </Select>
-        {!controls.modelAvailable ? (
+        {!controls.modelAvailable && !cliPicksModel ? (
           <p className="text-muted-foreground text-xs">
-            Unavailable here; new sessions will use {controls.resolvedModel}.
+            {/* The Antigravity Terminal passes the saved model unchanged (spec R12). */}
+            {driver !== "antigravity"
+              ? `Unavailable here; new sessions will use ${controls.resolvedModel}.`
+              : modelSupported
+                ? `Not in the current model list. New chats use ${controls.resolvedModel}. The terminal still starts with ${controls.configuredModel}.`
+                : `The model list is not loaded. The terminal starts with ${controls.configuredModel}.`}
           </p>
         ) : null}
       </div>
