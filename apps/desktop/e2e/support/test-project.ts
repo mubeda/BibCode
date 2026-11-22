@@ -1574,8 +1574,8 @@ export function prepareDesktopUiTestContext(
       // Every shell start-up directory points into the fixture HOME, so no host profile runs.
       environment.ZDOTDIR = fixtureUserHomePath;
       environment.XDG_CONFIG_HOME = NodePath.join(fixtureUserHomePath, ".config");
-      delete environment.ENV;
-      delete environment.BASH_ENV;
+      Reflect.deleteProperty(environment, "ENV");
+      Reflect.deleteProperty(environment, "BASH_ENV");
       pinShimsInLoginShellPath(fixtureUserHomePath, shimDirectory);
     }
   }

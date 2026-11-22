@@ -541,6 +541,7 @@ function cellName({ view, direction, path, chord, redoAfter, edit }: Cell): stri
 async function measureCell(cell: Cell): Promise<void> {
   const name = `undo-${cellName(cell)}`;
   const fileName = await openFreshFile(cell.view, name);
+  const unseededText = (await readState(cell.view, fileName)).text;
   // A formatting step shows in the text as the heading's own block, so it is read from the HTML.
   const marker = cell.edit === "format" ? "<h2" : cell.view === "source" ? "kq" : "kqv";
   const holdsStep = async () =>
@@ -561,6 +562,7 @@ async function measureCell(cell: Cell): Promise<void> {
   });
   // Past both editors' history grouping delay, so the edit is one closed step.
   await new Promise((resolve) => setTimeout(resolve, 800));
+  const seededText = (await readState(cell.view, fileName)).text;
   // A native redo gets two pending redo entries, so a redo that runs twice shows: the second
   // step is typed away from the first, which keeps the two steps apart in both editors.
   const secondMarker = "wv";
@@ -625,7 +627,8 @@ async function measureCell(cell: Cell): Promise<void> {
     stepPresent === expectMarker &&
     !secondPresent &&
     after.canUndo === expectMarker &&
-    after.canRedo === expectRedo;
+    after.canRedo === expectRedo &&
+    after.text === (expectMarker ? seededText : unseededText);
   recordEvidence({
     cell: cellName(cell),
     ...cell,
@@ -640,9 +643,16 @@ async function measureCell(cell: Cell): Promise<void> {
   expect({
     text: stepPresent,
     second: secondPresent,
+    exactText: after.text === (expectMarker ? seededText : unseededText),
     canUndo: after.canUndo,
     canRedo: after.canRedo,
-  }).toEqual({ text: expectMarker, second: false, canUndo: expectMarker, canRedo: expectRedo });
+  }).toEqual({
+    text: expectMarker,
+    second: false,
+    exactText: true,
+    canUndo: expectMarker,
+    canRedo: expectRedo,
+  });
 }
 
 /**
@@ -658,6 +668,7 @@ async function measureTwoSteps(view: View, path: InputPath): Promise<void> {
   // is typed at the start of the text; a new line would add a step a double undo hides behind.
   await new Promise((resolve) => setTimeout(resolve, 1_200));
   await placeCaretAtEnd(view, fileName, true);
+  const firstStep = await readState(view, fileName);
   typeNative("wv");
   await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("wv"));
   await new Promise((resolve) => setTimeout(resolve, 1_200));
@@ -666,7 +677,7 @@ async function measureTwoSteps(view: View, path: InputPath): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 800));
   const after = await readState(view, fileName);
   const events = await readProbe();
-  const passed = after.text.includes("kq") && !after.text.includes("wv") && after.canUndo;
+  const passed = after.text === firstStep.text && after.canUndo && after.canRedo;
   recordEvidence({
     cell: `${view}-two-steps-undo-${path}`,
     passed,
@@ -675,11 +686,7 @@ async function measureTwoSteps(view: View, path: InputPath): Promise<void> {
     sent,
     events,
   });
-  expect({ first: after.text.includes("kq"), second: after.text.includes("wv") }).toEqual({
-    first: true,
-    second: false,
-  });
-  expect(after.canUndo).toBe(true);
+  expect(after).toEqual({ text: firstStep.text, canUndo: true, canRedo: true });
 }
 
 /**
@@ -917,7 +924,7 @@ async function recordTerminalChord(sent: Chord = "primary+z"): Promise<void> {
     // which must still run no undo of its own.
     expect({
       reached,
-      cancelled: chord.cancelled || sent !== "primary+z",
+      cancelled: chord.cancelled || sent === "primary+shift+z",
       exec: chord.exec,
     }).toEqual({
       reached: true,
@@ -997,7 +1004,7 @@ async function measureLinkField(path: InputPath): Promise<void> {
   await browser.keys("Escape");
   await field.waitForDisplayed({ reverse: true });
   const filesAfter = await readState("rendered", fileName);
-  const fieldUndone = !fieldValue.toLowerCase().includes("lnkq");
+  const fieldUndone = fieldValue === "";
   recordEvidence({
     cell: `link-url-undo-${path}`,
     passed: fieldUndone && JSON.stringify(filesAfter) === JSON.stringify(filesBefore),
