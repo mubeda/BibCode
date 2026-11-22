@@ -96,7 +96,9 @@ pub(crate) fn rewind_keeps_files(provider: &str, api_version: u32) -> bool {
 
 /// The selected model refuses `option`.
 pub(crate) fn unsupported_option_refusal(option: &str) -> String {
-    format!("{option} is not supported by the selected model.")
+    format!(
+        "{option} is not supported by the selected model. Choose another option for this model."
+    )
 }
 
 /// A turn option carries no id.

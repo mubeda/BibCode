@@ -117,7 +117,7 @@ fn cursor_config_updates_reject_stale_or_malformed_descriptors_before_rpc() {
     };
     assert_eq!(
         refusal(json!([]), json!([{ "id": "fastMode", "value": true }])).as_deref(),
-        Some("Fast is not supported by the selected model.")
+        Some("Fast is not supported by the selected model. Choose another option for this model.")
     );
     assert_eq!(
         refusal(
@@ -125,7 +125,7 @@ fn cursor_config_updates_reject_stale_or_malformed_descriptors_before_rpc() {
             json!([{ "id": "contextWindow", "value": "1m" }]),
         )
         .as_deref(),
-        Some("Context 1m is not supported by the selected model.")
+        Some("Context 1m is not supported by the selected model. Choose another option for this model.")
     );
     assert_eq!(
         refusal(
@@ -770,7 +770,7 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
     // The model does not advertise the option, so a retry of the same turn cannot succeed.
     assert_eq!(
         refused.option_refusal(),
-        Some("Fast is not supported by the selected model."),
+        Some("Fast is not supported by the selected model. Choose another option for this model."),
         "{refused}"
     );
     runtime
@@ -872,7 +872,9 @@ async fn cursor_sends_only_advertised_bracketed_model_values() {
             .unwrap()
         )
         .as_deref(),
-        Some("Reasoning low is not supported by the selected model.")
+        Some(
+            "Reasoning low is not supported by the selected model. Choose another option for this model."
+        )
     );
     timeout(within, runtime.set_model("claude-opus-5"))
         .await
@@ -900,7 +902,7 @@ async fn cursor_sends_only_advertised_bracketed_model_values() {
             .unwrap()
         )
         .as_deref(),
-        Some("Fast is not supported by the selected model.")
+        Some("Fast is not supported by the selected model. Choose another option for this model.")
     );
     assert_eq!(
         refusal(
@@ -912,7 +914,9 @@ async fn cursor_sends_only_advertised_bracketed_model_values() {
             .unwrap()
         )
         .as_deref(),
-        Some("Context 1m is not supported by the selected model.")
+        Some(
+            "Context 1m is not supported by the selected model. Choose another option for this model."
+        )
     );
     assert_eq!(
         refusal(timeout(within, runtime.set_model("gpt-9")).await.unwrap()).as_deref(),
@@ -961,6 +965,72 @@ async fn cursor_sends_only_advertised_plain_model_values() {
         Some("gpt-9 is not available in Cursor."),
         "{refused}"
     );
+    peer_task.await.expect("peer");
+}
+
+/// Auto is the advertised `default[]` value, never the model the CLI remembers as current.
+#[tokio::test]
+async fn cursor_auto_selects_the_advertised_default_value() {
+    for auto in ["default", ""] {
+        auto_selects_the_advertised_default_value(auto).await;
+    }
+}
+
+async fn auto_selects_the_advertised_default_value(auto: &str) {
+    const NANO: &str = "gpt-5.4-nano[reasoning=medium]";
+    let (runtime, mut peer) = cursor_model_runtime(auto);
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": bracketed_model_options(NANO) }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "default[]" }))
+        .respond(json!({ "configOptions": bracketed_model_options("default[]") }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": NANO }))
+        .respond(json!({ "configOptions": bracketed_model_options(NANO) }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "default[]" }))
+        .respond(json!({ "configOptions": bracketed_model_options("default[]") }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+    let within = Duration::from_secs(5);
+
+    timeout(within, runtime.start())
+        .await
+        .unwrap()
+        .expect("start");
+    timeout(within, runtime.set_model("gpt-5.4-nano"))
+        .await
+        .unwrap()
+        .expect("switch away");
+    timeout(within, runtime.set_model("default"))
+        .await
+        .unwrap()
+        .expect("back to Auto");
+    peer_task.await.expect("peer");
+}
+
+/// A session that advertises no default value leaves Auto to Cursor, as before.
+#[tokio::test]
+async fn cursor_auto_without_an_advertised_default_is_left_to_cursor() {
+    let (runtime, mut peer) = cursor_model_runtime("default");
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new").respond(json!({
+        "sessionId": "s1",
+        "configOptions": [{
+            "id": "model", "category": "model", "type": "select", "currentValue": "gpt-5.4",
+            "options": [{ "value": "gpt-5.4" }, { "value": "gpt-5.5" }]
+        }]
+    }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+
+    timeout(Duration::from_secs(5), runtime.start())
+        .await
+        .unwrap()
+        .expect("start");
     peer_task.await.expect("peer");
 }
 

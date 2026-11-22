@@ -3407,7 +3407,8 @@ send the message later (OpenCode answering 408 or 429) leaves it definitely not
 sent too; its next attempt waits for the backoff and for any `Retry-After` it
 named, capped at 30 seconds. The delivery detail is what the turn shows, so every one is plain text from a single
 formatter that names the provider by its instance label, never by a driver id:
-the refusal itself, such as "Fast Mode is not supported by the selected model.";
+the refusal itself, such as "Fast Mode is not supported by the selected model.
+Choose another option for this model.";
 for a spawn failure, that the provider could not start and why; for an uncertain
 delivery, that the Claude instance never confirmed a written message, or that
 BiBCode can't check after a restart whether a provider without exact

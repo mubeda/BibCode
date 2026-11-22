@@ -4608,7 +4608,9 @@ mod tests {
             .expect_err("an unadvertised service tier is refused");
         assert_eq!(
             refused.option_refusal(),
-            Some("Service Tier slow is not supported by the selected model.")
+            Some(
+                "Service Tier slow is not supported by the selected model. Choose another option for this model."
+            )
         );
         // A model the list does not offer is refused on every retry too, naming the instance.
         let missing = runtime
