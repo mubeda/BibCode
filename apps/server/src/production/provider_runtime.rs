@@ -963,7 +963,10 @@ struct SessionPublicationState {
 type SessionPublicationFence = Arc<Mutex<SessionPublicationState>>;
 
 struct SessionEntry {
+    /// Holds the modes the thread asked for, confirmed or not: a restart launches with them.
     launch: ProviderLaunchRequest,
+    /// The modes the live driver acknowledged, per mode; a turn re-sends each one that differs.
+    confirmed_modes: Arc<StdMutex<ConfirmedModes>>,
     /// The retired Codex model the launch dropped, spelled as it was requested (#380 R4): the
     /// turns admitted before the drop fingerprint that spelling.
     dropped_model: Option<String>,
@@ -7651,12 +7654,18 @@ async fn run_supervisor(
                         && let Some(entry) = sessions.get_mut(thread_id)
                         && entry.launch.provider == "antigravity"
                     {
-                        if entry.launch.runtime_mode != *runtime_mode {
-                            entry.launch.runtime_mode = runtime_mode.clone();
+                        // The saved launch takes the request at once; each mode not yet
+                        // acknowledged for it is written (again) before the prompt, and stays
+                        // unconfirmed until its own acknowledgement.
+                        entry.launch.runtime_mode = runtime_mode.clone();
+                        entry.launch.interaction_mode = interaction_mode.clone();
+                        let mut confirmed = confirmed_modes(entry);
+                        if confirmed.runtime.as_ref() != Some(runtime_mode) {
+                            confirmed.runtime = None;
                             mode_changes.runtime = Some(runtime_mode.clone());
                         }
-                        if entry.launch.interaction_mode != *interaction_mode {
-                            entry.launch.interaction_mode = interaction_mode.clone();
+                        if confirmed.interaction.as_ref() != Some(interaction_mode) {
+                            confirmed.interaction = None;
                             mode_changes.interaction = Some(interaction_mode.clone());
                         }
                     }
@@ -8349,6 +8358,19 @@ struct ModeChanges {
     interaction: Option<String>,
 }
 
+/// The modes a live driver acknowledged; `None` while a write is unconfirmed.
+struct ConfirmedModes {
+    runtime: Option<String>,
+    interaction: Option<String>,
+}
+
+fn confirmed_modes(entry: &SessionEntry) -> std::sync::MutexGuard<'_, ConfirmedModes> {
+    entry
+        .confirmed_modes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_delivery(
     engine: &OrchestrationEngine,
@@ -8399,6 +8421,7 @@ async fn spawn_delivery(
     #[cfg(test)]
     let idle_deadline_test_observer = entry.idle_deadline_test_observer.clone();
     let driver = entry.driver.clone();
+    let confirmed = entry.confirmed_modes.clone();
     let pending_context_handoff = entry.pending_context_handoff.clone();
     let side_chat = side_chat_seed_state(entry);
     let seed_engine = engine.clone();
@@ -8421,11 +8444,18 @@ async fn spawn_delivery(
     };
     tokio::spawn(async move {
         let mode_failure = async {
+            let confirmed = || {
+                confirmed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            };
             if let Some(mode) = mode_changes.runtime {
-                driver.set_mode(mode).await?;
+                driver.set_mode(mode.clone()).await?;
+                confirmed().runtime = Some(mode);
             }
             if let Some(mode) = mode_changes.interaction {
-                driver.set_interaction_mode(mode).await?;
+                driver.set_interaction_mode(mode.clone()).await?;
+                confirmed().interaction = Some(mode);
             }
             Ok::<(), ProviderRuntimeError>(())
         }
@@ -10224,6 +10254,11 @@ async fn launch_session(
     sessions.insert(
         request.thread_id.clone(),
         SessionEntry {
+            // A started driver acknowledged its launch modes (Antigravity's start confirms them).
+            confirmed_modes: Arc::new(StdMutex::new(ConfirmedModes {
+                runtime: Some(request.runtime_mode.clone()),
+                interaction: Some(request.interaction_mode.clone()),
+            })),
             launch: request,
             dropped_model,
             driver,
@@ -10521,6 +10556,7 @@ async fn handle_command(
         OrchestrationCommand::ThreadRuntimeModeSet { runtime_mode, .. } => {
             match entry.driver.set_mode(runtime_mode.clone()).await {
                 Ok(()) => {
+                    confirmed_modes(entry).runtime = Some(runtime_mode.clone());
                     entry.launch.runtime_mode = runtime_mode;
                     persist_entry(&engine.repositories(), entry, "ready").await
                 }
@@ -10540,7 +10576,9 @@ async fn handle_command(
                 }
                 // The thread already asks for this mode: a restart must never start the
                 // session in the earlier, possibly more permissive one.
+                // The driver may hold the new mode unconfirmed: the next turn writes its own.
                 Err(error) => {
+                    confirmed_modes(entry).runtime = None;
                     entry.launch.runtime_mode = runtime_mode;
                     Err(error)
                 }
@@ -10555,6 +10593,7 @@ async fn handle_command(
                 .await
             {
                 Ok(()) => {
+                    confirmed_modes(entry).interaction = Some(interaction_mode.clone());
                     entry.launch.interaction_mode = interaction_mode;
                     persist_entry(&engine.repositories(), entry, "ready").await
                 }
@@ -10574,6 +10613,7 @@ async fn handle_command(
                 }
                 // As for the runtime mode: a restart starts in the mode the thread asks for.
                 Err(error) => {
+                    confirmed_modes(entry).interaction = None;
                     entry.launch.interaction_mode = interaction_mode;
                     Err(error)
                 }
@@ -39174,6 +39214,10 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s","configOptions":%s}}\n' "$id" "$sid" "$(options default)" ;;
     *'"method":"session/set_config_option"'*)
       value=$(printf '%s\n' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+      # Never answers the first `auto` write; the marker file records that it was withheld.
+      if [ "$value" = auto ] && [ -n "$BIBCODE_TEST_WITHHOLD_FIRST_AUTO" ] && [ ! -e "$BIBCODE_TEST_WITHHOLD_FIRST_AUTO" ]; then : > "$BIBCODE_TEST_WITHHOLD_FIRST_AUTO"; continue; fi
+      # Refuses one mode: the answer keeps the CLI in `default`.
+      [ -z "$BIBCODE_TEST_REFUSE_MODE" ] || [ "$value" != "$BIBCODE_TEST_REFUSE_MODE" ] || value=default
       printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":%s}}\n' "$id" "$(options "$value")" ;;
     *'"method":"session/prompt"'*)
       [ -z "$BIBCODE_TEST_REJECT_PROMPT" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"prompt rejected"}}\n' "$id"; continue; }
@@ -39909,6 +39953,132 @@ done
             .expect("shutdown in time")
             .expect("shutdown");
         engine.shutdown().await;
+    }
+
+    /// A turn asking for full access plus Plan in an approval-required Chat session: when the
+    /// CLI never answers the first `auto` write, the retry writes both modes again, so Plan is
+    /// acknowledged before the prompt; a refusal of either mode sends no prompt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_retry_confirms_every_unconfirmed_mode_before_the_prompt() {
+        async fn deliver(
+            supervisor: &super::ProviderRuntimeSupervisor,
+        ) -> super::ProviderDeliveryOutcome {
+            let mut command = serde_json::to_value(antigravity_turn("plan")).unwrap();
+            command["interactionMode"] = json!("plan");
+            let command: OrchestrationCommand = serde_json::from_value(command).unwrap();
+            // The previous delivery's completion can arrive before the supervisor retires it.
+            let delivery = timeout(Duration::from_secs(5), async {
+                loop {
+                    match supervisor
+                        .deliver_turn(command.clone(), "plan-key".to_owned())
+                        .await
+                    {
+                        Ok(delivery) => return delivery,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    }
+                }
+            })
+            .await
+            .expect("admitted in time");
+            timeout(Duration::from_secs(30), delivery.completion())
+                .await
+                .expect("delivered in time")
+        }
+        fn writes(capture: &std::path::Path) -> Vec<String> {
+            std::fs::read_to_string(capture)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|message| match message["method"].as_str() {
+                    Some("session/set_config_option") => {
+                        message["params"]["value"].as_str().map(str::to_owned)
+                    }
+                    Some("session/prompt") => Some("prompt".to_owned()),
+                    _ => None,
+                })
+                .collect()
+        }
+        async fn session(
+            engine: &super::OrchestrationEngine,
+            temp: &TempDir,
+            switch: &str,
+            capture: &std::path::Path,
+        ) -> super::ProviderRuntimeSupervisor {
+            let supervisor = antigravity_supervisor(engine, temp).await;
+            let mut launch = native_launch(temp, "antigravity");
+            launch.thread_id = "t1".to_owned();
+            launch.binary_path = antigravity_fixture_with(temp, switch, capture);
+            timeout(Duration::from_secs(10), supervisor.launch(launch))
+                .await
+                .expect("launch in time")
+                .expect("started in approval-required Chat");
+            supervisor
+        }
+
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture = temp.path().join("requests.jsonl");
+        let withheld = temp.path().join("withheld");
+        let engine = supervisor_engine().await;
+        let supervisor = session(
+            &engine,
+            &temp,
+            &format!("BIBCODE_TEST_WITHHOLD_FIRST_AUTO='{}'", withheld.display()),
+            &capture,
+        )
+        .await;
+        let outcome = deliver(&supervisor).await;
+        assert!(
+            matches!(
+                outcome,
+                super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ),
+            "{outcome:?}"
+        );
+        assert!(withheld.exists(), "the first `auto` write was withheld");
+        let outcome = deliver(&supervisor).await;
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            writes(&capture),
+            ["default", "auto", "auto", "plan", "prompt"],
+            "Plan is acknowledged before the prompt"
+        );
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("shutdown in time")
+            .expect("shutdown");
+        engine.shutdown().await;
+
+        for refused in ["auto", "plan"] {
+            let temp = TempDir::new().expect("provider fixture directory");
+            let capture = temp.path().join("requests.jsonl");
+            let engine = supervisor_engine().await;
+            let supervisor = session(
+                &engine,
+                &temp,
+                &format!("BIBCODE_TEST_REFUSE_MODE={refused}"),
+                &capture,
+            )
+            .await;
+            let outcome = deliver(&supervisor).await;
+            assert!(
+                !matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+                "{refused}: {outcome:?}"
+            );
+            assert!(
+                !writes(&capture).contains(&"prompt".to_owned()),
+                "{refused}: {:?}",
+                writes(&capture)
+            );
+            timeout(Duration::from_secs(10), supervisor.shutdown())
+                .await
+                .expect("shutdown in time")
+                .expect("shutdown");
+            engine.shutdown().await;
+        }
     }
 
     /// ACP answers `session/prompt` only when the turn ends, so the thread must read running

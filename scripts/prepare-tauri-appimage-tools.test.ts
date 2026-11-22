@@ -4,7 +4,7 @@ import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   GSTREAMER_PLUGIN_PIN,
   GTK_PLUGIN_PIN,
@@ -47,7 +47,13 @@ function toolPath(root: string, name: string): string {
   return NodePath.join(root, "target/.tauri", name);
 }
 
+// A host CARGO_TARGET_DIR must never redirect a test into real cached tools.
+beforeEach(() => {
+  vi.stubEnv("CARGO_TARGET_DIR", undefined);
+});
+
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const directory of temporaryDirectories.splice(0)) {
     NodeFS.rmSync(directory, { recursive: true, force: true });
   }
@@ -85,33 +91,68 @@ describe("prepare Tauri AppImage tools", () => {
     expect(NodeFS.existsSync(NodePath.join(repositoryRoot, "target"))).toBe(false);
   });
 
-  it.each([
-    ["unset", undefined, (root: string) => NodePath.join(root, "target/.tauri")],
-    ["empty", "", (root: string) => NodePath.join(root, "target/.tauri")],
-    [
-      "absolute",
-      NodePath.join(NodeOS.tmpdir(), "bibcode-cargo-target"),
-      (_root: string) => NodePath.join(NodeOS.tmpdir(), "bibcode-cargo-target/.tauri"),
-    ],
-    ["relative", "out/cargo", (root: string) => NodePath.join(root, "out/cargo/.tauri")],
-  ])(
-    "writes the tools where Tauri reads them for a %s CARGO_TARGET_DIR",
-    async (_name, value, expected) => {
+  it("writes the tools to <repository>/target when CARGO_TARGET_DIR is unset or empty", async () => {
+    for (const cargoTargetDirectory of [undefined, ""]) {
       const repositoryRoot = makeRepositoryRoot();
-      const expectedDirectory = expected(repositoryRoot);
-      if (value !== undefined && NodePath.isAbsolute(value)) {
-        temporaryDirectories.push(value);
-      }
 
       const result = await prepareTauriAppImageTools({
         repositoryRoot,
         platform: "linux",
-        cargoTargetDirectory: value,
+        ...(cargoTargetDirectory === undefined ? {} : { cargoTargetDirectory }),
+        cargoMetadataTargetDirectory: () => {
+          throw new Error("Cargo is asked only for a set CARGO_TARGET_DIR");
+        },
         plugin: FIXTURE_PIN,
         gstreamerPlugin: FIXTURE_PIN,
         download: async () => FIXTURE_PLUGIN,
       });
 
+      expect(result).toMatchObject({
+        status: "prepared",
+        toolsDirectory: NodePath.join(repositoryRoot, "target/.tauri"),
+      });
+    }
+  });
+
+  // Tauri runs Cargo in apps/desktop/src-tauri and reads `<cargo metadata target_directory>/.tauri`.
+  it.each([
+    ["an absolute", "absolute", undefined],
+    ["a relative", "out/cargo", undefined],
+    ["a relative", "out/cargo", "from-cargo"],
+  ])(
+    "writes the tools where Tauri reads them for %s CARGO_TARGET_DIR %s (Cargo reports %s)",
+    async (_name, value, reported) => {
+      const repositoryRoot = makeRepositoryRoot();
+      const cargoWorkingDirectory = NodePath.join(repositoryRoot, "apps/desktop/src-tauri");
+      let cargoTargetDirectory = value;
+      if (value === "absolute") {
+        cargoTargetDirectory = NodeFS.mkdtempSync(
+          NodePath.join(NodeOS.tmpdir(), "bibcode-cargo-target-"),
+        );
+        temporaryDirectories.push(cargoTargetDirectory);
+      }
+      const reportedDirectory =
+        reported === undefined ? undefined : NodePath.join(repositoryRoot, reported);
+      const expectedDirectory = NodePath.join(
+        reportedDirectory ?? NodePath.resolve(cargoWorkingDirectory, cargoTargetDirectory),
+        ".tauri",
+      );
+      const asked: Array<string> = [];
+
+      const result = await prepareTauriAppImageTools({
+        repositoryRoot,
+        platform: "linux",
+        cargoTargetDirectory,
+        cargoMetadataTargetDirectory: (directory) => {
+          asked.push(directory);
+          return reportedDirectory;
+        },
+        plugin: FIXTURE_PIN,
+        gstreamerPlugin: FIXTURE_PIN,
+        download: async () => FIXTURE_PLUGIN,
+      });
+
+      expect(asked).toEqual([cargoWorkingDirectory]);
       expect(result).toMatchObject({ status: "prepared", toolsDirectory: expectedDirectory });
       expect(NodeFS.existsSync(NodePath.join(expectedDirectory, "linuxdeploy-plugin-gtk.sh"))).toBe(
         true,

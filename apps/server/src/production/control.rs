@@ -7564,15 +7564,23 @@ done
         // The same CLI answering protocol 2: refused, so no session version replaces the
         // `--version` line it printed.
         let refused = sandbox.path("agy-echo-refused");
-        for (binary, protocol) in [(&echo, 1), (&refused, 2)] {
+        // A CLI that echoes its environment as the handshake's `agentInfo.version`.
+        let agent_echo = sandbox.path("agy-agent-echo");
+        const KEY: &str = r#""$TEST_ACCOUNT_KEY""#;
+        for (binary, protocol, version_line, agent_version) in [
+            (&echo, 1, KEY, "1.5.13"),
+            (&refused, 2, KEY, "1.5.13"),
+            (&agent_echo, 1, "1.5.13", r#"'"$TEST_ACCOUNT_KEY"'"#),
+        ] {
             let initialize =
-                provider_inventory::tests::antigravity_initialize(protocol, "1.5.13", true);
+                provider_inventory::tests::antigravity_initialize(protocol, "agent-version", true)
+                    .replace("agent-version", agent_version);
             crate::test_support::executable_fixture::write_executable(
                 binary,
                 format!(
                     r#"#!/bin/sh
 printf '%s\n' "$TEST_ACCOUNT_KEY" >&2
-case "$1" in --version) printf '%s\n' "$TEST_ACCOUNT_KEY"; exit 0 ;; esac
+case "$1" in --version) printf '%s\n' {version_line}; exit 0 ;; esac
 while IFS= read -r request; do
   id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$request" in
@@ -7608,6 +7616,13 @@ done
                 "antigravity-three": { "driver": "antigravity", "enabled": true,
                     "config": { "binaryPath": refused },
                     "environment": sensitive("TEST_ACCOUNT_KEY", DOTTED) },
+                // The version parser drops a leading `v`, so the raw text is what is checked.
+                "antigravity-four": { "driver": "antigravity", "enabled": true,
+                    "config": { "binaryPath": refused },
+                    "environment": sensitive("TEST_ACCOUNT_KEY", "v987.654.321") },
+                "antigravity-five": { "driver": "antigravity", "enabled": true,
+                    "config": { "binaryPath": agent_echo },
+                    "environment": sensitive("TEST_ACCOUNT_KEY", "v876.543.210") },
                 "codex": { "driver": "codex", "enabled": true,
                     "config": { "binaryPath": codex },
                     "environment": sensitive("CODEX_KEY", MARKER) }
@@ -7621,6 +7636,14 @@ done
         assert!(
             !published.contains(DOTTED),
             "a stored secret was published as a version"
+        );
+        let leaked = ["987.654.321", "876.543.210"]
+            .into_iter()
+            .filter(|bare| published.contains(bare))
+            .collect::<Vec<_>>();
+        assert!(
+            leaked.is_empty(),
+            "`v`-prefixed stored secrets were published as versions: {leaked:?}"
         );
         let row = |id: &str| {
             providers
