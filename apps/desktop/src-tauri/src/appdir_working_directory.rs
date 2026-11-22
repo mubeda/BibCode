@@ -8,6 +8,8 @@
 //! blank. So `main` hands such a launch to this bundle's `AppRun` once, and if that
 //! fails, at least changes to `usr` itself. See
 //! `docs/plans/2026-11-21-linux-software-rendering-design.md`.
+// Also compiled for tests on other Unix hosts; only Linux applies it.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
