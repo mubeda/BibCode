@@ -33990,6 +33990,70 @@ done
         fixture.close().await;
     }
 
+    /// A running turn's notice shows on the running session and clears with a `null` message;
+    /// one for a turn that already ended changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_notice_shows_on_the_running_session_and_clears() {
+        let _clock = keep_idle_clock_paused();
+        let fixture =
+            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "cursor").await;
+        IdleDeadlineFixture::accepted(fixture.admit("first").await, "idle-turn-1").await;
+        let last_error = || async {
+            fixture
+                .engine
+                .repositories()
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("projected session")
+                .last_error
+        };
+        let settle = |wanted: Option<&'static str>| async move {
+            timeout(Duration::from_secs(5), async {
+                while last_error().await.as_deref() != wanted {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("last error never became {wanted:?}"));
+        };
+        fixture
+            .emit_payload("turn.notice", "idle-turn-1", json!({ "message": "Quiet." }))
+            .await;
+        settle(Some("Quiet.")).await;
+        fixture
+            .assert_projection("running", Some("idle-turn-1"))
+            .await;
+        fixture
+            .emit_payload("turn.notice", "idle-turn-1", json!({ "message": null }))
+            .await;
+        settle(None).await;
+        fixture
+            .emit("turn.completed", "idle-turn-1", "assistant-first")
+            .await;
+        timeout(Duration::from_secs(5), async {
+            while fixture
+                .engine
+                .repositories()
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .is_some_and(|session| session.status == "running")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the turn completed");
+        fixture
+            .emit_payload("turn.notice", "idle-turn-1", json!({ "message": "Late." }))
+            .await;
+        fixture.stream("idle-turn-1", "assistant-late").await;
+        fixture.assert_projection("ready", None).await;
+        assert_eq!(last_error().await, None);
+        fixture.close().await;
+    }
+
     /// OpenCode announces a turn before BiBCode sends it. If that send fails no `turn.completed`
     /// follows, so the announcement must not leave the thread reading running.
     #[tokio::test(start_paused = true)]

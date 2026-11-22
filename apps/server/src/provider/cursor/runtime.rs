@@ -1135,13 +1135,15 @@ impl CursorSessionRuntime {
         // projected, none opens an approval or question, none is approved. Held across the
         // handler, so a stop cannot land between this check and a request being recorded.
         let ignored = self.inner.ignore_turn_output.lock().await;
-        let late = match ignored.as_deref() {
-            Some(ignored) => {
-                let active = self.inner.active_turn_id.lock().await;
-                active.is_none() || active.as_deref() == Some(ignored)
-            }
-            None => false,
-        };
+        // A retired process's messages are late too: it is being stopped.
+        let late = self.is_retired()
+            || match ignored.as_deref() {
+                Some(ignored) => {
+                    let active = self.inner.active_turn_id.lock().await;
+                    active.is_none() || active.as_deref() == Some(ignored)
+                }
+                None => false,
+            };
         match event {
             IncomingEvent::Notification { .. } if late => {
                 tracing::debug!(

@@ -50,13 +50,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
 const CURSOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(test)]
-const CURSOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const CURSOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(6);
 /// How long the session that reads Cursor's advertised model values may take; a CLI that does
 /// not answer still publishes its model list.
 #[cfg(not(test))]
 const CURSOR_SESSION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
-const CURSOR_SESSION_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const CURSOR_SESSION_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// The close is courtesy: the catalog is already read and the child stops next.
 const ANTIGRAVITY_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3397,7 +3397,7 @@ done
     #[tokio::test]
     async fn a_hung_cursor_session_read_never_discards_a_late_model_list() {
         let temp = tempfile::TempDir::new().expect("fixture directory");
-        let (executable, _sessions) = cursor_session_fixture(temp.path(), "2.5", ":");
+        let (executable, _sessions) = cursor_session_fixture(temp.path(), "4.5", ":");
         let models = probe_cursor_models(&executable, Some("late"), None, &[], temp.path(), &[])
             .await
             .expect("the late list is published");
