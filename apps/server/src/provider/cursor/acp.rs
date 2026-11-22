@@ -192,12 +192,16 @@ pub struct AcpRequestReceipt {
 }
 
 impl AcpRequestReceipt {
+    /// Cancel-safe: a caller that stops waiting, such as a timeout, can wait again and still gets
+    /// the writer's answer. The confirmation is dropped only once it has resolved.
     #[allow(clippy::result_large_err)]
     pub async fn written(&mut self) -> Result<(), AcpRequestWriteFailure> {
-        let Some(written) = self.written.take() else {
+        let Some(written) = self.written.as_mut() else {
             return Ok(());
         };
-        match written.await {
+        let confirmation = written.await;
+        self.written = None;
+        match confirmation {
             Ok(result) => result,
             Err(_) => {
                 self.registration.remove();
