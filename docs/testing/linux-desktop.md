@@ -581,8 +581,8 @@ that the window renders:
   with a `bibcode://` URL from `/` and from the home folder, for an extracted
   AppDir and for the AppImage, with the setting on and off. The window renders,
   `readlink /proc/<pid>/exe` of each WebKit child points into the AppDir, and
-  the desktop process's working folder (`readlink /proc/<pid>/cwd`) is the
-  AppDir's `usr`, as under `AppRun`. With the setting on, the WebKit children
+  the desktop process runs under `AppRun` (its environment has `APPDIR`, and
+  `readlink /proc/<pid>/cwd` is the AppDir's `usr`). With the setting on, the WebKit children
   hold both variables. In a container without FUSE, the AppImage handler needs
   `APPIMAGE_EXTRACT_AND_RUN=1` in the caller's environment. A system WebKitGTK
   under `/usr/lib/<triple>` can make a start from `/` look fine on an unfixed
@@ -597,8 +597,8 @@ that the window renders:
   `could not read the software rendering setting`, and the log line
   `software rendering start-up decision` records every start, in `server.log`
   of a release build too (they are written once the in-process server has
-  started). A launch outside `AppRun` from an AppDir also logs `started outside
-  AppRun; working folder moved to the AppDir's usr folder for WebKit`.
+  started). A launch outside `AppRun` from an AppDir restarts through `AppRun`; only
+  if that fails does it log `could not restart through the AppDir's AppRun`.
 
 Record the bundled WebKitGTK version (the `libwebkit2gtk-4.1.so.0.*` file name
 under `usr/lib`) with the result.

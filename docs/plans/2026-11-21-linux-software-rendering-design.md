@@ -322,17 +322,24 @@ version. A mounted AppImage's handler starts the AppImage, whose `AppRun`
 changes folder, so that route works.
 
 Measured in the lab: under `AppRun` the desktop process's working folder is
-`<AppDir>/usr`, whatever folder it was started from. The handler route lacks
-the GTK hook's variables (`GSETTINGS_SCHEMA_DIR`, `GDK_PIXBUF_MODULE_FILE`,
-`GIO_EXTRA_MODULES`, `GTK_EXE_PREFIX`, `LD_LIBRARY_PATH` and others); the
-window renders without them.
+`<AppDir>/usr`, whatever folder it was started from. The direct route also
+lacks the GTK hook's variables (`GSETTINGS_SCHEMA_DIR`,
+`GDK_PIXBUF_MODULE_FILE`, `GIO_EXTRA_MODULES`, `GTK_EXE_PREFIX`,
+`LD_LIBRARY_PATH` and others). In the Docker lab (X11) the window renders
+without them. In a Hyprland VM, with only the working folder fixed, the window
+opened but its page stayed blank on Wayland and on X11, while the same AppDir
+started through `AppRun` rendered.
 
-Fix: `main`, after the software-rendering step and before `run()`, changes the
-working folder to `<AppDir>/usr` when the executable is
-`<AppDir>/usr/bin/<name>` next to an `AppRun`. A pure function of the
-executable path decides it. A system install (`/usr/bin`, no `AppRun`) keeps
-its folder. Child processes then start from the same folder as under
-`AppRun`, so terminals and providers see no change from the menu route.
+Fix: `main`, after the CLI branches and before the software-rendering step,
+restarts the process through `<AppDir>/AppRun` with the same arguments when the
+executable is `<AppDir>/usr/bin/<name>` next to an `AppRun` and `APPDIR` is not
+set. `AppRun` exports `APPDIR`, so the restarted process does not restart
+again, and a link start then matches a menu start exactly. It runs before the
+software-rendering step, so the restarted process does not take BiBCode's own
+variables for the user's. If the restart fails, `main` logs why and changes
+to `<AppDir>/usr` itself, which is enough for WebKit to start. Pure functions
+of the executable path and of `APPDIR` decide both. A system install
+(`/usr/bin`, no `AppRun`) is unchanged.
 
 Alternatives:
 
@@ -340,18 +347,17 @@ Alternatives:
   executable's location.** Rejected: the release WebKitGTK reads them only in
   developer builds. Set to the bundled folders, the lab start from the home
   folder still aborted with the same relative path.
-- **Re-execute through `<AppDir>/AppRun`.** It would also give the handler
-  route the GTK hook's variables. Rejected for now: it runs the launcher hooks
-  a second time on every link start (including a D-Bus colour-scheme query
-  with a one-second timeout), needs a loop guard, and no missing variable has
-  shown a defect. Revisit if one does.
+- **Only change to `<AppDir>/usr`.** It fixes the abort and keeps the child
+  working folder of the menu route, but leaves the GTK environment out, and
+  the VM page stayed blank. Kept as the fallback.
 - **Rewrite the handler's `Exec` line to `AppRun`, or add `Path=`.** Rejected:
   the deep-link plugin rewrites the file on every start, so BiBCode would have
   to patch it after each registration and race the plugin.
 - **Stop the bundler's path rewrite.** Not in BiBCode's control.
 
-The remaining difference from the menu route is the GTK hook's variables. It
-is a documented residual.
+Cost: a link start from an extracted AppDir runs the launcher hooks once,
+including a D-Bus colour-scheme query with a one-second timeout, as a menu
+start does.
 
 ## Not changed
 

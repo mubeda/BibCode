@@ -2,9 +2,11 @@
 //! The AppImage bundler rewrites the bundled WebKitGTK's helper paths to
 //! `././/lib/...`, so WebKit finds `WebKitNetworkProcess` and its injected
 //! bundle relative to the working folder, and its release build ignores
-//! `WEBKIT_EXEC_PATH`. `AppRun` changes to `<AppDir>/usr` first; the generated
-//! `bibcode://` handler of an extracted AppDir starts the binary directly and
-//! skips that, so `main` does the same change itself. See
+//! `WEBKIT_EXEC_PATH`. `AppRun` changes to `<AppDir>/usr` and sets up the bundled
+//! GTK environment; the generated `bibcode://` handler of an extracted AppDir starts
+//! the binary directly and skips both, and in a Hyprland VM its page then stayed
+//! blank. So `main` restarts such a launch through `AppRun`, and if that fails, at
+//! least changes to `usr` itself. See
 //! `docs/plans/2026-11-21-linux-software-rendering-design.md`.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -22,35 +24,65 @@ pub(crate) fn appdir_usr(exe: &Path, exists: impl Fn(&Path) -> bool) -> Option<P
     exists(&usr.parent()?.join("AppRun")).then(|| usr.to_path_buf())
 }
 
-/// `Ok(true)` when `main` changed the working folder, or the reason it could not.
-static STARTUP: OnceLock<Result<bool, String>> = OnceLock::new();
+/// The `AppRun` to restart through: only when this launch did not come from it, which
+/// exports `APPDIR`, so the restarted process cannot loop.
+pub(crate) fn apprun_to_reexec(usr: &Path, appdir_set: bool) -> Option<PathBuf> {
+    (!appdir_set).then(|| usr.parent().unwrap_or(usr).join("AppRun"))
+}
 
-/// Moves an AppDir launch into `<AppDir>/usr`, where `AppRun` launches already run, so
-/// terminals and providers see the same base folder on every route. Call it from `main`
-/// before any webview.
+struct Startup {
+    /// `Ok(true)` when `main` changed the working folder, or the reason it could not.
+    moved: Result<bool, String>,
+    reexec_error: Option<String>,
+}
+
+static STARTUP: OnceLock<Startup> = OnceLock::new();
+
+/// Restarts an AppDir launch that skipped `AppRun` through it, so every route gets the same
+/// working folder and environment. If that fails, moves into `<AppDir>/usr`. Call it from
+/// `main` before any thread, and before BiBCode changes its own environment.
 #[cfg(target_os = "linux")]
 pub fn enter_appdir_usr() {
-    let usr = std::env::current_exe()
+    use std::os::unix::process::CommandExt;
+    let Some(usr) = std::env::current_exe()
         .ok()
-        .and_then(|exe| appdir_usr(&exe, Path::exists));
-    let outcome = match usr {
-        Some(usr) if std::env::current_dir().ok().as_deref() != Some(usr.as_path()) => {
-            std::env::set_current_dir(&usr)
-                .map(|()| true)
-                .map_err(|error| error.to_string())
-        }
-        _ => Ok(false),
+        .and_then(|exe| appdir_usr(&exe, Path::exists))
+    else {
+        return;
     };
-    let _ = STARTUP.set(outcome);
+    let reexec_error = apprun_to_reexec(&usr, std::env::var_os("APPDIR").is_some()).map(|apprun| {
+        // `exec` returns only when it failed.
+        let error = std::process::Command::new(apprun)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        error.to_string()
+    });
+    let moved = if std::env::current_dir().ok().as_deref() == Some(usr.as_path()) {
+        Ok(false)
+    } else {
+        std::env::set_current_dir(&usr)
+            .map(|()| true)
+            .map_err(|error| error.to_string())
+    };
+    let _ = STARTUP.set(Startup {
+        moved,
+        reexec_error,
+    });
 }
 
 /// Logs what `enter_appdir_usr` did; called from `setup`, once the log sink exists.
 pub(crate) fn record_startup() {
-    match STARTUP.get() {
-        Some(Ok(true)) => tracing::info!(
+    let Some(startup) = STARTUP.get() else {
+        return;
+    };
+    if let Some(error) = &startup.reexec_error {
+        tracing::warn!(%error, "could not restart through the AppDir's AppRun");
+    }
+    match &startup.moved {
+        Ok(true) => tracing::info!(
             "started outside AppRun; working folder moved to the AppDir's usr folder for WebKit"
         ),
-        Some(Err(error)) => tracing::warn!(
+        Err(error) => tracing::warn!(
             %error,
             "could not move to the AppDir's usr folder; WebKit may not find its helper processes"
         ),
@@ -67,6 +99,17 @@ mod tests {
         let exe = Path::new("/opt/squashfs-root/usr/bin/bibcode-desktop");
         let usr = appdir_usr(exe, |path| path == Path::new("/opt/squashfs-root/AppRun"));
         assert_eq!(usr.as_deref(), Some(Path::new("/opt/squashfs-root/usr")));
+    }
+
+    #[test]
+    fn appdir_working_directory_restarts_through_apprun_only_once() {
+        let usr = Path::new("/opt/squashfs-root/usr");
+        assert_eq!(
+            apprun_to_reexec(usr, false).as_deref(),
+            Some(Path::new("/opt/squashfs-root/AppRun"))
+        );
+        // AppRun exports APPDIR, so the process it starts does not restart again.
+        assert_eq!(apprun_to_reexec(usr, true), None);
     }
 
     #[test]

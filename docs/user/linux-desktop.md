@@ -64,6 +64,6 @@ started from such a terminal also runs without GPU compositing until you start
 it from elsewhere.
 
 A `bibcode://` link starts BiBCode when it is closed, from the AppImage and
-from an extracted AppDir. Started from an AppDir without its `AppRun`, BiBCode
-moves to the AppDir's `usr` folder first, as `AppRun` does, because the bundled
-WebKitGTK looks for its helper programs from there.
+from an extracted AppDir. Started from an AppDir without its `AppRun`, as the
+link handler does, BiBCode restarts itself through `AppRun`, so it runs as it
+does from the application menu.
