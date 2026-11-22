@@ -9575,10 +9575,18 @@ async fn publish_running_session(
         return Ok(());
     }
     if publication.terminal_revision != terminal_revision {
-        tracing::info!(
-            thread_id = %entry.launch.thread_id,
-            "a turn ended before this delivery was accepted; the session is not marked running"
-        );
+        // A provider whose own `turn.started` marked the turn running lost nothing here.
+        if provider_reports_its_turns(&entry.launch.provider) {
+            tracing::debug!(
+                thread_id = %entry.launch.thread_id,
+                "the provider's turn ended before its delivery was accepted"
+            );
+        } else {
+            tracing::info!(
+                thread_id = %entry.launch.thread_id,
+                "a turn ended before this delivery was accepted; the session is not marked running"
+            );
+        }
         return Ok(());
     }
     // An acceptance that names no turn (a Codex compaction, whose turn Codex reports after it
@@ -13910,11 +13918,14 @@ pub(crate) fn session_holds_a_turn(session: &ProjectionThreadSession) -> bool {
 
 /// Whether every `turn.started` the driver emits is a turn the provider reported running. Codex
 /// emits it for each `turn/started` notification, and Claude for a turn it starts itself (its
-/// delivered turns begin on their replay). Cursor, OpenCode, and Grok announce a turn before
-/// BiBCode sends it, so a send that then fails would leave the thread reading running; such a
-/// driver marks a turn the provider started itself with `providerStarted: true` instead.
+/// delivered turns begin on their replay). Antigravity announces each prompt as it writes it and
+/// ends every announced turn, an unsent one included, with `turn.completed`; ACP answers the
+/// prompt only when the turn ends, so its delivery is accepted too late to mark it running.
+/// Cursor, OpenCode, and Grok announce a turn before BiBCode sends it, so a send that then fails
+/// would leave the thread reading running; such a driver marks a turn the provider started itself
+/// with `providerStarted: true` instead.
 fn provider_reports_its_turns(provider: &str) -> bool {
-    matches!(provider, "codex" | "claude" | "claudeAgent")
+    matches!(provider, "codex" | "claude" | "claudeAgent" | "antigravity")
 }
 
 /// Whether BiBCode can see the session's work outside a turn, so its absence means idle. Claude
@@ -39168,7 +39179,11 @@ while IFS= read -r line; do
       [ -z "$BIBCODE_TEST_REJECT_PROMPT" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"prompt rejected"}}\n' "$id"; continue; }
       [ -z "$BIBCODE_TEST_DISCONNECT_AFTER_PROMPT" ] || exit 0
       [ -z "$BIBCODE_TEST_IGNORE_PROMPT" ] || continue
+      # Asks for a permission first and answers the prompt only once the reply arrives.
+      [ -z "$BIBCODE_TEST_APPROVAL_BEFORE_ANSWER" ] || { prompt_id=$id; printf '{"jsonrpc":"2.0","id":900,"method":"session/request_permission","params":{"sessionId":"antigravity-session","toolCall":{"toolCallId":"call-1","status":"pending","kind":"edit","title":"File notes.txt"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}\n'; continue; }
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+    *'"id":900'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt_id" ;;
   esac
 done
 "#;
@@ -39894,6 +39909,146 @@ done
             .expect("shutdown in time")
             .expect("shutdown");
         engine.shutdown().await;
+    }
+
+    /// ACP answers `session/prompt` only when the turn ends, so the thread must read running
+    /// from the prompt on: through a pending approval, until the answer ends the turn once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_turn_reads_running_while_its_approval_is_pending() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("captured log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        // The turn ends on the prompt answer, once after the approval and once after a Stop.
+        for stop in [false, true] {
+            let temp = TempDir::new().expect("provider fixture directory");
+            let capture = temp.path().join("requests.jsonl");
+            let engine = supervisor_engine().await;
+            let supervisor = antigravity_supervisor(&engine, &temp).await;
+            let mut launch = native_launch(&temp, "antigravity");
+            launch.thread_id = "t1".to_owned();
+            launch.runtime_mode = "full-access".to_owned();
+            launch.binary_path =
+                antigravity_fixture_with(&temp, "BIBCODE_TEST_APPROVAL_BEFORE_ANSWER=1", &capture);
+            timeout(Duration::from_secs(10), supervisor.launch(launch))
+                .await
+                .expect("launch in time")
+                .expect("started");
+            let delivery = timeout(
+                Duration::from_secs(5),
+                supervisor.deliver_turn(antigravity_turn("approve"), "approve-key".to_owned()),
+            )
+            .await
+            .expect("admitted in time")
+            .expect("admitted");
+            let repositories = engine.repositories();
+            let approval = timeout(Duration::from_secs(10), async {
+                loop {
+                    let pending = repositories
+                        .list_pending_approvals_by_thread("t1".to_owned())
+                        .await
+                        .unwrap();
+                    if let Some(approval) = pending.into_iter().next() {
+                        return approval;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the approval request reached the thread");
+            let session = repositories
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("session");
+            assert_eq!(session.status, "running", "{session:?}");
+            assert!(session.active_turn_id.is_some(), "{session:?}");
+            assert_eq!(session.active_turn_id, approval.turn_id);
+            let thread = repositories
+                .get_thread("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("thread");
+            assert_eq!(thread.latest_turn_id, session.active_turn_id);
+
+            let command = if stop {
+                json!({"type":"thread.turn.interrupt","commandId":"stop","threadId":"t1","turnId":approval.turn_id,"createdAt":"2026-07-16T00:00:00Z"})
+            } else {
+                json!({"type":"thread.approval.respond","commandId":"approve-reply","threadId":"t1","requestId":approval.request_id,"decision":"accept","createdAt":"2026-07-16T00:00:00Z"})
+            };
+            supervisor
+                .handle_orchestration(serde_json::from_value(command).unwrap())
+                .await
+                .expect("approval answered or turn stopped");
+            let outcome = timeout(Duration::from_secs(10), delivery.completion())
+                .await
+                .expect("delivered in time");
+            assert!(
+                matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+                "{outcome:?}"
+            );
+            timeout(Duration::from_secs(10), async {
+                while repositories
+                    .get_thread_session("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .is_some_and(|session| session.status == "running")
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the answer ended the turn");
+            // Nothing marks the ended turn running again, and its approval is closed.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let session = repositories
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("session");
+            assert_ne!(session.status, "running", "stop={stop}: {session:?}");
+            assert!(
+                repositories
+                    .list_pending_approvals_by_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|approval| approval.status != "pending"),
+                "stop={stop}"
+            );
+            timeout(Duration::from_secs(10), supervisor.shutdown())
+                .await
+                .expect("shutdown in time")
+                .expect("shutdown");
+            engine.shutdown().await;
+        }
+        let text = String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8");
+        assert!(
+            !text.contains("a turn ended before this delivery was accepted"),
+            "{text}"
+        );
     }
 
     /// An unsent frozen turn whose saved conversation is gone: the reconciliation launch fails

@@ -546,7 +546,11 @@ Idle suspension must never stop work the provider still runs:
   arms the next one. When the driver emits `turn.started` only for turns the
   provider reported running (Codex for each `turn/started`, Claude for a turn it
   starts itself), the session is also projected `running` with that turn unless
-  it already reads so. Cursor, OpenCode, and Grok announce a turn before BiBCode
+  it already reads so. Antigravity is projected the same way: it announces each
+  prompt as it writes it and ends every announced turn, an unsent one included,
+  with `turn.completed`, while its delivery is accepted only when ACP answers the
+  prompt, at the end of the turn, too late to mark it running. Such a late
+  acceptance publishes nothing. Cursor, OpenCode, and Grok announce a turn before BiBCode
   sends it, so their announcement does not change the projection: a send that
   fails reports no completion (OpenCode settles a turn whose request it never
   accepted, a 4xx refusal or a connection that never opened, with a `cancelled`
