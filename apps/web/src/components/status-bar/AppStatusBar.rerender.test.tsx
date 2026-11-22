@@ -175,6 +175,7 @@ function codexUsage(usedPercent: number, readAtValue = readAt): ServerProviderUs
         },
         weekly: null,
         fableWeekly: null,
+        windowGroups: [],
         planType: "plus",
         rateLimitResetCredits: {
           availableCount: 1,

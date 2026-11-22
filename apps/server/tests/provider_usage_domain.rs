@@ -159,6 +159,7 @@ fn snapshot(provider: ProviderUsageProvider, updated_at: OffsetDateTime) -> Prov
         session: None,
         weekly: None,
         fable_weekly: None,
+        window_groups: Vec::new(),
         plan_type: None,
         rate_limit_reset_credits: None,
         updated_at,
@@ -776,8 +777,12 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
     set_provider_usage_environment("BIBCODE_CLAUDE_KEYCHAIN_ACCESS", "disabled");
     set_provider_usage_environment("CODEX_HOME", &codex_home);
 
-    let fetchers = production_fetchers();
-    assert_eq!(fetchers.len(), 2);
+    let fetchers = production_fetchers(
+        bibcode_server::server_settings::ProviderSettingsStore::new(temporary.path().join("state")),
+        None,
+    );
+    assert_eq!(fetchers.len(), 3);
+    assert_eq!(fetchers[2].provider, ProviderUsageProvider::Antigravity);
     assert_eq!(fetchers[0].provider, ProviderUsageProvider::Claude);
     assert_eq!(fetchers[1].provider, ProviderUsageProvider::Codex);
     let claude_fetch = &fetchers[0].fetch;

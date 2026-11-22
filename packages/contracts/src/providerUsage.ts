@@ -3,7 +3,7 @@ import * as Schema from "effect/Schema";
 
 import { NonNegativeInt } from "./baseSchemas.ts";
 
-export const ServerProviderUsageProvider = Schema.Literals(["claude", "codex"]);
+export const ServerProviderUsageProvider = Schema.Literals(["claude", "codex", "antigravity"]);
 export type ServerProviderUsageProvider = typeof ServerProviderUsageProvider.Type;
 
 export const ServerProviderUsageStatus = Schema.Literals([
@@ -30,6 +30,15 @@ export const ServerProviderUsageResetCredits = Schema.Struct({
 });
 export type ServerProviderUsageResetCredits = typeof ServerProviderUsageResetCredits.Type;
 
+/** A provider that reports several quota groups (Antigravity: one per model family). */
+export const ServerProviderUsageWindowGroup = Schema.Struct({
+  id: Schema.Literals(["gemini", "third-party", "other"]),
+  label: Schema.String,
+  session: Schema.NullOr(ServerProviderUsageWindow),
+  weekly: Schema.NullOr(ServerProviderUsageWindow),
+});
+export type ServerProviderUsageWindowGroup = typeof ServerProviderUsageWindowGroup.Type;
+
 export const ServerProviderUsageSnapshot = Schema.Struct({
   provider: ServerProviderUsageProvider,
   status: ServerProviderUsageStatus,
@@ -37,6 +46,9 @@ export const ServerProviderUsageSnapshot = Schema.Struct({
   weekly: Schema.NullOr(ServerProviderUsageWindow),
   fableWeekly: Schema.NullOr(ServerProviderUsageWindow).pipe(
     Schema.withDecodingDefaultTypeKey(Effect.succeed(null)),
+  ),
+  windowGroups: Schema.Array(ServerProviderUsageWindowGroup).pipe(
+    Schema.withDecodingDefaultTypeKey(Effect.succeed([])),
   ),
   planType: Schema.NullOr(Schema.String).pipe(
     Schema.withDecodingDefaultTypeKey(Effect.succeed(null)),
@@ -56,6 +68,12 @@ export const ServerProviderUsageResult = Schema.Struct({
   providers: Schema.Array(ServerProviderUsageSnapshot),
 });
 export type ServerProviderUsageResult = typeof ServerProviderUsageResult.Type;
+
+/** Antigravity is returned only when named; an omitted list keeps the legacy Claude and Codex pair. */
+export const ServerProviderUsageReadInput = Schema.Struct({
+  providers: Schema.optional(Schema.Array(ServerProviderUsageProvider)),
+});
+export type ServerProviderUsageReadInput = typeof ServerProviderUsageReadInput.Type;
 
 export const ServerProviderUsageRefreshInput = Schema.Struct({
   providers: Schema.optional(Schema.Array(ServerProviderUsageProvider)),

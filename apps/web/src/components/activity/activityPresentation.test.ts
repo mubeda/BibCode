@@ -37,6 +37,9 @@ describe("activityRecordTimeLabel", () => {
     expect(activityStopUnavailableReason("claudeAgent")).toBe(
       "Claude doesn't offer a way to stop this subagent from BiBCode.",
     );
+    expect(activityStopUnavailableReason("antigravity")).toBe(
+      "Antigravity doesn't offer a way to stop this subagent from BiBCode.",
+    );
     expect(activityStopUnavailableReason("custom")).toBe(
       "The provider doesn't offer a way to stop this subagent from BiBCode.",
     );

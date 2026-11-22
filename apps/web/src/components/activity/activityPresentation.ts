@@ -249,6 +249,7 @@ const PROVIDER_LABELS: Readonly<Record<string, string>> = {
   opencode: "OpenCode",
   cursor: "Cursor",
   grok: "Grok",
+  antigravity: "Antigravity",
 };
 
 /** Why a running subagent has no Stop, without promising another way to end it. */

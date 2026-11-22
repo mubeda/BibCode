@@ -5546,6 +5546,37 @@ boolean `force`. Omitting `force`, or sending `false`, uses the normal refresh
 throttle; `force: true` starts an explicit fetch even inside that interval.
 The default preserves compatibility for older clients.
 
+Antigravity reports its account quota as several groups (one per model family,
+each with a 5-hour and a weekly window), carried in the snapshot's optional
+`windowGroups`. Its snapshot appears in a response only when the request names
+`antigravity`: both `server.getProviderUsage` (optional `providers` input) and
+`server.refreshProviderUsage` answer a request that omits the list, and the
+usage nested in the Codex reset result, with Claude and Codex alone, so an older
+client never receives a provider it cannot decode. The status bar asks for
+Antigravity in its own request and read, with its own pending state, and stops
+polling a server whose answer has no Antigravity entry. The server runs one
+Antigravity attempt at a time as a task no caller owns: every request that
+arrives while it runs (forced or not) waits for that attempt, the result is
+committed once even when every caller went away, and a cancelled caller never
+stops the CLI. Automatic refreshes run the CLI at most once per five minutes,
+counted from the end of an attempt that ran the usage command; a result that
+ran nothing (instance off, CLI missing, version not confirmed) starts no
+cooldown. A forced refresh bypasses the cooldown. The global 30-second throttle
+covers Claude and Codex only, also inside a request that names Antigravity too.
+The CLI runs only when the default Antigravity instance is on, with that
+instance's environment including its stored secrets, and only after
+`--version` of the same resolved executable proves CLI 1.1.11 or newer; both
+runs get a null stdin. The service owns each attempt: one 20-second deadline
+covers the settings read, both runs and their cleanup, cancels through the
+supervisor so no descendant survives, and stops the task before another attempt
+may start; runtime shutdown closes admission and drains a running attempt
+before process ownership is frozen. The cooldown starts only when the usage
+command was spawned. An executable replaced at its resolved path between the
+version probe and the usage run is not detected: the configured binary is
+trusted as the chat provider trusts it. Antigravity data older than 30 minutes, including data
+retained on an error, is dropped and reads as out of date. The design is in
+`docs/plans/2026-11-21-antigravity-usage-design.md`.
+
 Forced refresh changes admission only. It does not authorize credential
 mutation or account management: provider usage fetchers remain observers of
 the local provider CLI's account. The client waits for the refresh command to

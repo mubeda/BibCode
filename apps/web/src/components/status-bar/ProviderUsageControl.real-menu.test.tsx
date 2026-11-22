@@ -35,6 +35,7 @@ function provider(kind: ProviderUsageViewModel["provider"]): ProviderUsageViewMo
     windows: [session],
     detailedWindows: [session],
     compactWindows: [session],
+    groups: [],
     plan: null,
     credits:
       kind === "codex"

@@ -1,5 +1,9 @@
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
-import type { EnvironmentId, ServerProviderUsageResult } from "@bibcode/contracts";
+import type {
+  EnvironmentId,
+  ServerProviderUsageProvider,
+  ServerProviderUsageResult,
+} from "@bibcode/contracts";
 import type {
   ClientSettings,
   StatusBarUsageMode,
@@ -38,8 +42,11 @@ import {
   type ResourceDiagnosticsQueryState,
 } from "./statusBarPresentation";
 import {
+  antigravityPlaceholderViewModel,
+  NOT_FETCHED_MESSAGE,
   buildProviderUsageViewModels,
   providerUsageRelativeLabelKey,
+  type AntigravityPlaceholder,
   type ProviderUsageViewModel,
 } from "./providerUsagePresentation";
 
@@ -64,6 +71,8 @@ interface ProviderUsagePresentation {
   readonly percentageDisplay: UsagePercentageDisplay;
   readonly showClaudeUsage: boolean;
   readonly showCodexUsage: boolean;
+  readonly showAntigravityUsage: boolean;
+  readonly antigravityPlaceholder: AntigravityPlaceholder | null;
   readonly relativeLabelKey: string;
   readonly providers: ReadonlyArray<ProviderUsageViewModel>;
 }
@@ -71,6 +80,7 @@ interface ProviderUsagePresentation {
 interface StatusBarClientSettings {
   readonly showClaudeUsage: boolean;
   readonly showCodexUsage: boolean;
+  readonly showAntigravityUsage: boolean;
   readonly showResourceUsage: boolean;
   readonly statusBarUsageMode: StatusBarUsageMode;
   readonly usagePercentageDisplay: UsagePercentageDisplay;
@@ -84,6 +94,7 @@ const providerUsageResetCacheAtom = Atom.family((_environmentId: EnvironmentId) 
 const selectStatusBarClientSettings = (settings: ClientSettings): StatusBarClientSettings => ({
   showClaudeUsage: settings.statusBarItems.includes("claude"),
   showCodexUsage: settings.statusBarItems.includes("codex"),
+  showAntigravityUsage: settings.showAntigravityUsage,
   showResourceUsage: settings.statusBarItems.includes("resource-usage"),
   statusBarUsageMode: settings.statusBarUsageMode,
   usagePercentageDisplay: settings.usagePercentageDisplay,
@@ -94,6 +105,7 @@ const equalStatusBarClientSettings = (
 ): boolean =>
   previous.showClaudeUsage === next.showClaudeUsage &&
   previous.showCodexUsage === next.showCodexUsage &&
+  previous.showAntigravityUsage === next.showAntigravityUsage &&
   previous.showResourceUsage === next.showResourceUsage &&
   previous.statusBarUsageMode === next.statusBarUsageMode &&
   previous.usagePercentageDisplay === next.usagePercentageDisplay;
@@ -123,10 +135,19 @@ function buildProviderUsagePresentation(
   const byProvider = new Map(derived.map((provider) => [provider.provider, provider]));
   return {
     ...input,
-    providers: (["claude", "codex"] as const).flatMap((provider) => {
+    providers: (["claude", "codex", "antigravity"] as const).flatMap((provider) => {
+      const visible = {
+        claude: input.showClaudeUsage,
+        codex: input.showCodexUsage,
+        antigravity: input.showAntigravityUsage,
+      }[provider];
+      if (!visible) return [];
       const viewModel = byProvider.get(provider);
-      const visible = provider === "claude" ? input.showClaudeUsage : input.showCodexUsage;
-      return visible && viewModel !== undefined ? [viewModel] : [];
+      if (viewModel !== undefined) return [viewModel];
+      // Antigravity renders before its first answer, and on a server that cannot serve it.
+      return provider === "antigravity" && input.antigravityPlaceholder !== null
+        ? [antigravityPlaceholderViewModel(input.antigravityPlaceholder)]
+        : [];
     }),
   };
 }
@@ -236,7 +257,7 @@ export function createStatusBarRefreshHandler(input: {
   readonly refreshProviderUsage: (value: {
     readonly environmentId: EnvironmentId;
     readonly input: {
-      readonly providers: readonly ["claude", "codex"];
+      readonly providers: readonly ServerProviderUsageProvider[];
       readonly force: boolean;
     };
   }) => Promise<unknown>;
@@ -262,6 +283,67 @@ export function createStatusBarRefreshHandler(input: {
   };
 }
 
+/**
+ * Antigravity refreshes in its own request with its own completion: it can never delay or fail
+ * the Claude and Codex request, and a slow Claude or Codex request never delays its re-read.
+ */
+export function createAntigravityUsageRefreshHandler(input: {
+  readonly environmentId: EnvironmentId | null;
+  readonly refreshProviderUsage: (value: {
+    readonly environmentId: EnvironmentId;
+    readonly input: {
+      readonly providers: readonly ServerProviderUsageProvider[];
+      readonly force: boolean;
+    };
+  }) => Promise<unknown>;
+  readonly refreshQuery: () => void;
+}) {
+  return async (force: boolean) => {
+    if (input.environmentId === null) return;
+    try {
+      await input.refreshProviderUsage({
+        environmentId: input.environmentId,
+        input: { providers: ["antigravity"], force },
+      });
+    } catch {
+      // An old server rejects the provider; its read answers without an entry, which says so.
+    } finally {
+      input.refreshQuery();
+    }
+  };
+}
+
+/**
+ * The one Refresh button serves every visible usage request. It spins while any of them runs and
+ * is disabled only while all of them run, so a slow request never blocks refreshing the others.
+ */
+export function statusBarRefreshControl(
+  requests: ReadonlyArray<{ readonly visible: boolean; readonly busy: boolean }>,
+): { readonly busy: boolean; readonly disabled: boolean } {
+  const visible = requests.filter((request) => request.visible);
+  return {
+    busy: visible.some((request) => request.busy),
+    disabled: visible.length > 0 && visible.every((request) => request.busy),
+  };
+}
+
+/** Joins the refresh already running for an environment, or starts one. */
+function joinRefreshFlight(
+  flights: Map<EnvironmentId, Promise<void>>,
+  environmentId: EnvironmentId,
+  start: () => Promise<void>,
+): Promise<void> {
+  const existing = flights.get(environmentId);
+  if (existing !== undefined) return existing;
+  const flight = start();
+  flights.set(environmentId, flight);
+  const finish = () => {
+    if (flights.get(environmentId) === flight) flights.delete(environmentId);
+  };
+  void flight.then(finish, finish);
+  return flight;
+}
+
 export function createStatusBarResourceRefreshHandler(input: {
   readonly environmentId: EnvironmentId | null;
   readonly refreshProcessDiagnostics: () => void;
@@ -276,10 +358,14 @@ export function createStatusBarResourceRefreshHandler(input: {
 
 export function AppStatusBarView({
   usage,
+  antigravityUsage = null,
+  antigravityUsageError = null,
+  showAntigravityUsage = false,
   diagnostics,
   localDiagnostics,
   terminalCount,
   isRefreshing = false,
+  isRefreshDisabled = isRefreshing,
   iconOnly = false,
   showClaudeUsage = true,
   showCodexUsage = true,
@@ -293,10 +379,18 @@ export function AppStatusBarView({
   onConsumeCodexRateLimitReset,
 }: {
   readonly usage: ServerProviderUsageResult | null;
+  /** The answer to the Antigravity-only read; null until it arrives. */
+  readonly antigravityUsage?: ServerProviderUsageResult | null;
+  /** Why the Antigravity read failed, while it has no answer to show. */
+  readonly antigravityUsageError?: string | null;
+  readonly showAntigravityUsage?: boolean;
   readonly diagnostics: ResourceDiagnosticsQueryState;
   readonly localDiagnostics: ResourceDiagnosticsQueryState | null;
   readonly terminalCount: number;
+  /** A usage request is running: the button spins. */
   readonly isRefreshing?: boolean;
+  /** Every visible usage request is running: another click would do nothing. */
+  readonly isRefreshDisabled?: boolean;
   readonly iconOnly?: boolean;
   readonly showClaudeUsage?: boolean;
   readonly showCodexUsage?: boolean;
@@ -311,7 +405,28 @@ export function AppStatusBarView({
     typeof ProviderUsageControl
   >["onConsumeCodexRateLimitReset"];
 }) {
-  const snapshots = usage?.providers ?? EMPTY_PROVIDER_USAGE_SNAPSHOTS;
+  const baseSnapshots = usage?.providers ?? EMPTY_PROVIDER_USAGE_SNAPSHOTS;
+  const answered =
+    antigravityUsage?.providers.find((snapshot) => snapshot.provider === "antigravity") ?? null;
+  // A failed read after the server's not-fetched answer has nothing to show but how to recover.
+  const antigravitySnapshot =
+    answered !== null && !(antigravityUsageError !== null && answered.error === NOT_FETCHED_MESSAGE)
+      ? answered
+      : null;
+  // Stable identity: the presentation cache below compares it.
+  const snapshots = useMemo(
+    () => (antigravitySnapshot === null ? baseSnapshots : [...baseSnapshots, antigravitySnapshot]),
+    [baseSnapshots, antigravitySnapshot],
+  );
+  // No entry in an answer that succeeded means a server that ignores the request for it.
+  const antigravityPlaceholder: AntigravityPlaceholder | null =
+    antigravitySnapshot !== null
+      ? null
+      : antigravityUsage !== null && answered === null
+        ? "unsupported"
+        : antigravityUsageError !== null
+          ? "failed"
+          : "loading";
   const readRelativeLabelKey = () =>
     providerUsageRelativeLabelKey(snapshots, presentationNow ?? DateTime.nowUnsafe());
   const relativeLabelKey = useSyncExternalStore(
@@ -324,6 +439,8 @@ export function AppStatusBarView({
     percentageDisplay: usagePercentageDisplay,
     showClaudeUsage,
     showCodexUsage,
+    showAntigravityUsage,
+    antigravityPlaceholder,
     relativeLabelKey,
   };
   // Rederive only when an input or a countdown label bucket changes, not on every clock tick.
@@ -336,6 +453,8 @@ export function AppStatusBarView({
     presentation.percentageDisplay !== usagePercentageDisplay ||
     presentation.showClaudeUsage !== showClaudeUsage ||
     presentation.showCodexUsage !== showCodexUsage ||
+    presentation.showAntigravityUsage !== showAntigravityUsage ||
+    presentation.antigravityPlaceholder !== antigravityPlaceholder ||
     presentation.relativeLabelKey !== relativeLabelKey
   ) {
     presentation = buildProviderUsagePresentation(presentationInput, presentationNow);
@@ -364,7 +483,7 @@ export function AppStatusBarView({
             aria-busy={isRefreshing}
             aria-label="Refresh provider usage"
             className="inline-flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground outline-none hover:bg-accent/70 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-60"
-            disabled={isRefreshing}
+            disabled={isRefreshDisabled}
             title={isRefreshing ? "Refreshing provider usage" : "Refresh provider usage"}
             type="button"
             onClick={onRefresh}
@@ -428,13 +547,21 @@ export function AppStatusBar() {
   const resourceAutoRefreshEnvironmentRef = useRef<EnvironmentId | null>(null);
   const refreshFlightsRef = useRef(new Map<EnvironmentId, Promise<void>>());
   const manualRefreshPendingRef = useRef(new Set<EnvironmentId>());
+  // Antigravity's request has its own flight and its own manual pending state.
+  const antigravityFlightsRef = useRef(new Map<EnvironmentId, Promise<void>>());
+  const antigravityManualPendingRef = useRef(new Set<EnvironmentId>());
+  const antigravityRefreshRef = useRef<() => Promise<void>>(async () => undefined);
   const [iconOnly, setIconOnly] = useState(false);
   const [manualRefreshPending, setManualRefreshPending] = useState<ReadonlySet<EnvironmentId>>(
     () => new Set(),
   );
+  const [antigravityManualPending, setAntigravityManualPending] = useState<
+    ReadonlySet<EnvironmentId>
+  >(() => new Set());
   const {
     showClaudeUsage,
     showCodexUsage,
+    showAntigravityUsage,
     showResourceUsage,
     statusBarUsageMode,
     usagePercentageDisplay,
@@ -458,6 +585,15 @@ export function AppStatusBar() {
       : serverEnvironment.processDiagnostics({
           environmentId: primaryLocalEnvironmentId,
           input: {},
+        }),
+  );
+  // Antigravity is named in its own read, so a server only answers for it when asked.
+  const antigravityUsage = useEnvironmentQuery(
+    environmentId === null || !showAntigravityUsage
+      ? null
+      : serverEnvironment.providerUsage({
+          environmentId,
+          input: { providers: ["antigravity"] },
         }),
   );
   const terminalSessions = useKnownTerminalSessions({ environmentId, threadId: null });
@@ -503,23 +639,48 @@ export function AppStatusBar() {
       usage.revalidate,
     ],
   );
+  const performAntigravityRefresh = useCallback(
+    (force: boolean) =>
+      createAntigravityUsageRefreshHandler({
+        environmentId,
+        refreshProviderUsage,
+        refreshQuery: rereadFor({
+          force,
+          refresh: antigravityUsage.refresh,
+          revalidate: antigravityUsage.revalidate,
+        }),
+      })(force),
+    [antigravityUsage.refresh, antigravityUsage.revalidate, environmentId, refreshProviderUsage],
+  );
+  // A server whose answer has no Antigravity entry cannot serve it: automatic refreshes stop
+  // asking, and only the user's Refresh checks again (after a server upgrade, say).
+  const antigravityServed =
+    antigravityUsage.data === null ||
+    antigravityUsage.data.providers.some((snapshot) => snapshot.provider === "antigravity");
+  const refreshAntigravity = useCallback((): Promise<void> => {
+    if (environmentId === null || !showAntigravityUsage || !antigravityServed) {
+      return Promise.resolve();
+    }
+    return joinRefreshFlight(antigravityFlightsRef.current, environmentId, () =>
+      performAntigravityRefresh(false),
+    );
+  }, [antigravityServed, environmentId, performAntigravityRefresh, showAntigravityUsage]);
   const refresh = useCallback((): Promise<void> => {
     if (environmentId === null) return Promise.resolve();
-    const existing = refreshFlightsRef.current.get(environmentId);
-    if (existing !== undefined) return existing;
-
-    const flight = performRefresh(false);
-    refreshFlightsRef.current.set(environmentId, flight);
-    const finish = () => {
-      if (refreshFlightsRef.current.get(environmentId) === flight) {
-        refreshFlightsRef.current.delete(environmentId);
-      }
-    };
-    void flight.then(finish, finish);
-    return flight;
+    return joinRefreshFlight(refreshFlightsRef.current, environmentId, () => performRefresh(false));
   }, [environmentId, performRefresh]);
   const handleRefresh = useCallback(() => {
-    if (environmentId === null || manualRefreshPendingRef.current.has(environmentId)) return;
+    if (environmentId === null) return;
+    if (showAntigravityUsage && !antigravityManualPendingRef.current.has(environmentId)) {
+      antigravityManualPendingRef.current.add(environmentId);
+      setAntigravityManualPending(new Set(antigravityManualPendingRef.current));
+      const finishAntigravity = () => {
+        if (!antigravityManualPendingRef.current.delete(environmentId)) return;
+        setAntigravityManualPending(new Set(antigravityManualPendingRef.current));
+      };
+      void performAntigravityRefresh(true).then(finishAntigravity, finishAntigravity);
+    }
+    if (manualRefreshPendingRef.current.has(environmentId)) return;
 
     manualRefreshPendingRef.current.add(environmentId);
     setManualRefreshPending(new Set(manualRefreshPendingRef.current));
@@ -529,7 +690,7 @@ export function AppStatusBar() {
       setManualRefreshPending(new Set(manualRefreshPendingRef.current));
     };
     void flight.then(finish, finish);
-  }, [environmentId, performRefresh]);
+  }, [environmentId, performAntigravityRefresh, performRefresh, showAntigravityUsage]);
   const resourceRefresh = useMemo(
     () =>
       createStatusBarResourceRefreshHandler({
@@ -569,7 +730,8 @@ export function AppStatusBar() {
 
   useEffect(() => {
     refreshRef.current = refresh;
-  }, [refresh]);
+    antigravityRefreshRef.current = refreshAntigravity;
+  }, [refresh, refreshAntigravity]);
 
   useEffect(() => {
     resourceRefreshRef.current = resourceRefresh;
@@ -585,6 +747,8 @@ export function AppStatusBar() {
       resourceAutoRefreshEnvironmentRef.current = null;
       refreshFlightsRef.current.clear();
       manualRefreshPendingRef.current.clear();
+      antigravityFlightsRef.current.clear();
+      antigravityManualPendingRef.current.clear();
     },
     [],
   );
@@ -646,6 +810,26 @@ export function AppStatusBar() {
     }
   }, [atomRegistry, environmentId, resetUsage, resetUsageAtom, usage.emission]);
 
+  // Antigravity polls on its own: turning it on reads it now, and neither a pending nor a failed
+  // Claude and Codex read holds it back.
+  useEffect(() => {
+    if (environmentId === null || !showAntigravityUsage) return undefined;
+    return startStatusBarUsageAutoRefresh({ refresh: () => antigravityRefreshRef.current() });
+  }, [environmentId, showAntigravityUsage]);
+
+  const refreshControl = statusBarRefreshControl([
+    {
+      visible: showClaudeUsage || showCodexUsage,
+      busy: usage.isPending || (environmentId !== null && manualRefreshPending.has(environmentId)),
+    },
+    {
+      visible: showAntigravityUsage,
+      busy:
+        antigravityUsage.isPending ||
+        (environmentId !== null && antigravityManualPending.has(environmentId)),
+    },
+  ]);
+
   return (
     <div ref={containerRef}>
       <AppStatusBarView
@@ -663,12 +847,14 @@ export function AppStatusBar() {
               }
         }
         terminalCount={terminalSessions.length}
-        isRefreshing={
-          usage.isPending || (environmentId !== null && manualRefreshPending.has(environmentId))
-        }
+        isRefreshing={refreshControl.busy}
+        isRefreshDisabled={refreshControl.disabled}
         iconOnly={iconOnly}
         showClaudeUsage={showClaudeUsage}
         showCodexUsage={showCodexUsage}
+        showAntigravityUsage={showAntigravityUsage}
+        antigravityUsage={showAntigravityUsage ? antigravityUsage.data : null}
+        antigravityUsageError={showAntigravityUsage ? antigravityUsage.error : null}
         showResourceUsage={showResourceUsage}
         providerStateKey={environmentId ?? "no-environment"}
         statusBarUsageMode={statusBarUsageMode}

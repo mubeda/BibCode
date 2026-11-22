@@ -84,7 +84,10 @@ vi.mock("../../state/query", () => ({
   useEnvironmentQuery: (input: unknown) => {
     const index = harness.queryInputs.length;
     harness.queryInputs.push(input);
-    return harness.queries[index];
+    // The Antigravity read comes last and is off in these tests.
+    return (
+      harness.queries[index] ?? { data: null, error: null, refresh: vi.fn(), revalidate: vi.fn() }
+    );
   },
 }));
 vi.mock("../../state/server", () => ({
@@ -145,6 +148,8 @@ vi.mock("./providerUsagePresentation", () => ({
     return providers;
   },
   providerUsageRelativeLabelKey: () => "stable-label-bucket",
+  antigravityPlaceholderViewModel: () => ({ provider: "antigravity", windows: [] }),
+  providerUsageLabel: (provider: string) => provider,
 }));
 
 import {
@@ -383,7 +388,7 @@ describe("AppStatusBar", () => {
     const resourceCleanup = vi.fn();
     harness.refSeeds = { 3: usageCleanup, 4: "old", 5: resourceCleanup, 6: "old" };
     renderStatusBar();
-    expect(harness.queryInputs).toEqual([null, null, null]);
+    expect(harness.queryInputs).toEqual([null, null, null, null]);
     expect(harness.terminalInput).toEqual({ environmentId: null, threadId: null });
     harness.effects[0]?.();
     harness.effects[1]?.();
@@ -413,7 +418,7 @@ describe("AppStatusBar", () => {
     harness.queries = [query(null), query(), query()];
     harness.refSeeds = { 4: environmentId, 6: environmentId };
     renderStatusBar();
-    expect(harness.queryInputs).toHaveLength(3);
+    expect(harness.queryInputs).toHaveLength(4);
     expect(harness.primaryLocalSelectionInput).toBe(environmentId);
     expect(harness.providerUsage).toHaveBeenCalledWith({ environmentId, input: {} });
     expect(harness.diagnostics).toHaveBeenNthCalledWith(1, { environmentId, input: {} });
@@ -682,5 +687,63 @@ describe("AppStatusBarView defaults", () => {
     expect(harness.resourceSegments).toHaveLength(0);
     expect(harness.buttons).toHaveLength(0);
     expect(markup).not.toContain("Refresh status bar usage");
+  });
+});
+
+describe("AppStatusBar with Antigravity on", () => {
+  const environmentId = EnvironmentId.make("environment-local");
+  const antigravityCalls = () =>
+    harness.refreshProviderUsage.mock.calls.filter(
+      ([request]) =>
+        (request as { input: { providers: string[] } }).input.providers[0] === "antigravity",
+    );
+
+  beforeEach(() => {
+    harness.selectedEnvironment = { environmentId };
+    harness.clientSettings = {
+      ...harness.clientSettings,
+      showAntigravityUsage: true,
+    } as typeof harness.clientSettings;
+  });
+
+  it("reads and polls Antigravity on its own, even while the Claude and Codex read is pending", async () => {
+    vi.useFakeTimers();
+    harness.queries = [query(null, true), query(), query(), query()];
+    renderStatusBar();
+    harness.effects[0]?.();
+    const cleanup = harness.effects.at(-1)?.();
+    try {
+      expect(antigravityCalls()).toHaveLength(1);
+      expect(antigravityCalls()[0]?.[0]).toMatchObject({
+        input: { providers: ["antigravity"], force: false },
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(antigravityCalls().length).toBeGreaterThan(1);
+    } finally {
+      if (typeof cleanup === "function") cleanup();
+    }
+  });
+
+  it("leaves Antigravity out of the Claude and Codex poll", () => {
+    harness.queries = [
+      query({ providers: [] }),
+      query(),
+      query(),
+      query({ providers: [{ provider: "antigravity" }] }),
+    ];
+    renderStatusBar();
+    harness.effects[0]?.();
+    invokeRef(1);
+    expect(antigravityCalls()).toHaveLength(0);
+    expect(harness.refreshProviderUsage).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops polling a server whose answer has no Antigravity entry", () => {
+    harness.queries = [query({ providers: [] }), query(), query(), query({ providers: [] })];
+    renderStatusBar();
+    harness.effects[0]?.();
+    const cleanup = harness.effects.at(-1)?.();
+    if (typeof cleanup === "function") cleanup();
+    expect(antigravityCalls()).toHaveLength(0);
   });
 });

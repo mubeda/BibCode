@@ -218,6 +218,9 @@ export const ClientSettingsSchema = Schema.Struct({
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_STATUS_BAR_ITEMS)),
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_STATUS_BAR_ITEMS)),
   ),
+  // Its own flag, not a `StatusBarItem`: an older client resets the whole item list when it
+  // meets a literal it does not know, and would write that reset back.
+  showAntigravityUsage: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   statusBarUsageMode: StatusBarUsageMode.pipe(
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_STATUS_BAR_USAGE_MODE)),
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_STATUS_BAR_USAGE_MODE)),
@@ -906,6 +909,7 @@ export const ClientSettingsPatch = Schema.Struct({
   sidebarThreadSortOrder: Schema.optionalKey(SidebarThreadSortOrder),
   sidebarThreadPreviewCount: Schema.optionalKey(SidebarThreadPreviewCount),
   statusBarItems: Schema.optionalKey(Schema.Array(StatusBarItem)),
+  showAntigravityUsage: Schema.optionalKey(Schema.Boolean),
   statusBarUsageMode: Schema.optionalKey(StatusBarUsageMode),
   timestampFormat: Schema.optionalKey(TimestampFormat),
   terminalFontPreference: Schema.optionalKey(TerminalFontPreference),

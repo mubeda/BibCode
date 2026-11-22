@@ -102,6 +102,7 @@ function provider(overrides: Partial<ProviderUsageViewModel> = {}): ProviderUsag
     windows: [session],
     detailedWindows: [session],
     compactWindows: [session],
+    groups: [],
     plan: null,
     credits: null,
     updatedAt,
