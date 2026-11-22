@@ -1,6 +1,6 @@
 # Provider architecture
 
-BiBCode currently supports Codex, Claude, Cursor, and OpenCode. A provider
+BiBCode currently supports Codex, Claude, Cursor, Antigravity, and OpenCode. A provider
 instance binds a driver to its configured executable, options, readiness state,
 and instance metadata. Commands identify the instance rather than
 reconstructing driver state in the client.
@@ -8,7 +8,8 @@ reconstructing driver state in the client.
 Built-in provider settings defaults come from one server table. Both the control
 plane and the runtime settings reader fill missing fields from it, so a partial
 `providers.<driver>` object means the same thing everywhere. Codex, Claude,
-Cursor, and OpenCode are enabled by default; Grok is disabled. Explicitly saved
+Cursor, and OpenCode are enabled by default; Antigravity (Preview) and Grok are
+disabled. Explicitly saved
 values, including `enabled: false`, are preserved.
 
 `supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
@@ -212,13 +213,14 @@ No identity or label is inferred from a description.
 Each driver translates between the common orchestration model and its native
 protocol:
 
-| Provider | Native integration                             | Steer                 | Checkpoint revert       | Activity support                                                                           |
-| -------- | ---------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
-| Codex    | Codex App Server JSON-RPC                      | `turn/steer`          | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
-| Claude   | Claude stream-JSON CLI and authenticated hooks | Stream-JSON user line | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
-| Cursor   | Agent Client Protocol                          | Unsupported           | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
-| Grok     | Agent Client Protocol                          | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
-| OpenCode | OpenCode server/events API                     | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Provider    | Native integration                                              | Steer                 | Checkpoint revert       | Activity support                                                                           |
+| ----------- | --------------------------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
+| Codex       | Codex App Server JSON-RPC                                       | `turn/steer`          | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Claude      | Claude stream-JSON CLI and authenticated hooks                  | Stream-JSON user line | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
+| Cursor      | Agent Client Protocol                                           | Unsupported           | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
+| Antigravity | `agy acp`, Agent Client Protocol (Preview, disabled by default) | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
+| Grok        | Agent Client Protocol                                           | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
+| OpenCode    | OpenCode server/events API                                      | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
 
 Codex, Cursor, and Grok keep the provider's JSON-RPC request ID for their wire
 response. BiBCode gives each approval or question an opaque request ID scoped
