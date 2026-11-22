@@ -79,8 +79,40 @@ fn merge_provider_snapshot(
     if provider_snapshot_identity(&next) != Some(current_identity) {
         return next;
     }
+    let antigravity = next["driver"] == "antigravity";
     if !models_authoritative && let Some(value) = current.get("models") {
-        next["models"] = value.clone();
+        next["models"] = if antigravity {
+            // The probed catalog stays until the next full probe; custom models follow settings.
+            let probed = value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|model| model["isCustom"] != true)
+                .cloned()
+                .collect::<Vec<_>>();
+            let custom = next["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|model| !probed.iter().any(|listed| listed["slug"] == model["slug"]));
+            let custom = custom.cloned().collect::<Vec<_>>();
+            probed.into_iter().chain(custom).collect()
+        } else {
+            value.clone()
+        };
+    }
+    // Only a full probe opens an Antigravity session, so the sign-in it read stays until the next.
+    if antigravity
+        && next["auth"]["status"] == "unknown"
+        && let Some(auth) = current.get("auth")
+    {
+        next["auth"] = auth.clone();
+        if auth["status"] == "unauthenticated"
+            && next.get("message").is_none()
+            && let Some(message) = current.get("message")
+        {
+            next["message"] = message.clone();
+        }
     }
     for field in ["slashCommands", "skills", "agents"] {
         if let Some(value) = current.get(field) {
@@ -362,6 +394,8 @@ pub struct NativeServerControl {
     providers: Arc<RwLock<Vec<Value>>>,
     provider_maintenance: ProviderMaintenance,
     tools: ToolMaintenance,
+    /// Attributes the processes a full provider probe starts, once the runtime attaches it.
+    process_attribution: Arc<std::sync::OnceLock<crate::diagnostics::ProcessAttributionRegistry>>,
     capability_tasks: TaskTracker,
     capability_shutdown: CancellationToken,
     capability_admission: Arc<std::sync::Mutex<()>>,
@@ -510,6 +544,7 @@ impl NativeServerControl {
             providers,
             provider_maintenance,
             tools,
+            process_attribution: Arc::default(),
             capability_tasks: TaskTracker::new(),
             capability_shutdown: CancellationToken::new(),
             capability_admission: Arc::new(std::sync::Mutex::new(())),
@@ -1065,6 +1100,7 @@ impl NativeServerControl {
         &self,
         registry: crate::diagnostics::ProcessAttributionRegistry,
     ) {
+        let _ = self.process_attribution.set(registry.clone());
         self.tools.attach_attribution(registry);
     }
 
@@ -1672,12 +1708,19 @@ impl NativeServerControl {
                 instance_id,
                 cwd,
                 &self.provider_maintenance,
+                self.process_attribution.get(),
             )
             .await;
         }
         // Tools are re-checked with every full refresh; they publish their own changes.
         let (providers, ()) = tokio::join!(
-            provider_inventory::probe_full(settings, None, cwd, &self.provider_maintenance),
+            provider_inventory::probe_full(
+                settings,
+                None,
+                cwd,
+                &self.provider_maintenance,
+                self.process_attribution.get(),
+            ),
             self.tools.refresh(update_checks_enabled(settings), cwd),
         );
         providers
@@ -3016,6 +3059,14 @@ fn apply_settings_defaults(settings: &mut Value) {
             "agentMessaging": { "enabled": false },
         }),
     );
+    // A blank path reads as the default, as the settings contract decodes it.
+    if let Some(antigravity) = settings.pointer_mut("/providers/antigravity")
+        && antigravity["binaryPath"]
+            .as_str()
+            .is_some_and(|path| path.trim().is_empty())
+    {
+        antigravity["binaryPath"] = json!("agy");
+    }
     let object = settings.as_object_mut().expect("settings object");
     object
         .entry("defaultAgent")
@@ -6932,6 +6983,96 @@ done
             // A probe that read no version cannot tell an OpenCode 2 instance.
             assert_eq!(merged["supportsContextWindowUsage"], true);
         }
+    }
+
+    /// A quick refresh starts no Antigravity session, so it keeps the sign-in state and the models
+    /// the last full probe read, while the custom models follow the settings. A full probe after
+    /// sign-in replaces both. Other drivers keep publishing the refreshed sign-in state.
+    #[test]
+    fn antigravity_quick_refresh_keeps_probed_models_and_sign_in_until_a_full_probe() {
+        let sign_in = "Antigravity is not signed in.";
+        let current = json!({
+            "instanceId": "antigravity",
+            "driver": "antigravity",
+            "status": "ready",
+            "auth": { "status": "unauthenticated" },
+            "message": sign_in,
+            "models": [
+                { "slug": "model-alpha", "name": "Model Alpha", "isCustom": false },
+                { "slug": "removed-custom", "name": "removed-custom", "isCustom": true }
+            ]
+        });
+        let quick = |driver: &str| provider_inventory::ProviderProbeResult {
+            snapshot: json!({
+                "instanceId": driver,
+                "driver": driver,
+                "status": "ready",
+                "auth": { "status": "unknown" },
+                "models": [{ "slug": "added-custom", "name": "added-custom", "isCustom": true }]
+            }),
+            rich_metadata: provider_inventory::RichMetadataOutcome::NotRequested,
+            models_authoritative: false,
+        };
+
+        let merged = merge_provider_snapshot(Some(&current), quick("antigravity"));
+        assert_eq!(merged["auth"], json!({ "status": "unauthenticated" }));
+        assert_eq!(merged["message"], sign_in);
+        assert_eq!(
+            merged["models"],
+            json!([
+                { "slug": "model-alpha", "name": "Model Alpha", "isCustom": false },
+                { "slug": "added-custom", "name": "added-custom", "isCustom": true }
+            ])
+        );
+
+        let signed_in = provider_inventory::ProviderProbeResult {
+            snapshot: json!({
+                "instanceId": "antigravity",
+                "driver": "antigravity",
+                "status": "ready",
+                "auth": { "status": "authenticated" },
+                "models": [{ "slug": "model-beta", "name": "Model Beta", "isCustom": false }]
+            }),
+            rich_metadata: provider_inventory::RichMetadataOutcome::Succeeded,
+            models_authoritative: true,
+        };
+        let replaced = merge_provider_snapshot(Some(&merged), signed_in.clone());
+        assert_eq!(replaced, signed_in.snapshot);
+
+        let cursor = json!({
+            "instanceId": "cursor",
+            "driver": "cursor",
+            "status": "ready",
+            "auth": { "status": "authenticated" },
+            "models": []
+        });
+        let merged = merge_provider_snapshot(Some(&cursor), quick("cursor"));
+        assert_eq!(merged["auth"], json!({ "status": "unknown" }));
+    }
+
+    /// A blank Antigravity binary path reads as `agy`, as the settings contract decodes it,
+    /// never as an empty program the inventory would try to resolve.
+    #[test]
+    fn a_blank_antigravity_binary_path_falls_back_to_agy() {
+        for blank in ["", "   "] {
+            let mut settings = json!({
+                "providers": { "antigravity": { "enabled": true, "binaryPath": blank } }
+            });
+            apply_settings_defaults(&mut settings);
+            assert_eq!(
+                settings["providers"]["antigravity"]["binaryPath"], "agy",
+                "{blank:?}"
+            );
+            assert_eq!(settings["providers"]["antigravity"]["enabled"], true);
+        }
+        let mut custom = json!({
+            "providers": { "antigravity": { "binaryPath": "custom-cli" } }
+        });
+        apply_settings_defaults(&mut custom);
+        assert_eq!(
+            custom["providers"]["antigravity"]["binaryPath"],
+            "custom-cli"
+        );
     }
 
     /// A probe that read the instance's version tells whether its chats report context usage

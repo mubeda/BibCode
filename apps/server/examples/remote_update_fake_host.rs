@@ -626,7 +626,7 @@ mod tests {
         let path = temp.path().join("userdata/settings.json");
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["enableProviderUpdateChecks"], false);
-        for driver in ["codex", "claudeAgent", "cursor", "grok", "opencode"] {
+        for driver in hermetic_providers::BUILTIN_PROVIDER_DRIVERS {
             assert_eq!(value["providers"][driver]["enabled"], false);
             let pin = Path::new(value["providers"][driver]["binaryPath"].as_str().unwrap());
             assert!(pin.is_absolute());

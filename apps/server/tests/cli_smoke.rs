@@ -49,7 +49,7 @@ fn hermetic_settings_are_seeded_in_the_selected_state_directory() {
         )
         .expect("hermetic settings JSON");
         assert_eq!(settings["enableProviderUpdateChecks"], false);
-        for driver in ["codex", "claudeAgent", "cursor", "grok", "opencode"] {
+        for driver in hermetic_providers::BUILTIN_PROVIDER_DRIVERS {
             let binary = settings["providers"][driver]["binaryPath"]
                 .as_str()
                 .expect("pinned provider binary");
