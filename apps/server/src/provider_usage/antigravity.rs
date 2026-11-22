@@ -1250,6 +1250,78 @@ mod tests {
             assert_eq!(snapshot.error.as_deref(), Some(MESSAGE_FORMAT));
         }
 
+        /// Shutdown while the usage run's spawn is held (the script is still open for writing,
+        /// `ETXTBSY`): once shutdown returns, the CLI neither runs nor starts later (#414).
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn shutdown_during_a_held_usage_spawn_leaves_no_cli_process() {
+            let fixture = Fixture::new();
+            let release = fixture.sandbox.path("release");
+            let ready = fixture.sandbox.path("ready");
+            // `--version` leaves a writer on the script until `release` exists, and answers
+            // only once that writer is open.
+            let holder = format!(
+                "(exec 3>>\"$0\"; : > '{ready}'; while [ ! -e '{release}' ]; do sleep 0.01; done) </dev/null >/dev/null 2>&1 &\nwhile [ ! -e '{ready}' ]; do sleep 0.01; done\n{VERSION_OK}",
+                ready = ready.display(),
+                release = release.display()
+            );
+            let path = script(&fixture, "agy", &holder, &usage_ok());
+            let document = document_for(&path);
+            let verified: Arc<StdMutex<Option<VerifiedExecutable>>> = Arc::default();
+            let fetcher = ProviderUsageFetcher {
+                provider: ProviderUsageProvider::Antigravity,
+                fetch: Arc::new(move || -> FetchFuture {
+                    let (document, verified) = (document.clone(), verified.clone());
+                    Box::pin(async move {
+                        fetch_for_document(&document, None, &verified, DEADLINE).await
+                    })
+                }),
+            };
+            let service = crate::provider_usage::ProviderUsageService::new(
+                vec![fetcher],
+                Arc::new(OffsetDateTime::now_utc),
+            );
+            let refresh = tokio::spawn({
+                let service = service.clone();
+                async move {
+                    service
+                        .refresh_forced(Some(vec![ProviderUsageProvider::Antigravity]))
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !fixture.calls().iter().any(|call| call == "--version") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the version probe ran");
+            // The usage spawn is now retrying against the busy script.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let shutdown = tokio::spawn({
+                let service = service.clone();
+                async move { service.shutdown().await }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Released after shutdown cancelled the attempt: a spawn still retrying would start.
+            std::fs::write(&release, "").expect("release the writer");
+            shutdown.await.expect("shutdown task");
+            let _ = refresh.await;
+            let held = service.single_flights[&ProviderUsageProvider::Antigravity]
+                .lock()
+                .unwrap()
+                .cooldown_from;
+            assert!(held.is_none(), "the usage CLI was spawned after shutdown");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(fixture.calls(), ["--version"]);
+            let running = std::process::Command::new("pgrep")
+                .arg("-f")
+                .arg(&path)
+                .status()
+                .expect("pgrep");
+            assert!(!running.success(), "a usage CLI process is still running");
+        }
+
         #[tokio::test]
         async fn failures_log_a_class_never_the_cli_text() {
             let Some(child) = crate::test_support::in_own_process(

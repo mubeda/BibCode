@@ -599,6 +599,9 @@ that the window renders:
   of a release build too (they are written once the in-process server has
   started). A launch outside `AppRun` from an AppDir restarts through `AppRun`; only
   if that fails does it log `could not restart through the AppDir's AppRun`.
+  Started with another extracted AppDir's `APPDIR` and its paths in
+  `LD_LIBRARY_PATH`, `PATH` and `XDG_DATA_DIRS` (#413), a terminal's environment
+  holds none of that AppDir's entries.
 
 Record the bundled WebKitGTK version (the `libwebkit2gtk-4.1.so.0.*` file name
 under `usr/lib`) with the result.
