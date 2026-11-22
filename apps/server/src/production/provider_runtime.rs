@@ -10341,7 +10341,12 @@ async fn handle_command(
                     )
                     .await
                 }
-                Err(error) => Err(error),
+                // The thread already asks for this mode: a restart must never start the
+                // session in the earlier, possibly more permissive one.
+                Err(error) => {
+                    entry.launch.runtime_mode = runtime_mode;
+                    Err(error)
+                }
             }
         }
         OrchestrationCommand::ThreadInteractionModeSet {
@@ -10370,7 +10375,11 @@ async fn handle_command(
                     )
                     .await
                 }
-                Err(error) => Err(error),
+                // As for the runtime mode: a restart starts in the mode the thread asks for.
+                Err(error) => {
+                    entry.launch.interaction_mode = interaction_mode;
+                    Err(error)
+                }
             }
         }
         OrchestrationCommand::ThreadMetaUpdate {
@@ -15167,9 +15176,11 @@ where
 
 async fn kill_child(child: &SharedChild) {
     let mut child = child.lock().await;
-    if let Some(pid) = child.id() {
-        exits::note_stop_requested(pid);
-    }
+    // Already reaped: its process group id may belong to another process by now.
+    let Some(pid) = child.id() else {
+        return;
+    };
+    exits::note_stop_requested(pid);
     let report = terminate_and_wait(&mut **child).await;
     log_cleanup_failures("provider process", &report);
 }
@@ -16106,10 +16117,11 @@ impl Drop for AntigravityDriver {
         self.runtime.close();
         // The group kill is sent here, synchronously, so it happens even when no task can run
         // any more (a runtime shutting down); only the reap is handed off.
-        if let Ok(mut child) = self.child.try_lock() {
-            if let Some(pid) = child.id() {
-                exits::note_stop_requested(pid);
-            }
+        // Only a child still owned is signalled: a reaped one's group id may be reused.
+        if let Ok(mut child) = self.child.try_lock()
+            && let Some(pid) = child.id()
+        {
+            exits::note_stop_requested(pid);
             let _ = child.start_kill();
         }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -22262,7 +22274,10 @@ mod tests {
         answers: usize,
         modes: Vec<String>,
         set_mode_unsupported: bool,
+        /// `set_mode` fails as a CLI that did not confirm the mode would.
+        set_mode_fails: bool,
         interaction_modes: Vec<String>,
+        set_interaction_mode_unsupported: bool,
         models: Vec<String>,
         retired_model: Option<&'static str>,
         rollbacks: Vec<i64>,
@@ -22674,6 +22689,12 @@ mod tests {
                         capability: "runtime mode",
                     });
                 }
+                if state.set_mode_fails {
+                    return Err(super::ProviderRuntimeError::Provider {
+                        provider: "codex".to_owned(),
+                        detail: "the mode was not confirmed".to_owned(),
+                    });
+                }
                 Ok(())
             })
         }
@@ -22683,7 +22704,14 @@ mod tests {
             mode: String,
         ) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
             Box::pin(async move {
-                self.state.lock().unwrap().interaction_modes.push(mode);
+                let mut state = self.state.lock().unwrap();
+                state.interaction_modes.push(mode);
+                if state.set_interaction_mode_unsupported {
+                    return Err(super::ProviderRuntimeError::UnsupportedCapability {
+                        provider: "codex".to_owned(),
+                        capability: "interaction mode",
+                    });
+                }
                 Ok(())
             })
         }
@@ -22850,7 +22878,7 @@ mod tests {
     impl ProviderDriverFactory for SequencedSupervisorFactory {
         fn create(
             &self,
-            _: super::ProviderLaunchRequest,
+            request: super::ProviderLaunchRequest,
         ) -> super::BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, super::ProviderRuntimeError>>
         {
             Box::pin(async move {
@@ -22861,6 +22889,7 @@ mod tests {
                     .pop_front()
                     .expect("sequenced provider driver");
                 state.lock().unwrap().launches += 1;
+                state.lock().unwrap().launch_requests.push(request);
                 Ok(Arc::new(SupervisorDriver {
                     state,
                     events: tokio::sync::Mutex::new(events),
@@ -31170,6 +31199,73 @@ done
         tokio::task::yield_now().await;
         assert_eq!(first.lock().unwrap().targeted_calls.len(), 2);
         assert!(replacement.lock().unwrap().targeted_calls.is_empty());
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    /// A mode switch the driver could not confirm still becomes the session's launch mode: a
+    /// later restart (here for an interaction mode the driver cannot switch in place) starts
+    /// the replacement in the thread's current mode, never the more permissive earlier one.
+    #[tokio::test]
+    async fn a_restart_after_an_unconfirmed_mode_switch_launches_the_requested_mode() {
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let first = Arc::new(StdMutex::new(SupervisorDriverState {
+            set_mode_fails: true,
+            set_interaction_mode_unsupported: true,
+            ..SupervisorDriverState::default()
+        }));
+        let replacement = Arc::new(StdMutex::new(SupervisorDriverState::default()));
+        let (_first_tx, first_rx) = mpsc::channel(1);
+        let (_replacement_tx, replacement_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SequencedSupervisorFactory {
+                drivers: StdMutex::new(std::collections::VecDeque::from([
+                    (first.clone(), first_rx),
+                    (replacement.clone(), replacement_rx),
+                ])),
+            }),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        launch.runtime_mode = "full-access".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+
+        let switched = timeout(
+            std::time::Duration::from_secs(2),
+            supervisor.handle_orchestration(OrchestrationCommand::ThreadRuntimeModeSet {
+                command_id: "mode-unconfirmed".to_owned(),
+                thread_id: "t1".to_owned(),
+                runtime_mode: "approval-required".to_owned(),
+                created_at: "2026-07-16T00:00:00Z".to_owned(),
+            }),
+        )
+        .await
+        .expect("mode switch returns");
+        assert!(switched.is_err(), "the driver did not confirm the mode");
+        timeout(
+            std::time::Duration::from_secs(2),
+            supervisor.handle_orchestration(OrchestrationCommand::ThreadInteractionModeSet {
+                command_id: "plan-restart".to_owned(),
+                thread_id: "t1".to_owned(),
+                interaction_mode: "plan".to_owned(),
+                created_at: "2026-07-16T00:00:01Z".to_owned(),
+            }),
+        )
+        .await
+        .expect("restart returns")
+        .expect("restart succeeds");
+        let relaunched = replacement.lock().unwrap().launch_requests.clone();
+        assert_eq!(relaunched.len(), 1);
+        assert_eq!(relaunched[0].runtime_mode, "approval-required");
+        assert_eq!(relaunched[0].interaction_mode, "plan");
 
         supervisor.shutdown().await.expect("shutdown supervisor");
         engine.shutdown().await;

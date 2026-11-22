@@ -150,6 +150,8 @@ pub(crate) struct ProviderProbeResult {
     pub(crate) session_reads: SessionReads,
     /// A digest of the binary path and environment the probe launched with.
     pub(crate) launch_inputs: u64,
+    /// [`Self::launch_inputs`] with the configured custom models: what a reused catalog keys on.
+    pub(crate) catalog_inputs: u64,
 }
 
 impl ProviderProbeResult {
@@ -207,7 +209,7 @@ pub(crate) async fn probe_full(
 }
 
 /// [`probe_full`] that keeps the last ACP catalog of the instances in `reuse` instead of
-/// probing it again (see [`acp_catalog_inputs`]).
+/// probing it again (see [`antigravity_catalog_inputs`]).
 pub(crate) async fn probe_full_reusing(
     settings: &Value,
     selected: Option<&str>,
@@ -228,27 +230,17 @@ pub(crate) async fn probe_full_reusing(
     .await
 }
 
-/// The instances whose catalog an ACP connection reads (Cursor's model list, Antigravity's
-/// session), each with the probe's inputs as one comparable text. While an instance's inputs
-/// stay those of its last read, within the refresh TTL, a full refresh may reuse its catalog:
-/// an Antigravity probe opens a session in the user's account.
-/// The inputs are a digest: the environment carries the stored secrets.
-pub(crate) fn acp_catalog_inputs(settings: &Value) -> HashMap<String, u64> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
+/// The enabled Antigravity instances, each with the inputs of its catalog read (a digest: the
+/// environment carries the stored secrets). An Antigravity probe opens a session in the user's
+/// account, so after a signed-in read with these same inputs a full refresh within the refresh
+/// TTL may reuse its catalog. Cursor is always probed again.
+pub(crate) fn antigravity_catalog_inputs(settings: &Value) -> HashMap<String, u64> {
     definitions(settings)
         .into_iter()
-        .filter(|definition| matches!(definition.driver.as_str(), "cursor" | "antigravity"))
+        .filter(|definition| definition.driver == "antigravity" && definition.enabled)
         .map(|definition| {
-            let mut hasher = DefaultHasher::new();
-            (
-                definition.enabled,
-                &definition.binary_path,
-                &definition.environment,
-                &definition.endpoint,
-                &definition.custom_models,
-            )
-                .hash(&mut hasher);
-            (definition.instance_id, hasher.finish())
+            let inputs = catalog_inputs(&definition);
+            (definition.instance_id, inputs)
         })
         .collect()
 }
@@ -547,6 +539,7 @@ async fn probe_one(
     )
     .await;
     result.launch_inputs = launch_inputs(&definition);
+    result.catalog_inputs = catalog_inputs(&definition);
     maintenance
         .enrich_snapshot(&target, &mut result.snapshot, checks_enabled)
         .await;
@@ -558,6 +551,14 @@ fn launch_inputs(definition: &ProviderDefinition) -> u64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     (&definition.binary_path, &definition.environment).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The launch inputs and the custom models: a catalog read with other ones is read again.
+fn catalog_inputs(definition: &ProviderDefinition) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    (launch_inputs(definition), &definition.custom_models).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -652,7 +653,7 @@ pub(crate) fn unsupported_instances(settings: &Value) -> Vec<ProviderProbeResult
         .collect()
 }
 
-/// `reuse_catalog` skips the ACP catalog probe (Cursor's model list, Antigravity's session):
+/// `reuse_catalog` skips Antigravity's session probe:
 /// the last one stays through the merge.
 async fn probe_one_snapshot(
     definition: &ProviderDefinition,
@@ -949,7 +950,6 @@ async fn probe_one_snapshot(
                 capabilities.skills = workspace_capabilities.skills;
                 capabilities.agents = workspace_capabilities.agents;
                 if include_slow_capabilities
-                    && !reuse_catalog
                     && let Some(discovered) = probe_cursor_models(
                         &executable,
                         definition.endpoint.as_deref(),

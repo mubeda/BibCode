@@ -1277,6 +1277,8 @@ async fn a_failed_switch_keeps_the_new_mode_and_refuses_prompts_until_acknowledg
     assert!(peer.silent().await);
 }
 
+/// Mode writes reach the CLI one at a time, and each writes the latest setting: an older
+/// switch's answer never confirms a newer one, and a newer switch waits for the older write.
 #[tokio::test]
 async fn an_older_mode_answer_never_confirms_a_newer_switch() {
     let (runtime, mut peer) = started("full-access", "auto").await;
@@ -1290,24 +1292,70 @@ async fn an_older_mode_answer_never_confirms_a_newer_switch() {
         let runtime = runtime.clone();
         async move { runtime.set_runtime_mode("full-access").await }
     });
-    let newer = peer.expect("session/set_config_option").await;
-    assert_eq!(newer["params"]["value"], "auto");
-    peer.reply(&newer, json!({ "configOptions": standard_options("auto") }))
-        .await;
-    to_auto.await.unwrap().expect("newer switch acknowledged");
-    // The older answer lands last and shows `default`: the mode is no longer confirmed.
+    assert!(
+        peer.silent().await,
+        "the newer write waits for the older one"
+    );
     peer.reply(
         &older,
         json!({ "configOptions": standard_options("default") }),
     )
     .await;
-    let _ = to_default.await.unwrap();
-    let _send = spawn_send(&runtime).await;
-    let rewrite = peer.expect("session/set_config_option").await;
-    assert_eq!(
-        rewrite["params"]["value"], "auto",
-        "the latest setting wins"
+    let _ = timeout(Duration::from_secs(5), to_default)
+        .await
+        .expect("older switch in time");
+    let newer = peer.expect("session/set_config_option").await;
+    assert_eq!(newer["params"]["value"], "auto", "the latest setting wins");
+    peer.reply(&newer, json!({ "configOptions": standard_options("auto") }))
+        .await;
+    timeout(Duration::from_secs(5), to_auto)
+        .await
+        .expect("newer switch in time")
+        .unwrap()
+        .expect("newer switch acknowledged");
+}
+
+/// The reverse: a switch to full access in flight when the thread moves back to approval-
+/// required. Its `auto` answer confirms nothing, `default` is written after it, and the prompt
+/// follows that confirmed `default`, never an `auto` written later.
+#[tokio::test]
+async fn a_full_access_write_in_flight_never_runs_the_next_prompt_in_auto() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let to_auto = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_runtime_mode("full-access").await }
+    });
+    let older = peer.expect("session/set_config_option").await;
+    assert_eq!(older["params"]["value"], "auto");
+    let to_default = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_runtime_mode("approval-required").await }
+    });
+    let send = spawn_send(&runtime).await;
+    assert!(
+        peer.silent().await,
+        "nothing is written past the unanswered mode write"
     );
+    peer.reply(&older, json!({ "configOptions": standard_options("auto") }))
+        .await;
+    let _ = timeout(Duration::from_secs(5), to_auto)
+        .await
+        .expect("older switch in time");
+    let newer = peer.expect("session/set_config_option").await;
+    assert_eq!(newer["params"]["value"], "default");
+    peer.reply(
+        &newer,
+        json!({ "configOptions": standard_options("default") }),
+    )
+    .await;
+    timeout(Duration::from_secs(5), to_default)
+        .await
+        .expect("newer switch in time")
+        .unwrap()
+        .expect("default acknowledged");
+    let prompt = peer.next().await;
+    assert_eq!(prompt["method"], "session/prompt", "{prompt}");
+    drop(send);
 }
 
 #[tokio::test]

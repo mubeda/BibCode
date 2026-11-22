@@ -2490,6 +2490,10 @@ async fn refuse_unsupported_remote_settings(
     else {
         return refuse("remote-fetch-mapping-unsupported", FETCH_SETTINGS_REFUSAL);
     };
+    // A read cut at the output limit may have dropped a later setting that refuses.
+    if output.stdout_truncated {
+        return refuse("remote-fetch-mapping-unsupported", FETCH_SETTINGS_REFUSAL);
+    }
     let own = format!("remote.{remote}.");
     let group = format!("remotes.{remote}");
     let mut urls = Vec::new();
@@ -2563,6 +2567,13 @@ async fn check_remote_branch_delete(
         }
         error
     })?;
+    // A cut answer may have dropped the HEAD or the branch line the checks below rely on.
+    if outputs.iter().any(|output| output.stdout_truncated) {
+        return refuse(
+            "remote-default-unknown",
+            "The remote's default branch could not be checked.",
+        );
+    }
     let branch_ref = format!("refs/heads/{branch}");
     let mut default_ref = None;
     let mut head_advertised = false;
@@ -7230,6 +7241,38 @@ mod tests {
             .expect_err("a rewritten push is refused");
 
         assert_eq!(failure.code, "remote-push-url-differs");
+        for repository in [remote.path(), other.path()] {
+            assert_eq!(
+                remote_refs(repository),
+                "refs/heads/feature\nrefs/heads/main"
+            );
+        }
+    }
+
+    /// A settings read cut at the output limit is not the whole allowlist: a `pushurl` past the
+    /// cut must still refuse, so a truncated read refuses before anything is deleted.
+    #[tokio::test]
+    async fn remote_branch_delete_refuses_when_the_settings_read_is_truncated() {
+        let (remote, fixture) = remote_delete_fixture();
+        let other = second_remote(fixture.path());
+        let config = fixture.path().join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).expect("config");
+        contents.push_str("[padding]\n");
+        let value = "x".repeat(1000);
+        for index in 0..1100 {
+            contents.push_str(&format!("\tentry{index} = {value}\n"));
+        }
+        contents.push_str(&format!(
+            "[remote \"origin\"]\n\tpushurl = {}\n",
+            other.path().to_string_lossy()
+        ));
+        std::fs::write(&config, contents).expect("padded config");
+
+        let failure = delete_on_remote(fixture.path(), &remote_delete(fixture.path(), "feature"))
+            .await
+            .expect_err("a truncated settings read is refused");
+
+        assert_eq!(failure.code, "remote-fetch-mapping-unsupported");
         for repository in [remote.path(), other.path()] {
             assert_eq!(
                 remote_refs(repository),
