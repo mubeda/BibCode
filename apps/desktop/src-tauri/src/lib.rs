@@ -508,11 +508,29 @@ mod tests {
         let capability = &config["app"]["security"]["capabilities"][0];
 
         assert_main_webview_only(capability);
+        // The inline capability replaces `capabilities/`, so it repeats every product permission
+        // (#417: without `allow-desktop-preview` the preview never opened in test builds).
+        let production: Value = serde_json::from_str(include_str!("../capabilities/default.json"))
+            .expect("default capability JSON should parse");
+        let granted = capability["permissions"]
+            .as_array()
+            .expect("desktop E2E capability should list permissions");
+        for permission in production["permissions"]
+            .as_array()
+            .expect("default capability should list permissions")
+        {
+            assert!(
+                granted.contains(permission),
+                "desktop E2E capability lacks product permission {permission}",
+            );
+        }
         assert_eq!(
             capability.get("permissions"),
             Some(&serde_json::json!([
                 "allow-desktop-bridge",
+                "allow-desktop-preview",
                 "core:default",
+                "deep-link:default",
                 "wdio:default",
                 "allow-desktop-e2e-lifecycle"
             ]))

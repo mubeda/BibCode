@@ -3959,9 +3959,14 @@ sizes. Cover relevant:
   no Undo or Redo item. Native cells cover two steps undone one at a time,
   redo with two pending redo entries, a formatting step, the chat composer, a
   plain textarea, the inline comment field, the Link URL field, and the
-  terminal keeping Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y off macOS. The preview
-  browser cells are pending: the spec cannot yet observe a page in the preview
-  webview, so undo there is checked by hand. Run it alone with
+  terminal keeping Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y off macOS. A driver cell
+  opens a local HTML file in the preview browser and fails unless the page
+  loads and its native screenshot shows the probe page's colour over the whole
+  slot. While the preview's child webview is open the embedded WebDriver finds
+  no window, so the page reports the preview's events to the spec over a
+  loopback endpoint and closes that webview before WebDriver resumes. The
+  preview undo cells are pending: on macOS keys typed after the native click
+  never reached the preview page, so undo there is checked by hand. Run it alone with
   `BIBCODE_E2E_SPEC=./specs/files-undo-shortcuts.e2e.ts`, once with and once
   without `BIBCODE_E2E_NATIVE_INPUT=1`, both with `BIBCODE_E2E_PROFILER=1`. Each
   cell's result and the events that reached the page are in
