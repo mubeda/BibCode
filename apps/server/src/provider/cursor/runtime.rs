@@ -26,8 +26,7 @@ use crate::provider::{
 use super::{
     acp::{
         AcpJsonRpcConnection, AcpProtocolError, AcpRequestWriteFailure, IncomingEvent,
-        JsonRpcErrorShape, acp_error_class,
-        acp_turn_state,
+        JsonRpcErrorShape, acp_error_class, acp_turn_state,
     },
     model::{
         acp_config_option_current_value, acp_model_descriptor, acp_model_values_are_bracketed,
@@ -557,7 +556,10 @@ impl CursorSessionRuntime {
             .and_then(Value::as_str)
             .unwrap_or("model")
             .to_owned();
-        let previous = descriptor.get("currentValue").cloned().unwrap_or(Value::Null);
+        let previous = descriptor
+            .get("currentValue")
+            .cloned()
+            .unwrap_or(Value::Null);
         let session_id = self.provider_session_id().await?;
         match self.set_config_option(&session_id, &config_id, value).await {
             Ok(next) => {
@@ -697,6 +699,7 @@ impl CursorSessionRuntime {
         Ok(turn_id)
     }
 
+    #[allow(clippy::result_large_err)]
     pub async fn send_turn_with_receipt(
         &self,
         input: Option<&str>,
@@ -1141,7 +1144,10 @@ impl CursorSessionRuntime {
         };
         match event {
             IncomingEvent::Notification { .. } if late => {
-                tracing::debug!(provider = PROVIDER, "dropped a stopped turn's late notification");
+                tracing::debug!(
+                    provider = PROVIDER,
+                    "dropped a stopped turn's late notification"
+                );
             }
             IncomingEvent::Request {
                 wire_id, method, ..
@@ -1939,7 +1945,11 @@ mod tests {
             next_of(&runtime, "turn.notice").await.payload["message"].is_string(),
             "a pending call does not pause the clock"
         );
-        write_frame(&mut responses, tool_update("tool_call_update", "in_progress")).await;
+        write_frame(
+            &mut responses,
+            tool_update("tool_call_update", "in_progress"),
+        )
+        .await;
         assert!(next_of(&runtime, "turn.notice").await.payload["message"].is_null());
         next_of(&runtime, "item.updated").await;
         assert!(
@@ -1965,9 +1975,15 @@ mod tests {
             .await
             .expect("session prompt should write");
         let prompt = read_request(&mut requests).await;
-        assert_eq!(next_of(&runtime, "turn.started").await.turn_id.as_deref(), Some(receipt.turn_id.as_str()));
+        assert_eq!(
+            next_of(&runtime, "turn.started").await.turn_id.as_deref(),
+            Some(receipt.turn_id.as_str())
+        );
         runtime.interrupt_turn().await.expect("stop");
-        assert_eq!(read_request(&mut requests).await["method"], "session/cancel");
+        assert_eq!(
+            read_request(&mut requests).await["method"],
+            "session/cancel"
+        );
 
         async fn late(responses: &mut DuplexStream) {
             let frames = [
@@ -1985,8 +2001,14 @@ mod tests {
                 json!({ "jsonrpc": "2.0", "id": 83, "method": "cursor/create_plan",
                     "params": { "plan": "# Late" } }),
             ];
-            let text = frames.iter().map(|frame| format!("{frame}\n")).collect::<String>();
-            responses.write_all(text.as_bytes()).await.expect("late write");
+            let text = frames
+                .iter()
+                .map(|frame| format!("{frame}\n"))
+                .collect::<String>();
+            responses
+                .write_all(text.as_bytes())
+                .await
+                .expect("late write");
         }
         late(&mut responses).await;
         let mut answers = Vec::new();
@@ -2037,9 +2059,15 @@ mod tests {
             .send_turn_with_receipt(Some("hello"), Vec::new())
             .await
             .expect("session prompt should write");
-        assert_eq!(read_request(&mut requests).await["method"], "session/prompt");
+        assert_eq!(
+            read_request(&mut requests).await["method"],
+            "session/prompt"
+        );
         runtime.interrupt_turn().await.expect("stop");
-        assert_eq!(read_request(&mut requests).await["method"], "session/cancel");
+        assert_eq!(
+            read_request(&mut requests).await["method"],
+            "session/cancel"
+        );
         timeout(Duration::from_secs(5), runtime.abandoned())
             .await
             .expect("the unanswered cancel retires the runtime");
@@ -2055,7 +2083,10 @@ mod tests {
             .send_turn_with_receipt(Some("again"), Vec::new())
             .await
             .expect_err("a retired runtime takes no prompt");
-        assert!(matches!(refused, CursorRuntimeError::Protocol(_)), "{refused}");
+        assert!(
+            matches!(refused, CursorRuntimeError::Protocol(_)),
+            "{refused}"
+        );
         assert!(
             timeout(Duration::from_millis(200), requests.next_line())
                 .await
@@ -2070,8 +2101,9 @@ mod tests {
             .expect("the written prompt stays accepted");
         let rest = timeout(Duration::from_secs(1), runtime.collect_events(1)).await;
         assert!(
-            rest.as_ref()
-                .is_ok_and(|rest| rest.iter().all(|event| event.event_type == "session.exited")),
+            rest.as_ref().is_ok_and(|rest| rest
+                .iter()
+                .all(|event| event.event_type == "session.exited")),
             "{rest:?}"
         );
     }
@@ -2175,7 +2207,10 @@ mod tests {
         let completed = timeout(Duration::from_secs(2), async {
             loop {
                 let event = runtime.next_event().await.expect("event");
-                assert_ne!(event.event_type, "turn.notice", "no notice while reporting or waiting");
+                assert_ne!(
+                    event.event_type, "turn.notice",
+                    "no notice while reporting or waiting"
+                );
                 if event.event_type == "turn.completed" {
                     return event;
                 }
@@ -2270,7 +2305,10 @@ mod tests {
         )
         .await;
         let rollback = read_request(&mut requests).await;
-        assert_eq!(rollback["params"]["value"], "m[reasoning=medium,fast=false]");
+        assert_eq!(
+            rollback["params"]["value"],
+            "m[reasoning=medium,fast=false]"
+        );
         write_frame(
             &mut responses,
             json!({ "jsonrpc": "2.0", "id": rollback["id"], "result": {

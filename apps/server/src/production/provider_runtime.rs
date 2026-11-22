@@ -3955,9 +3955,14 @@ mod workspace_loss_tests {
         }))
         .unwrap();
         let mut payload = serde_json::to_value(&command).unwrap();
-        freeze_delivery_route(&f.engine, &f._root.path().to_path_buf(), &command, &mut payload)
-            .await
-            .unwrap();
+        freeze_delivery_route(
+            &f.engine,
+            &f._root.path().to_path_buf(),
+            &command,
+            &mut payload,
+        )
+        .await
+        .unwrap();
         f.engine
             .dispatch_with_admission(
                 command.clone(),
@@ -4009,7 +4014,11 @@ mod workspace_loss_tests {
         .await
         .expect("the message settles");
         assert_eq!(state, TurnDeliveryState::Delivered);
-        assert_eq!(f.driver.launches.load(Ordering::SeqCst), 2, "launched again");
+        assert_eq!(
+            f.driver.launches.load(Ordering::SeqCst),
+            2,
+            "launched again"
+        );
         assert_eq!(f.driver.sends.load(Ordering::SeqCst), 1);
         service.shutdown().await;
         supervisor.shutdown().await.unwrap();

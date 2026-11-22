@@ -952,7 +952,7 @@ pub fn discover_models_with_advertised_values(
             if carriers.is_empty() {
                 // A plain advertised value keeps its model, with no option a bracketed session
                 // could apply to it.
-                if !advertised.iter().any(|value| *value == base) {
+                if !advertised.contains(&base) {
                     continue;
                 }
                 Vec::new()
@@ -998,7 +998,10 @@ fn carries(params: &[(&str, &str)], id: &str, value: &str) -> bool {
     params.iter().any(|(key, carried)| {
         (*key == id || (REASONING_KEYS.contains(key) && REASONING_KEYS.contains(&id)))
             && (*carried == value
-                || matches!((*carried, value), ("extra-high", "xhigh") | ("xhigh", "extra-high")))
+                || matches!(
+                    (*carried, value),
+                    ("extra-high", "xhigh") | ("xhigh", "extra-high")
+                ))
     })
 }
 
@@ -1013,8 +1016,7 @@ fn narrow_config_options(options: Vec<Value>, carriers: &[&[(&str, &str)]]) -> V
         .into_iter()
         .filter_map(|mut option| {
             let id = option.get("id").and_then(Value::as_str)?.to_owned();
-            let carried =
-                |value: &str| carriers.iter().any(|params| carries(params, &id, value));
+            let carried = |value: &str| carriers.iter().any(|params| carries(params, &id, value));
             let kept = option
                 .get("options")
                 .and_then(Value::as_array)?
@@ -1342,7 +1344,10 @@ mod tests {
         let models = discover_models_with_advertised_values(&list, &[], &advertised).unwrap();
         // A mixed catalog keeps its plain model, with no options to refuse.
         assert_eq!(
-            models.iter().map(|model| model.slug.as_str()).collect::<Vec<_>>(),
+            models
+                .iter()
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
             ["default", "m", "n"]
         );
         assert_eq!(models[0].capabilities["optionDescriptors"], json!([]));
@@ -1391,8 +1396,20 @@ mod tests {
             }
         }
         // m keeps only Reasoning (Fast is not free of it); n keeps both, every pair advertised.
-        assert_eq!(models[1].capabilities["optionDescriptors"].as_array().unwrap().len(), 1);
-        assert_eq!(models[2].capabilities["optionDescriptors"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            models[1].capabilities["optionDescriptors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            models[2].capabilities["optionDescriptors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(checked > 0);
     }
 
@@ -1460,7 +1477,8 @@ mod tests {
     /// never sent as typed.
     #[test]
     fn an_option_without_values_refuses_every_model_but_its_current_one() {
-        let descriptor = json!({ "id": "model", "category": "model", "currentValue": "m", "options": [] });
+        let descriptor =
+            json!({ "id": "model", "category": "model", "currentValue": "m", "options": [] });
         assert_eq!(
             resolve_advertised_model_value(&descriptor, "m").unwrap(),
             json!("m")

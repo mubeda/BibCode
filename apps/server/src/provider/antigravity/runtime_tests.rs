@@ -1324,7 +1324,10 @@ async fn an_answered_mode_write_without_its_options_is_refused() {
     let mode = peer.expect("session/set_config_option").await;
     assert_eq!(mode["params"]["value"], "default");
     peer.reply(&mode, json!({})).await;
-    let error = switch.await.unwrap().expect_err("an unconfirmed mode refuses");
+    let error = switch
+        .await
+        .unwrap()
+        .expect_err("an unconfirmed mode refuses");
     assert!(
         matches!(error, AntigravityRuntimeError::ModeUnavailable { .. }),
         "{error:?}"

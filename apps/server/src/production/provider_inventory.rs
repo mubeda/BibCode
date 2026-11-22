@@ -3363,7 +3363,11 @@ done
             );
         }
         probe(account("b")).await;
-        assert_eq!(opened(&sessions), 2, "another environment reads its own session");
+        assert_eq!(
+            opened(&sessions),
+            2,
+            "another environment reads its own session"
+        );
     }
 
     /// A failed session read is remembered for a while instead of opening a session on every
