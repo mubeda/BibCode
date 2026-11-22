@@ -1781,6 +1781,17 @@ launches. `BIBCODE_GDK_BACKEND=x11` restores the previous backend selection.
 Preferring native Wayland avoids oversized rendering from integer GTK scaling
 under Xwayland on fractionally scaled Hyprland/Omarchy desktops.
 
+GPU compositing can be turned off on Linux (#411) for machines whose graphics
+driver hangs in WebKitGTK's compositor thread. `main` reads
+`linuxSoftwareRendering` from `desktop-settings.json`, or the
+`BIBCODE_SOFTWARE_RENDERING` override, while the process is still
+single-threaded and after the crash hook, and sets
+`WEBKIT_DISABLE_COMPOSITING_MODE=1` and `WEBKIT_DISABLE_DMABUF_RENDERER=1`
+unless the user exported them. It does this in the binary, not the launcher,
+so every start route gets it. An in-app restart starts the new process
+without the variables BiBCode set (`relaunch.rs`), so turning the setting off
+takes effect. See `docs/plans/2026-11-21-linux-software-rendering-design.md`.
+
 The wrapper also removes the GTK theme lookup and default, and replaces the
 forced `GTK_THEME` export with a conditional export only for a nonempty,
 user-supplied `APPIMAGE_GTK_THEME`. An inherited `GTK_THEME` otherwise passes

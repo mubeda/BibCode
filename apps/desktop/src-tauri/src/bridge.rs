@@ -1556,15 +1556,13 @@ pub async fn desktop_bridge_set_wsl_only(
 #[cfg(target_os = "linux")]
 fn linux_software_rendering_state(enabled: bool) -> Value {
     use crate::software_rendering::{
-        Override, WEBKIT_VARIABLES, gpu_compositing_disabled, restart_applies, startup_decision,
+        Override, gpu_compositing_disabled, restart_applies, startup_decision,
     };
     let decision = startup_decision();
     json!({
         "enabled": enabled,
         "override": decision.override_value.map(Override::as_str),
-        "gpuCompositingDisabled": gpu_compositing_disabled(
-            std::env::var_os(WEBKIT_VARIABLES[0]).as_deref()
-        ),
+        "gpuCompositingDisabled": gpu_compositing_disabled(|name| std::env::var_os(name)),
         "restartApplies": restart_applies(enabled, &decision, |name| {
             std::env::var_os(name).is_some()
         }),

@@ -189,10 +189,11 @@ process:
   new process then inherits the variables and stays in software rendering,
   which fails safe.
 
-The update restart skips `RunEvent::Exit` (`updates.rs:931-935`). If the
-user turned the setting off and an update restarts BiBCode before the user
-did, that restart keeps software rendering until the next quit and reopen.
-This also fails safe; it is documented, not changed.
+The update restart (`updates.rs:931-935`) calls `app.restart()` from the
+install command, off the main thread. Tauri 2.11.6 then restarts through
+`RunEvent::Exit` (`src/app.rs:588-600`), so the same handoff strips the
+variables there too. Only a restart that runs on the main thread skips the
+exit callback and inherits them; that fails safe.
 
 Rejected: removing the variables from this process before restarting.
 By then the process is multi-threaded, so changing its environment is
@@ -226,10 +227,10 @@ not touch.
     a lookup of the present environment and whether the platform is
     Linux. It returns which variables to set and a record for the log.
   - Pure helpers say whether a restart can apply the stored setting and
-    whether GPU compositing is off in this process: the
-    `WEBKIT_DISABLE_COMPOSITING_MODE` value is present and is not `"0"`.
-    WebKitGTK reads the variable that way, an assumption checked in the
-    lab.
+    whether GPU compositing is off in this process: either variable is
+    present and is not `"0"`. Checked on WebKitGTK 2.50 in a Hyprland VM:
+    either variable alone removes the web process's `ThreadedCompositor`
+    thread, and `WEBKIT_DISABLE_COMPOSITING_MODE=0` alone keeps it.
   - The module compiles on every platform, so its tests run anywhere, and
     off Linux it changes nothing. The file read takes the path as a
     parameter, so tests use a temporary directory.
@@ -296,7 +297,15 @@ settings loss cases, and the Linux-only UI states. Whether the GPU hang
 itself stops on the affected machine can only be shown there, by the 20
 launches and the 24-hour run named in #411.
 
+Found while verifying, and not changed here: from an extracted AppDir, the
+binary started from any folder other than its `usr` folder aborts before the
+first window, because the bundled WebKitGTK finds its helper processes
+relative to the working directory. The generated `bibcode://` handler of an
+extracted AppDir starts the binary that way, so that cold-start route fails
+with or without this setting. A mounted AppImage's handler starts the
+AppImage, whose `AppRun` changes to `usr` first.
+
 ## Not changed
 
 macOS and Windows behavior, the crash hook order, the AppImage hooks, the
-child isolation policy, the update restart and the deep-link plugin.
+child isolation policy and the deep-link plugin.

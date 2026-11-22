@@ -8,7 +8,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use serde_json::Value;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -97,9 +97,13 @@ pub(crate) fn restart_applies(
     }
 }
 
-/// WebKitGTK disables compositing when the variable is present and not `0`.
-pub(crate) fn gpu_compositing_disabled(value: Option<&OsStr>) -> bool {
-    value.is_some_and(|value| value != "0")
+/// Whether WebKit runs without its GPU compositor: either variable present and not `0`. On
+/// WebKitGTK 2.50 either one alone removes the `ThreadedCompositor` thread (checked in a
+/// Hyprland VM), and `WEBKIT_DISABLE_COMPOSITING_MODE=0` alone keeps it.
+pub(crate) fn gpu_compositing_disabled(value_of: impl Fn(&str) -> Option<OsString>) -> bool {
+    WEBKIT_VARIABLES
+        .into_iter()
+        .any(|name| value_of(name).is_some_and(|value| value != "0"))
 }
 
 /// The stored setting from a parsed `desktop-settings.json`; anything but `true` is off.
@@ -190,9 +194,7 @@ pub(crate) fn record_startup() {
         stored = startup.decision.stored,
         override_value = startup.decision.override_value.map(Override::as_str),
         set = ?startup.decision.set,
-        gpu_compositing_disabled = gpu_compositing_disabled(
-            std::env::var_os(WEBKIT_VARIABLES[0]).as_deref()
-        ),
+        gpu_compositing_disabled = gpu_compositing_disabled(|name| std::env::var_os(name)),
         "software rendering start-up decision"
     );
 }
@@ -289,9 +291,24 @@ mod tests {
 
     #[test]
     fn software_rendering_reports_compositing_off_only_for_a_value_other_than_zero() {
-        assert!(gpu_compositing_disabled(Some(OsStr::new("1"))));
-        assert!(!gpu_compositing_disabled(Some(OsStr::new("0"))));
-        assert!(!gpu_compositing_disabled(None));
+        let with = |values: &[(&str, &str)]| {
+            let values: Vec<(String, OsString)> = values
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
+                .collect();
+            gpu_compositing_disabled(move |name| {
+                values
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            })
+        };
+        assert!(with(&[(COMPOSITING, "1"), (DMABUF, "1")]));
+        assert!(with(&[(DMABUF, "1")]));
+        // A user's `0` for one variable does not hide the other.
+        assert!(with(&[(COMPOSITING, "0"), (DMABUF, "1")]));
+        assert!(!with(&[(COMPOSITING, "0")]));
+        assert!(!with(&[]));
     }
 
     #[test]
