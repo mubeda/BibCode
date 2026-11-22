@@ -891,7 +891,39 @@ async fn a_switch_to_approval_required_stops_auto_answers_before_the_cli_acknowl
     peer.fail(&mode, -32603, "Internal error").await;
     assert!(switch.await.unwrap().is_err());
 
-    let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
+    // The CLI may still run in `auto`, so the next prompt first writes the mode again, and is
+    // refused if that fails too.
+    let send = || {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .send_turn_with_receipt(Some("hello"), Vec::new())
+                .await
+        })
+    };
+    let refused = send();
+    let retry = peer.expect("session/set_config_option").await;
+    assert_eq!(retry["params"]["value"], "default");
+    peer.fail(&retry, -32603, "Internal error").await;
+    assert!(refused.await.unwrap().is_err());
+    assert!(
+        peer.silent().await,
+        "no prompt while the mode is unconfirmed"
+    );
+
+    let accepted = send();
+    let retry = peer.expect("session/set_config_option").await;
+    assert_eq!(retry["params"]["value"], "default");
+    peer.reply(
+        &retry,
+        json!({ "configOptions": standard_options("default") }),
+    )
+    .await;
+    let _receipt = accepted
+        .await
+        .unwrap()
+        .expect("prompt written once confirmed");
+    peer.expect("session/prompt").await;
     peer.permission(allow_or_deny()).await;
     opened_request_id(&runtime).await;
     assert!(peer.silent().await, "no auto answer after the switch");

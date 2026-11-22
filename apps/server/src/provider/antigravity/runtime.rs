@@ -168,6 +168,8 @@ struct RuntimeInner {
     provider_session_id: Mutex<Option<String>>,
     config_options: Mutex<Vec<Value>>,
     legacy_models: AtomicBool,
+    /// A live mode switch the CLI did not acknowledge: the next prompt writes the mode first.
+    mode_unconfirmed: AtomicBool,
     /// (runtime mode, interaction mode).
     modes: Mutex<(String, String)>,
     active_turn_id: Mutex<Option<String>>,
@@ -205,6 +207,7 @@ impl AntigravitySessionRuntime {
                 provider_session_id: Mutex::new(None),
                 config_options: Mutex::new(Vec::new()),
                 legacy_models: AtomicBool::new(false),
+                mode_unconfirmed: AtomicBool::new(false),
                 modes: Mutex::new(modes),
                 active_turn_id: Mutex::new(None),
                 ignored_turn_id: Mutex::new(None),
@@ -483,7 +486,7 @@ impl AntigravitySessionRuntime {
         if !loosens {
             self.inner.modes.lock().await.0 = mode.to_owned();
         }
-        self.apply_mode(mode, &interaction_mode).await?;
+        self.apply_live_mode(mode, &interaction_mode).await?;
         if loosens {
             self.inner.modes.lock().await.0 = mode.to_owned();
         }
@@ -496,7 +499,21 @@ impl AntigravitySessionRuntime {
             modes.1 = mode.to_owned();
             modes.0.clone()
         };
-        self.apply_mode(&runtime_mode, mode).await
+        self.apply_live_mode(&runtime_mode, mode).await
+    }
+
+    /// [`Self::apply_mode`] on a running session, which keeps running when the write fails: the
+    /// CLI may still be in the old mode, so the next prompt writes the recorded mode first.
+    async fn apply_live_mode(
+        &self,
+        runtime_mode: &str,
+        interaction_mode: &str,
+    ) -> Result<(), AntigravityRuntimeError> {
+        let result = self.apply_mode(runtime_mode, interaction_mode).await;
+        self.inner
+            .mode_unconfirmed
+            .store(result.is_err(), Ordering::SeqCst);
+        result
     }
 
     /// Writes the advertised `mode` option and requires the answer to show it. No fallback to
@@ -543,6 +560,11 @@ impl AntigravitySessionRuntime {
         attachments: Vec<Value>,
     ) -> Result<AntigravityPromptReceipt, AntigravityRuntimeError> {
         let session_id = self.provider_session_id().await?;
+        if self.inner.mode_unconfirmed.load(Ordering::SeqCst) {
+            let (runtime_mode, interaction_mode) = self.inner.modes.lock().await.clone();
+            self.apply_live_mode(&runtime_mode, &interaction_mode)
+                .await?;
+        }
         let turn_id = format!("turn-{}", Uuid::new_v4());
         *self.inner.active_turn_id.lock().await = Some(turn_id.clone());
         *self.inner.ignored_turn_id.lock().await = None;

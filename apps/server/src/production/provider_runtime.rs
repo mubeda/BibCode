@@ -16078,6 +16078,14 @@ struct AntigravityDriver {
     attachments: AttachmentMaterializer,
     binary_path: String,
     started: std::time::Instant,
+    /// Stops the child once the runtime abandons it; aborted with the driver.
+    abandon_watch: JoinHandle<()>,
+}
+
+impl Drop for AntigravityDriver {
+    fn drop(&mut self) {
+        self.abandon_watch.abort();
+    }
 }
 
 impl AntigravityDriver {
@@ -16087,6 +16095,16 @@ impl AntigravityDriver {
         request: ProviderLaunchRequest,
         attachments: AttachmentMaterializer,
         attribution: ProcessAttributionRegistry,
+    ) -> Result<Self, ProviderRuntimeError> {
+        Self::spawn_with_cancel_grace(request, attachments, attribution, ANTIGRAVITY_CANCEL_GRACE)
+            .await
+    }
+
+    async fn spawn_with_cancel_grace(
+        request: ProviderLaunchRequest,
+        attachments: AttachmentMaterializer,
+        attribution: ProcessAttributionRegistry,
+        cancel_grace: Duration,
     ) -> Result<Self, ProviderRuntimeError> {
         let started = std::time::Instant::now();
         let binary_path = request.binary_path.clone();
@@ -16117,14 +16135,14 @@ impl AntigravityDriver {
                 interaction_mode: request.interaction_mode,
                 model: request.model,
                 resume_session_id: request.resume_cursor.as_ref().and_then(resume_string),
-                cancel_grace: ANTIGRAVITY_CANCEL_GRACE,
+                cancel_grace,
                 start_timeout: ANTIGRAVITY_START_TIMEOUT,
             },
             connection,
             incoming,
         );
         let child: SharedChild = Arc::new(Mutex::new(child));
-        tokio::spawn({
+        let abandon_watch = tokio::spawn({
             let runtime = runtime.clone();
             let child = Arc::downgrade(&child);
             async move {
@@ -16140,6 +16158,7 @@ impl AntigravityDriver {
             attachments,
             binary_path,
             started,
+            abandon_watch,
         })
     }
 
@@ -38768,6 +38787,7 @@ while IFS= read -r line; do
     *'"method":"session/prompt"'*)
       [ -z "$BIBCODE_TEST_REJECT_PROMPT" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"prompt rejected"}}\n' "$id"; continue; }
       [ -z "$BIBCODE_TEST_DISCONNECT_AFTER_PROMPT" ] || exit 0
+      [ -z "$BIBCODE_TEST_IGNORE_PROMPT" ] || continue
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
   esac
 done
@@ -39023,6 +39043,104 @@ done
                 .and_then(super::resume_string),
             Some("antigravity-session".to_owned()),
             "a different id tells the supervisor the resume was lost"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_factory_dispatches_antigravity_to_its_driver() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(&temp, "antigravity");
+        request.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        let driver = factory
+            .create(request)
+            .await
+            .expect("the factory spawns it");
+        let started = driver.start().await.expect("the chat starts");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert_eq!(
+            started
+                .resume_cursor
+                .as_ref()
+                .and_then(super::resume_string),
+            Some("antigravity-session".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unanswered_antigravity_cancel_stops_the_child_as_a_requested_stop() {
+        let captured = crate::diagnostics::profiler::exits::CapturedExits::start();
+        let temp = TempDir::new().expect("provider fixture directory");
+        let requests = temp.path().join("requests.jsonl");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(&temp, "antigravity");
+        request.binary_path = executable_fixture(&temp, "agy", ANTIGRAVITY_FIXTURE)
+            .to_string_lossy()
+            .into_owned();
+        for (name, value) in [
+            ("BIBCODE_TEST_IGNORE_PROMPT", "1"),
+            ("BIBCODE_TEST_REQUEST_CAPTURE", requests.to_str().unwrap()),
+        ] {
+            request
+                .environment
+                .insert(name.to_owned(), value.to_owned());
+        }
+        let driver = Arc::new(
+            super::AntigravityDriver::spawn_with_cancel_grace(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                Duration::from_millis(100),
+            )
+            .await
+            .expect("the Antigravity fixture spawns"),
+        );
+        driver.start().await.expect("the chat starts");
+        let delivery = tokio::spawn({
+            let driver = driver.clone();
+            async move {
+                driver
+                    .deliver(
+                        "hello".to_owned(),
+                        Vec::new(),
+                        "default".to_owned(),
+                        "key".to_owned(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !captured_methods(&requests).contains(&"session/prompt".to_owned()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the prompt is written");
+        driver.interrupt(None).await.expect("cancel sent");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("the delivery ends once the child is stopped")
+            .expect("delivery task");
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Ambiguous { .. }),
+            "{outcome:?}"
+        );
+        // A reaped child has no id any more: the watcher killed and waited for it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while driver.child.lock().await.id().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the child was stopped and reaped");
+        driver.shutdown().await.expect("fixture shutdown");
+        assert!(
+            captured.take().is_empty(),
+            "a requested stop is not a crash"
         );
     }
 
