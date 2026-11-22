@@ -32,8 +32,11 @@ fn main() {
     }
     // An extracted AppDir's `bibcode://` handler skips `AppRun` (#412): restart through it
     // before BiBCode sets any variable, which the restarted process would take as the user's.
+    // SAFETY: still single-threaded, for the same reasons as the step below.
     #[cfg(target_os = "linux")]
-    bibcode_desktop_lib::enter_appdir_usr();
+    unsafe {
+        bibcode_desktop_lib::enter_appdir_usr()
+    };
     // The GUI only, still single-threaded: before any webview, whose web processes inherit it.
     // SAFETY: no thread exists yet. The crash hook spawns none on Linux, and the open-url and
     // CLI branches that start a runtime have exited above.

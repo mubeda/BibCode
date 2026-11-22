@@ -236,22 +236,25 @@ mod tests {
 
     #[test]
     fn a_relaunch_keeps_the_users_webkit_variables_on_both_paths() {
-        let Some(isolated) = crate::test_support::isolated_scenario(
-            "relaunch::tests::a_relaunch_keeps_the_users_webkit_variables_on_both_paths",
-        ) else {
+        use crate::test_support::reexec;
+        const NAME: &str =
+            "relaunch::tests::a_relaunch_keeps_the_users_webkit_variables_on_both_paths";
+        const PHASE: &str = "relaunch-webkit-variables";
+        let Some(isolated) = reexec::enter(NAME, PHASE) else {
+            // The fixture environment goes to the child process, never through `set_var`.
+            reexec::run(NAME, PHASE, None, |command| {
+                command
+                    .env("APPIMAGE", "/tmp/bibcode-test.AppImage")
+                    .env("APPDIR", "/tmp/bibcode-test-appdir")
+                    // A user's value under the AppDir is one the AppImage child filter drops.
+                    .env(
+                        "WEBKIT_DISABLE_COMPOSITING_MODE",
+                        "/tmp/bibcode-test-appdir/usr",
+                    )
+                    .env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+            });
             return;
         };
-        // SAFETY: the isolated child runs only this test, which starts no thread.
-        unsafe {
-            std::env::set_var("APPIMAGE", "/tmp/bibcode-test.AppImage");
-            std::env::set_var("APPDIR", "/tmp/bibcode-test-appdir");
-            // A user's value under the AppDir is one the AppImage child filter drops.
-            std::env::set_var(
-                "WEBKIT_DISABLE_COMPOSITING_MODE",
-                "/tmp/bibcode-test-appdir/usr",
-            );
-            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-        }
         let env_of = |command: &Command, name: &str| {
             command
                 .get_envs()

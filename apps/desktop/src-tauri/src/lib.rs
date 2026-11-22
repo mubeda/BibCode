@@ -199,19 +199,17 @@ pub fn run() {
         #[cfg(unix)]
         backend::install_termination_signal_handler(app_handle.clone(), backend.clone());
         tauri::async_runtime::spawn(async move {
-            match exposure_coordinator
+            let started = exposure_coordinator
                 .run_exclusive(backend.start_default(app_handle))
-                .await
-            {
-                // A release build's log sink exists only once the in-process server started.
-                Ok(_config) => {
-                    software_rendering::record_startup();
-                    appdir_working_directory::record_startup();
-                }
-                Err(error) => {
-                    tracing::error!("failed to start Tauri desktop backend: {error}");
-                    backend.record_error(error);
-                }
+                .await;
+            // A release build's log sink exists only once the in-process server tried to
+            // start; a failed start still logs these with the error below.
+            software_rendering::record_startup();
+            #[cfg(target_os = "linux")]
+            appdir_working_directory::record_startup();
+            if let Err(error) = started {
+                tracing::error!("failed to start Tauri desktop backend: {error}");
+                backend.record_error(error);
             }
         });
         Ok(())
@@ -396,6 +394,7 @@ fn desktop_e2e_logging_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin
         .build()
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 mod appdir_working_directory;
 #[cfg(target_os = "linux")]
 pub use appdir_working_directory::enter_appdir_usr;

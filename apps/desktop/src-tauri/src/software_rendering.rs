@@ -143,7 +143,19 @@ pub(crate) fn patch_setting(document: Option<Value>, enabled: bool) -> Result<Va
             object.insert(SETTING_KEY.to_owned(), Value::Bool(enabled));
             Ok(Value::Object(object))
         }
-        _ => Err("desktop-settings.json is not a JSON object; fix or remove it".to_owned()),
+        _ => Err(NOT_AN_OBJECT.to_owned()),
+    }
+}
+
+const NOT_AN_OBJECT: &str = "desktop-settings.json is not a JSON object; fix or remove it";
+
+/// The stored setting for Settings, which refuses the document shapes a save would refuse,
+/// so the row shows the repair guidance before the user tries to save.
+pub(crate) fn stored_setting_for_settings(document: Option<Value>) -> Result<bool, String> {
+    match document {
+        None => Ok(false),
+        Some(document @ Value::Object(_)) => Ok(setting_from_document(&document)),
+        Some(_) => Err(NOT_AN_OBJECT.to_owned()),
     }
 }
 
@@ -217,7 +229,7 @@ pub(crate) fn variables_set_by_bibcode() -> &'static [&'static str] {
         .map_or(&[], |startup| startup.decision.set.as_slice())
 }
 
-/// Logs the start-up decision; called from `setup`, once the log sink exists.
+/// Logs the start-up decision once the log sink exists.
 pub(crate) fn record_startup() {
     let Some(startup) = STARTUP.get() else {
         return;
@@ -417,6 +429,20 @@ mod tests {
             vec![(COMPOSITING, OsString::from("0"))]
         );
         assert!(user_variables(&[COMPOSITING, DMABUF], lookup(&[(COMPOSITING, "1")])).is_empty());
+    }
+
+    #[test]
+    fn software_rendering_settings_read_refuses_what_a_save_refuses() {
+        assert_eq!(stored_setting_for_settings(None), Ok(false));
+        assert_eq!(
+            stored_setting_for_settings(Some(json!({ SETTING_KEY: true, "wslOnly": "bad" }))),
+            Ok(true)
+        );
+        for root in [json!([]), json!("text"), json!(null)] {
+            let error = stored_setting_for_settings(Some(root.clone())).unwrap_err();
+            assert!(error.contains("fix or remove"), "{root}: {error}");
+            assert!(patch_setting(Some(root), true).is_err());
+        }
     }
 
     #[test]

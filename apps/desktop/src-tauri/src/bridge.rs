@@ -1602,8 +1602,10 @@ pub fn desktop_bridge_get_linux_software_rendering(
     app: AppHandle<DesktopRuntime>,
 ) -> Result<Value, Value> {
     #[cfg(target_os = "linux")]
-    return read_desktop_settings(&app)
-        .map(|settings| linux_software_rendering_state(settings.linux_software_rendering))
+    return desktop_settings_path(&app)
+        .and_then(|path| read_json_file(&path))
+        .and_then(crate::software_rendering::stored_setting_for_settings)
+        .map(linux_software_rendering_state)
         .map_err(Value::String);
     #[cfg(not(target_os = "linux"))]
     {
