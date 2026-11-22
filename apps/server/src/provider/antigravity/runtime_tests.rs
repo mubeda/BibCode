@@ -1032,6 +1032,41 @@ async fn an_unanswered_cancel_ends_the_turn_and_abandons_the_process() {
     );
 }
 
+/// Updates a cancelled turn still sends after it ended, answered or abandoned, are dropped:
+/// they never reach the thread as turnless output.
+#[tokio::test]
+async fn a_cancelled_turns_updates_after_its_end_are_dropped() {
+    for answered in [true, false] {
+        let mut options = options("full-access");
+        options.cancel_grace = Duration::from_millis(50);
+        let (runtime, mut peer) = started_with(options, "auto").await;
+        let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+        runtime.interrupt_turn().await.expect("cancel sent");
+        peer.expect("session/cancel").await;
+        if answered {
+            peer.reply(&prompt, json!({ "stopReason": "cancelled" }))
+                .await;
+        }
+        events_until(&runtime, "turn.completed").await;
+        peer.update(
+            SESSION,
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "late" } }),
+        )
+        .await;
+        peer.update(
+            SESSION,
+            json!({ "sessionUpdate": "plan", "entries": [{ "content": "late", "status": "pending" }] }),
+        )
+        .await;
+        assert!(
+            timeout(Duration::from_millis(300), runtime.next_event())
+                .await
+                .is_err(),
+            "answered: {answered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_answered_cancel_does_not_abandon_the_process() {
     let mut options = options("full-access");

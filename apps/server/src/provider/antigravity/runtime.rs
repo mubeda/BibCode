@@ -1069,9 +1069,13 @@ impl AntigravitySessionRuntime {
                 .active_turn
                 .clone()
                 .filter(|turn| gate.cancelled_turn.as_ref() != Some(turn));
+            // A cancelled turn's updates stay dropped after it ended, until the next prompt.
             (
                 gate.session_id.clone(),
-                (turn_id, gate.active_turn.is_some()),
+                (
+                    turn_id,
+                    gate.active_turn.is_some() || gate.cancelled_turn.is_some(),
+                ),
             )
         };
         if session_id.is_none()
