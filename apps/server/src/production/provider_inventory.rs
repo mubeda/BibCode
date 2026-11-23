@@ -2374,6 +2374,8 @@ async fn probe_cursor_models(
                     "clientCapabilities": {
                         "fs": { "readTextFile": false, "writeTextFile": false },
                         "terminal": false,
+                        // As the runtime asks, so the session read sees the values it will use.
+                        "_meta": { "parameterizedModelPicker": true },
                     },
                     "clientInfo": { "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") },
                 }),
@@ -3265,6 +3267,53 @@ done
             std::fs::read_to_string(&sessions).expect("a session was opened"),
             "opened\n"
         );
+    }
+
+    /// A Cursor CLI that switches to plain model names and separate options when BiBCode asks for
+    /// its parameterized model picker: Grok 4.7 publishes every Reasoning and Context value and
+    /// Fast. Without the request the CLI folds one combination into the model value.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_inventory_publishes_every_grok_option_from_a_parameterized_session() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let executable = temp.path().join("cursor-agent");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            r#"#!/bin/sh
+picker=no
+while IFS= read -r line; do
+  id=${line#*\"id\":}; id=${id%%[!0-9]*}
+  case "$line" in
+    *'"method":"initialize"'*'"parameterizedModelPicker":true'*) picker=yes; printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"cursor/list_available_models"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"models":[{"value":"grok-4.7","name":"Grok 4.7","configOptions":[{"id":"context","category":"model_config","type":"select","currentValue":"256k","options":[{"value":"256k"},{"value":"500k"}]},{"id":"reasoning_effort","category":"thought_level","type":"select","currentValue":"high","options":[{"value":"low"},{"value":"medium"},{"value":"high"},{"value":"xhigh"}]},{"id":"fast","category":"model_config","type":"select","currentValue":"true","options":[{"value":"false"},{"value":"true"}]}]}]}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      if [ "$picker" = yes ]; then value='grok-4.7'; else value='grok-4.7[context=256k,reasoning_effort=high,fast=true]'; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"default","options":[{"value":"default"},{"value":"%s"}]}]}}\n' "$id" "$value" ;;
+  esac
+done
+"#,
+        );
+        let models =
+            probe_cursor_models(&executable, Some("2026.11.22"), None, &[], temp.path(), &[])
+                .await
+                .expect("the fixture lists models");
+        assert_eq!(models.len(), 1, "{models:?}");
+        assert_eq!(models[0]["slug"], "grok-4.7");
+        let descriptors = &models[0]["capabilities"]["optionDescriptors"];
+        let ids = |descriptor: &Value| {
+            descriptor["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|choice| choice["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(descriptors[0]["id"], "reasoning", "{descriptors}");
+        assert_eq!(ids(&descriptors[0]), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(descriptors[1]["id"], "contextWindow", "{descriptors}");
+        assert_eq!(ids(&descriptors[1]), ["256k", "500k"]);
+        assert_eq!(descriptors[2]["id"], "fastMode", "{descriptors}");
     }
 
     /// A CLI that never answers the session read still publishes its model list, unnarrowed.

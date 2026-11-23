@@ -33,10 +33,22 @@ prompt: it opens a Cursor sign-in page and sends nothing until you finish it.
 
 The model picker lists each Cursor model once, by its base name, with its
 reasoning, context, fast and thinking options. BiBCode sends the session only a
-model value the session advertises. Cursor CLIs since 2026.11 advertise one
-value per model with its options folded in, such as
-`gpt-5.4-nano[reasoning=medium]`, and reject a plain model name; BiBCode sends
-that advertised value. With these CLIs the picker offers each model only the
+model value the session advertises, and only option values it advertises.
+BiBCode asks Cursor for its parameterized model picker
+(`clientCapabilities._meta.parameterizedModelPicker` in `initialize`, both in
+the runtime and in the inventory's session read). Cursor CLIs that honor it,
+such as 2026.11.22, advertise plain model names; once a model is set, the
+session advertises its options separately (for Grok 4.7: `reasoning_effort` low
+to xhigh, `context` 256k or 500k, and `fast`), and BiBCode sets each option on
+its own, so the picker offers every value the CLI lists, Grok 4.7 Low included.
+BiBCode finds Reasoning under the name the session gives it (`effort`,
+`reasoning` or `reasoning_effort`) and sends Extra High as `xhigh` or
+`extra-high`, whichever the model advertises.
+
+As a fallback, a Cursor CLI that ignores the request advertises one value per
+model with its options folded in, such as `gpt-5.4-nano[reasoning=medium]`, and
+rejects a plain model name; BiBCode then sends that advertised value. With these
+CLIs the picker offers each model only the
 option values an advertised value carries, and only options it can offer
 together: when the CLI advertises some combinations of two options but not
 others, such as High reasoning only with Fast on, the picker shows one of them
@@ -50,8 +62,8 @@ minutes, while the model list is published without it. An option that no adverti
 saved from an older catalog, is refused before the turn is sent with a message
 naming it and saying to choose another option, as is a model the session does
 not offer.
-Older CLIs that advertise plain values and separate options keep working the
-same way. Clearing a model's options goes back to the values Cursor offered when
+Older CLIs that advertise plain values and separate options work as the
+parameterized picker does. Clearing a model's options goes back to the values Cursor offered when
 the session started. When Cursor no longer offers those values, it keeps the
 ones it uses now, BiBCode sends no change, and the chat shows "Cursor no longer
 offers this model's previous default options, so it keeps its current ones." Auto, and a thread with no model selected, sends the session's

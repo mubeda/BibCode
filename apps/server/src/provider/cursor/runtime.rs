@@ -444,7 +444,13 @@ impl CursorSessionRuntime {
                 "initialize",
                 json!({
                     "protocolVersion": 1,
-                    "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false }, "terminal": false },
+                    // Asks Cursor for plain model names with separate options, so every value the
+                    // CLI lists can be chosen; a CLI that ignores it keeps bracketed values.
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false,
+                        "_meta": { "parameterizedModelPicker": true },
+                    },
                     "clientInfo": { "name": "bibcode-rust", "version": "0.1.1" },
                 }),
             )
@@ -1821,6 +1827,17 @@ mod tests {
         Lines<BufReader<DuplexStream>>,
         DuplexStream,
     ) {
+        runtime_with_model(provider_session_id, "default")
+    }
+
+    fn runtime_with_model(
+        provider_session_id: Option<&str>,
+        model: &str,
+    ) -> (
+        CursorSessionRuntime,
+        Lines<BufReader<DuplexStream>>,
+        DuplexStream,
+    ) {
         let (stdout, stdout_peer) = duplex(4096);
         let (stdin_peer, stdin) = duplex(4096);
         let (stderr, _stderr_peer) = duplex(4096);
@@ -1832,7 +1849,7 @@ mod tests {
                 cwd: "/workspace".to_owned(),
                 runtime_mode: "full-access".to_owned(),
                 interaction_mode: "default".to_owned(),
-                model: "default".to_owned(),
+                model: model.to_owned(),
                 resume_session_id: None,
                 mcp_servers: Vec::new(),
             },
@@ -3060,6 +3077,129 @@ mod tests {
         assert!(
             matches!(error, CursorRuntimeError::ConfigUpdateRolledBack { .. }),
             "{error:?}"
+        );
+    }
+
+    /// Answers the next request, which must be `method`, with `result`, and returns its params.
+    async fn answer(
+        requests: &mut Lines<BufReader<DuplexStream>>,
+        responses: &mut DuplexStream,
+        method: &str,
+        result: Value,
+    ) -> Value {
+        let request = read_request(requests).await;
+        assert_eq!(request["method"], method, "{request}");
+        write_frame(
+            responses,
+            json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }),
+        )
+        .await;
+        request["params"].clone()
+    }
+
+    /// Grok 4.7 as `cursor-agent acp` 2026.11.22 advertises it in parameterized mode.
+    fn parameterized_grok(reasoning: &str, fast: &str) -> Value {
+        let select = |id: &str, category: &str, values: &[&str], current: &str| {
+            json!({
+                "id": id, "category": category, "type": "select", "currentValue": current,
+                "options": values.iter().map(|value| json!({ "value": value })).collect::<Vec<_>>()
+            })
+        };
+        json!([
+            select(
+                "model",
+                "model",
+                &["default", "grok-4.7", "gpt-5.5"],
+                "grok-4.7"
+            ),
+            select("context", "model_config", &["256k", "500k"], "256k"),
+            select(
+                "reasoning_effort",
+                "thought_level",
+                &["low", "medium", "high", "xhigh"],
+                reasoning
+            ),
+            select("fast", "model_config", &["false", "true"], fast),
+        ])
+    }
+
+    /// BiBCode asks Cursor for its parameterized model picker, so the session advertises plain
+    /// model names and separate options: Grok 4.7 Low without Fast is the base model, then each
+    /// option on its own, and nothing else.
+    #[tokio::test]
+    async fn a_parameterized_session_sets_the_base_model_then_each_option() {
+        let (runtime, mut requests, mut responses) = runtime_with_model(None, "grok-4.7");
+        let start = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.start().await }
+        });
+        let initialize = answer(&mut requests, &mut responses, "initialize", json!({})).await;
+        assert_eq!(
+            initialize["clientCapabilities"]["_meta"]["parameterizedModelPicker"],
+            true
+        );
+        answer(&mut requests, &mut responses, "authenticate", json!({})).await;
+        let mut opened = parameterized_grok("high", "true");
+        opened[0]["currentValue"] = json!("default");
+        answer(
+            &mut requests,
+            &mut responses,
+            "session/new",
+            json!({ "sessionId": "cursor-session", "configOptions": [opened[0]] }),
+        )
+        .await;
+        let model = answer(
+            &mut requests,
+            &mut responses,
+            "session/set_config_option",
+            json!({ "configOptions": parameterized_grok("high", "true") }),
+        )
+        .await;
+        assert_eq!(
+            (&model["configId"], &model["value"]),
+            (&json!("model"), &json!("grok-4.7"))
+        );
+        start.await.unwrap().expect("started");
+
+        let set = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .set_options(vec![
+                        json!({ "id": "reasoning", "value": "low" }),
+                        json!({ "id": "fastMode", "value": false }),
+                    ])
+                    .await
+            }
+        });
+        let reasoning = answer(
+            &mut requests,
+            &mut responses,
+            "session/set_config_option",
+            json!({ "configOptions": parameterized_grok("low", "true") }),
+        )
+        .await;
+        assert_eq!(
+            (&reasoning["configId"], &reasoning["value"]),
+            (&json!("reasoning_effort"), &json!("low"))
+        );
+        let fast = answer(
+            &mut requests,
+            &mut responses,
+            "session/set_config_option",
+            json!({ "configOptions": parameterized_grok("low", "false") }),
+        )
+        .await;
+        assert_eq!(
+            (&fast["configId"], &fast["value"]),
+            (&json!("fast"), &json!("false"))
+        );
+        set.await.unwrap().expect("options applied");
+        assert!(
+            timeout(Duration::from_millis(100), requests.next_line())
+                .await
+                .is_err(),
+            "nothing else was sent"
         );
     }
 
