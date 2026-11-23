@@ -407,6 +407,20 @@ async fn interrupt_holds_queued_rows_until_client_promotes_only_the_head() {
 }
 
 #[tokio::test]
+async fn a_late_interrupt_for_a_finished_turn_leaves_the_queue_unheld() {
+    // Mutation caught: a delayed Stop naming an earlier turn holding the follow-ups of the turn
+    // running now, which that Stop does not end.
+    let engine = engine().await;
+    session(&engine, "running", "running").await;
+    enqueue(&engine, "queued-1", true).await;
+    engine.dispatch(command(json!({"type":"thread.turn.interrupt", "commandId":"late-stop", "threadId":"t", "turnId":"finished", "createdAt":TIME}))).await.unwrap();
+    assert!(!row(&engine, "queued-1").await.held);
+    engine.dispatch(command(json!({"type":"thread.turn.interrupt", "commandId":"stop", "threadId":"t", "turnId":"running", "createdAt":TIME}))).await.unwrap();
+    assert!(row(&engine, "queued-1").await.held);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn dismissing_a_failed_head_allows_the_next_queued_turn() {
     let engine = engine().await;
     session(&engine, "running", "running").await;

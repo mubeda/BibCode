@@ -3322,7 +3322,11 @@ Requests also settle without an answer:
 
 - **The user stops it.** A turn interrupt or a `thread.session.stop` expires
   the thread's open requests in the same commit (`reason: "stopped"`), for
-  every provider.
+  every provider. An interrupt that names a turn reaches only that turn: it
+  expires the requests recorded for that turn, and a request with no turn only
+  while the named turn is the session's active turn. A late Stop for a finished
+  turn therefore keeps the running turn's requests open and does not hold its
+  queue, as providers ignore a Stop for a turn that is not running.
 - **An in-process provider's session ends.** A `thread.session-set` to
   `error`, `interrupted`, `stopped` or `idle` that moves a Codex or Claude
   session out of `running` or `starting` (read in the same transaction)

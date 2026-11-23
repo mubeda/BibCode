@@ -6553,6 +6553,12 @@ async fn persist_command(
         )),
         _ => None,
     };
+    // An interrupt naming a turn reaches only that turn: a late Stop for a finished turn
+    // neither holds the queue of the turn running now nor expires its requests.
+    let interrupted_turn = match command {
+        OrchestrationCommand::ThreadTurnInterrupt { turn_id, .. } => turn_id.clone(),
+        _ => None,
+    };
     let hold = match command {
         OrchestrationCommand::ThreadTurnInterrupt {
             thread_id,
@@ -6615,6 +6621,11 @@ async fn persist_command(
         .call(move |connection| {
             let transaction = connection.transaction()?;
             let mut hold = hold;
+            if let (Some(named), Some((thread_id, _))) = (&interrupted_turn, &hold)
+                && active_turn_of_tx(&transaction, thread_id)?.is_some_and(|active| &active != named)
+            {
+                hold = None;
+            }
             let mut copy_receipts = Vec::new();
             if let Some(step) = compaction_step {
                 let applied = apply_compaction_step_tx(
@@ -6681,6 +6692,7 @@ async fn persist_command(
                     &transaction,
                     thread_id,
                     cause,
+                    interrupted_turn.as_deref(),
                     created_at,
                     &command_id,
                 )?);
@@ -8271,30 +8283,56 @@ fn request_expiry_summary(kind: &str) -> &'static str {
     }
 }
 
-/// Activities expiring every request still open on `thread_id` when `cause` proves nobody can
+fn active_turn_of_tx(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    Ok(transaction
+        .query_row(
+            "SELECT active_turn_id FROM projection_thread_sessions WHERE thread_id = ?",
+            [thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Activities expiring the requests still open on `thread_id` when `cause` proves nobody can
 /// answer them (#187); without this they read Pending Approval or Awaiting Input forever. A
-/// provider that asks one again reopens it.
+/// provider that asks one again reopens it. With `turn`, an interrupt naming that turn, only the
+/// requests of that turn expire; one with no turn of its own expires only while `turn` is the
+/// session's active turn.
 fn expire_open_requests_tx(
     transaction: &Transaction<'_>,
     thread_id: &str,
     cause: &RequestExpiryCause,
+    turn: Option<&str>,
     created_at: &str,
     command_id: &str,
 ) -> Result<Vec<NewOrchestrationEvent>, PersistenceError> {
     let session = transaction
         .query_row(
-            "SELECT status, provider_name FROM projection_thread_sessions WHERE thread_id = ?",
+            "SELECT status, provider_name, active_turn_id FROM projection_thread_sessions WHERE thread_id = ?",
             [thread_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?;
+    let active_turn = session
+        .as_ref()
+        .and_then(|(_, _, active)| active.as_deref());
     let (reason, status) = match cause {
         RequestExpiryCause::UserStopped(status) => ("stopped", *status),
         RequestExpiryCause::SessionEnded(status) => {
             // Only a live session ends a turn: a repeated settlement, or one of a session that
             // was already settled (a relaunch, say), leaves its requests as they are. A provider
             // that keeps its asks past its session still holds them.
-            let Some((previous, provider)) = session.as_ref() else {
+            let Some((previous, provider, _)) = session.as_ref() else {
                 return Ok(Vec::new());
             };
             if !matches!(previous.as_str(), "running" | "starting")
@@ -8310,6 +8348,9 @@ fn expire_open_requests_tx(
     // waits on it, and an answer to it is refused as stale. The entry ends with its process.
     Ok(open_requests_of_thread(transaction, thread_id)?
         .into_iter()
+        .filter(|(_, _, request_turn)| {
+            turn.is_none_or(|named| request_turn.as_deref().or(active_turn) == Some(named))
+        })
         .map(|(kind, request_id, turn_id)| {
             make_event(
                 "thread.activity-appended",
