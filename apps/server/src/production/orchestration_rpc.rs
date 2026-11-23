@@ -4826,6 +4826,10 @@ mod tests {
         interrupt_calls: AtomicUsize,
         fail_set_model_calls: AtomicUsize,
         pause_next_set_model: std::sync::Mutex<Option<Arc<ModelMutationPause>>>,
+        /// A start that never returns once `start_entered` fires.
+        start_hangs: AtomicBool,
+        start_entered: tokio::sync::Notify,
+        send_calls: AtomicUsize,
     }
 
     #[derive(Default)]
@@ -4847,7 +4851,13 @@ mod tests {
 
     impl ProviderDriver for ModelMutationProbe {
         fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
-            Box::pin(async { Ok(StartedSession::default()) })
+            Box::pin(async {
+                if self.start_hangs.load(Ordering::SeqCst) {
+                    self.start_entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(StartedSession::default())
+            })
         }
 
         fn send(
@@ -4856,6 +4866,7 @@ mod tests {
             _attachments: Vec<Value>,
             _interaction_mode: String,
         ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(None) })
         }
 
@@ -6619,6 +6630,224 @@ mod tests {
         .await
         .expect("panel archives");
         assert_eq!(probe.interrupt_calls.load(Ordering::SeqCst), 1);
+        engine.shutdown().await;
+    }
+
+    /// A thread "t" whose provider start never returns once launched, with the real delivery
+    /// worker and supervisor behind the RPC registration.
+    async fn hung_start_fixture() -> (
+        OrchestrationEngine,
+        tempfile::TempDir,
+        Arc<ModelMutationProbe>,
+        ProviderRegistration,
+    ) {
+        let engine = migrated_engine().await;
+        let state = tempfile::tempdir().expect("provider state");
+        for command in [
+            json!({
+                "type":"project.create", "commandId":"hung-project", "projectId":"hung-project",
+                "title":"Hung Project", "workspaceRoot":state.path(),
+                "defaultModelSelection":null, "createdAt":CREATED_AT
+            }),
+            json!({
+                "type":"thread.create", "commandId":"hung-thread", "threadId":"t",
+                "projectId":"hung-project", "title":"t", "kind":"workspace",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "interactionMode":"default",
+                "branch":null, "worktreePath":null, "createdAt":CREATED_AT
+            }),
+        ] {
+            engine
+                .dispatch(decode_command(command))
+                .await
+                .expect("fixture command");
+        }
+        let probe = Arc::new(ModelMutationProbe::default());
+        probe.start_hangs.store(true, Ordering::SeqCst);
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(ModelMutationProbeFactory(probe.clone())),
+            ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            SupervisorOptions::default(),
+        ));
+        let registration = ProviderRegistration {
+            provider: provider.clone(),
+            settings_root: state.path().to_path_buf(),
+            attachments: AttachmentMaterializer::new(state.path().join("attachments")),
+            turn_delivery: Arc::new(TurnDeliveryService::start(
+                engine.clone(),
+                provider,
+                state.path().to_path_buf(),
+            )),
+            uploads: test_upload_registry(),
+        };
+        (engine, state, probe, registration)
+    }
+
+    async fn wait_until_launch_ends(engine: &OrchestrationEngine) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while engine.thread_session_launching("t") {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the hung start ends");
+    }
+
+    /// The app's Stop on a message whose provider start hangs: ChatView dismisses the message's
+    /// delivery by its message id, and the send's command id is a different client id. The
+    /// Dismiss through the RPC handler must end the launch the delivery worker started for it.
+    #[tokio::test]
+    async fn the_app_stop_dismiss_ends_a_hung_provider_start() {
+        let (engine, _state, probe, registration) = hung_start_fixture().await;
+        let send = decode_command(json!({
+            "type":"thread.turn.start", "commandId":"send-command", "threadId":"t",
+            "message":{"messageId":"sent-message", "role":"user", "text":"hello", "attachments":[]},
+            "createdAt":CREATED_AT
+        }));
+        let digest = canonical_command_digest(&send).expect("digest");
+        dispatch_turn_for_test(
+            engine.clone(),
+            registration.clone(),
+            send,
+            digest,
+            "orchestration.dispatchCommand".into(),
+            None,
+            &UploadOwner::Unauthenticated,
+        )
+        .await
+        .expect("the send is admitted");
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("send-command".into())
+            .await
+            .expect("row read")
+            .expect("durable row");
+        assert_eq!(
+            row.message_id, "sent-message",
+            "ids differ, as in production"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            probe.start_entered.notified(),
+        )
+        .await
+        .expect("the worker launched and the start hangs");
+        assert!(engine.thread_session_launching("t"));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_prepared_for_test(
+                &engine,
+                Some(registration.clone()),
+                delivery_resolution("stop-command", "t", "sent-message", "dismiss"),
+            ),
+        )
+        .await
+        .expect("the Dismiss answers")
+        .expect("the Dismiss is accepted");
+
+        wait_until_launch_ends(&engine).await;
+        assert_eq!(
+            probe.send_calls.load(Ordering::SeqCst),
+            0,
+            "nothing was sent"
+        );
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("send-command".into())
+            .await
+            .expect("row read")
+            .expect("durable row");
+        assert_eq!(row.state, TurnDeliveryState::Dismissed);
+        registration.turn_delivery.shutdown().await;
+        registration
+            .provider
+            .shutdown()
+            .await
+            .expect("provider stops");
+        engine.shutdown().await;
+    }
+
+    /// The app's Stop on a thread with no cancellable message sends a turnless interrupt; it
+    /// must still end a start that does not return.
+    #[tokio::test]
+    async fn the_app_stop_interrupt_ends_a_hung_start_without_a_cancellable_message() {
+        let (engine, state, probe, registration) = hung_start_fixture().await;
+        let provider = registration.provider.clone();
+        let cwd = state.path().to_path_buf();
+        let launch = tokio::spawn(async move {
+            provider
+                .launch(ProviderLaunchRequest {
+                    thread_id: "t".to_owned(),
+                    activity_causal_revision: 0,
+                    provider: "codex".to_owned(),
+                    provider_label: "Codex".to_owned(),
+                    provider_instance_id: Some("codex".to_owned()),
+                    binary_path: "probe".to_owned(),
+                    cwd,
+                    runtime_mode: "full-access".to_owned(),
+                    interaction_mode: "default".to_owned(),
+                    model: Some("gpt-5".to_owned()),
+                    options: Vec::new(),
+                    custom_models: Vec::new(),
+                    service_tier: None,
+                    effort: None,
+                    agent: None,
+                    resume_cursor: None,
+                    environment: Default::default(),
+                    endpoint: None,
+                    server_password: None,
+                    mcp: None,
+                    codex_home: None,
+                    open_url: None,
+                    host_thread_id: None,
+                    side_chat_host_thread_id: None,
+                    code_review: false,
+                })
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            probe.start_entered.notified(),
+        )
+        .await
+        .expect("the start hangs");
+
+        // `buildThreadTurnInterruptInput` omits the turn id while the session is not running.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_prepared_for_test(
+                &engine,
+                Some(registration.clone()),
+                decode_command(json!({
+                    "type":"thread.turn.interrupt", "commandId":"stop-command", "threadId":"t",
+                    "createdAt":CREATED_AT
+                })),
+            ),
+        )
+        .await
+        .expect("the interrupt answers")
+        .expect("the interrupt is accepted");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), launch)
+            .await
+            .expect("the hung start ends")
+            .expect("launch task joins");
+        assert!(
+            matches!(result, Err(ProviderRuntimeError::LaunchStopped { .. })),
+            "{result:?}"
+        );
+        wait_until_launch_ends(&engine).await;
+        assert_eq!(probe.send_calls.load(Ordering::SeqCst), 0);
+        registration.turn_delivery.shutdown().await;
+        registration
+            .provider
+            .shutdown()
+            .await
+            .expect("provider stops");
         engine.shutdown().await;
     }
 
