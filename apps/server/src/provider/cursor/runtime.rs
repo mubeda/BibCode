@@ -256,6 +256,9 @@ struct RuntimeInner {
     /// driver stops the process.
     abandoned: AtomicBool,
     abandon: Notify,
+    /// Cursor kept its current options because their previous defaults are gone; the next turn
+    /// shows it once, since that turn's own session update replaces an idle notice at once.
+    kept_options_note: std::sync::Mutex<bool>,
     /// Pauses the next claim of a turn until released, for tests: (entered, release).
     #[cfg(test)]
     before_claim: std::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
@@ -322,6 +325,7 @@ impl CursorSessionRuntime {
             open_tool_calls: std::sync::Mutex::new(HashSet::new()),
             abandoned: AtomicBool::new(false),
             abandon: Notify::new(),
+            kept_options_note: std::sync::Mutex::new(false),
             #[cfg(test)]
             before_claim: std::sync::Mutex::new(None),
         });
@@ -597,8 +601,10 @@ impl CursorSessionRuntime {
         Ok(())
     }
 
-    /// Says that Cursor keeps its current options because their previous defaults are gone.
+    /// Says that Cursor keeps its current options because their previous defaults are gone: on
+    /// the session now, and on the next turn once it starts.
     async fn note_kept_options(&self) {
+        *lock(&self.inner.kept_options_note) = true;
         self.emit(
             "session.notice",
             None,
@@ -959,6 +965,15 @@ impl CursorSessionRuntime {
             json!({ "model": self.inner.options.model }),
         )
         .await;
+        if std::mem::take(&mut *lock(&self.inner.kept_options_note)) {
+            self.emit(
+                "turn.notice",
+                Some(turn_id.clone()),
+                None,
+                json!({ "message": CLEARED_OPTIONS_KEPT_NOTE }),
+            )
+            .await;
+        }
         // Armed when the turn is announced, so a prompt write that blocks is silent too.
         self.watch_silence(turn_id.clone());
         let connection = self.inner.connection.lock().await.clone();
@@ -2691,11 +2706,26 @@ mod tests {
                 .is_err(),
             "nothing was sent"
         );
+        let note = "Cursor no longer offers this model's previous default options, so it keeps \
+                    its current ones.";
         assert_eq!(
             next_of(&runtime, "session.notice").await.payload["message"],
-            "Cursor no longer offers this model's previous default options, so it keeps its \
-             current ones."
+            note
         );
+        // The next turn's own session update replaces the idle notice, so the turn shows it.
+        let receipt = runtime
+            .send_turn_with_receipt(Some("hello"), Vec::new())
+            .await
+            .expect("the prompt is written");
+        let started = next_of(&runtime, "turn.started").await;
+        let shown = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("the turn shows the note")
+            .expect("event");
+        assert_eq!(shown.event_type, "turn.notice");
+        assert_eq!(shown.turn_id, started.turn_id);
+        assert_eq!(shown.payload["message"], note);
+        assert_eq!(shown.turn_id.as_deref(), Some(receipt.turn_id.as_str()));
     }
 
     #[tokio::test]

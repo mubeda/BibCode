@@ -1342,23 +1342,30 @@ impl AntigravitySessionRuntime {
     }
 }
 
-/// Google's notice that the account may no longer use the service, cut out of `message`, which
-/// may hold anything else: from "This service has been disabled in this account" through "Terms
-/// of Service.", and the appeal sentence when one follows it.
+/// Google's notice that the account may no longer use the service, when `message` carries it:
+/// it says the service was disabled in this account and names the Terms of Service. Only the
+/// notice is kept, cut out of whatever else the line holds, best effort: from "This service"
+/// (or "disabled in this account") through "Terms of Service", and the appeal sentence when one
+/// follows it.
 fn account_disabled_notice(message: &str) -> Option<String> {
-    const START: &str = "this service has been disabled in this account";
-    const NOTICE_END: &str = "terms of service.";
+    const DISABLED: &str = "disabled in this account";
+    const TERMS: &str = "terms of service";
+    const OPENING: &str = "this service has been ";
     const APPEAL_END: &str = "this product.";
     // ASCII lowercasing keeps every byte offset, so the offsets index `message` too.
     let lower = message.to_ascii_lowercase();
-    let start = lower.find(START)?;
-    let rest = &lower[start..];
-    let notice = rest.find(NOTICE_END)? + NOTICE_END.len();
-    let end = rest[notice..]
+    let disabled = lower.find(DISABLED)?;
+    let terms = disabled + lower[disabled..].find(TERMS)? + TERMS.len();
+    let start = lower[..disabled]
+        .rfind(OPENING)
+        .filter(|opening| opening + OPENING.len() == disabled)
+        .unwrap_or(disabled);
+    let notice = terms + usize::from(lower[terms..].starts_with('.'));
+    let end = lower[notice..]
         .find(APPEAL_END)
         .filter(|offset| *offset < 200)
         .map_or(notice, |offset| notice + offset + APPEAL_END.len());
-    Some(message[start..start + end].to_owned())
+    Some(message[start..end].to_owned())
 }
 
 /// One classifier for every request: `-32000` "Authentication required" is the sign-in error,

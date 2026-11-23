@@ -4269,6 +4269,44 @@ mod workspace_loss_tests {
         f.shutdown().await;
     }
 
+    /// The start notice keeps the session's own state: a ready session reads ready with the
+    /// notice, and Stop puts back what it showed before.
+    #[tokio::test]
+    async fn the_start_notice_keeps_and_restores_the_sessions_state() {
+        let f = Fixture::new(false).await;
+        f.project("ready").await;
+        let launch = f.launch_hanging();
+        f.wait_for_start_notice().await;
+        let session = f.session().await;
+        assert_eq!(session.status, "ready");
+        assert_eq!(session.active_turn_id, None);
+        timeout(
+            Duration::from_secs(5),
+            route_orchestration_command(
+                &f.supervisor,
+                &f.engine,
+                &f._root.path().to_path_buf(),
+                serde_json::from_value(json!({
+                    "type":"thread.turn.interrupt","commandId":"stop","threadId":"t1",
+                    "createdAt":BEFORE_LOSS,
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect("Stop is not stuck behind the start")
+        .expect("Stop reports no error");
+        timeout(Duration::from_secs(5), launch)
+            .await
+            .expect("Stop ends the launch")
+            .unwrap()
+            .expect_err("the start was stopped");
+        let session = f.session().await;
+        assert_eq!(session.status, "ready");
+        assert_eq!(session.last_error, None);
+        f.shutdown().await;
+    }
+
     /// The server's shutdown ends a start that never returns too. Nothing was sent, so the
     /// message waits for the next start of the server.
     #[tokio::test]

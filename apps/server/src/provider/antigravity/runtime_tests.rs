@@ -1900,6 +1900,24 @@ async fn a_disabled_account_is_its_own_error() {
         "{error:?}"
     );
 
+    // Worded a little differently, the notice is still recognised, and only it is kept.
+    let (runtime, mut peer) = connect(options("full-access"));
+    let start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    peer.fail(
+        &initialize,
+        -32603,
+        "request placeholder-id: Disabled in this account for violation of Terms of Service; \
+         contact support",
+    )
+    .await;
+    let error = finish(start).await.expect_err("the account is disabled");
+    assert!(
+        matches!(&error, AntigravityRuntimeError::AccountDisabled { google_message }
+            if google_message == "Disabled in this account for violation of Terms of Service"),
+        "{error:?}"
+    );
+
     // The CLI prints it on its error output and exits before it answers.
     let (runtime, mut peer) = connect(options("full-access"));
     let start = spawn_start(&runtime);
