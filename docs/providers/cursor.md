@@ -54,22 +54,24 @@ together: when the CLI advertises some combinations of two options but not
 others, such as High reasoning only with Fast on, the picker shows one of them
 and Cursor's advertised value decides the other. A model the CLI advertises as a
 plain value, such as Auto, keeps its place without options, and a custom model
-appears only when the CLI advertises it. Provider inventory opens one empty
-Cursor session per CLI version, model list and instance environment to read the
-advertised values (Cursor does not list empty sessions); refreshes at the same
-time share that one read, and a read that fails is not tried again for a few
-minutes, while the model list is published without it. An option that no advertised value of the model holds, such as one
-saved from an older catalog, is refused before the turn is sent with a message
-naming it and saying to choose another option, as is a model the session does
-not offer.
-Older CLIs that advertise plain values and separate options work as the
-parameterized picker does. Clearing a model's options goes back to the values Cursor offered when
-the session started. When Cursor no longer offers those values, it keeps the
-ones it uses now, BiBCode sends no change, and the chat shows "Cursor no longer
-offers this model's previous default options, so it keeps its current ones." Auto, and a thread with no model selected, sends the session's
-advertised `default[...]` value, so it never runs the model the CLI last
-remembered; a session that advertises no default value leaves the choice to
-Cursor.
+appears only when the CLI advertises it. Older CLIs that advertise plain values
+and separate options work as the parameterized picker does.
+
+In every mode, provider inventory opens one empty Cursor session per CLI
+version, model list and instance environment to read the advertised values
+(Cursor does not list empty sessions); refreshes at the same time share that one
+read, and a read that fails is not tried again for a few minutes, while the
+model list is published without it. An option value the session does not
+advertise, such as one saved from an older catalog, is refused before the turn
+is sent with a message naming it and saying to choose another option, as is a
+model the session does not offer. Clearing a model's options goes back to the
+values Cursor offered when the session started. When Cursor no longer offers
+those values, it keeps the ones it uses now, BiBCode sends no change, and the
+chat shows "Cursor no longer offers this model's previous default options, so it
+keeps its current ones." Auto, and a thread with no model selected, sends the
+session's advertised Auto value (`default`, or `default[...]` in the fallback),
+so it never runs the model the CLI last remembered; a session that advertises no
+default value leaves the choice to Cursor.
 
 A Cursor turn that receives no update at all for five minutes, while it waits
 on neither the user nor a tool Cursor reports running, shows the notice
