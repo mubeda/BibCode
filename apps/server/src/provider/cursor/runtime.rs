@@ -1088,13 +1088,18 @@ impl CursorSessionRuntime {
         self.inner.abandon.notify_one();
     }
 
-    pub async fn interrupt_turn(&self) -> Result<(), CursorRuntimeError> {
+    /// Stops the running turn. With `requested`, only when it is that turn: a late stop for a
+    /// turn that already ended must not stop the next one.
+    pub async fn interrupt_turn(&self, requested: Option<&str>) -> Result<(), CursorRuntimeError> {
         let turn_id = {
             let mut ignored = self.inner.ignore_turn_output.lock().await;
             let active = self.inner.active_turn_id.lock().await;
             let Some(turn_id) = active.clone() else {
                 return Ok(());
             };
+            if requested.is_some_and(|requested| requested != turn_id) {
+                return Ok(());
+            }
             *ignored = Some(turn_id.clone());
             // Recorded with the turn's claim, so whichever path ends the turn sees the stop.
             if let Some(stopped) = lock(&self.inner.unsettled_turns).get_mut(&turn_id) {
@@ -2139,7 +2144,7 @@ mod tests {
             next_of(&runtime, "turn.started").await.turn_id.as_deref(),
             Some(receipt.turn_id.as_str())
         );
-        runtime.interrupt_turn().await.expect("stop");
+        runtime.interrupt_turn(None).await.expect("stop");
         assert_eq!(
             read_request(&mut requests).await["method"],
             "session/cancel"
@@ -2223,7 +2228,7 @@ mod tests {
             read_request(&mut requests).await["method"],
             "session/prompt"
         );
-        runtime.interrupt_turn().await.expect("stop");
+        runtime.interrupt_turn(None).await.expect("stop");
         assert_eq!(
             read_request(&mut requests).await["method"],
             "session/cancel"
@@ -2426,7 +2431,7 @@ mod tests {
             }
         });
         next_of(&runtime, "turn.started").await;
-        runtime.interrupt_turn().await.expect("stop");
+        runtime.interrupt_turn(None).await.expect("stop");
         timeout(Duration::from_secs(5), runtime.abandoned())
             .await
             .expect("the runtime is retired");
@@ -2477,7 +2482,7 @@ mod tests {
             .await
             .expect("session prompt should write");
         let prompt = read_request(&mut requests).await;
-        runtime.interrupt_turn().await.expect("stop");
+        runtime.interrupt_turn(None).await.expect("stop");
         assert_eq!(
             read_request(&mut requests).await["method"],
             "session/cancel"
@@ -2557,7 +2562,7 @@ mod tests {
         .await
         .expect("part of the prompt was written")
         .expect("read");
-        runtime.interrupt_turn().await.expect("stop");
+        runtime.interrupt_turn(None).await.expect("stop");
         drop(requests);
         let receipt = timeout(Duration::from_secs(5), send)
             .await
@@ -2595,7 +2600,7 @@ mod tests {
         timeout(Duration::from_secs(5), entered.notified())
             .await
             .expect("the unsent prompt reaches its claim");
-        let _ = runtime.interrupt_turn().await;
+        let _ = runtime.interrupt_turn(None).await;
         release.notify_one();
         let receipt = timeout(Duration::from_secs(5), send)
             .await
@@ -2628,7 +2633,7 @@ mod tests {
             }
         });
         next_of(&runtime, "turn.started").await;
-        runtime.interrupt_turn().await.expect("stop");
+        runtime.interrupt_turn(None).await.expect("stop");
         timeout(Duration::from_secs(5), runtime.abandoned())
             .await
             .expect("the write deadline retires the runtime");
@@ -2680,7 +2685,7 @@ mod tests {
             }
         });
         next_of(&runtime, "turn.started").await;
-        runtime.interrupt_turn().await.expect("stop");
+        runtime.interrupt_turn(None).await.expect("stop");
         drop(requests);
         let receipt = timeout(Duration::from_secs(5), send)
             .await
@@ -2688,6 +2693,106 @@ mod tests {
             .unwrap()
             .expect("a stopped prompt settles");
         assert!(receipt.stopped_unsent(), "nothing of the prompt was sent");
+    }
+
+    /// A late stop for a finished turn leaves the next one alone: its prompt that took no byte
+    /// is still unsent and may be sent again, and it does not end as cancelled.
+    #[tokio::test]
+    async fn a_late_stop_for_a_finished_turn_leaves_the_unsent_next_prompt_retryable() {
+        let (runtime, mut requests, mut responses) = delivery_runtime(Some("cursor-session"));
+        let first = runtime
+            .send_turn_with_receipt(Some("first"), Vec::new())
+            .await
+            .expect("the first prompt is written");
+        let request: Value = serde_json::from_str(
+            &requests
+                .next_line()
+                .await
+                .expect("request read")
+                .expect("first prompt"),
+        )
+        .expect("valid JSON-RPC request");
+        responses
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"stopReason\":\"end_turn\"}}}}\n",
+                    request["id"]
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("prompt response write");
+        let finished = first.turn_id.clone();
+        timeout(Duration::from_secs(2), first.completion())
+            .await
+            .expect("resolved")
+            .expect("the first turn finishes");
+        assert_eq!(
+            next_of(&runtime, "turn.completed").await.turn_id.as_deref(),
+            Some(finished.as_str())
+        );
+        fill_cli_input(&runtime).await;
+        let send = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .send_turn_with_receipt(Some("second"), Vec::new())
+                    .await
+            }
+        });
+        let started = next_of(&runtime, "turn.started").await;
+        assert_ne!(started.turn_id.as_deref(), Some(finished.as_str()));
+        runtime
+            .interrupt_turn(Some(&finished))
+            .await
+            .expect("a stale stop is no error");
+        // The CLI's input closes: the blocked write fails with nothing of the prompt sent.
+        drop(requests);
+        let error = timeout(Duration::from_secs(5), send)
+            .await
+            .expect("the send ends")
+            .unwrap()
+            .expect_err("the unsent prompt is not settled as stopped");
+        assert!(
+            matches!(
+                error,
+                CursorRuntimeError::Protocol(AcpProtocolError::WriteFailure { .. })
+            ),
+            "{error:?}"
+        );
+        let completed = next_of(&runtime, "turn.completed").await;
+        assert_eq!(completed.turn_id, started.turn_id);
+        assert_eq!(completed.payload["state"], "failed");
+        assert_no_second_completion(&runtime).await;
+    }
+
+    /// A stop that names the running turn still stops it.
+    #[tokio::test]
+    async fn a_stop_naming_the_active_turn_stops_it() {
+        let (runtime, requests, _responses) = delivery_runtime(Some("cursor-session"));
+        fill_cli_input(&runtime).await;
+        let send = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .send_turn_with_receipt(Some("hello"), Vec::new())
+                    .await
+            }
+        });
+        let started = next_of(&runtime, "turn.started").await;
+        runtime
+            .interrupt_turn(started.turn_id.as_deref())
+            .await
+            .expect("stop");
+        drop(requests);
+        let receipt = timeout(Duration::from_secs(5), send)
+            .await
+            .expect("the send ends")
+            .unwrap()
+            .expect("a stopped prompt settles");
+        assert!(receipt.stopped_unsent(), "nothing of the prompt was sent");
+        let completed = next_of(&runtime, "turn.completed").await;
+        assert_eq!(completed.payload["state"], "cancelled");
     }
 
     /// Cleared options whose baseline the latest answer no longer advertises keep the value
