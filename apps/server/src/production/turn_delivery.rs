@@ -2035,6 +2035,13 @@ fn provider_delivery_outcome(
             Some(TurnDeliveryFailureReason::FoundWithoutTurn),
             DeliveryTaskOutcome::Finished,
         ),
+        // Settled, never sent again, and no turn of it runs: its pending marker goes.
+        ProviderDeliveryOutcome::StoppedUnsent => (
+            TurnDeliveryState::Delivered,
+            None,
+            Some(TurnDeliveryFailureReason::FoundWithoutTurn),
+            DeliveryTaskOutcome::Finished,
+        ),
         ProviderDeliveryOutcome::NotSentRetryAfter {
             detail,
             retry_after,

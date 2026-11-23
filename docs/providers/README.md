@@ -27,14 +27,25 @@ that its local CLI is installed or ready.
 ## Starting a provider
 
 A provider CLI can wait silently while it starts, for example on one of its MCP
-servers that never connects. Every provider therefore has two minutes to start;
-Cursor and Antigravity have 60 seconds of their own, which end first. When the
-time runs out, BiBCode stops the process, records the session as failed, and
-shows that the provider did not finish starting, with the command that lists
-its MCP servers and their state where the CLI has one (for example
-`codex mcp list` or `cursor-agent mcp list`). The message that was waiting was
-not sent, so BiBCode tries it again a limited number of times; after the last
-try it fails with that message.
+servers that never connects. A slow start may still finish, so BiBCode never
+stops a provider for starting slowly. When a provider has not started after two
+minutes (60 seconds for Cursor and Antigravity), the thread shows, while it is
+still connecting, "<Provider> is taking longer than usual to start. One of its
+MCP servers may not be responding; run `<cli> mcp list` in a terminal to see
+which one." The command is named only for CLIs that have one (`claude`,
+`codex`, `opencode`, `agy`, `cursor-agent`). BiBCode keeps waiting, and the
+notice clears once the start ends; a start that then finishes goes on normally,
+so resuming, restarting, rewinding and compacting never fail because a start
+was slow.
+
+**Stop**, stopping the session, deleting the chat and closing a chat panel end a
+start that has not finished: BiBCode stops the provider process, and the message
+that was waiting is settled as stopped, never sent again and not shown as an
+error. Stopping BiBCode ends it too; that message was not sent and waits for the
+next start.
+
+BiBCode starts one provider session at a time. While one start waits, other
+chats' provider commands wait behind it until it finishes or is stopped.
 
 ## Tools and Claude Code's own updates
 

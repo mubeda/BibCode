@@ -2038,6 +2038,57 @@ struct RestoreHolds {
     admitted: HashMap<String, usize>,
 }
 
+/// How each launching thread's start is ended from outside the provider supervisor's queue.
+#[derive(Clone, Default)]
+pub(crate) struct LaunchStops(Arc<StdMutex<HashMap<String, LaunchStop>>>);
+
+impl LaunchStops {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, LaunchStop>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Stops the thread's launch whose start has not returned. Whether one was in flight.
+    pub(crate) fn stop(&self, thread_id: &str) -> bool {
+        let stops = self.lock();
+        let stop = stops.get(thread_id);
+        if let Some(stop) = stop {
+            stop.token.cancel();
+        }
+        stop.is_some()
+    }
+
+    /// Stops every launch in flight because the server shuts down: nothing was sent.
+    pub(crate) fn stop_all_for_shutdown(&self) {
+        for stop in self.lock().values() {
+            stop.shutdown.store(true, Ordering::SeqCst);
+            stop.token.cancel();
+        }
+    }
+}
+
+/// Ends a provider session launch whose start has not returned. The supervisor awaits every
+/// start in its one queue, so a stop of the thread, or the server's shutdown, reaches the start
+/// here instead of waiting behind it.
+#[derive(Clone, Default)]
+pub(crate) struct LaunchStop {
+    token: CancellationToken,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl LaunchStop {
+    /// Resolves once the launch is stopped.
+    pub(crate) async fn stopped(&self) {
+        self.token.cancelled().await;
+    }
+
+    /// Whether the server's shutdown, not the user, stopped the launch.
+    pub(crate) fn by_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+}
+
 fn decrement(counts: &mut HashMap<String, usize>, thread_id: &str) {
     if let Some(count) = counts.get_mut(thread_id) {
         *count -= 1;
@@ -2051,12 +2102,23 @@ fn decrement(counts: &mut HashMap<String, usize>, thread_id: &str) {
 pub(crate) struct SessionLaunch {
     engine: OrchestrationEngine,
     thread_id: String,
+    stop: LaunchStop,
+}
+
+impl SessionLaunch {
+    /// Ends this launch's start when the thread is stopped or the server shuts down.
+    pub(crate) fn stop(&self) -> &LaunchStop {
+        &self.stop
+    }
 }
 
 impl Drop for SessionLaunch {
     fn drop(&mut self) {
         let mut holds = self.engine.lock_restore_holds();
         decrement(&mut holds.launching, &self.thread_id);
+        if !holds.launching.contains_key(&self.thread_id) {
+            self.engine.launch_stops.lock().remove(&self.thread_id);
+        }
     }
 }
 /// Why a provider session cannot launch while another chat restores files in its checkout.
@@ -2295,6 +2357,7 @@ pub struct OrchestrationEngine {
     thread_turns: ThreadTurnFence,
     checkout_turns: CheckoutTurnFence,
     restore_holds: Arc<StdMutex<RestoreHolds>>,
+    launch_stops: LaunchStops,
     compaction_waiters: CompactionWaiters,
     ask_recovery_holds: AskRecoveryHolds,
     checkpoint_holds: CheckpointHolds,
@@ -2395,6 +2458,7 @@ impl OrchestrationEngine {
             thread_turns: ThreadTurnFence::default(),
             checkout_turns: CheckoutTurnFence::default(),
             restore_holds: Arc::default(),
+            launch_stops: LaunchStops::default(),
             compaction_waiters: CompactionWaiters::default(),
             ask_recovery_holds: AskRecoveryHolds::default(),
             checkpoint_holds: CheckpointHolds::default(),
@@ -3104,10 +3168,22 @@ impl OrchestrationEngine {
             return Err(RESTORING_FILES_DETAIL.to_owned());
         }
         *holds.launching.entry(thread_id.to_owned()).or_default() += 1;
+        let stop = self
+            .launch_stops
+            .lock()
+            .entry(thread_id.to_owned())
+            .or_default()
+            .clone();
         Ok(SessionLaunch {
             engine: self.clone(),
             thread_id: thread_id.to_owned(),
+            stop,
         })
+    }
+
+    /// The registry that stops this engine's provider launches whose start has not returned.
+    pub(crate) fn launch_stops(&self) -> LaunchStops {
+        self.launch_stops.clone()
     }
 
     fn lock_restore_holds(&self) -> std::sync::MutexGuard<'_, RestoreHolds> {

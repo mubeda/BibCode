@@ -114,7 +114,6 @@ fn options(runtime_mode: &str) -> AntigravitySessionOptions {
         model: None,
         resume_session_id: None,
         cancel_grace: Duration::from_secs(5),
-        start_timeout: Duration::from_secs(3),
         control_timeout: Duration::from_secs(3),
         initial_options: Vec::new(),
     }
@@ -338,34 +337,33 @@ async fn the_handshake_speaks_protocol_one_and_never_authenticates() {
     assert!(peer.silent().await);
 }
 
+/// A slow start is never given up here: the launch shows a notice and only a stop ends it. A
+/// start whose answers come late completes normally.
 #[tokio::test]
-async fn a_silent_peer_cannot_stall_the_start() {
-    let mut options = options("full-access");
-    options.start_timeout = Duration::from_millis(100);
-    let (runtime, mut peer) = connect(options.clone());
-    let start = spawn_start(&runtime);
-    peer.expect("initialize").await;
-    let error = finish(start).await.expect_err("an unanswered initialize");
-    assert!(
-        matches!(error, AntigravityRuntimeError::StartTimedOut),
-        "{error:?}"
-    );
-
-    // The deadline covers the whole start, the session open included.
-    let (runtime, mut peer) = connect(options);
+async fn a_slow_peer_keeps_the_start_waiting_until_it_answers() {
+    let (runtime, mut peer) = connect(options("full-access"));
     let start = spawn_start(&runtime);
     let initialize = peer.expect("initialize").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !start.is_finished(),
+        "an unanswered initialize keeps waiting"
+    );
     peer.reply(
         &initialize,
         initialize_result("1.5.13", 1, all_capabilities()),
     )
     .await;
-    peer.expect("session/new").await;
-    let error = finish(start).await.expect_err("an unanswered session/new");
+    let new = peer.expect("session/new").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        matches!(error, AntigravityRuntimeError::StartTimedOut),
-        "{error:?}"
+        !start.is_finished(),
+        "an unanswered session/new keeps waiting"
     );
+    peer.reply(&new, session_result(SESSION, standard_options("default")))
+        .await;
+    answer_mode(&mut peer, "auto").await;
+    assert_eq!(finish(start).await.unwrap(), SESSION);
 }
 
 #[tokio::test]
@@ -1592,10 +1590,9 @@ async fn a_silent_control_request_ends_in_time_and_unconfirms_the_mode() {
 }
 
 #[tokio::test]
-async fn the_initial_thinking_level_is_written_inside_the_start_deadline() {
+async fn the_initial_thinking_level_is_written_during_the_start() {
     let level_low = || vec![json!({ "id": "reasoning", "value": "low" })];
     let mut withheld = options("full-access");
-    withheld.start_timeout = Duration::from_millis(300);
     withheld.initial_options = level_low();
     let (runtime, mut peer) = connect(withheld);
     let start = spawn_start(&runtime);
@@ -1610,12 +1607,13 @@ async fn the_initial_thinking_level_is_written_inside_the_start_deadline() {
         .await;
     let level = peer.expect("session/set_config_option").await;
     assert_eq!(level["params"]["configId"], "thought_level");
-    // Withheld: the start deadline, not the supervisor, ends the wait.
-    let error = finish(start).await.expect_err("a silent level write");
+    // Withheld: the start keeps waiting; only a stop of the launch ends it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        matches!(error, AntigravityRuntimeError::StartTimedOut),
-        "{error:?}"
+        !start.is_finished(),
+        "a silent level write keeps the start waiting"
     );
+    start.abort();
 
     // Acknowledged: the supervisor's later write of the same level writes nothing.
     let mut acknowledged = options("full-access");
@@ -1849,4 +1847,91 @@ async fn uncategorized_model_and_level_options_the_inventory_publishes_are_writt
         .expect("level write in time")
         .unwrap()
         .expect("level written");
+}
+
+/// BiBCode names itself to the CLI at this server's own version.
+#[tokio::test]
+async fn the_handshake_names_bibcode_at_its_own_version() {
+    let (runtime, mut peer) = connect(options("full-access"));
+    let _start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    assert_eq!(
+        initialize["params"]["clientInfo"],
+        json!({ "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") })
+    );
+}
+
+/// Google's generic notice that an account may no longer use the service.
+const ACCOUNT_DISABLED: &str = "This service has been disabled in this account for violation of \
+                                Terms of Service. Please submit an appeal to continue using this \
+                                product.";
+
+/// Google's notice that the account is disabled is its own error, whether an ACP answer or the
+/// error output of a CLI that exits carries it. It keeps only Google's notice, never the rest of
+/// the line.
+#[tokio::test]
+async fn a_disabled_account_is_its_own_error() {
+    let (runtime, mut peer) = connect(options("full-access"));
+    let start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    peer.reply(
+        &initialize,
+        initialize_result("1.5.13", 1, all_capabilities()),
+    )
+    .await;
+    let new = peer.expect("session/new").await;
+    peer.fail(
+        &new,
+        -32603,
+        &format!("upstream error: {ACCOUNT_DISABLED} (request placeholder-id)"),
+    )
+    .await;
+    let error = finish(start).await.expect_err("the account is disabled");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Google has disabled Antigravity for this account. Appeal through Google to restore \
+             access. Google's message: {ACCOUNT_DISABLED}"
+        )
+    );
+    assert!(
+        matches!(&error, AntigravityRuntimeError::AccountDisabled { google_message }
+            if google_message == ACCOUNT_DISABLED),
+        "{error:?}"
+    );
+
+    // Worded a little differently, the notice is still recognised, and only it is kept.
+    let (runtime, mut peer) = connect(options("full-access"));
+    let start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    peer.fail(
+        &initialize,
+        -32603,
+        "request placeholder-id: Disabled in this account for violation of Terms of Service; \
+         contact support",
+    )
+    .await;
+    let error = finish(start).await.expect_err("the account is disabled");
+    assert!(
+        matches!(&error, AntigravityRuntimeError::AccountDisabled { google_message }
+            if google_message == "Disabled in this account for violation of Terms of Service"),
+        "{error:?}"
+    );
+
+    // The CLI prints it on its error output and exits before it answers.
+    let (runtime, mut peer) = connect(options("full-access"));
+    let start = spawn_start(&runtime);
+    peer.expect("initialize").await;
+    peer.stderr
+        .write_all(format!("Error: {ACCOUNT_DISABLED}\n").as_bytes())
+        .await
+        .expect("stderr write");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(peer);
+    let error = finish(start).await.expect_err("the CLI exited");
+    assert!(
+        matches!(&error, AntigravityRuntimeError::AccountDisabled { google_message }
+            if google_message == ACCOUNT_DISABLED),
+        "{error:?}"
+    );
 }

@@ -10,5 +10,5 @@ pub use acp::{AcpConnectionConfig, AcpJsonRpcConnection, IncomingEvent};
 pub use runtime::{
     AntigravityPromptReceipt, AntigravityRuntimeError, AntigravityRuntimeEvent,
     AntigravitySessionOptions, AntigravitySessionRuntime, DEFAULT_CANCEL_GRACE,
-    DEFAULT_CONTROL_TIMEOUT, DEFAULT_START_TIMEOUT,
+    DEFAULT_CONTROL_TIMEOUT, START_NOTICE_DELAY,
 };

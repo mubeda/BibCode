@@ -360,6 +360,29 @@ describe("header + status", () => {
     expect(ui.byLabel("Switch", "Enable Antigravity").checked).toBe(false);
   });
 
+  it("notes Google's written position once Antigravity is enabled or set up, never blocking it", () => {
+    const antigravity = getDriverOption(ProviderDriverKind.make("antigravity"))!;
+    const note = "Antigravity FAQ says tools that wrap the Antigravity CLI";
+    const card = (enabled: boolean, installed: boolean | undefined) =>
+      render(
+        baseProps({
+          instanceId: ProviderInstanceId.make("antigravity"),
+          instance: { driver: antigravity.value, enabled } as ProviderInstanceConfig,
+          driverOption: antigravity,
+          liveProvider:
+            installed === undefined
+              ? undefined
+              : liveProvider({ driver: antigravity.value, enabled, installed }),
+        }),
+      );
+
+    expect(card(true, undefined)).toContain(note);
+    expect(ui.byLabel("Switch", "Enable Antigravity").disabled).toBeUndefined();
+    expect(card(false, true)).toContain(note);
+    expect(card(false, false)).not.toContain(note);
+    expect(render(baseProps())).not.toContain(note);
+  });
+
   it("falls back to the driver-option icon when the driver kind is invalid", () => {
     const markup = render(
       baseProps({

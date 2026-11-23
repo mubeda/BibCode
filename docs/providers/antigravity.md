@@ -26,6 +26,12 @@ Antigravity Terminal. On a server without a browser, run `agy acp --login`
 instead. BiBCode never handles your credentials. If you are not signed in,
 Settings and the chat report that state and tell you to sign in first.
 
+If Google has disabled Antigravity for the signed-in account, the CLI answers
+with Google's notice that the service was disabled for a violation of its Terms
+of Service. BiBCode then fails the message once, without sending it again, with
+"Google has disabled Antigravity for this account. Appeal through Google to
+restore access." followed by Google's own notice.
+
 ## Settings
 
 Enable the Antigravity card in **Settings → Providers** and, if `agy` is not on the
@@ -54,6 +60,11 @@ activity, and approval requests like the other chat providers.
   edits files without asking and still asks before it runs a command.
 - **Full access:** BiBCode sets the CLI's `auto` mode. The CLI then runs tools
   without asking.
+
+If the CLI has not finished starting the session within 60 seconds, the chat
+shows "Antigravity is taking longer than usual to start. One of its MCP servers
+may not be responding; run `agy mcp list` in a terminal to see which one." and
+BiBCode keeps waiting; see [Starting a provider](README.md#starting-a-provider).
 
 BiBCode never answers a permission request for you, in any mode. A request the
 CLI sends is always shown to you. When you change the mode while the agent is
@@ -109,4 +120,6 @@ with your own sign-in. These two statements have not been reconciled, and whethe
 BiBCode counts is not established. An API key or an enterprise plan is the route
 Google supports officially. Read the FAQ and the
 [ACP page](https://antigravity.google/docs/cli/acp), check which plan covers your
-use, and decide for yourself before relying on it.
+use, and decide for yourself before relying on it. Settings → Providers repeats
+the FAQ's statement on the Antigravity card while Antigravity is enabled or
+installed; it never stops you from enabling it.

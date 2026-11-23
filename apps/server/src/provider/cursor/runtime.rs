@@ -29,8 +29,9 @@ use super::{
         JsonRpcErrorShape, acp_error_class, acp_turn_state,
     },
     model::{
-        acp_config_option_current_value, acp_model_descriptor, acp_model_values_are_bracketed,
-        advertised_auto_model_value, resolve_acp_config_updates_with_baseline,
+        CLEARED_OPTIONS_KEPT_NOTE, acp_config_option_current_value, acp_model_descriptor,
+        acp_model_values_are_bracketed, advertised_auto_model_value,
+        cleared_options_lose_the_baseline, resolve_acp_config_updates_with_baseline,
         resolve_acp_default_model_config, resolve_advertised_model_value,
         resolve_bracketed_model_options,
     },
@@ -51,9 +52,9 @@ const PROMPT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a stopped process may take to fail the blocked write, which tells how much was sent.
 const RETIRED_WRITE_SETTLE: Duration = Duration::from_secs(10);
 /// How long starting the session (initialize, authenticate, session/new or session/load, and the
-/// initial model and mode) may take before BiBCode stops the process. A CLI waits silently for
-/// an MCP server that never connects; it fires before the shared provider start limit.
-pub const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// initial model and mode) may take before the chat shows that Cursor is slow to start. A CLI
+/// waits silently for an MCP server that never connects; the start keeps waiting.
+pub const START_NOTICE_DELAY: Duration = Duration::from_secs(60);
 const FIXED_EVENT_TIME: &str = "2026-07-10T00:00:00.000Z";
 
 /// Phrases that mean the saved Cursor session itself is gone. A `session/load`
@@ -110,9 +111,31 @@ pub struct CursorRuntimeEvent {
 pub struct CursorPromptReceipt {
     pub turn_id: String,
     completion: oneshot::Receiver<Result<(), CursorRuntimeError>>,
+    /// The user stopped the prompt before any of it was sent: it is settled, never sent again,
+    /// and Cursor has nothing of it.
+    stopped_unsent: bool,
+}
+
+/// A receipt whose outcome is already known.
+fn settled_receipt(
+    turn_id: String,
+    outcome: Result<(), CursorRuntimeError>,
+    stopped_unsent: bool,
+) -> CursorPromptReceipt {
+    let (settled, completion) = oneshot::channel();
+    let _ = settled.send(outcome);
+    CursorPromptReceipt {
+        turn_id,
+        completion,
+        stopped_unsent,
+    }
 }
 
 impl CursorPromptReceipt {
+    pub fn stopped_unsent(&self) -> bool {
+        self.stopped_unsent
+    }
+
     pub async fn completion(self) -> Result<(), CursorRuntimeError> {
         self.completion.await.unwrap_or_else(|_| {
             Err(CursorRuntimeError::Protocol(AcpProtocolError::Closed {
@@ -178,13 +201,6 @@ pub enum CursorRuntimeError {
     },
     #[error("Cursor session configuration is uncertain: {detail}")]
     ConfigurationUncertain { detail: String },
-    /// The session did not start within [`START_TIMEOUT`]; its process is retired. Nothing was
-    /// sent, so a message waiting on it may be sent again.
-    #[error(
-        "Cursor did not finish starting. One of its MCP servers may not be responding; run \
-         `cursor-agent mcp list` in a terminal to see which one."
-    )]
-    StartTimedOut,
 }
 
 impl OptionRefusal for CursorRuntimeError {
@@ -213,9 +229,10 @@ struct RuntimeInner {
     runtime_mode: Mutex<String>,
     interaction_mode: Mutex<String>,
     active_turn_id: Mutex<Option<String>>,
-    /// Turns announced with `turn.started` whose `turn.completed` is not emitted yet. Every path
-    /// that ends a turn claims it here first, so a turn ends exactly once.
-    unsettled_turns: std::sync::Mutex<HashSet<String>>,
+    /// Turns announced with `turn.started` whose `turn.completed` is not emitted yet, each with
+    /// whether the user stopped it. Every path that ends a turn claims it here first, so a turn
+    /// ends exactly once, and learns from that one claim whether it was stopped.
+    unsettled_turns: std::sync::Mutex<HashMap<String, bool>>,
     events_tx: mpsc::UnboundedSender<CursorRuntimeEvent>,
     events_rx: Mutex<mpsc::UnboundedReceiver<CursorRuntimeEvent>>,
     event_counter: Mutex<u64>,
@@ -231,7 +248,6 @@ struct RuntimeInner {
     cancel_grace: std::sync::Mutex<Duration>,
     prompt_write_timeout: std::sync::Mutex<Duration>,
     retired_write_settle: std::sync::Mutex<Duration>,
-    start_timeout: std::sync::Mutex<Duration>,
     /// Tool calls of the active turn Cursor reports `in_progress`: a long command is silent, not
     /// stalled.
     open_tool_calls: std::sync::Mutex<HashSet<String>>,
@@ -240,6 +256,12 @@ struct RuntimeInner {
     /// driver stops the process.
     abandoned: AtomicBool,
     abandon: Notify,
+    /// Cursor kept its current options because their previous defaults are gone; the next turn
+    /// shows it once, since that turn's own session update replaces an idle notice at once.
+    kept_options_note: std::sync::Mutex<bool>,
+    /// Pauses the next claim of a turn until released, for tests: (entered, release).
+    #[cfg(test)]
+    before_claim: std::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 struct SilenceClock {
@@ -285,7 +307,7 @@ impl CursorSessionRuntime {
             runtime_mode: Mutex::new(runtime_mode),
             interaction_mode: Mutex::new(interaction_mode),
             active_turn_id: Mutex::new(None),
-            unsettled_turns: std::sync::Mutex::new(HashSet::new()),
+            unsettled_turns: std::sync::Mutex::new(HashMap::new()),
             events_tx,
             events_rx: Mutex::new(events_rx),
             event_counter: Mutex::new(0),
@@ -300,10 +322,12 @@ impl CursorSessionRuntime {
             cancel_grace: std::sync::Mutex::new(STOP_CANCEL_GRACE),
             prompt_write_timeout: std::sync::Mutex::new(PROMPT_WRITE_TIMEOUT),
             retired_write_settle: std::sync::Mutex::new(RETIRED_WRITE_SETTLE),
-            start_timeout: std::sync::Mutex::new(START_TIMEOUT),
             open_tool_calls: std::sync::Mutex::new(HashSet::new()),
             abandoned: AtomicBool::new(false),
             abandon: Notify::new(),
+            kept_options_note: std::sync::Mutex::new(false),
+            #[cfg(test)]
+            before_claim: std::sync::Mutex::new(None),
         });
         let runtime = Self { inner };
         runtime.attach_incoming(connection, incoming);
@@ -324,6 +348,21 @@ impl CursorSessionRuntime {
     /// Resolves once the process is retired; the driver then stops it.
     pub async fn abandoned(&self) {
         self.inner.abandon.notified().await;
+    }
+
+    /// Closes the connection: the writer task ends and the CLI's stdin closes. The readers and
+    /// the incoming task end when the CLI's output closes.
+    pub async fn close(&self) {
+        self.inner.connection.lock().await.shutdown();
+    }
+
+    #[cfg(test)]
+    async fn pause_before_claim(&self) {
+        let gate = lock(&self.inner.before_claim).take();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
     }
 
     /// Whether the process is retired: the session takes nothing more and must be launched again.
@@ -397,30 +436,7 @@ impl CursorSessionRuntime {
         });
     }
 
-    /// Replaces [`START_TIMEOUT`], for tests.
-    pub fn set_start_timeout(&self, timeout: Duration) {
-        *lock(&self.inner.start_timeout) = timeout;
-    }
-
-    /// Starts the session within [`START_TIMEOUT`]. On expiry the process is retired, so the
-    /// driver stops it, and the start fails as never sent.
     pub async fn start(&self) -> Result<String, CursorRuntimeError> {
-        let deadline = *lock(&self.inner.start_timeout);
-        match tokio::time::timeout(deadline, self.start_session()).await {
-            Ok(started) => started,
-            Err(_) => {
-                tracing::warn!(
-                    provider = PROVIDER,
-                    deadline_secs = deadline.as_secs(),
-                    "Cursor did not finish starting before its deadline; stopping its process"
-                );
-                self.retire();
-                Err(CursorRuntimeError::StartTimedOut)
-            }
-        }
-    }
-
-    async fn start_session(&self) -> Result<String, CursorRuntimeError> {
         self.emit("session.started", None, None, json!({})).await;
         let connection = self.inner.connection.lock().await.clone();
         connection
@@ -538,7 +554,7 @@ impl CursorSessionRuntime {
             return self.set_bracketed_options(&current, options).await;
         }
         let baseline = self.inner.baseline_config_options.lock().await.clone();
-        let updates = resolve_acp_config_updates_with_baseline(
+        let (updates, kept) = resolve_acp_config_updates_with_baseline(
             &Value::Array(current.clone()),
             &Value::Array(baseline),
             &Value::Array(options),
@@ -579,7 +595,23 @@ impl CursorSessionRuntime {
                 }
             }
         }
+        if kept {
+            self.note_kept_options().await;
+        }
         Ok(())
+    }
+
+    /// Says that Cursor keeps its current options because their previous defaults are gone: on
+    /// the session now, and on the next turn once it starts.
+    async fn note_kept_options(&self) {
+        *lock(&self.inner.kept_options_note) = true;
+        self.emit(
+            "session.notice",
+            None,
+            None,
+            json!({ "message": CLEARED_OPTIONS_KEPT_NOTE }),
+        )
+        .await;
     }
 
     /// Options of a session that folds them into its model values: a switch to the advertised
@@ -595,10 +627,14 @@ impl CursorSessionRuntime {
         let baseline = acp_model_descriptor(&baseline)
             .and_then(|descriptor| descriptor.get("currentValue"))
             .and_then(Value::as_str);
+        let cleared = options.is_empty();
         let Some(value) =
             resolve_bracketed_model_options(descriptor, &Value::Array(options), baseline)
                 .map_err(CursorRuntimeError::UnsupportedOption)?
         else {
+            if cleared && cleared_options_lose_the_baseline(descriptor, baseline) {
+                self.note_kept_options().await;
+            }
             return Ok(());
         };
         let config_id = descriptor
@@ -781,15 +817,47 @@ impl CursorSessionRuntime {
                     provider = PROVIDER,
                     "writing a prompt to Cursor blocked past its deadline; stopping its process"
                 );
+                const NOT_TAKEN: &str =
+                    "Cursor did not take the prompt and its process was stopped";
+                // The turn ends before the process is stopped, so its `turn.completed` comes
+                // before the `session.exited` the stop causes.
+                let claimed = self.claim_turn(&turn_id, false).await;
+                if let Some(stopped) = claimed {
+                    let error = AcpProtocolError::WriteFailure {
+                        message: NOT_TAKEN.to_owned(),
+                    };
+                    self.emit_turn_end(turn_id.clone(), stopped, &error).await;
+                }
                 self.retire();
                 let settle = *lock(&self.inner.retired_write_settle);
-                tokio::time::timeout(settle, request.written())
+                let written = tokio::time::timeout(settle, request.written())
                     .await
-                    .unwrap_or_else(|_| {
-                        Err(AcpRequestWriteFailure::unconfirmed(
-                            "Cursor did not take the prompt and its process was stopped",
-                        ))
-                    })
+                    .unwrap_or_else(|_| Err(AcpRequestWriteFailure::unconfirmed(NOT_TAKEN)));
+                // Only a stop ends a turn before its prompt's own path does.
+                let stopped = claimed.unwrap_or(true);
+                return match written {
+                    Err(failure) if failure.is_definitely_not_sent() && !stopped => {
+                        Err(failure.into_error().into())
+                    }
+                    Err(failure) if failure.is_definitely_not_sent() => {
+                        Ok(settled_receipt(turn_id, Ok(()), true))
+                    }
+                    // A stopped prompt settles however much of it was sent.
+                    _ if stopped => Ok(settled_receipt(turn_id, Ok(()), false)),
+                    Ok(()) => Ok(settled_receipt(
+                        turn_id,
+                        Err(AcpProtocolError::Closed {
+                            reason: NOT_TAKEN.to_owned(),
+                        }
+                        .into()),
+                        false,
+                    )),
+                    Err(failure) => Ok(settled_receipt(
+                        turn_id,
+                        Err(failure.into_error().into()),
+                        false,
+                    )),
+                };
             }
         };
         let completion = match written {
@@ -806,59 +874,66 @@ impl CursorSessionRuntime {
         Ok(CursorPromptReceipt {
             turn_id,
             completion,
+            stopped_unsent: false,
         })
     }
 
     /// A prompt that never reached the CLI: its announced turn ends once, so every `turn.started`
     /// has its `turn.completed`. An unsent prompt fails and may be sent again. One the user
-    /// stopped ends as cancelled and settles as delivered, so the stopped message is never sent
+    /// stopped ends as cancelled and settles with Cursor having none of it, so it is never sent
     /// again; an unanswered stop may already have ended it.
     async fn end_unsent_turn(
         &self,
         turn_id: String,
         error: AcpProtocolError,
     ) -> Result<CursorPromptReceipt, CursorRuntimeError> {
-        let stopped =
-            self.inner.ignore_turn_output.lock().await.as_deref() == Some(turn_id.as_str());
-        if self.claim_turn(&turn_id, false).await {
-            let payload = if stopped {
-                json!({ "state": "cancelled", "stopReason": "cancelled" })
-            } else {
-                json!({
-                    "state": "failed",
-                    "stopReason": "error",
-                    "errorMessage": error.to_string(),
-                    "errorClass": acp_error_class(&error),
-                })
-            };
-            self.emit("turn.completed", Some(turn_id.clone()), None, payload)
-                .await;
-            if !stopped {
+        match self.claim_turn(&turn_id, false).await {
+            Some(false) => {
+                self.emit_turn_end(turn_id, false, &error).await;
                 return Err(error.into());
             }
+            Some(true) => self.emit_turn_end(turn_id.clone(), true, &error).await,
+            // Only a stop ends a turn before its prompt's own path does.
+            None => {}
         }
-        let (settled, completion) = oneshot::channel();
-        let _ = settled.send(Ok(()));
-        Ok(CursorPromptReceipt {
-            turn_id,
-            completion,
-        })
+        Ok(settled_receipt(turn_id, Ok(()), true))
     }
 
-    /// Claims the end of `turn_id`. Of every path that can end a turn (its prompt's answer, a
-    /// prompt that was never sent, a stop the CLI did not answer), only the one that gets `true`
-    /// emits its `turn.completed` and settles its delivery. With `only_if_active`, a turn a newer
-    /// one has replaced is not claimed.
-    async fn claim_turn(&self, turn_id: &str, only_if_active: bool) -> bool {
+    /// The `turn.completed` of a turn its prompt's answer did not end: cancelled when the user
+    /// stopped it, failed with `error` otherwise.
+    async fn emit_turn_end(&self, turn_id: String, stopped: bool, error: &AcpProtocolError) {
+        let payload = if stopped {
+            json!({ "state": "cancelled", "stopReason": "cancelled" })
+        } else {
+            json!({
+                "state": "failed",
+                "stopReason": "error",
+                "errorMessage": error.to_string(),
+                "errorClass": acp_error_class(error),
+            })
+        };
+        self.emit("turn.completed", Some(turn_id), None, payload)
+            .await;
+    }
+
+    /// Claims the end of `turn_id`, with whether the user stopped it. Of every path that can end
+    /// a turn (its prompt's answer, a prompt that was never sent, a stop the CLI did not
+    /// answer), only the one that gets `Some` emits its `turn.completed` and settles its
+    /// delivery, both from that one answer. With `only_if_active`, a turn a newer one has
+    /// replaced is not claimed.
+    async fn claim_turn(&self, turn_id: &str, only_if_active: bool) -> Option<bool> {
+        #[cfg(test)]
+        self.pause_before_claim().await;
         let mut active = self.inner.active_turn_id.lock().await;
         let is_active = active.as_deref() == Some(turn_id);
-        if (only_if_active && !is_active) || !lock(&self.inner.unsettled_turns).remove(turn_id) {
-            return false;
+        if only_if_active && !is_active {
+            return None;
         }
+        let stopped = lock(&self.inner.unsettled_turns).remove(turn_id)?;
         if is_active {
             *active = None;
         }
-        true
+        Some(stopped)
     }
 
     async fn prepare_prompt(
@@ -869,9 +944,15 @@ impl CursorSessionRuntime {
         self.ensure_usable().await?;
         let session_id = self.provider_session_id().await?;
         let turn_id = format!("turn-{}", Uuid::new_v4());
-        *self.inner.active_turn_id.lock().await = Some(turn_id.clone());
-        *self.inner.ignore_turn_output.lock().await = None;
-        lock(&self.inner.unsettled_turns).insert(turn_id.clone());
+        {
+            // Under the stop's own locks: a stop targets the previous turn, or is recorded for
+            // this one after the previous stop is cleared, never wiped by it.
+            let mut ignored = self.inner.ignore_turn_output.lock().await;
+            let mut active = self.inner.active_turn_id.lock().await;
+            lock(&self.inner.unsettled_turns).insert(turn_id.clone(), false);
+            *active = Some(turn_id.clone());
+            *ignored = None;
+        }
         lock(&self.inner.open_tool_calls).clear();
         *self.inner.silence.lock().await = SilenceClock {
             last_activity: tokio::time::Instant::now(),
@@ -884,6 +965,15 @@ impl CursorSessionRuntime {
             json!({ "model": self.inner.options.model }),
         )
         .await;
+        if std::mem::take(&mut *lock(&self.inner.kept_options_note)) {
+            self.emit(
+                "turn.notice",
+                Some(turn_id.clone()),
+                None,
+                json!({ "message": CLEARED_OPTIONS_KEPT_NOTE }),
+            )
+            .await;
+        }
         // Armed when the turn is announced, so a prompt write that blocks is silent too.
         self.watch_silence(turn_id.clone());
         let connection = self.inner.connection.lock().await.clone();
@@ -935,10 +1025,10 @@ impl CursorSessionRuntime {
             let _ = connection.barrier().await;
             // A turn already ended, by a stop the CLI did not answer: its prompt was written, so
             // the delivery stays accepted, and the answer ends nothing twice.
-            if !runtime.claim_turn(&background_turn_id, false).await {
+            let Some(stopped) = runtime.claim_turn(&background_turn_id, false).await else {
                 let _ = completion_tx.send(Ok(()));
                 return;
-            }
+            };
             match result {
                 Ok(response) => {
                     let stop_reason = response
@@ -959,24 +1049,12 @@ impl CursorSessionRuntime {
                     let _ = completion_tx.send(Ok(()));
                 }
                 Err(error) => {
-                    let detail = error.to_string();
-                    // Attribute from the variant, not the flattened string: a
-                    // JSON-RPC error is the agent's, a broken pipe is ours.
-                    let class = acp_error_class(&error);
                     runtime
-                        .emit(
-                            "turn.completed",
-                            Some(background_turn_id),
-                            None,
-                            json!({
-                                "state": "failed",
-                                "stopReason": "error",
-                                "errorMessage": detail,
-                                "errorClass": class,
-                            }),
-                        )
+                        .emit_turn_end(background_turn_id, stopped, &error)
                         .await;
-                    let _ = completion_tx.send(Err(error.into()));
+                    // A prompt the user stopped settles however its write or answer broke, so
+                    // it is never sent again.
+                    let _ = completion_tx.send(if stopped { Ok(()) } else { Err(error.into()) });
                 }
             }
         });
@@ -993,9 +1071,9 @@ impl CursorSessionRuntime {
     /// Ends a stopped turn whose cancel the CLI did not answer within the grace: the turn ends
     /// once, as cancelled, and the process is retired.
     async fn end_unanswered_stop(&self, turn_id: String) {
-        if !self.claim_turn(&turn_id, true).await {
+        let Some(stopped) = self.claim_turn(&turn_id, true).await else {
             return;
-        }
+        };
         tracing::warn!(
             provider = PROVIDER,
             "Cursor did not answer the cancel of a stopped turn; stopping its process"
@@ -1003,21 +1081,27 @@ impl CursorSessionRuntime {
         lock(&self.inner.open_tool_calls).clear();
         // Retired before the turn ends, so the next message never reaches this process.
         self.inner.abandoned.store(true, Ordering::SeqCst);
-        self.emit(
-            "turn.completed",
-            Some(turn_id),
-            None,
-            json!({ "state": "cancelled", "stopReason": "cancelled" }),
-        )
-        .await;
+        let unanswered = AcpProtocolError::Closed {
+            reason: "Cursor did not answer the stop".to_owned(),
+        };
+        self.emit_turn_end(turn_id, stopped, &unanswered).await;
         self.inner.abandon.notify_one();
     }
 
     pub async fn interrupt_turn(&self) -> Result<(), CursorRuntimeError> {
-        let Some(turn_id) = self.inner.active_turn_id.lock().await.clone() else {
-            return Ok(());
+        let turn_id = {
+            let mut ignored = self.inner.ignore_turn_output.lock().await;
+            let active = self.inner.active_turn_id.lock().await;
+            let Some(turn_id) = active.clone() else {
+                return Ok(());
+            };
+            *ignored = Some(turn_id.clone());
+            // Recorded with the turn's claim, so whichever path ends the turn sees the stop.
+            if let Some(stopped) = lock(&self.inner.unsettled_turns).get_mut(&turn_id) {
+                *stopped = true;
+            }
+            turn_id
         };
-        *self.inner.ignore_turn_output.lock().await = Some(turn_id.clone());
         // The turn's output is ignored from here on, so its tool calls never report closing.
         lock(&self.inner.open_tool_calls).clear();
         let pending_ids = self
@@ -2447,6 +2531,251 @@ mod tests {
                 .is_err(),
             "nothing was written"
         );
+    }
+
+    /// (a) Stop, then the partial write of the prompt breaks before the stop's grace ends: the
+    /// turn ends once, as cancelled, and the stopped prompt settles: not uncertain, never sent
+    /// again.
+    #[tokio::test]
+    async fn a_stopped_prompt_whose_partial_write_breaks_ends_once_as_cancelled() {
+        let (runtime, mut requests, _responses) = delivery_runtime(Some("cursor-session"));
+        let send = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .send_turn_with_receipt(Some(&"x".repeat(64 * 1024)), Vec::new())
+                    .await
+            }
+        });
+        next_of(&runtime, "turn.started").await;
+        // Part of the prompt reached the CLI's input before it stopped reading.
+        let mut first = [0_u8; 1];
+        timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(requests.get_mut().get_mut(), &mut first),
+        )
+        .await
+        .expect("part of the prompt was written")
+        .expect("read");
+        runtime.interrupt_turn().await.expect("stop");
+        drop(requests);
+        let receipt = timeout(Duration::from_secs(5), send)
+            .await
+            .expect("the send ends")
+            .unwrap()
+            .expect("part of the prompt was written");
+        timeout(Duration::from_secs(2), receipt.completion())
+            .await
+            .expect("resolved")
+            .expect("settled, so it is neither uncertain nor sent again");
+        let completed = next_of(&runtime, "turn.completed").await;
+        assert_eq!(completed.payload["state"], "cancelled");
+        assert_no_second_completion(&runtime).await;
+    }
+
+    /// (b) A stop recorded after the write failed with nothing sent but before the turn was
+    /// claimed is honoured: the prompt is never sent again.
+    #[tokio::test]
+    async fn a_stop_recorded_just_before_the_claim_is_never_resent() {
+        let (runtime, requests, _responses) = delivery_runtime(Some("cursor-session"));
+        let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        *lock(&runtime.inner.before_claim) = Some((entered.clone(), release.clone()));
+        fill_cli_input(&runtime).await;
+        let send = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .send_turn_with_receipt(Some("hello"), Vec::new())
+                    .await
+            }
+        });
+        next_of(&runtime, "turn.started").await;
+        // The CLI's input closes: the blocked write fails with nothing of the prompt sent.
+        drop(requests);
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the unsent prompt reaches its claim");
+        let _ = runtime.interrupt_turn().await;
+        release.notify_one();
+        let receipt = timeout(Duration::from_secs(5), send)
+            .await
+            .expect("the send ends")
+            .unwrap()
+            .expect("a stopped prompt settles; it is not reported unsent");
+        timeout(Duration::from_secs(2), receipt.completion())
+            .await
+            .expect("resolved")
+            .expect("settled");
+        let completed = next_of(&runtime, "turn.completed").await;
+        assert_eq!(completed.payload["state"], "cancelled");
+        assert_no_second_completion(&runtime).await;
+    }
+
+    /// (c) A stop while the prompt write takes no byte, with the write deadline firing before
+    /// the stop's grace: the turn ends once, as cancelled, before the stopped process's
+    /// `session.exited`.
+    #[tokio::test]
+    async fn a_stopped_unsent_prompt_ends_before_the_session_exits() {
+        let (runtime, requests, responses) = delivery_runtime(Some("cursor-session"));
+        runtime.set_stop_deadlines(STOP_CANCEL_GRACE, Duration::from_millis(500));
+        fill_cli_input(&runtime).await;
+        let send = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .send_turn_with_receipt(Some("hello"), Vec::new())
+                    .await
+            }
+        });
+        next_of(&runtime, "turn.started").await;
+        runtime.interrupt_turn().await.expect("stop");
+        timeout(Duration::from_secs(5), runtime.abandoned())
+            .await
+            .expect("the write deadline retires the runtime");
+        // The driver stops the process: its output closes first, then its input.
+        drop(responses);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(requests);
+        let receipt = timeout(Duration::from_secs(5), send)
+            .await
+            .expect("the send ends")
+            .unwrap()
+            .expect("a stopped prompt settles");
+        timeout(Duration::from_secs(2), receipt.completion())
+            .await
+            .expect("resolved")
+            .expect("settled");
+        let mut ends = Vec::new();
+        timeout(Duration::from_secs(5), async {
+            while ends.len() < 2 {
+                let event = runtime.next_event().await.expect("event");
+                if matches!(
+                    event.event_type.as_str(),
+                    "turn.completed" | "session.exited"
+                ) {
+                    ends.push((event.event_type, event.payload));
+                }
+            }
+        })
+        .await
+        .expect("both ends arrive");
+        assert_eq!(ends[0].0, "turn.completed", "{ends:?}");
+        assert_eq!(ends[0].1["state"], "cancelled");
+        assert_eq!(ends[1].0, "session.exited", "{ends:?}");
+        assert_no_second_completion(&runtime).await;
+    }
+
+    /// (d) A stopped prompt that sent nothing tells the delivery so: it settles without the
+    /// provider having any of it, so a side chat's host context is still owed.
+    #[tokio::test]
+    async fn a_stopped_unsent_prompt_says_it_sent_nothing() {
+        let (runtime, requests, _responses) = delivery_runtime(Some("cursor-session"));
+        fill_cli_input(&runtime).await;
+        let send = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .send_turn_with_receipt(Some("hello"), Vec::new())
+                    .await
+            }
+        });
+        next_of(&runtime, "turn.started").await;
+        runtime.interrupt_turn().await.expect("stop");
+        drop(requests);
+        let receipt = timeout(Duration::from_secs(5), send)
+            .await
+            .expect("the send ends")
+            .unwrap()
+            .expect("a stopped prompt settles");
+        assert!(receipt.stopped_unsent(), "nothing of the prompt was sent");
+    }
+
+    /// Cleared options whose baseline the latest answer no longer advertises keep the value
+    /// Cursor uses now: nothing is sent, nothing is refused, and a note says so.
+    async fn clearing_keeps_the_current_options(current: Vec<Value>, baseline: Vec<Value>) {
+        let (runtime, mut requests, _responses) = delivery_runtime(Some("cursor-session"));
+        *runtime.inner.config_options.lock().await = current;
+        *runtime.inner.baseline_config_options.lock().await = baseline;
+        timeout(Duration::from_secs(2), runtime.set_options(Vec::new()))
+            .await
+            .expect("clearing waits on no answer")
+            .expect("clearing is not refused");
+        assert!(
+            timeout(Duration::from_millis(100), requests.next_line())
+                .await
+                .is_err(),
+            "nothing was sent"
+        );
+        let note = "Cursor no longer offers this model's previous default options, so it keeps \
+                    its current ones.";
+        assert_eq!(
+            next_of(&runtime, "session.notice").await.payload["message"],
+            note
+        );
+        // The next turn's own session update replaces the idle notice, so the turn shows it.
+        let receipt = runtime
+            .send_turn_with_receipt(Some("hello"), Vec::new())
+            .await
+            .expect("the prompt is written");
+        let started = next_of(&runtime, "turn.started").await;
+        let shown = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("the turn shows the note")
+            .expect("event");
+        assert_eq!(shown.event_type, "turn.notice");
+        assert_eq!(shown.turn_id, started.turn_id);
+        assert_eq!(shown.payload["message"], note);
+        assert_eq!(shown.turn_id.as_deref(), Some(receipt.turn_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn clearing_keeps_bracketed_options_whose_baseline_is_gone() {
+        let gone = |value: &str| {
+            vec![json!({
+                "id": "model", "category": "model", "type": "select", "currentValue": value,
+                "options": [{ "value": value }]
+            })]
+        };
+        clearing_keeps_the_current_options(
+            bracketed_options("m[reasoning=high,fast=false]"),
+            gone("m[reasoning=low,fast=false]"),
+        )
+        .await;
+        // A plain baseline value the latest answer no longer advertises.
+        clearing_keeps_the_current_options(
+            bracketed_options("m[reasoning=high,fast=false]"),
+            gone("m"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn clearing_keeps_separate_options_whose_baseline_is_gone() {
+        let effort = |current: &str, values: &[&str]| {
+            vec![json!({
+                "id": "effort", "category": "model_option", "type": "select",
+                "currentValue": current,
+                "options": values.iter().map(|value| json!({ "value": value })).collect::<Vec<_>>()
+            })]
+        };
+        clearing_keeps_the_current_options(
+            effort("high", &["low", "high"]),
+            effort("medium", &["low", "medium", "high"]),
+        )
+        .await;
+    }
+
+    /// Closing the runtime ends the connection's writer task, so the CLI's input closes and the
+    /// connection does not outlive the stopped process.
+    #[tokio::test]
+    async fn close_ends_the_cli_input() {
+        let (runtime, mut requests, _responses) = delivery_runtime(Some("cursor-session"));
+        runtime.close().await;
+        let line = timeout(Duration::from_secs(5), requests.next_line())
+            .await
+            .expect("the input closes")
+            .expect("read");
+        assert_eq!(line, None);
     }
 
     /// A turn that keeps sending updates, or waits on the user or a running tool, is never cut

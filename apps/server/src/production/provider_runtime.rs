@@ -77,7 +77,7 @@ use crate::{
             AntigravitySessionOptions, AntigravitySessionRuntime,
             DEFAULT_CANCEL_GRACE as ANTIGRAVITY_CANCEL_GRACE,
             DEFAULT_CONTROL_TIMEOUT as ANTIGRAVITY_CONTROL_TIMEOUT,
-            DEFAULT_START_TIMEOUT as ANTIGRAVITY_START_TIMEOUT,
+            START_NOTICE_DELAY as ANTIGRAVITY_START_NOTICE_DELAY,
         },
         attachments::{
             AttachmentMaterializer, MaterializedAttachment, append_file_references,
@@ -143,24 +143,19 @@ const PROVIDER_STREAM_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Providers normally settle an interrupt within a second or two.
 const PROVIDER_INTERRUPT_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long any provider may take to start before BiBCode stops it. A CLI can wait silently for
-/// an MCP server that never connects; the single supervisor actor awaits every launch, so an
-/// unbounded start stalls every session. Cursor's and Antigravity's own 60-second limits fire
-/// first.
-const PROVIDER_START_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long any provider may take to start before BiBCode shows that it is slow. A CLI can wait
+/// silently for an MCP server that never connects; the start keeps waiting, since a slow start
+/// may still finish, and only a stop of the thread or the server's shutdown ends it.
+const PROVIDER_START_NOTICE_DELAY: Duration = Duration::from_secs(120);
 
-/// The error of a start that did not finish within `deadline`, naming the provider and, when its
-/// CLI has one, the command that shows which MCP server does not answer.
-fn start_timeout_error(provider: &str, deadline: Duration) -> ProviderRuntimeError {
-    let within = match deadline.as_secs() {
-        seconds if seconds >= 120 => format!("{} minutes", seconds / 60),
-        seconds => format!("{seconds} seconds"),
-    };
-    let mut detail = format!(
-        "{} did not finish starting within {within}.",
+/// The notice of a start that is taking long, naming the provider and, when its CLI has one, the
+/// command that shows which MCP server does not answer.
+fn start_notice(provider: &str) -> String {
+    let mut notice = format!(
+        "{} is taking longer than usual to start.",
         provider_display_name(provider)
     );
-    // Each command checked with `<cli> mcp --help` on the installed CLI; Grok's was not.
+    // Each command checked with `<cli> mcp --help` on the installed CLI; Grok has none.
     let check = match provider {
         "claudeAgent" | "claude" => Some("claude"),
         "codex" => Some("codex"),
@@ -170,15 +165,12 @@ fn start_timeout_error(provider: &str, deadline: Duration) -> ProviderRuntimeErr
         _ => None,
     };
     if let Some(cli) = check {
-        detail.push_str(&format!(
+        notice.push_str(&format!(
             " One of its MCP servers may not be responding; run `{cli} mcp list` in a terminal to \
              see which one."
         ));
     }
-    ProviderRuntimeError::Provider {
-        provider: provider.to_owned(),
-        detail,
-    }
+    notice
 }
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
@@ -358,6 +350,9 @@ pub enum ProviderDeliveryOutcome {
     },
     /// The provider already has the message, so it was not sent again and starts no turn.
     AlreadyDelivered,
+    /// The user stopped the message before any of it reached the provider: it is settled, never
+    /// sent again, and the provider has none of it, so a side chat still owes its host's context.
+    StoppedUnsent,
     /// Not sent, and the provider asked to wait at least `retry_after` before sending it again.
     NotSentRetryAfter {
         detail: String,
@@ -444,9 +439,10 @@ impl ProviderDeliveryHandle {
 
 pub trait ProviderDriver: Send + Sync {
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>>;
-    /// How long `start` may take before the launch stops the driver and fails as not sent.
-    fn start_deadline(&self) -> Duration {
-        PROVIDER_START_TIMEOUT
+    /// How long `start` may take before the thread shows that the provider is slow to start.
+    /// The launch keeps waiting.
+    fn start_notice_delay(&self) -> Duration {
+        PROVIDER_START_NOTICE_DELAY
     }
     /// Whether `start`'s activity capabilities are all this process will report. When false, a
     /// startup `ActivityCapabilities::none()` means "not known yet": a restarted session keeps
@@ -677,6 +673,10 @@ pub enum ProviderRuntimeError {
     StaleSession { thread_id: String, action: String },
     #[error("thread {thread_id} already has an active provider runtime")]
     SessionAlreadyExists { thread_id: String },
+    /// The user stopped the thread while its provider was still starting. Nothing was sent, and
+    /// the message the launch was for is settled, never sent again.
+    #[error("thread {thread_id}'s provider start was stopped")]
+    LaunchStopped { thread_id: String },
     /// A reconciliation launch found the frozen conversation gone and started nothing.
     #[error("the provider no longer has thread {thread_id}'s frozen conversation")]
     FrozenConversationLost { thread_id: String },
@@ -757,6 +757,8 @@ pub struct ProviderRuntimeSupervisor {
     connect_mcp: Arc<RwLock<Option<Arc<ConnectMcpService>>>>,
     open_url: Option<OpenUrlEnvironment>,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
+    /// Reaches a launch whose start has not returned, outside the queue the start blocks.
+    launch_stops: crate::orchestration::engine::LaunchStops,
 }
 
 #[derive(Clone)]
@@ -1354,6 +1356,7 @@ impl ProviderRuntimeSupervisor {
         let worker_sender = sender.clone();
         let activity_cancellation = Arc::new(RwLock::new(None));
         let worker_activity_cancellation = activity_cancellation.clone();
+        let launch_stops = engine.launch_stops();
         let worker = tokio::spawn(async move {
             run_supervisor(
                 engine,
@@ -1386,6 +1389,7 @@ impl ProviderRuntimeSupervisor {
             connect_mcp: Arc::new(RwLock::new(None)),
             open_url,
             activity_cancellation,
+            launch_stops,
         }
     }
 
@@ -1520,11 +1524,31 @@ impl ProviderRuntimeSupervisor {
         &self,
         command: OrchestrationCommand,
     ) -> Result<(), ProviderRuntimeError> {
-        self.request(|response| SupervisorMessage::Handle {
-            command: Box::new(command),
-            response,
-        })
-        .await
+        // A stop ends a start that has not returned first: the queue awaits that start. A launch
+        // has no turn yet, so an interrupt naming a turn (a late Stop, a compaction's own
+        // interrupt) is not aimed at it.
+        let stopped_launch = match &command {
+            OrchestrationCommand::ThreadTurnInterrupt {
+                thread_id,
+                turn_id: None,
+                ..
+            }
+            | OrchestrationCommand::ThreadSessionStop { thread_id, .. } => {
+                self.launch_stops.stop(thread_id)
+            }
+            _ => false,
+        };
+        let result = self
+            .request(|response| SupervisorMessage::Handle {
+                command: Box::new(command),
+                response,
+            })
+            .await;
+        match result {
+            // The stop ended the start, so there is no session left to stop.
+            Err(ProviderRuntimeError::SessionNotFound { .. }) if stopped_launch => Ok(()),
+            result => result,
+        }
     }
 
     pub async fn capture_session_identity(
@@ -1712,6 +1736,7 @@ impl ProviderRuntimeSupervisor {
         if self.stopped.is_cancelled() {
             return Ok(());
         }
+        self.launch_stops.stop_all_for_shutdown();
         let result = self
             .request(|response| SupervisorMessage::Shutdown { response })
             .await;
@@ -1844,12 +1869,17 @@ pub async fn route_orchestration_command(
 
     let action = command.command_type().to_owned();
     match supervisor.handle_orchestration(command.clone()).await {
-        Ok(()) => Ok(()),
+        // The user stopped the thread while the command's restart started: nothing more to do.
+        Ok(()) | Err(ProviderRuntimeError::LaunchStopped { .. }) => Ok(()),
         Err(ProviderRuntimeError::SessionNotFound { .. })
             if matches!(command, OrchestrationCommand::ThreadTurnStart { .. }) =>
         {
             let request = launch_request_for_command(engine, settings_root, &command, None).await?;
-            supervisor.launch(request).await?;
+            match supervisor.launch(request).await {
+                // The user stopped the thread while it started: nothing more to do.
+                Err(ProviderRuntimeError::LaunchStopped { .. }) => return Ok(()),
+                launched => launched?,
+            }
             supervisor.handle_orchestration(command).await
         }
         Err(ProviderRuntimeError::SessionNotFound { .. })
@@ -2311,10 +2341,11 @@ fn frozen_failure_outcome(
     label: Option<&str>,
 ) -> ProviderDeliveryOutcome {
     let detail = delivery_detail(error, label);
-    if matches!(error, ProviderRuntimeError::InvalidOption { .. }) {
-        ProviderDeliveryOutcome::Refused { detail }
-    } else {
-        ProviderDeliveryOutcome::Rejected { detail }
+    match error {
+        ProviderRuntimeError::InvalidOption { .. } => ProviderDeliveryOutcome::Refused { detail },
+        // The user stopped the restart the delivery needed: settled, never sent again.
+        ProviderRuntimeError::LaunchStopped { .. } => ProviderDeliveryOutcome::StoppedUnsent,
+        _ => ProviderDeliveryOutcome::Rejected { detail },
     }
 }
 
@@ -2325,6 +2356,8 @@ fn frozen_failure_outcome(
 fn launch_failure_outcome(error: &ProviderRuntimeError, label: &str) -> ProviderDeliveryOutcome {
     let detail = delivery_detail(error, Some(label));
     match error {
+        // The user stopped it: settled, so the stopped message is never sent again.
+        ProviderRuntimeError::LaunchStopped { .. } => ProviderDeliveryOutcome::StoppedUnsent,
         ProviderRuntimeError::InvalidOption { .. } => ProviderDeliveryOutcome::Refused { detail },
         ProviderRuntimeError::IncompatibleProvider { .. }
         | ProviderRuntimeError::MissingExecutable { .. }
@@ -2339,6 +2372,30 @@ fn launch_failure_outcome(error: &ProviderRuntimeError, label: &str) -> Provider
 #[cfg(test)]
 mod delivery_failure_tests {
     use super::*;
+
+    /// A disabled Antigravity account is never retried: a launch or a send that meets it fails
+    /// the message once, with the clear sentence and Google's own words in the details.
+    #[test]
+    fn a_disabled_antigravity_account_fails_the_message_once() {
+        let disabled = || AntigravityRuntimeError::AccountDisabled {
+            google_message: "Placeholder notice from Google.".to_owned(),
+        };
+        let error = super::antigravity_error(disabled());
+        let detail = delivery_detail(&error, None);
+        assert_eq!(
+            detail,
+            "Google has disabled Antigravity for this account. Appeal through Google to restore \
+             access. Google's message: Placeholder notice from Google."
+        );
+        assert!(matches!(
+            launch_failure_outcome(&error, "Antigravity"),
+            ProviderDeliveryOutcome::Rejected { .. }
+        ));
+        assert!(matches!(
+            super::antigravity_unsent_outcome(disabled()),
+            ProviderDeliveryOutcome::Rejected { .. }
+        ));
+    }
 
     #[test]
     fn transport_line_too_long_rejects_direct_and_nested_launch_errors() {
@@ -2549,6 +2606,9 @@ pub(crate) fn delivery_detail(
         ProviderRuntimeError::SessionAlreadyExists { .. } => {
             "A session is already running for this thread.".to_owned()
         }
+        ProviderRuntimeError::LaunchStopped { .. } => {
+            "The chat was stopped while its agent was starting.".to_owned()
+        }
         ProviderRuntimeError::FrozenConversationLost { .. } => {
             RECONCILED_CONVERSATION_LOST_DETAIL.to_owned()
         }
@@ -2698,6 +2758,8 @@ fn delivery_enqueue_failure(
     let detail = delivery_detail(error, provider_label);
     match error {
         ProviderRuntimeError::ResponseDropped => ProviderDeliveryOutcome::Ambiguous { detail },
+        // The user stopped the restart the delivery needed: settled, never sent again.
+        ProviderRuntimeError::LaunchStopped { .. } => ProviderDeliveryOutcome::StoppedUnsent,
         _ => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
     }
 }
@@ -3251,11 +3313,15 @@ mod workspace_loss_tests {
         mode_release: Arc<Notify>,
         /// The first launch reports its process retired while set, and refuses settings.
         first_launch_retired: Arc<AtomicBool>,
-        /// `start` never returns while set, as a CLI waiting on an MCP server that never
-        /// connects, and the start deadline is shortened.
+        /// `start` waits for `start_release` while set, as a CLI waiting on an MCP server that
+        /// never connects, and the start notice shows sooner.
         start_hangs: Arc<AtomicBool>,
+        start_release: Arc<Notify>,
         launches: Arc<AtomicUsize>,
         launch_index: usize,
+        /// The text of every turn delivered, and the outcomes the next deliveries answer.
+        delivered_texts: Arc<std::sync::Mutex<Vec<String>>>,
+        delivery_outcomes: Arc<std::sync::Mutex<VecDeque<ProviderDeliveryOutcome>>>,
     }
 
     type CompactScript = (ProviderCompactionStart, Vec<ProviderEvent>);
@@ -3275,18 +3341,18 @@ mod workspace_loss_tests {
     }
 
     impl ProviderDriver for LossDriver {
-        fn start_deadline(&self) -> Duration {
+        fn start_notice_delay(&self) -> Duration {
             if self.start_hangs.load(Ordering::SeqCst) {
                 Duration::from_millis(200)
             } else {
-                PROVIDER_START_TIMEOUT
+                PROVIDER_START_NOTICE_DELAY
             }
         }
 
         fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
             Box::pin(async {
                 if self.start_hangs.load(Ordering::SeqCst) {
-                    std::future::pending::<()>().await;
+                    self.start_release.notified().await;
                 }
                 Ok(StartedSession {
                     resume_cursor: Some(json!({"threadId":"loss-native-session"})),
@@ -3309,6 +3375,28 @@ mod workspace_loss_tests {
                 }
                 self.native_returned.notify_one();
                 Ok((!self.unknown_turn_id.load(Ordering::SeqCst)).then(|| "turn-1".to_owned()))
+            })
+        }
+
+        fn deliver(
+            &self,
+            text: String,
+            attachments: Vec<Value>,
+            interaction_mode: String,
+            _: String,
+        ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+            Box::pin(async move {
+                self.delivered_texts.lock().unwrap().push(text.clone());
+                let scripted = self.delivery_outcomes.lock().unwrap().pop_front();
+                if let Some(outcome) = scripted {
+                    return outcome;
+                }
+                match self.send(text, attachments, interaction_mode).await {
+                    Ok(turn_id) => ProviderDeliveryOutcome::Accepted { turn_id },
+                    Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                        detail: delivery_detail(&error, None),
+                    },
+                }
             })
         }
 
@@ -3515,6 +3603,11 @@ mod workspace_loss_tests {
         }
 
         async fn with_hook(live: bool, hook: AcceptedPublicationTestHook) -> Self {
+            Self::build(live, hook, false).await
+        }
+
+        /// With `side_chat`, `t1` is a side chat beside the host thread `h`.
+        async fn build(live: bool, hook: AcceptedPublicationTestHook, side_chat: bool) -> Self {
             let root = tempfile::tempdir().unwrap();
             let database = Database::open_in_memory().await.unwrap();
             database
@@ -3528,10 +3621,21 @@ mod workspace_loss_tests {
             let engine = OrchestrationEngine::start(database, EngineOptions::default())
                 .await
                 .unwrap();
-            for command in [
+            let threads = if side_chat {
+                vec![
+                    json!({"type":"thread.create","commandId":"host","threadId":"h","projectId":"p1","title":"Host","kind":"workspace","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":BEFORE_LOSS}),
+                    json!({"type":"thread.create","commandId":"thread","threadId":"t1","projectId":"p1","title":"Panel: Side chat · Codex","kind":"panel","hostThreadId":"h","sideChat":true,"modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":BEFORE_LOSS}),
+                ]
+            } else {
+                vec![
+                    json!({"type":"thread.create","commandId":"thread","threadId":"t1","projectId":"p1","title":"Thread","kind":"workspace","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":BEFORE_LOSS}),
+                ]
+            };
+            for command in std::iter::once(
                 json!({"type":"project.create","commandId":"project","projectId":"p1","title":"Project","workspaceRoot":root.path(),"createdAt":BEFORE_LOSS}),
-                json!({"type":"thread.create","commandId":"thread","threadId":"t1","projectId":"p1","title":"Thread","kind":"workspace","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":BEFORE_LOSS}),
-            ] {
+            )
+            .chain(threads)
+            {
                 engine
                     .dispatch(serde_json::from_value(command).unwrap())
                     .await
@@ -3988,61 +4092,296 @@ mod workspace_loss_tests {
     /// A session whose process was retired (a Cursor stop the CLI ignored) is launched again for
     /// the next message, even one that changes the model: it never reaches the retired process,
     /// so it is delivered, not rejected.
-    /// A start that never returns is stopped at the deadline: the driver is shut down, the
-    /// runtime is recorded as failed with a message naming the provider and its MCP check, and
-    /// the message waiting on the launch is not sent, so it is retried.
+    const CODEX_START_NOTICE: &str = "Codex is taking longer than usual to start. One of its MCP \
+                                      servers may not be responding; run `codex mcp list` in a \
+                                      terminal to see which one.";
+
+    impl Fixture {
+        /// Launches with a start that waits for `start_release`.
+        fn launch_hanging(&self) -> JoinHandle<Result<(), ProviderRuntimeError>> {
+            self.driver.start_hangs.store(true, Ordering::SeqCst);
+            let supervisor = self.supervisor.clone();
+            let launch = self.launch.clone();
+            tokio::spawn(async move { supervisor.launch(launch).await })
+        }
+
+        async fn last_error(&self) -> Option<String> {
+            self.engine
+                .repositories()
+                .get_thread_session("t1".into())
+                .await
+                .unwrap()
+                .and_then(|session| session.last_error)
+        }
+
+        async fn wait_for_start_notice(&self) {
+            timeout(Duration::from_secs(5), async {
+                while self.last_error().await.as_deref() != Some(CODEX_START_NOTICE) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the start notice is shown");
+        }
+    }
+
+    /// A start that does not return shows the notice at its notice delay and keeps waiting: the
+    /// driver is not stopped, and the launch completes normally once the start returns, which
+    /// clears the notice.
     #[tokio::test]
-    async fn a_start_that_never_returns_is_stopped_at_its_deadline() {
+    async fn a_slow_start_shows_a_notice_and_completes_when_it_returns() {
+        let f = Fixture::new(false).await;
+        let launch = f.launch_hanging();
+        f.wait_for_start_notice().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!launch.is_finished(), "the start keeps waiting");
+        assert_eq!(
+            f.driver.shutdowns.load(Ordering::SeqCst),
+            0,
+            "never stopped"
+        );
+        f.driver.start_release.notify_one();
+        timeout(Duration::from_secs(5), launch)
+            .await
+            .expect("the launch ends once the start returns")
+            .unwrap()
+            .expect("the slow start completes normally");
+        let session = f.session().await;
+        assert_eq!(session.status, "ready");
+        assert_eq!(session.last_error, None, "the notice clears");
+        assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 0);
+        f.shutdown().await;
+    }
+
+    /// Stop, stopping the session, and deleting the thread each end a start that never returns,
+    /// although the supervisor's queue awaits it. The stopped message is settled, never sent
+    /// again, and none of them reports an error.
+    #[tokio::test]
+    async fn a_stop_ends_a_start_that_never_returns() {
+        for stop in ["interrupt", "session-stop", "delete"] {
+            let f = Fixture::new(false).await;
+            let launch = f.launch_hanging();
+            f.wait_for_start_notice().await;
+            let command: OrchestrationCommand = serde_json::from_value(match stop {
+                "interrupt" => {
+                    json!({"type":"thread.turn.interrupt","commandId":"stop","threadId":"t1","createdAt":BEFORE_LOSS})
+                }
+                "session-stop" => {
+                    json!({"type":"thread.session.stop","commandId":"stop","threadId":"t1","createdAt":BEFORE_LOSS})
+                }
+                _ => json!({"type":"thread.delete","commandId":"stop","threadId":"t1"}),
+            })
+            .unwrap();
+            timeout(
+                Duration::from_secs(5),
+                route_orchestration_command(
+                    &f.supervisor,
+                    &f.engine,
+                    &f._root.path().to_path_buf(),
+                    command,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{stop} waited behind the start"))
+            .unwrap_or_else(|error| panic!("{stop} reported {error:?}"));
+            let error = timeout(Duration::from_secs(5), launch)
+                .await
+                .expect("the stop ends the launch")
+                .unwrap()
+                .expect_err("the start was stopped");
+            assert!(
+                matches!(&error, ProviderRuntimeError::LaunchStopped { thread_id } if thread_id == "t1"),
+                "{stop}: {error:?}"
+            );
+            assert!(
+                matches!(
+                    launch_failure_outcome(&error, "launch"),
+                    ProviderDeliveryOutcome::StoppedUnsent
+                ),
+                "{stop}: settled, so never sent again"
+            );
+            assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1, "{stop}");
+            assert_eq!(f.last_error().await, None, "{stop}: the notice clears");
+            f.shutdown().await;
+        }
+    }
+
+    /// The delivery a hung start was for: Stop settles it as stopped (never sent again, so
+    /// never launched again), while an interrupt naming a turn, which cannot be aimed at a
+    /// start, leaves the start waiting.
+    #[tokio::test]
+    async fn a_stopped_start_settles_its_delivery_and_a_turn_interrupt_does_not_stop_it() {
         let f = Fixture::new(false).await;
         f.driver.start_hangs.store(true, Ordering::SeqCst);
-        let error = timeout(
+        let delivery = tokio::spawn({
+            let supervisor = f.supervisor.clone();
+            let engine = f.engine.clone();
+            let root = f._root.path().to_path_buf();
+            async move {
+                deliver_orchestration_turn(
+                    &supervisor,
+                    &engine,
+                    &root,
+                    turn("hung", false),
+                    "hung-key".into(),
+                )
+                .await
+            }
+        });
+        f.wait_for_start_notice().await;
+        let interrupt = |turn_id: Option<&str>| -> OrchestrationCommand {
+            serde_json::from_value(json!({
+                "type":"thread.turn.interrupt","commandId":format!("stop-{turn_id:?}"),
+                "threadId":"t1","turnId":turn_id,"createdAt":BEFORE_LOSS,
+            }))
+            .unwrap()
+        };
+        let late = tokio::spawn({
+            let supervisor = f.supervisor.clone();
+            let command = interrupt(Some("earlier-turn"));
+            async move { supervisor.handle_orchestration(command).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !delivery.is_finished(),
+            "a turn's interrupt left the start waiting"
+        );
+        timeout(
             Duration::from_secs(5),
-            f.supervisor.launch(f.launch.clone()),
+            route_orchestration_command(
+                &f.supervisor,
+                &f.engine,
+                &f._root.path().to_path_buf(),
+                interrupt(None),
+            ),
         )
         .await
-        .expect("the deadline ends the launch")
-        .expect_err("the start did not finish");
-        let expected = "Codex did not finish starting within 0 seconds. One of its MCP servers \
-                        may not be responding; run `codex mcp list` in a terminal to see which one.";
-        assert!(
-            matches!(&error, ProviderRuntimeError::Provider { provider, detail }
-                if provider == "codex" && detail == expected),
-            "{error:?}"
-        );
-        assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
-        let runtime = f
-            .engine
-            .repositories()
-            .get_provider_session_runtime("t1".into())
+        .expect("Stop is not stuck behind the start")
+        .expect("Stop reports no error");
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("Stop ends the delivery's launch")
+            .unwrap();
+        assert_eq!(outcome, ProviderDeliveryOutcome::StoppedUnsent);
+        let _ = timeout(Duration::from_secs(5), late).await;
+        assert_eq!(f.driver.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0, "nothing was sent");
+        f.shutdown().await;
+    }
+
+    /// The start notice keeps the session's own state: a ready session reads ready with the
+    /// notice, and Stop puts back what it showed before.
+    #[tokio::test]
+    async fn the_start_notice_keeps_and_restores_the_sessions_state() {
+        let f = Fixture::new(false).await;
+        f.project("ready").await;
+        let launch = f.launch_hanging();
+        f.wait_for_start_notice().await;
+        let session = f.session().await;
+        assert_eq!(session.status, "ready");
+        assert_eq!(session.active_turn_id, None);
+        timeout(
+            Duration::from_secs(5),
+            route_orchestration_command(
+                &f.supervisor,
+                &f.engine,
+                &f._root.path().to_path_buf(),
+                serde_json::from_value(json!({
+                    "type":"thread.turn.interrupt","commandId":"stop","threadId":"t1",
+                    "createdAt":BEFORE_LOSS,
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect("Stop is not stuck behind the start")
+        .expect("Stop reports no error");
+        timeout(Duration::from_secs(5), launch)
+            .await
+            .expect("Stop ends the launch")
+            .unwrap()
+            .expect_err("the start was stopped");
+        let session = f.session().await;
+        assert_eq!(session.status, "ready");
+        assert_eq!(session.last_error, None);
+        f.shutdown().await;
+    }
+
+    /// The server's shutdown ends a start that never returns too. Nothing was sent, so the
+    /// message waits for the next start of the server.
+    #[tokio::test]
+    async fn shutdown_ends_a_start_that_never_returns() {
+        let f = Fixture::new(false).await;
+        let launch = f.launch_hanging();
+        f.wait_for_start_notice().await;
+        timeout(Duration::from_secs(5), f.supervisor.shutdown())
+            .await
+            .expect("the shutdown is not stuck behind the start")
+            .unwrap();
+        let error = timeout(Duration::from_secs(5), launch)
             .await
             .unwrap()
-            .expect("runtime recorded");
-        assert_eq!(runtime.status, "error");
+            .unwrap()
+            .expect_err("the start was stopped");
         assert!(
             matches!(
                 launch_failure_outcome(&error, "launch"),
                 ProviderDeliveryOutcome::DefinitelyNotSent { .. }
             ),
-            "not sent, so retried"
+            "{error:?}"
         );
+        f.engine.shutdown().await;
+    }
+
+    /// What a Cursor delivery answers for a prompt the user stopped before any of it was sent.
+    const STOPPED_UNSENT_OUTCOME: ProviderDeliveryOutcome = ProviderDeliveryOutcome::StoppedUnsent;
+
+    /// (d) A side chat's first prompt that the user stopped before any of it was sent leaves its
+    /// host's context owed: the next prompt still carries it.
+    #[tokio::test]
+    async fn a_stopped_unsent_first_side_chat_prompt_leaves_the_host_context_owed() {
+        let f = Fixture::build(true, AcceptedPublicationTestHook::default(), true).await;
+        f.driver
+            .delivery_outcomes
+            .lock()
+            .unwrap()
+            .push_back(STOPPED_UNSENT_OUTCOME);
+        for id in ["first", "second"] {
+            let delivery = f
+                .supervisor
+                .deliver_turn(turn(id, false), format!("{id}-key"))
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), delivery.completion())
+                .await
+                .expect("the delivery ends");
+        }
+        let texts = f.driver.delivered_texts.lock().unwrap().clone();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(
+            texts[0].starts_with("<bibcode_thread_context>"),
+            "{texts:?}"
+        );
+        assert!(
+            texts[1].starts_with("<bibcode_thread_context>"),
+            "the host's context is still owed: {texts:?}"
+        );
+        f.shutdown().await;
     }
 
     #[test]
-    fn a_start_timeout_names_the_mcp_check_only_where_the_cli_has_one() {
-        let detail = |provider: &str| match start_timeout_error(provider, PROVIDER_START_TIMEOUT) {
-            ProviderRuntimeError::Provider { detail, .. } => detail,
-            other => panic!("{other:?}"),
-        };
+    fn a_start_notice_names_the_mcp_check_only_where_the_cli_has_one() {
         assert_eq!(
-            detail("claudeAgent"),
-            "Claude did not finish starting within 2 minutes. One of its MCP servers may not be \
+            start_notice("claudeAgent"),
+            "Claude is taking longer than usual to start. One of its MCP servers may not be \
              responding; run `claude mcp list` in a terminal to see which one."
         );
-        assert!(detail("opencode").contains("`opencode mcp list`"));
-        assert!(detail("antigravity").contains("`agy mcp list`"));
+        assert!(start_notice("opencode").contains("`opencode mcp list`"));
+        assert!(start_notice("antigravity").contains("`agy mcp list`"));
+        assert!(start_notice("cursor").contains("`cursor-agent mcp list`"));
         assert_eq!(
-            detail("grok"),
-            "Grok did not finish starting within 2 minutes."
+            start_notice("grok"),
+            "Grok is taking longer than usual to start."
         );
     }
 
@@ -10173,6 +10512,7 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
         ProviderRuntimeError::SessionNotFound { .. } => "session missing",
         ProviderRuntimeError::StaleSession { .. } => "session stale",
         ProviderRuntimeError::SessionAlreadyExists { .. } => "session conflict",
+        ProviderRuntimeError::LaunchStopped { .. } => "session start stopped",
         ProviderRuntimeError::FrozenConversationLost { .. } => "provider conversation lost",
         ProviderRuntimeError::UnsupportedProvider { .. } => "unsupported provider",
         ProviderRuntimeError::UnsupportedCapability { .. } => "unsupported capability",
@@ -10192,6 +10532,139 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
     ProviderRuntimeError::Provider {
         provider: "agent-activity".to_owned(),
         detail: category.to_owned(),
+    }
+}
+
+/// The session state a start notice replaced: status, active turn, error and its class.
+type SessionBeforeNotice = (String, Option<String>, Option<String>, Option<String>);
+
+/// Awaits the driver's start. Past the driver's notice delay the thread shows that the provider
+/// is slow to start, and the start keeps waiting: a slow start may still finish. Only a stop of
+/// the thread, or the server's shutdown, ends a start that does not return. The notice clears
+/// once the start ends.
+async fn start_with_notice(
+    engine: &OrchestrationEngine,
+    request: &ProviderLaunchRequest,
+    driver: &dyn ProviderDriver,
+    stop: &crate::orchestration::engine::LaunchStop,
+) -> Result<StartedSession, ProviderRuntimeError> {
+    let start = driver.start();
+    tokio::pin!(start);
+    let notice_delay = tokio::time::sleep(driver.start_notice_delay());
+    tokio::pin!(notice_delay);
+    let mut notice_due = true;
+    let mut replaced = None;
+    let result = loop {
+        tokio::select! {
+            result = &mut start => break result,
+            () = stop.stopped() => {
+                tracing::info!(
+                    thread_id = %request.thread_id,
+                    provider = %request.provider,
+                    shutdown = stop.by_shutdown(),
+                    "a provider start was stopped before it finished"
+                );
+                break Err(if stop.by_shutdown() {
+                    ProviderRuntimeError::Shutdown
+                } else {
+                    ProviderRuntimeError::LaunchStopped {
+                        thread_id: request.thread_id.clone(),
+                    }
+                });
+            }
+            () = &mut notice_delay, if notice_due => {
+                notice_due = false;
+                tracing::warn!(
+                    thread_id = %request.thread_id,
+                    provider = %request.provider,
+                    "a provider is taking long to start; showing a notice and waiting"
+                );
+                replaced = show_session_notice(engine, request, start_notice(&request.provider)).await;
+            }
+        }
+    };
+    if let Some(previous) = replaced {
+        clear_start_notice(engine, request, previous).await;
+    }
+    result
+}
+
+/// Shows `message` on the thread's session, keeping its status and turn. The state it replaced,
+/// or `None` when it could not be shown.
+async fn show_session_notice(
+    engine: &OrchestrationEngine,
+    request: &ProviderLaunchRequest,
+    message: String,
+) -> Option<SessionBeforeNotice> {
+    let session = match engine
+        .repositories()
+        .get_thread_session(request.thread_id.clone())
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::warn!(%error, thread_id = %request.thread_id, "could not read the session for a notice");
+            return None;
+        }
+    };
+    let previous = session.map_or_else(
+        || ("idle".to_owned(), None, None, None),
+        |session| {
+            (
+                session.status,
+                session.active_turn_id,
+                session.last_error,
+                session.last_error_class,
+            )
+        },
+    );
+    let shown = dispatch_session_state(
+        engine,
+        request,
+        &previous.0,
+        previous.1.clone(),
+        Some(message),
+        None,
+    )
+    .await;
+    match shown {
+        Ok(()) => Some(previous),
+        Err(error) => {
+            tracing::warn!(%error, thread_id = %request.thread_id, "could not show a notice");
+            None
+        }
+    }
+}
+
+/// Puts back the session state the start notice replaced, unless something newer replaced the
+/// notice meanwhile.
+async fn clear_start_notice(
+    engine: &OrchestrationEngine,
+    request: &ProviderLaunchRequest,
+    (status, active_turn_id, last_error, last_error_class): SessionBeforeNotice,
+) {
+    let notice = start_notice(&request.provider);
+    let showing = engine
+        .repositories()
+        .get_thread_session(request.thread_id.clone())
+        .await
+        .is_ok_and(|session| {
+            session.is_some_and(|session| session.last_error.as_deref() == Some(notice.as_str()))
+        });
+    if !showing {
+        return;
+    }
+    if let Err(error) = dispatch_session_state(
+        engine,
+        request,
+        &status,
+        active_turn_id,
+        last_error,
+        last_error_class,
+    )
+    .await
+    {
+        tracing::warn!(%error, thread_id = %request.thread_id, "could not clear a start notice");
     }
 }
 
@@ -10232,7 +10705,7 @@ async fn launch_session(
     // Every provider driver is created below, so this is the one place a session of a thread
     // held by another chat's file restore could start again (#279). Registered until the launch
     // ends, so a restore that marks the thread meanwhile refuses instead.
-    let _launch = engine
+    let launch_registration = engine
         .begin_session_launch(&request.thread_id)
         .map_err(|detail| {
             tracing::warn!(thread_id = %request.thread_id, "a provider session launch was refused: another chat restores files in its checkout");
@@ -10296,18 +10769,14 @@ async fn launch_session(
     driver
         .set_agent_activity_enabled(activity_enabled_at_launch)
         .await?;
-    let start_deadline = driver.start_deadline();
-    let started = match tokio::time::timeout(start_deadline, driver.start())
-        .await
-        .unwrap_or_else(|_| {
-            tracing::warn!(
-                thread_id = %request.thread_id,
-                provider = %request.provider,
-                deadline_secs = start_deadline.as_secs(),
-                "a provider did not finish starting before its deadline; stopping it"
-            );
-            Err(start_timeout_error(&request.provider, start_deadline))
-        }) {
+    let started = start_with_notice(
+        engine,
+        &request,
+        driver.as_ref(),
+        launch_registration.stop(),
+    )
+    .await;
+    let started = match started {
         Ok(started) => started,
         Err(error) => {
             let _ = driver.shutdown().await;
@@ -13299,6 +13768,14 @@ async fn project_provider_event(
             .await
             .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
     {
+        return Ok(());
+    }
+    // A notice about the session itself, such as Cursor keeping its current options, shows on
+    // the session whatever its state, until its next update.
+    if event.event_type == "session.notice" {
+        if let Some(message) = event.payload.get("message").and_then(Value::as_str) {
+            show_session_notice(engine, launch, message.to_owned()).await;
+        }
         return Ok(());
     }
     // A running turn's notice, such as a Cursor turn silent for minutes, shows on the running
@@ -16455,6 +16932,10 @@ impl CursorDriver {
 }
 
 impl ProviderDriver for CursorDriver {
+    fn start_notice_delay(&self) -> Duration {
+        crate::provider::cursor::runtime::START_NOTICE_DELAY
+    }
+
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
         Box::pin(async move {
             let session_id = self
@@ -16522,6 +17003,9 @@ impl ProviderDriver for CursorDriver {
                     };
                 }
             };
+            if receipt.stopped_unsent() {
+                return ProviderDeliveryOutcome::StoppedUnsent;
+            }
             let turn_id = receipt.turn_id.clone();
             match receipt.completion().await {
                 Ok(()) => ProviderDeliveryOutcome::Accepted {
@@ -16649,6 +17133,8 @@ impl ProviderDriver for CursorDriver {
 
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            // The writer task holds the CLI's stdin until the connection closes.
+            self.runtime.close().await;
             kill_child(&self.child).await;
             Ok(())
         })
@@ -16735,7 +17221,6 @@ impl AntigravityDriver {
                 model: request.model,
                 resume_session_id: request.resume_cursor.as_ref().and_then(resume_string),
                 cancel_grace,
-                start_timeout: ANTIGRAVITY_START_TIMEOUT,
                 control_timeout: ANTIGRAVITY_CONTROL_TIMEOUT,
                 initial_options: request.options,
             },
@@ -16819,6 +17304,13 @@ impl AntigravityDriver {
 /// same way on every launch, so they are final for a delivery (D-A8).
 fn antigravity_error(error: AntigravityRuntimeError) -> ProviderRuntimeError {
     match error {
+        // Not retryable; the detail keeps Google's own notice.
+        AntigravityRuntimeError::AccountDisabled { .. } => {
+            ProviderRuntimeError::IncompatibleProvider {
+                provider: "antigravity".to_owned(),
+                detail: error.to_string(),
+            }
+        }
         AntigravityRuntimeError::SignInRequired
         | AntigravityRuntimeError::UnsupportedVersion { .. }
         | AntigravityRuntimeError::ModeUnavailable { .. } => {
@@ -16885,6 +17377,10 @@ fn unsent_outcome(error: ProviderRuntimeError) -> ProviderDeliveryOutcome {
 }
 
 impl ProviderDriver for AntigravityDriver {
+    fn start_notice_delay(&self) -> Duration {
+        ANTIGRAVITY_START_NOTICE_DELAY
+    }
+
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
         Box::pin(async move {
             let session_id = match self.runtime.start().await {
@@ -16947,6 +17443,7 @@ impl ProviderDriver for AntigravityDriver {
                 },
                 Err(
                     error @ (AntigravityRuntimeError::SignInRequired
+                    | AntigravityRuntimeError::AccountDisabled { .. }
                     | AntigravityRuntimeError::Protocol(
                         crate::provider::antigravity::acp::AcpProtocolError::RemoteRequest {
                             ..
@@ -21164,7 +21661,8 @@ impl ClaudeDriver {
             }
             ProviderDeliveryOutcome::Accepted { .. }
             | ProviderDeliveryOutcome::AcceptedInNewConversation { .. }
-            | ProviderDeliveryOutcome::AlreadyDelivered => ProviderCompactionStart::NotStarted {
+            | ProviderDeliveryOutcome::AlreadyDelivered
+            | ProviderDeliveryOutcome::StoppedUnsent => ProviderCompactionStart::NotStarted {
                 detail: "the compaction was not written".to_owned(),
             },
         };
@@ -29819,12 +30317,12 @@ done
         );
     }
 
-    /// A Cursor that never answers `session/new`, as when one of its MCP servers never
-    /// connects, is stopped at the start deadline with an error that names the check, and the
-    /// launch fails as not sent, so the message is retried.
+    /// A Cursor that does not answer `session/new`, as when one of its MCP servers never
+    /// connects, is not given up: its start keeps waiting and its process keeps running. The
+    /// launch shows the start notice after a minute, and only a stop ends the start.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_cursor_that_never_finishes_starting_is_stopped_at_the_deadline() {
+    async fn a_cursor_that_does_not_finish_starting_keeps_waiting() {
         let temp = TempDir::new().expect("provider fixture directory");
         let executable = executable_fixture(
             &temp,
@@ -29848,32 +30346,19 @@ done
         )
         .await
         .expect("the fixture spawns");
-        driver.runtime.set_start_timeout(Duration::from_millis(300));
-        let error = timeout(Duration::from_secs(5), driver.start())
-            .await
-            .expect("the deadline ends the start")
-            .expect_err("session/new was never answered");
+        assert_eq!(driver.start_notice_delay(), Duration::from_secs(60));
         assert!(
-            matches!(&error, super::ProviderRuntimeError::Provider { detail, .. }
-                if detail == "Cursor did not finish starting. One of its MCP servers may not be \
-                              responding; run `cursor-agent mcp list` in a terminal to see which \
-                              one."),
-            "{error:?}"
+            timeout(Duration::from_secs(1), driver.start())
+                .await
+                .is_err(),
+            "the start keeps waiting on session/new"
         );
+        assert!(!driver.runtime.is_retired());
         assert!(
-            matches!(
-                super::launch_failure_outcome(&error, "launch"),
-                super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
-            ),
-            "not sent, so retried"
+            driver.child.lock().await.id().is_some(),
+            "the process keeps running"
         );
-        timeout(Duration::from_secs(5), async {
-            while driver.child.lock().await.id().is_some() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the child was stopped and reaped");
+        driver.shutdown().await.expect("fixture shutdown");
     }
 
     #[tokio::test]
@@ -30259,6 +30744,7 @@ done
             connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
             open_url: None,
             activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
+            launch_stops: Default::default(),
         };
         assert_eq!(
             supervisor
@@ -30279,6 +30765,7 @@ done
             connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
             open_url: None,
             activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
+            launch_stops: Default::default(),
         };
         let drop_response = tokio::spawn(async move {
             let Some(super::SupervisorMessage::CancelActivityTarget { response, .. }) =
@@ -34233,6 +34720,38 @@ done
         fixture.stream("idle-turn-1", "assistant-late").await;
         fixture.assert_projection("ready", None).await;
         assert_eq!(last_error().await, None);
+        fixture.close().await;
+    }
+
+    /// A session's notice, such as Cursor keeping its current options because their previous
+    /// defaults are gone, shows on the session while it is idle and keeps its state.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_notice_shows_on_an_idle_session() {
+        let _clock = keep_idle_clock_paused();
+        let fixture =
+            IdleDeadlineFixture::new_for_provider(BUSY_SESSION_IDLE_TIMEOUT, "cursor").await;
+        fixture
+            .emit_payload("session.notice", "unused", json!({ "message": "Kept." }))
+            .await;
+        // The clock is paused, so the wait is bounded by a count of polls, not by time.
+        let mut shown = false;
+        for _ in 0..2_000 {
+            shown = fixture
+                .engine
+                .repositories()
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .and_then(|session| session.last_error)
+                .as_deref()
+                == Some("Kept.");
+            if shown {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(shown, "the notice shows");
+        fixture.assert_projection("ready", None).await;
         fixture.close().await;
     }
 

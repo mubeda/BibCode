@@ -5,6 +5,7 @@ import {
   ChevronDownIcon,
   CopyIcon,
   DownloadIcon,
+  ExternalLinkIcon,
   LoaderIcon,
   PlusIcon,
   RefreshCwIcon,
@@ -27,6 +28,7 @@ import {
 } from "@bibcode/contracts";
 
 import { cn } from "../../lib/utils";
+import { readLocalApi } from "../../localApi";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { normalizeProviderAccentColor } from "../../providerInstances";
 import { Badge } from "../ui/badge";
@@ -54,6 +56,12 @@ import {
   getProviderVersionLabel,
   type ProviderStatusKey,
 } from "./providerStatus";
+
+/** Google's written position on the Antigravity chat, as `docs/providers/antigravity.md` cites it. */
+const ANTIGRAVITY_TERMS_NOTE =
+  "Google's Antigravity FAQ says tools that wrap the Antigravity CLI are not supported on consumer plans. An API key or an enterprise plan is the route Google supports officially.";
+const ANTIGRAVITY_TERMS_DOCS_URL =
+  "https://github.com/mubeda/BibCode/blob/main/docs/providers/antigravity.md#why-it-is-preview";
 
 const ENVIRONMENT_VARIABLE_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
@@ -613,6 +621,24 @@ export function ProviderInstanceCard({
     </p>
   );
 
+  // What Google has said in writing about the chat's use of the CLI; informative, never a gate.
+  const antigravityTermsNode =
+    driverKind === "antigravity" && (enabled || liveProvider?.installed) ? (
+      <p className="text-xs text-muted-foreground">
+        {ANTIGRAVITY_TERMS_NOTE}{" "}
+        <Button
+          type="button"
+          variant="link"
+          size="xs"
+          className="h-auto px-0 text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+          onClick={() => void readLocalApi()?.shell.openExternal(ANTIGRAVITY_TERMS_DOCS_URL)}
+        >
+          Why it is Preview
+          <ExternalLinkIcon aria-hidden />
+        </Button>
+      </p>
+    ) : null;
+
   const versionCodeNode = versionLabel ? (
     <code className="text-xs text-muted-foreground">{versionLabel}</code>
   ) : null;
@@ -769,6 +795,7 @@ export function ProviderInstanceCard({
               {titleTailNode}
             </div>
             {authRowNode}
+            {antigravityTermsNode}
             {onSessionDefaultsChange ? (
               <ProviderSessionDefaultsControls
                 driver={instance.driver}

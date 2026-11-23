@@ -15,10 +15,10 @@ pub(crate) const CONTEXT_LABEL: &str = "Context";
 pub(crate) const FAST_LABEL: &str = "Fast";
 pub(crate) const THINKING_LABEL: &str = "Thinking";
 
-/// A turn that clears its options asks for the model's defaults, which the session no longer
-/// offers.
-const CLEARED_OPTIONS_UNAVAILABLE_REFUSAL: &str = "This model's default options are no longer available. Choose its options, or choose another \
-     model.";
+/// Shown when a turn that clears its options cannot go back to the model's defaults, which the
+/// session no longer offers: Cursor keeps the options it uses now.
+pub const CLEARED_OPTIONS_KEPT_NOTE: &str =
+    "Cursor no longer offers this model's previous default options, so it keeps its current ones.";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -371,15 +371,10 @@ pub fn resolve_bracketed_model_options(
         })
     };
     let holds_all = |value: &&String| wanted.iter().all(|option| holds(value, option));
-    if let Some(baseline) = baseline
-        && wanted.is_empty()
-        && !candidates.iter().any(|value| keeps_baseline(value))
-    {
-        // Cleared options go back to the baseline, which no advertised value holds any more.
-        return Err(RefusedOption::new(
-            format!("Cursor model config option does not advertise the baseline value {baseline}"),
-            CLEARED_OPTIONS_UNAVAILABLE_REFUSAL,
-        ));
+    // Cleared options go back to the baseline only while the latest answer still offers it;
+    // otherwise Cursor keeps its current value.
+    if wanted.is_empty() && cleared_options_lose_the_baseline(descriptor, baseline) {
+        return Ok(None);
     }
     if let Some(value) = candidates
         .iter()
@@ -407,6 +402,38 @@ pub fn resolve_bracketed_model_options(
         format!("Cursor session does not advertise {base} with {label} {value}"),
         unsupported_option_refusal(&option),
     ))
+}
+
+/// Whether clearing every option can no longer go back to `baseline`, the model's value when the
+/// session started: the latest answer advertises neither it nor, for a bracketed baseline, a
+/// value of the model that holds its options. Cursor then keeps its current value.
+pub fn cleared_options_lose_the_baseline(descriptor: &Value, baseline: Option<&str>) -> bool {
+    let Some(current) = descriptor.get("currentValue").and_then(Value::as_str) else {
+        return false;
+    };
+    let base = resolve_acp_base_model_id(current);
+    let Some(baseline) = baseline.filter(|baseline| resolve_acp_base_model_id(baseline) == base)
+    else {
+        return false;
+    };
+    let advertised = advertised_values(descriptor)
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    if advertised.iter().any(|value| value == baseline) {
+        return false;
+    }
+    let Some((_, base_params)) = bracketed_model_value(baseline) else {
+        return true;
+    };
+    // As the resolver keeps the baseline: a value of the model that holds every baseline option.
+    !std::iter::once(current.to_owned())
+        .chain(advertised)
+        .filter(|value| resolve_acp_base_model_id(value) == base)
+        .any(|value| {
+            bracketed_model_value(&value)
+                .is_none_or(|(_, own)| base_params.iter().all(|param| own.contains(param)))
+        })
 }
 
 pub fn build_capabilities_from_config_options(options: &Value) -> Value {
@@ -626,13 +653,15 @@ pub fn resolve_acp_config_updates(
 }
 
 /// [`resolve_acp_config_updates`], plus the updates that restore every supported option the turn
-/// leaves out to the session's baseline. Restoring depends only on the session's configuration,
-/// so a failure there is a configuration BiBCode can't work with.
+/// leaves out to the session's baseline, and whether one could not be restored. The baseline was
+/// read when the session started: an option whose baseline value the latest answer no longer
+/// offers keeps its current value. Restoring depends only on the session's configuration, so a
+/// failure there is a configuration BiBCode can't work with.
 pub fn resolve_acp_config_updates_with_baseline(
     options: &Value,
     baseline: &Value,
     updates: &Value,
-) -> Result<Vec<Value>, RefusedOption> {
+) -> Result<(Vec<Value>, bool), RefusedOption> {
     let mut resolved = resolve_acp_config_updates(options, updates)?;
     let requested_config_ids = resolved
         .iter()
@@ -646,7 +675,11 @@ pub fn resolve_acp_config_updates_with_baseline(
     let baseline = baseline.as_array().ok_or_else(|| {
         RefusedOption::unusable("Cursor session did not advertise baseline config options")
     })?;
+    let latest = options.as_array().ok_or_else(|| {
+        RefusedOption::unusable("Cursor session did not advertise config options")
+    })?;
 
+    let mut kept = false;
     for (config_id, category) in supported_baseline_config_options(baseline) {
         if requested_config_ids
             .iter()
@@ -654,20 +687,24 @@ pub fn resolve_acp_config_updates_with_baseline(
         {
             continue;
         }
-        let descriptor = expected_config_option(baseline, config_id, category)
-            .map_err(RefusedOption::unusable)?;
-        ensure_select_config_option(descriptor, config_id).map_err(RefusedOption::unusable)?;
         let baseline_value = acp_config_option_baseline_value(baseline, config_id)
             .map_err(RefusedOption::unusable)?;
-        ensure_advertised_value(descriptor, &baseline_value, config_id)
-            .map_err(RefusedOption::unusable)?;
+        let Ok(descriptor) = expected_config_option(latest, config_id, category) else {
+            kept = true;
+            continue;
+        };
+        ensure_select_config_option(descriptor, config_id).map_err(RefusedOption::unusable)?;
+        if ensure_advertised_value(descriptor, &baseline_value, config_id).is_err() {
+            kept = true;
+            continue;
+        }
         let current_value = acp_config_option_current_value(options, config_id)?;
         if current_value != baseline_value {
             resolved.push(json!({ "configId": config_id, "value": baseline_value }));
         }
     }
 
-    Ok(resolved)
+    Ok((resolved, kept))
 }
 
 pub fn resolve_acp_default_model_config(options: &Value) -> Result<(String, Value), String> {
@@ -1599,17 +1636,30 @@ mod tests {
     }
 
     /// Cleared options go back to the baseline only while the latest answer still advertises a
-    /// value that holds it; otherwise they are refused, and the stale baseline is never sent.
+    /// value that holds it; otherwise Cursor keeps its current value, and the stale baseline is
+    /// never sent.
     #[test]
-    fn cleared_options_refuse_a_baseline_the_session_no_longer_advertises() {
+    fn cleared_options_keep_the_current_value_when_the_baseline_is_gone() {
         let descriptor = json!({
             "id": "model", "category": "model", "currentValue": "m[reasoning=high]",
             "options": [{ "value": "m[reasoning=high]" }, { "value": "m[reasoning=max]" }]
         });
-        let refused =
+        assert_eq!(
             resolve_bracketed_model_options(&descriptor, &json!([]), Some("m[reasoning=medium]"))
-                .expect_err("medium is no longer advertised");
-        assert_eq!(refused.refusal, CLEARED_OPTIONS_UNAVAILABLE_REFUSAL);
+                .expect("not refused"),
+            None,
+            "medium is no longer advertised"
+        );
+        assert!(cleared_options_lose_the_baseline(
+            &descriptor,
+            Some("m[reasoning=medium]")
+        ));
+        // A plain baseline value the latest answer no longer advertises.
+        assert_eq!(
+            resolve_bracketed_model_options(&descriptor, &json!([]), Some("m")).unwrap(),
+            None
+        );
+        assert!(cleared_options_lose_the_baseline(&descriptor, Some("m")));
         // A baseline still advertised is restored.
         let descriptor = json!({
             "id": "model", "category": "model", "currentValue": "m[reasoning=high]",
