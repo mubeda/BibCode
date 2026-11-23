@@ -85,6 +85,13 @@ pub enum AntigravityRuntimeError {
         "Antigravity is not signed in. Open an Antigravity Terminal and run `agy`, or run `agy acp --login`, then send the message again."
     )]
     SignInRequired,
+    /// Google disabled Antigravity for the signed-in account. Sending again cannot help, so the
+    /// message fails once. Google's own notice follows the sentence, in the turn's error and the
+    /// delivery's details alike.
+    #[error(
+        "Google has disabled Antigravity for this account. Appeal through Google to restore access. Google's message: {google_message}"
+    )]
+    AccountDisabled { google_message: String },
     /// The CLI is older than 1.5.4, speaks another ACP version, or has no working `agy acp`.
     #[error("{}", unsupported_version_message(.version.as_deref()))]
     UnsupportedVersion { version: Option<String> },
@@ -120,6 +127,7 @@ impl AntigravityRuntimeError {
         match self {
             Self::Protocol(error) => acp_error_class(error),
             Self::SignInRequired => "sign_in_required",
+            Self::AccountDisabled { .. } => "account_disabled",
             Self::UnsupportedVersion { .. } => "unsupported_version",
             Self::ModeUnavailable { .. } => "mode_unavailable",
             Self::ControlTimedOut => "control_timeout",
@@ -187,6 +195,8 @@ struct RuntimeInner {
     legacy_models: AtomicBool,
     /// The start failed because the connection to the child broke, not on a refusal.
     start_lost_connection: AtomicBool,
+    /// Google's message, when the CLI wrote on its error output that the account is disabled.
+    account_disabled: std::sync::Mutex<Option<String>>,
     abandoned_turns: Mutex<HashSet<String>>,
     events_tx: mpsc::UnboundedSender<AntigravityRuntimeEvent>,
     events_rx: Mutex<mpsc::UnboundedReceiver<AntigravityRuntimeEvent>>,
@@ -271,6 +281,7 @@ impl AntigravitySessionRuntime {
                 config_options: Mutex::new(Vec::new()),
                 legacy_models: AtomicBool::new(false),
                 start_lost_connection: AtomicBool::new(false),
+                account_disabled: std::sync::Mutex::new(None),
                 abandoned_turns: Mutex::new(HashSet::new()),
                 events_tx,
                 events_rx: Mutex::new(events_rx),
@@ -294,7 +305,7 @@ impl AntigravitySessionRuntime {
     /// Initializes, checks the CLI, opens the session (resume, else load, else new), then
     /// writes the model, the thinking level and the mode. Returns the ACP session id.
     pub async fn start(&self) -> Result<String, AntigravityRuntimeError> {
-        let result = self.start_session().await;
+        let mut result = self.start_session().await;
         if let Err(error) = &result {
             if matches!(
                 error,
@@ -307,6 +318,17 @@ impl AntigravitySessionRuntime {
                 self.inner
                     .start_lost_connection
                     .store(true, Ordering::SeqCst);
+            }
+            // A CLI that exits on a disabled account says so only on its error output, however
+            // its start then failed.
+            let disabled = self
+                .inner
+                .account_disabled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(google_message) = disabled {
+                result = Err(AntigravityRuntimeError::AccountDisabled { google_message });
             }
             // A start that failed mid-way: no session id may survive it.
             let mut gate = self.inner.gate.lock().await;
@@ -334,7 +356,8 @@ impl AntigravitySessionRuntime {
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
                     "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false }, "terminal": false },
-                    "clientInfo": { "name": "bibcode-rust", "version": "0.1.1" },
+                    // This server, at its own version.
+                    "clientInfo": { "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") },
                 }),
             )
             .await
@@ -1026,6 +1049,13 @@ impl AntigravitySessionRuntime {
                 }
             }
             IncomingEvent::Stderr { message } => {
+                if let Some(notice) = account_disabled_notice(&message) {
+                    *self
+                        .inner
+                        .account_disabled
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notice);
+                }
                 // Provider stderr can hold anything; only its size is logged.
                 tracing::debug!(
                     provider = PROVIDER,
@@ -1312,9 +1342,34 @@ impl AntigravitySessionRuntime {
     }
 }
 
-/// One classifier for every request: `-32000` "Authentication required" is the sign-in error;
-/// any other `-32000` is a generic server error and passes through.
+/// Google's notice that the account may no longer use the service, cut out of `message`, which
+/// may hold anything else: from "This service has been disabled in this account" through "Terms
+/// of Service.", and the appeal sentence when one follows it.
+fn account_disabled_notice(message: &str) -> Option<String> {
+    const START: &str = "this service has been disabled in this account";
+    const NOTICE_END: &str = "terms of service.";
+    const APPEAL_END: &str = "this product.";
+    // ASCII lowercasing keeps every byte offset, so the offsets index `message` too.
+    let lower = message.to_ascii_lowercase();
+    let start = lower.find(START)?;
+    let rest = &lower[start..];
+    let notice = rest.find(NOTICE_END)? + NOTICE_END.len();
+    let end = rest[notice..]
+        .find(APPEAL_END)
+        .filter(|offset| *offset < 200)
+        .map_or(notice, |offset| notice + offset + APPEAL_END.len());
+    Some(message[start..start + end].to_owned())
+}
+
+/// One classifier for every request: `-32000` "Authentication required" is the sign-in error,
+/// and Google's notice that the account is disabled is its own error, whatever its code; any
+/// other error passes through.
 fn classify(error: AcpProtocolError) -> AntigravityRuntimeError {
+    if let AcpProtocolError::RemoteRequest { message, .. } = &error
+        && let Some(google_message) = account_disabled_notice(message)
+    {
+        return AntigravityRuntimeError::AccountDisabled { google_message };
+    }
     match &error {
         AcpProtocolError::RemoteRequest {
             code: -32000,

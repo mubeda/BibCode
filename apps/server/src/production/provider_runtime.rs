@@ -1524,9 +1524,15 @@ impl ProviderRuntimeSupervisor {
         &self,
         command: OrchestrationCommand,
     ) -> Result<(), ProviderRuntimeError> {
-        // A stop ends a start that has not returned first: the queue awaits that start.
+        // A stop ends a start that has not returned first: the queue awaits that start. A launch
+        // has no turn yet, so an interrupt naming a turn (a late Stop, a compaction's own
+        // interrupt) is not aimed at it.
         let stopped_launch = match &command {
-            OrchestrationCommand::ThreadTurnInterrupt { thread_id, .. }
+            OrchestrationCommand::ThreadTurnInterrupt {
+                thread_id,
+                turn_id: None,
+                ..
+            }
             | OrchestrationCommand::ThreadSessionStop { thread_id, .. } => {
                 self.launch_stops.stop(thread_id)
             }
@@ -1863,7 +1869,8 @@ pub async fn route_orchestration_command(
 
     let action = command.command_type().to_owned();
     match supervisor.handle_orchestration(command.clone()).await {
-        Ok(()) => Ok(()),
+        // The user stopped the thread while the command's restart started: nothing more to do.
+        Ok(()) | Err(ProviderRuntimeError::LaunchStopped { .. }) => Ok(()),
         Err(ProviderRuntimeError::SessionNotFound { .. })
             if matches!(command, OrchestrationCommand::ThreadTurnStart { .. }) =>
         {
@@ -2334,10 +2341,11 @@ fn frozen_failure_outcome(
     label: Option<&str>,
 ) -> ProviderDeliveryOutcome {
     let detail = delivery_detail(error, label);
-    if matches!(error, ProviderRuntimeError::InvalidOption { .. }) {
-        ProviderDeliveryOutcome::Refused { detail }
-    } else {
-        ProviderDeliveryOutcome::Rejected { detail }
+    match error {
+        ProviderRuntimeError::InvalidOption { .. } => ProviderDeliveryOutcome::Refused { detail },
+        // The user stopped the restart the delivery needed: settled, never sent again.
+        ProviderRuntimeError::LaunchStopped { .. } => ProviderDeliveryOutcome::StoppedUnsent,
+        _ => ProviderDeliveryOutcome::Rejected { detail },
     }
 }
 
@@ -2364,6 +2372,30 @@ fn launch_failure_outcome(error: &ProviderRuntimeError, label: &str) -> Provider
 #[cfg(test)]
 mod delivery_failure_tests {
     use super::*;
+
+    /// A disabled Antigravity account is never retried: a launch or a send that meets it fails
+    /// the message once, with the clear sentence and Google's own words in the details.
+    #[test]
+    fn a_disabled_antigravity_account_fails_the_message_once() {
+        let disabled = || AntigravityRuntimeError::AccountDisabled {
+            google_message: "Placeholder notice from Google.".to_owned(),
+        };
+        let error = super::antigravity_error(disabled());
+        let detail = delivery_detail(&error, None);
+        assert_eq!(
+            detail,
+            "Google has disabled Antigravity for this account. Appeal through Google to restore \
+             access. Google's message: Placeholder notice from Google."
+        );
+        assert!(matches!(
+            launch_failure_outcome(&error, "Antigravity"),
+            ProviderDeliveryOutcome::Rejected { .. }
+        ));
+        assert!(matches!(
+            super::antigravity_unsent_outcome(disabled()),
+            ProviderDeliveryOutcome::Rejected { .. }
+        ));
+    }
 
     #[test]
     fn transport_line_too_long_rejects_direct_and_nested_launch_errors() {
@@ -2726,6 +2758,8 @@ fn delivery_enqueue_failure(
     let detail = delivery_detail(error, provider_label);
     match error {
         ProviderRuntimeError::ResponseDropped => ProviderDeliveryOutcome::Ambiguous { detail },
+        // The user stopped the restart the delivery needed: settled, never sent again.
+        ProviderRuntimeError::LaunchStopped { .. } => ProviderDeliveryOutcome::StoppedUnsent,
         _ => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
     }
 }
@@ -4170,6 +4204,69 @@ mod workspace_loss_tests {
             assert_eq!(f.last_error().await, None, "{stop}: the notice clears");
             f.shutdown().await;
         }
+    }
+
+    /// The delivery a hung start was for: Stop settles it as stopped (never sent again, so
+    /// never launched again), while an interrupt naming a turn, which cannot be aimed at a
+    /// start, leaves the start waiting.
+    #[tokio::test]
+    async fn a_stopped_start_settles_its_delivery_and_a_turn_interrupt_does_not_stop_it() {
+        let f = Fixture::new(false).await;
+        f.driver.start_hangs.store(true, Ordering::SeqCst);
+        let delivery = tokio::spawn({
+            let supervisor = f.supervisor.clone();
+            let engine = f.engine.clone();
+            let root = f._root.path().to_path_buf();
+            async move {
+                deliver_orchestration_turn(
+                    &supervisor,
+                    &engine,
+                    &root,
+                    turn("hung", false),
+                    "hung-key".into(),
+                )
+                .await
+            }
+        });
+        f.wait_for_start_notice().await;
+        let interrupt = |turn_id: Option<&str>| -> OrchestrationCommand {
+            serde_json::from_value(json!({
+                "type":"thread.turn.interrupt","commandId":format!("stop-{turn_id:?}"),
+                "threadId":"t1","turnId":turn_id,"createdAt":BEFORE_LOSS,
+            }))
+            .unwrap()
+        };
+        let late = tokio::spawn({
+            let supervisor = f.supervisor.clone();
+            let command = interrupt(Some("earlier-turn"));
+            async move { supervisor.handle_orchestration(command).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !delivery.is_finished(),
+            "a turn's interrupt left the start waiting"
+        );
+        timeout(
+            Duration::from_secs(5),
+            route_orchestration_command(
+                &f.supervisor,
+                &f.engine,
+                &f._root.path().to_path_buf(),
+                interrupt(None),
+            ),
+        )
+        .await
+        .expect("Stop is not stuck behind the start")
+        .expect("Stop reports no error");
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("Stop ends the delivery's launch")
+            .unwrap();
+        assert_eq!(outcome, ProviderDeliveryOutcome::StoppedUnsent);
+        let _ = timeout(Duration::from_secs(5), late).await;
+        assert_eq!(f.driver.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0, "nothing was sent");
+        f.shutdown().await;
     }
 
     /// The server's shutdown ends a start that never returns too. Nothing was sent, so the
@@ -17169,6 +17266,13 @@ impl AntigravityDriver {
 /// same way on every launch, so they are final for a delivery (D-A8).
 fn antigravity_error(error: AntigravityRuntimeError) -> ProviderRuntimeError {
     match error {
+        // Not retryable; the detail keeps Google's own notice.
+        AntigravityRuntimeError::AccountDisabled { .. } => {
+            ProviderRuntimeError::IncompatibleProvider {
+                provider: "antigravity".to_owned(),
+                detail: error.to_string(),
+            }
+        }
         AntigravityRuntimeError::SignInRequired
         | AntigravityRuntimeError::UnsupportedVersion { .. }
         | AntigravityRuntimeError::ModeUnavailable { .. } => {
@@ -17301,6 +17405,7 @@ impl ProviderDriver for AntigravityDriver {
                 },
                 Err(
                     error @ (AntigravityRuntimeError::SignInRequired
+                    | AntigravityRuntimeError::AccountDisabled { .. }
                     | AntigravityRuntimeError::Protocol(
                         crate::provider::antigravity::acp::AcpProtocolError::RemoteRequest {
                             ..

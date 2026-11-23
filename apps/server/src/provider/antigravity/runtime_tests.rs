@@ -1848,3 +1848,72 @@ async fn uncategorized_model_and_level_options_the_inventory_publishes_are_writt
         .unwrap()
         .expect("level written");
 }
+
+/// BiBCode names itself to the CLI at this server's own version.
+#[tokio::test]
+async fn the_handshake_names_bibcode_at_its_own_version() {
+    let (runtime, mut peer) = connect(options("full-access"));
+    let _start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    assert_eq!(
+        initialize["params"]["clientInfo"],
+        json!({ "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") })
+    );
+}
+
+/// Google's generic notice that an account may no longer use the service.
+const ACCOUNT_DISABLED: &str = "This service has been disabled in this account for violation of \
+                                Terms of Service. Please submit an appeal to continue using this \
+                                product.";
+
+/// Google's notice that the account is disabled is its own error, whether an ACP answer or the
+/// error output of a CLI that exits carries it. It keeps only Google's notice, never the rest of
+/// the line.
+#[tokio::test]
+async fn a_disabled_account_is_its_own_error() {
+    let (runtime, mut peer) = connect(options("full-access"));
+    let start = spawn_start(&runtime);
+    let initialize = peer.expect("initialize").await;
+    peer.reply(
+        &initialize,
+        initialize_result("1.5.13", 1, all_capabilities()),
+    )
+    .await;
+    let new = peer.expect("session/new").await;
+    peer.fail(
+        &new,
+        -32603,
+        &format!("upstream error: {ACCOUNT_DISABLED} (request placeholder-id)"),
+    )
+    .await;
+    let error = finish(start).await.expect_err("the account is disabled");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Google has disabled Antigravity for this account. Appeal through Google to restore \
+             access. Google's message: {ACCOUNT_DISABLED}"
+        )
+    );
+    assert!(
+        matches!(&error, AntigravityRuntimeError::AccountDisabled { google_message }
+            if google_message == ACCOUNT_DISABLED),
+        "{error:?}"
+    );
+
+    // The CLI prints it on its error output and exits before it answers.
+    let (runtime, mut peer) = connect(options("full-access"));
+    let start = spawn_start(&runtime);
+    peer.expect("initialize").await;
+    peer.stderr
+        .write_all(format!("Error: {ACCOUNT_DISABLED}\n").as_bytes())
+        .await
+        .expect("stderr write");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(peer);
+    let error = finish(start).await.expect_err("the CLI exited");
+    assert!(
+        matches!(&error, AntigravityRuntimeError::AccountDisabled { google_message }
+            if google_message == ACCOUNT_DISABLED),
+        "{error:?}"
+    );
+}
