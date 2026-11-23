@@ -47,7 +47,13 @@ flowchart TB
   webviews into the window's content box, where bounds cannot move them, so
   the desktop wraps the main webview in a `GtkOverlay` with a pass-through
   `GtkFixed` layer and places preview views there
-  (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). On macOS a native
+  (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). A Linux preview
+  takes GTK keyboard focus when it is created; before it hides or closes, the
+  host hands focus back to the main webview if the preview held it, because
+  GTK leaves the window with no focus widget otherwise. WebKitGTK binds no key
+  to a text field's undo, so the host also gives preview pages on Linux the
+  Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y text-field chords the app's own fields get
+  (#408) through an initialization script in the main frame. On macOS a native
   preview is a view above the webview, so a popup drawn over it would sit under
   it. Sheets and dialogs hide the whole preview; a menu, popover, select or
   combobox leases the popup's rectangle while open, and a preview is hidden

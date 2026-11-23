@@ -529,6 +529,16 @@ inside it reaches the page. Record a screenshot per backend after the split
 drag. A preview that does not follow its panel is a product failure; record
 the backend, scale, and step that broke it.
 
+Keyboard focus: GTK moves keyboard focus between webviews only on a real
+click or a host `set_focus`. A WebDriver click, `element.focus()` or the X
+window focus does not move it, and `document.hasFocus()` in the main page
+shows where it is. Open a preview, close or hide it without clicking, and
+type: the keys must reach the app, because the host hands focus back to the
+main webview when a focused preview hides or closes. In the preview, type in a
+text field and press Ctrl+Z: the field must undo. Packaged native-input cells
+click their target natively before typing for the same reason, so they do not
+depend on which cell ran before them.
+
 The placement itself is covered by an ignored unit test that needs a display;
 run it per backend before the manual steps:
 
