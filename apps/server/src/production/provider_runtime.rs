@@ -789,6 +789,8 @@ enum SupervisorMessage {
         context_handoff: bool,
         /// The frozen start this launch resumes the conversation for.
         frozen_delivery: Option<Box<ProviderTurnDelivery>>,
+        /// The message whose delivery or reconciliation needs this launch; its Dismiss stops it.
+        message_id: Option<String>,
         /// Fail with `FrozenConversationLost`, keeping the saved cursor, instead of continuing in
         /// a new conversation when the requested one is gone.
         abort_on_lost_resume: bool,
@@ -1407,7 +1409,7 @@ impl ProviderRuntimeSupervisor {
     }
 
     pub async fn launch(&self, request: ProviderLaunchRequest) -> Result<(), ProviderRuntimeError> {
-        self.launch_with_context_handoff(request, false, None, false)
+        self.launch_with_context_handoff(request, false, None, None, false)
             .await
             .map(|_| ())
     }
@@ -1417,8 +1419,9 @@ impl ProviderRuntimeSupervisor {
     async fn launch_for_reconciliation(
         &self,
         request: ProviderLaunchRequest,
+        message_id: Option<String>,
     ) -> Result<(), ProviderRuntimeError> {
-        self.launch_with_context_handoff(request, false, None, true)
+        self.launch_with_context_handoff(request, false, None, message_id, true)
             .await
             .map(|_| ())
     }
@@ -1432,6 +1435,7 @@ impl ProviderRuntimeSupervisor {
         mut request: ProviderLaunchRequest,
         context_handoff: bool,
         frozen_delivery: Option<ProviderTurnDelivery>,
+        message_id: Option<String>,
         abort_on_lost_resume: bool,
     ) -> Result<Option<ProviderTurnDelivery>, ProviderRuntimeError> {
         if request.mcp.is_none()
@@ -1471,6 +1475,7 @@ impl ProviderRuntimeSupervisor {
             request: Box::new(request),
             context_handoff,
             frozen_delivery: frozen_delivery.map(Box::new),
+            message_id,
             abort_on_lost_resume,
             response,
         })
@@ -2288,6 +2293,7 @@ async fn deliver_orchestration_turn_with_identity(
                     request,
                     started_new_conversation,
                     frozen_delivery.clone(),
+                    frozen_delivery.as_ref().map(|row| row.message_id.clone()),
                     false,
                 )
                 .await
@@ -2829,7 +2835,10 @@ pub async fn reconcile_orchestration_turn(
                 };
             }
             let label = request.provider_label.clone();
-            match supervisor.launch_for_reconciliation(request).await {
+            match supervisor
+                .launch_for_reconciliation(request, Some(row.message_id.clone()))
+                .await
+            {
                 Ok(()) => {}
                 Err(ProviderRuntimeError::FrozenConversationLost { .. }) => {
                     return ProviderReconciliationOutcome::ConversationLost {
@@ -4318,6 +4327,20 @@ mod workspace_loss_tests {
         /// Seeds a durable start for `id` and claims it, as the delivery worker does: the
         /// returned row is `sending`, the state the web Stop (Dismiss) cancels.
         async fn claimed_delivery(&self, id: &str) -> (OrchestrationCommand, ProviderTurnDelivery) {
+            let command = self.admitted_delivery(id).await;
+            let row = self
+                .engine
+                .repositories()
+                .claim_provider_turn(id.into(), BEFORE_LOSS.into())
+                .await
+                .unwrap()
+                .expect("the delivery is claimed");
+            assert_eq!(row.state, TurnDeliveryState::Sending);
+            (command, row)
+        }
+
+        /// Seeds a durable start for `id`, left `pending`.
+        async fn admitted_delivery(&self, id: &str) -> OrchestrationCommand {
             let command = turn(id, false);
             let mut payload = serde_json::to_value(&command).unwrap();
             freeze_delivery_route(
@@ -4353,15 +4376,7 @@ mod workspace_loss_tests {
                 )
                 .await
                 .unwrap();
-            let row = self
-                .engine
-                .repositories()
-                .claim_provider_turn(id.into(), BEFORE_LOSS.into())
-                .await
-                .unwrap()
-                .expect("the delivery is claimed");
-            assert_eq!(row.state, TurnDeliveryState::Sending);
-            (command, row)
+            command
         }
 
         /// The web Stop while the thread is not running: Dismiss of the message's delivery.
@@ -4554,6 +4569,91 @@ mod workspace_loss_tests {
             TurnDeliveryState::Dismissed
         );
         f.shutdown().await;
+    }
+
+    /// Dismissing a newer pending message B, while the launch for the message A ahead of it is
+    /// running, must not stop A's launch: A is sent, never settled as stopped.
+    #[tokio::test]
+    async fn dismissing_a_pending_message_does_not_stop_the_launch_ahead_of_it() {
+        let f = Fixture::new(false).await;
+        f.driver.options_hang.store(true, Ordering::SeqCst);
+        let (command, row) = f.claimed_delivery("running-a").await;
+        let delivery = f.deliver_frozen(command, row);
+        timeout(Duration::from_secs(5), f.driver.options_entered.notified())
+            .await
+            .expect("A's launch is applying its options");
+        f.admitted_delivery("pending-b").await;
+        f.dismiss("pending-b").await;
+        let follow_up = tokio::spawn({
+            let supervisor = f.supervisor.clone();
+            async move {
+                supervisor
+                    .interrupt_after_cancel(
+                        "dismiss-pending-b".into(),
+                        "t1".into(),
+                        BEFORE_LOSS.into(),
+                        Some("pending-b"),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        f.driver.options_release.notify_one();
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("A's delivery ends")
+            .unwrap();
+        let _ = timeout(Duration::from_secs(5), follow_up)
+            .await
+            .expect("the follow-up ends");
+        assert_ne!(
+            outcome,
+            ProviderDeliveryOutcome::StoppedUnsent,
+            "A was dropped"
+        );
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 1, "A was sent");
+        assert_eq!(
+            f.delivery_state("pending-b").await,
+            TurnDeliveryState::Dismissed
+        );
+        f.shutdown().await;
+    }
+
+    /// The Dismiss of a message whose reconciliation launch hangs still ends that launch, and the
+    /// Dismiss of another message does not.
+    #[tokio::test]
+    async fn a_dismiss_ends_only_its_own_reconciliation_launch() {
+        for own in [false, true] {
+            let f = Fixture::new(false).await;
+            let (_, row) = f.claimed_delivery("reconciling").await;
+            f.driver.start_hangs.store(true, Ordering::SeqCst);
+            let reconcile = tokio::spawn({
+                let supervisor = f.supervisor.clone();
+                let engine = f.engine.clone();
+                let root = f._root.path().to_path_buf();
+                async move { reconcile_orchestration_turn(&supervisor, &engine, &root, row).await }
+            });
+            timeout(Duration::from_secs(5), async {
+                while !f.engine.thread_session_launching("t1") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the reconciliation launch started");
+            let stopped = f
+                .supervisor
+                .launch_stops
+                .stop("t1", Some(if own { "reconciling" } else { "another" }));
+            assert_eq!(stopped, own);
+            if !own {
+                f.driver.start_release.notify_one();
+            }
+            timeout(Duration::from_secs(5), reconcile)
+                .await
+                .unwrap_or_else(|_| panic!("own={own}: the reconciliation ends"))
+                .unwrap();
+            f.shutdown().await;
+        }
     }
 
     /// A plain Stop, and the follow-up of a Dismiss of the launching message itself, still end
@@ -6960,6 +7060,7 @@ mod workspace_loss_tests {
             f.launch.clone(),
             false,
             None,
+            None,
             false,
             None,
             None,
@@ -7175,6 +7276,7 @@ mod workspace_loss_tests {
                 "t1",
                 launch,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -7229,6 +7331,7 @@ mod workspace_loss_tests {
             &mut sessions,
             "t1",
             f.launch.clone(),
+            None,
             None,
         )
         .await;
@@ -8300,6 +8403,7 @@ async fn run_supervisor(
                 request,
                 context_handoff,
                 frozen_delivery,
+                message_id,
                 abort_on_lost_resume,
                 response,
             } => {
@@ -8311,6 +8415,7 @@ async fn run_supervisor(
                     *request,
                     context_handoff,
                     frozen_delivery.as_deref(),
+                    message_id.as_deref(),
                     abort_on_lost_resume,
                     operational_log.as_ref(),
                     None,
@@ -8695,6 +8800,7 @@ async fn run_supervisor(
                             selection,
                             operational_log.as_ref(),
                             true,
+                            frozen_delivery.as_ref().map(|row| row.message_id.as_str()),
                         )
                         .await?;
                     }
@@ -11274,6 +11380,7 @@ async fn launch_session(
     mut request: ProviderLaunchRequest,
     context_handoff: bool,
     frozen_delivery: Option<&ProviderTurnDelivery>,
+    message_id: Option<&str>,
     abort_on_lost_resume: bool,
     operational_log: Option<&ProviderOperationalLog>,
     inherited_activity_lifecycle: Option<SharedActivityLifecycle>,
@@ -11303,10 +11410,7 @@ async fn launch_session(
     // held by another chat's file restore could start again (#279). Registered until the launch
     // ends, so a restore that marks the thread meanwhile refuses instead.
     let launch_registration = engine
-        .begin_session_launch(
-            &request.thread_id,
-            frozen_delivery.map(|row| row.message_id.as_str()),
-        )
+        .begin_session_launch(&request.thread_id, message_id)
         .map_err(|detail| {
             tracing::warn!(thread_id = %request.thread_id, "a provider session launch was refused: another chat restores files in its checkout");
             ProviderRuntimeError::Provider {
@@ -11833,6 +11937,7 @@ async fn handle_command(
                 // A settings change saved for a queued message must not restart the session
                 // under the turn that is still running. The message's own start applies it.
                 matches!(command, OrchestrationCommand::ThreadTurnStart { .. }),
+                None,
             )
             .await?;
         }
@@ -11964,6 +12069,7 @@ async fn handle_command(
                         &thread_id,
                         launch,
                         operational_log,
+                        None,
                     )
                     .await
                 }
@@ -12001,6 +12107,7 @@ async fn handle_command(
                         &thread_id,
                         launch,
                         operational_log,
+                        None,
                     )
                     .await
                 }
@@ -12147,7 +12254,7 @@ async fn reopen_for_rewind(
         ));
     }
     if let Err(error) = supervisor
-        .launch_with_context_handoff(request, false, None, true)
+        .launch_with_context_handoff(request, false, None, None, true)
         .await
     {
         let reason = match error {
@@ -12412,7 +12519,7 @@ async fn reopen_for_compaction(
         )));
     }
     if let Err(error) = supervisor
-        .launch_with_context_handoff(request, false, None, true)
+        .launch_with_context_handoff(request, false, None, None, true)
         .await
     {
         let reason = match error {
@@ -12807,6 +12914,7 @@ async fn reconcile_model_selection(
     selection: &Value,
     operational_log: Option<&ProviderOperationalLog>,
     starting_turn: bool,
+    message_id: Option<&str>,
 ) -> Result<(), ProviderRuntimeError> {
     let target_model = model_from_selection(selection);
     let selection_options = selection_options(selection);
@@ -12992,6 +13100,7 @@ async fn reconcile_model_selection(
             thread_id,
             launch,
             operational_log,
+            message_id,
         )
         .await?;
     }
@@ -13004,6 +13113,7 @@ async fn reconcile_model_selection(
             thread_id,
             launch,
             operational_log,
+            message_id,
         )
         .await?;
     }
@@ -13075,6 +13185,7 @@ fn record_option_reconciliation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn restart_session(
     engine: &OrchestrationEngine,
     factory: &Arc<dyn ProviderDriverFactory>,
@@ -13083,6 +13194,7 @@ async fn restart_session(
     thread_id: &str,
     mut launch: ProviderLaunchRequest,
     operational_log: Option<&ProviderOperationalLog>,
+    message_id: Option<&str>,
 ) -> Result<(), ProviderRuntimeError> {
     #[cfg(test)]
     let idle_deadline_test_observer = sessions
@@ -13155,6 +13267,7 @@ async fn restart_session(
         launch,
         context_handoff,
         None,
+        message_id,
         false,
         operational_log,
         inherited_activity_lifecycle,
@@ -42057,7 +42170,7 @@ done
         launch.resume_cursor = Some(json!({ "schemaVersion": 1, "sessionId": "saved-session" }));
         let error = timeout(
             Duration::from_secs(10),
-            supervisor.launch_for_reconciliation(launch),
+            supervisor.launch_for_reconciliation(launch, None),
         )
         .await
         .expect("launch in time")
