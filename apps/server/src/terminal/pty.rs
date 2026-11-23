@@ -1586,7 +1586,13 @@ mod tests {
 
         let printed = format!("{command:?}");
 
-        assert!(printed.contains("BIBCODE_AGENT_AUTH"), "{printed}");
+        // Windows keys are case-insensitive, so the builder keeps and prints them lowercased.
+        let key = if cfg!(windows) {
+            "bibcode_agent_auth"
+        } else {
+            "BIBCODE_AGENT_AUTH"
+        };
+        assert!(printed.contains(key), "{printed}");
         assert!(
             !printed.contains("agent-token-value"),
             "the PTY command printed an environment value"
