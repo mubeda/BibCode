@@ -38,6 +38,8 @@ pub fn place_child(webview: &tauri::Webview, x: f64, y: f64, width: f64, height:
 /// See `super::return_focus`. Runs on the GTK thread ahead of the hide or close
 /// queued after it; `is_focus` holds whether or not the window is active.
 pub fn return_focus(webview: &tauri::Webview) {
+    use tauri::Manager;
+
     let app = webview.app_handle().clone();
     let result = webview.with_webview(move |platform| {
         if !platform.inner().is_focus() {
