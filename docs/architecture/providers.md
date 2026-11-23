@@ -627,6 +627,10 @@ deleted), so the next message after a restart resumes the same native
 conversation. Explicit stop, thread deletion, and provider restart still delete
 the row.
 
+**Stop** names the turn it stops. When the projected session's active turn is
+a different one, the Stop is stale: the supervisor answers it without calling
+the driver, so a late Stop never cancels the next turn, for every provider.
+
 **Stop** has a deadline. When the projection shows a running turn and Stop
 names that turn (or no turn), the supervisor arms a 10-second interrupt deadline before asking the driver to
 interrupt, and bounds that driver call by the same 10 seconds because the single
