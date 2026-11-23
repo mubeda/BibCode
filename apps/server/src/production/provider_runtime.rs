@@ -964,6 +964,8 @@ impl PublicationTestGate {
 #[derive(Clone, Debug, Default)]
 struct AcceptedPublicationTestHook {
     before_publication: Option<Arc<PublicationTestGate>>,
+    /// Pauses a delivery after its row is frozen and before its prompt is sent.
+    before_send: Option<Arc<PublicationTestGate>>,
     after_runtime: Option<Arc<PublicationTestGate>>,
     publication_enqueued: Option<Arc<tokio::sync::Notify>>,
     admission_waiting: Option<Arc<tokio::sync::Notify>>,
@@ -4280,6 +4282,194 @@ mod workspace_loss_tests {
             "never relaunched"
         );
         assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        f.shutdown().await;
+    }
+
+    impl Fixture {
+        /// Seeds a durable start for `id` and claims it, as the delivery worker does: the
+        /// returned row is `sending`, the state the web Stop (Dismiss) cancels.
+        async fn claimed_delivery(&self, id: &str) -> (OrchestrationCommand, ProviderTurnDelivery) {
+            let command = turn(id, false);
+            let mut payload = serde_json::to_value(&command).unwrap();
+            freeze_delivery_route(
+                &self.engine,
+                &self._root.path().to_path_buf(),
+                &command,
+                &mut payload,
+            )
+            .await
+            .unwrap();
+            self.engine
+                .dispatch_with_admission(
+                    command.clone(),
+                    CommandAdmission {
+                        payload_digest: canonical_command_digest(&command).unwrap(),
+                        attachment_refs: Vec::new(),
+                        provider_turn: Some(NewProviderTurnDelivery {
+                            command_id: id.into(),
+                            thread_id: "t1".into(),
+                            message_id: id.into(),
+                            provider_instance_id: "codex".into(),
+                            provider_kind: "codex".into(),
+                            provider_session_id: None,
+                            delivery_key: format!("{id}-key"),
+                            payload,
+                            state: TurnDeliveryState::Pending,
+                            mode: TurnDeliveryMode::Start,
+                            created_at: BEFORE_LOSS.into(),
+                        }),
+                        agent_message: None,
+                    },
+                    || {},
+                )
+                .await
+                .unwrap();
+            let row = self
+                .engine
+                .repositories()
+                .claim_provider_turn(id.into(), BEFORE_LOSS.into())
+                .await
+                .unwrap()
+                .expect("the delivery is claimed");
+            assert_eq!(row.state, TurnDeliveryState::Sending);
+            (command, row)
+        }
+
+        /// The web Stop while the thread is not running: Dismiss of the message's delivery.
+        async fn dismiss(&self, id: &str) {
+            self.engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.turn-delivery.resolve","commandId":format!("dismiss-{id}"),
+                        "threadId":"t1","messageId":id,"action":"dismiss","createdAt":BEFORE_LOSS,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn delivery_state(&self, id: &str) -> TurnDeliveryState {
+            self.engine
+                .repositories()
+                .get_provider_turn_delivery(id.into())
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+        }
+
+        fn deliver_frozen(
+            &self,
+            command: OrchestrationCommand,
+            row: ProviderTurnDelivery,
+        ) -> JoinHandle<ProviderDeliveryOutcome> {
+            let supervisor = self.supervisor.clone();
+            let engine = self.engine.clone();
+            let root = self._root.path().to_path_buf();
+            tokio::spawn(async move {
+                let key = row.delivery_key.clone();
+                deliver_orchestration_turn_with_identity(
+                    &supervisor,
+                    &engine,
+                    &root,
+                    command,
+                    key,
+                    Some(row),
+                )
+                .await
+            })
+        }
+    }
+
+    /// The web Stop (Dismiss) landing while the launch the delivery needed is still applying
+    /// its options: the launch returns Ok and keeps the session, but the delivery reads the row
+    /// again after the launch, finds it dismissed, and sends nothing.
+    #[tokio::test]
+    async fn a_dismiss_during_the_launch_sends_nothing() {
+        let f = Fixture::new(false).await;
+        f.driver.options_hang.store(true, Ordering::SeqCst);
+        let (command, row) = f.claimed_delivery("dismissed-launch").await;
+        let delivery = f.deliver_frozen(command, row);
+        timeout(Duration::from_secs(5), f.driver.options_entered.notified())
+            .await
+            .expect("the start returned and options are being applied");
+        f.dismiss("dismissed-launch").await;
+        f.driver.options_release.notify_one();
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("the delivery ends")
+            .unwrap();
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::Rejected { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.driver.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0, "nothing was sent");
+        assert!(f.driver.delivered_texts.lock().unwrap().is_empty());
+        assert_eq!(
+            f.delivery_state("dismissed-launch").await,
+            TurnDeliveryState::Dismissed
+        );
+        f.shutdown().await;
+    }
+
+    /// The web Stop (Dismiss) landing after the launch returned Ok and its session was kept, but
+    /// before the queued Deliver runs, which still holds the row it read before the Dismiss: the
+    /// freeze only takes a `sending` row, so nothing is sent and the row stays dismissed.
+    #[tokio::test]
+    async fn a_dismiss_after_the_launch_before_deliver_sends_nothing() {
+        let f = Fixture::new(true).await;
+        let (command, row) = f.claimed_delivery("dismissed-queued").await;
+        f.dismiss("dismissed-queued").await;
+        let outcome = timeout(Duration::from_secs(5), f.deliver_frozen(command, row))
+            .await
+            .expect("the delivery ends")
+            .unwrap();
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::DefinitelyNotSent { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0, "nothing was sent");
+        assert!(f.driver.delivered_texts.lock().unwrap().is_empty());
+        assert_eq!(
+            f.delivery_state("dismissed-queued").await,
+            TurnDeliveryState::Dismissed
+        );
+        f.shutdown().await;
+    }
+
+    /// The web Stop (Dismiss) landing after Deliver froze the row and before the prompt is
+    /// written: the stopped prompt is settled unsent and never reaches the provider.
+    #[tokio::test]
+    async fn a_dismiss_after_the_freeze_before_the_send_sends_nothing() {
+        let gate = Arc::new(PublicationTestGate::default());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                before_send: Some(gate.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        let (command, row) = f.claimed_delivery("dismissed-frozen").await;
+        let delivery = f.deliver_frozen(command, row);
+        timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("the row is frozen and the send is next");
+        f.dismiss("dismissed-frozen").await;
+        gate.release.notify_one();
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("the delivery ends")
+            .unwrap();
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0, "nothing was sent");
+        assert!(f.driver.delivered_texts.lock().unwrap().is_empty());
+        assert_eq!(outcome, ProviderDeliveryOutcome::StoppedUnsent);
+        assert_eq!(
+            f.delivery_state("dismissed-frozen").await,
+            TurnDeliveryState::Dismissed
+        );
         f.shutdown().await;
     }
 
@@ -9091,6 +9281,51 @@ async fn delivery_text(
         .map(DeliveryText::Turn)
 }
 
+/// The last await before a frozen delivery's prompt is sent: the freeze's own guarded UPDATE
+/// again, so it and the engine's Dismiss of a `sending` row exclude each other in the database.
+/// A row that left `sending` was dismissed by the user's Stop and settles unsent.
+async fn send_fence(
+    repositories: &Repositories,
+    row: &ProviderTurnDelivery,
+    provider_session_id: &str,
+) -> Option<ProviderDeliveryOutcome> {
+    let not_sent =
+        |error: crate::persistence::PersistenceError| ProviderDeliveryOutcome::DefinitelyNotSent {
+            detail: delivery_detail(&ProviderRuntimeError::Persistence(error.to_string()), None),
+        };
+    match repositories
+        .freeze_provider_turn_session(
+            row.command_id.clone(),
+            row.attempts,
+            row.provider_instance_id.clone(),
+            row.provider_kind.clone(),
+            provider_session_id.to_owned(),
+            now(),
+        )
+        .await
+    {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(
+            match repositories
+                .get_provider_turn_delivery(row.command_id.clone())
+                .await
+            {
+                Ok(Some(current)) if current.state == TurnDeliveryState::Dismissed => {
+                    ProviderDeliveryOutcome::StoppedUnsent
+                }
+                Ok(_) => ProviderDeliveryOutcome::DefinitelyNotSent {
+                    detail: format!(
+                        "durable provider delivery {} changed before its send",
+                        row.command_id
+                    ),
+                },
+                Err(error) => not_sent(error),
+            },
+        ),
+        Err(error) => Some(not_sent(error)),
+    }
+}
+
 /// Modes a live Antigravity session must confirm before a turn's prompt.
 #[derive(Default)]
 struct ModeChanges {
@@ -9204,14 +9439,14 @@ async fn spawn_delivery(
         // A refused mode is final; an unanswered write may be transient and is retried.
         let freeze_failure = if let Some(error) = mode_failure {
             Some(unsent_outcome(error))
-        } else if let Some((row, provider_session_id)) = frozen_session {
+        } else if let Some((row, provider_session_id)) = frozen_session.as_ref() {
             match repositories
                 .freeze_provider_turn_session(
                     row.command_id.clone(),
                     row.attempts,
                     row.provider_instance_id.clone(),
                     row.provider_kind.clone(),
-                    provider_session_id,
+                    provider_session_id.clone(),
                     now(),
                 )
                 .await
@@ -9256,7 +9491,14 @@ async fn spawn_delivery(
                 },
             }
         } else {
-            match delivery_text(
+            #[cfg(test)]
+            if let Some(gate) = accepted_publication_test_hook
+                .as_ref()
+                .and_then(|hook| hook.before_send.as_ref())
+            {
+                gate.pause().await;
+            }
+            let text = delivery_text(
                 &repositories,
                 &pending_context_handoff,
                 side_chat_seed_ref(&side_chat),
@@ -9264,12 +9506,17 @@ async fn spawn_delivery(
                 &command_id,
                 &message,
             )
-            .await
-            {
+            .await;
+            let stopped = match (&text, frozen_session.as_ref()) {
+                (Ok(_), Some((row, session))) => send_fence(&repositories, row, session).await,
+                _ => None,
+            };
+            match (stopped, text) {
+                (Some(stopped), _) => stopped,
                 // A side chat that owes its seed sends nothing without it, and an unreadable
                 // provenance sends nothing either; the delivery fails and its retry reads again.
-                Err(detail) => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
-                Ok(DeliveryText::AgentMessage) => {
+                (None, Err(detail)) => ProviderDeliveryOutcome::DefinitelyNotSent { detail },
+                (None, Ok(DeliveryText::AgentMessage)) => {
                     driver
                         .deliver_agent_message(
                             message.text,
@@ -9279,7 +9526,7 @@ async fn spawn_delivery(
                         )
                         .await
                 }
-                Ok(DeliveryText::Turn(handoff)) => {
+                (None, Ok(DeliveryText::Turn(handoff))) => {
                     let (text, carried) = match handoff {
                         Some(handoff) => (handoff.text, Some(handoff.side_chat_seed)),
                         None => (message.text, None),
