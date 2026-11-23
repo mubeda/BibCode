@@ -12013,20 +12013,6 @@ async fn handle_command(
             // Stop must end the turn even if the provider never answers or settles it.
             match repositories.get_thread_session(thread_id.clone()).await {
                 Ok(session) => {
-                    // A late Stop for an earlier turn must reach no provider: most interrupt
-                    // whatever runs, so it would cancel the turn running now.
-                    if crate::orchestration::engine::interrupt_is_stale(
-                        turn_id.as_deref(),
-                        session
-                            .as_ref()
-                            .and_then(|session| session.active_turn_id.as_deref()),
-                    ) {
-                        tracing::info!(
-                            thread_id,
-                            "a Stop for a turn that is no longer active was not sent to the provider"
-                        );
-                        return Ok(());
-                    }
                     // A late Stop for an earlier turn must not retire the turn running now.
                     if let Some(running_turn) = session
                         .filter(|_| entry.driver.owns_native_work())
@@ -34198,15 +34184,7 @@ done
                         .await
                     }
                 }));
-            if matches!(response, InterruptResponse::StaleTurn) {
-                // A Stop for a turn that is not the active one never reaches the provider,
-                // which would stop the turn running now instead.
-                interrupt.take().unwrap().await.unwrap().unwrap();
-                assert_eq!(first.lock().unwrap().interrupts, 0);
-            } else {
-                entered.notified().await;
-                assert_eq!(first.lock().unwrap().interrupts, 1);
-            }
+            entered.notified().await;
             let completion = super::ProviderEvent {
                 native_event_id: None,
                 event_type: "turn.completed".to_owned(),
@@ -34218,6 +34196,9 @@ done
                 activity: Vec::new(),
                 activity_controls: Default::default(),
             };
+            if matches!(response, InterruptResponse::StaleTurn) {
+                interrupt.take().unwrap().await.unwrap().unwrap();
+            }
             let mut held_settlement = None;
             if matches!(response, InterruptResponse::SettlesDuringRetirement) {
                 interrupt.take().unwrap().await.unwrap().unwrap();

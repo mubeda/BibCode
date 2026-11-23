@@ -627,9 +627,16 @@ deleted), so the next message after a restart resumes the same native
 conversation. Explicit stop, thread deletion, and provider restart still delete
 the row.
 
-**Stop** names the turn it stops. When the projected session's active turn is
-a different one, the Stop is stale: the supervisor answers it without calling
-the driver, so a late Stop never cancels the next turn, for every provider.
+**Stop** names the turn it stops. When the session's active turn is a
+different one, the Stop is stale. The orchestration engine decides this once,
+inside the Stop's commit, and the RPC layer then sends a stale Stop to no
+supervisor, so a late Stop never cancels the next turn, for every provider. A
+Stop the engine judged live reaches the driver, whatever the supervisor reads
+by then. Claude, OpenCode and Grok interrupt whatever runs, so they stop the
+turn whose requests the commit expired. Codex, Cursor and Antigravity aim the
+interrupt at the named turn and ignore it when another one runs by then. The
+supervisor makes no second stale check; its own interrupts (a compaction's
+turn, a Dismiss or a panel archive) are never stale.
 
 **Stop** has a deadline. When the projection shows a running turn and Stop
 names that turn (or no turn), the supervisor arms a 10-second interrupt deadline before asking the driver to
