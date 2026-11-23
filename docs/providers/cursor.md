@@ -77,7 +77,10 @@ a crash, so nothing the old prompt still produces can reach the next message;
 the next message starts Cursor again and resumes the session. BiBCode also stops
 the process when Cursor does not take a prompt within 30 seconds; a prompt it
 did not read at all is sent again, one it may have partly read is not. A prompt
-you stopped is never sent again, even if Cursor never read it.
+you stopped is never sent again, even if Cursor never read it. A **Stop** that
+names a turn stops only that turn: a late Stop for a turn that already ended
+leaves the next turn alone, so that turn is not cancelled and a prompt Cursor
+has not read yet can still be sent.
 
 Cursor waits silently for an MCP server that never connects. If Cursor has not
 finished starting the session within 60 seconds, the chat shows "Cursor is
