@@ -3229,6 +3229,8 @@ impl ClaudeProviderRuntime {
                     item_id,
                 ));
             }
+            // The next idle answer must not reuse this one's `message_start` id.
+            self.release_assistant_message();
             return events;
         }
         self.stop_turn_input();
@@ -3308,7 +3310,16 @@ impl ClaudeProviderRuntime {
             events.extend(self.start_follow_up_turn());
         }
         self.follow_ups_carried = self.follow_ups_after_turn;
+        // The message id belongs to the turn that just ended. An answer Claude gives
+        // afterwards, with no new `message_start`, is stored under the turn. Leaving the
+        // id set appends that answer onto the previous message.
+        self.release_assistant_message();
         events
+    }
+
+    /// Drops the assistant message id from the turn that owned it.
+    fn release_assistant_message(&mut self) {
+        self.active_assistant_item_id = None;
     }
 
     fn flush_incomplete_tools(&mut self) -> Vec<CanonicalEvent> {

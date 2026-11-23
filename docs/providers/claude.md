@@ -455,7 +455,8 @@ Known limits:
 - An answer Claude gives in a turn of its own with no replay before it (what
   Claude Code 2.1.326 sends when a background task finishes while no turn
   runs) opens no BiBCode turn. Its text and tool calls are stored under the
-  last turn's id. A tool call completes from its own result. The answer's
+  last turn's id, not under the previous answer's provider message id, so the
+  task answer does not extend that message. A tool call completes from its own result. The answer's
   `result` completes its text, any tool call, thinking block or compaction
   still open, closes subagent rows Claude no longer lists, and withdraws an
   approval or question it left pending, but completes no turn. It completes

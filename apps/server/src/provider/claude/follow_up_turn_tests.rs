@@ -193,6 +193,75 @@ fn an_answer_with_no_turn_ends_its_text_and_completes_no_turn() {
     assert_eq!(completed.turn_id, delta.turn_id);
 }
 
+/// A delivered turn keeps the assistant message id from its `message_start`. Claude Code
+/// 2.1.326 then answers a background task, with no turn open, by a text delta and no new
+/// `message_start`. That delta must not reuse the previous message's id: a streaming delta
+/// is appended to the projection row with that id, so the task answer would rewrite the
+/// previous answer. With no provider message id it is stored under the turn, and a later
+/// idle answer must not reuse an id this one claimed either.
+#[test]
+fn an_idle_answer_does_not_extend_the_previous_assistant_message() {
+    let mut runtime = runtime();
+    kinds(
+        &mut runtime,
+        &stream(json!({"type":"message_start","message":{"id":"msg-1"}})),
+    );
+    let delivered = runtime.handle_raw_value(&text_delta(), 1_000);
+    let delivered_delta = delivered
+        .events
+        .iter()
+        .find(|event| event.event_type == "content.delta")
+        .expect("the turn's text");
+    assert_eq!(delivered_delta.item_id.as_deref(), Some("msg-1"));
+    kinds(&mut runtime, &result());
+
+    let mut events = Vec::new();
+    for frame in [
+        task("task_notification", "bg"),
+        init(),
+        text_delta(),
+        idle_result(false),
+    ] {
+        events.extend(runtime.handle_raw_value(&frame, 1_000).events);
+    }
+    let delta = events
+        .iter()
+        .find(|event| event.event_type == "content.delta")
+        .expect("the idle answer's text");
+    assert_ne!(
+        delta.item_id.as_deref(),
+        Some("msg-1"),
+        "the idle answer was appended to the previous message"
+    );
+    assert!(
+        delta.item_id.is_none(),
+        "the idle answer is stored under the turn, not a provider message: {:?}",
+        delta.item_id
+    );
+    let completed = events
+        .iter()
+        .find(|event| event.event_type == "assistant.message.completed")
+        .expect("the idle answer ends");
+    assert_eq!(completed.item_id, delta.item_id);
+    assert_eq!(completed.turn_id, delta.turn_id);
+
+    kinds(
+        &mut runtime,
+        &stream(json!({"type":"message_start","message":{"id":"idle-msg"}})),
+    );
+    kinds(&mut runtime, &text_delta());
+    kinds(&mut runtime, &idle_result(false));
+    let later = runtime.handle_raw_value(&text_delta(), 1_000);
+    let later_delta = later
+        .events
+        .iter()
+        .find(|event| event.event_type == "content.delta")
+        .expect("the next idle answer");
+    assert_ne!(later_delta.item_id.as_deref(), Some("idle-msg"));
+    assert_ne!(later_delta.item_id.as_deref(), Some("msg-1"));
+    assert!(later_delta.item_id.is_none(), "{:?}", later_delta.item_id);
+}
+
 /// An answer with no turn that streams text, calls a tool, then streams more text under a second
 /// message: its `result` ends both texts under the ids each was stored with, and only the last
 /// completion ends the answer, so one context query follows it.
