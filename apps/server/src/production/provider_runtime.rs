@@ -18269,11 +18269,11 @@ impl ProviderDriver for AntigravityDriver {
     }
     fn interrupt(
         &self,
-        _: Option<String>,
+        turn_id: Option<String>,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.runtime
-                .interrupt_turn()
+                .interrupt_turn(turn_id.as_deref())
                 .await
                 .map_err(antigravity_error)
         })

@@ -978,7 +978,7 @@ async fn cancel_answers_pending_approvals_and_drops_a_later_answer() {
     let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
     peer.permission(allow_or_deny()).await;
     let request_id = opened_request_id(&runtime).await;
-    runtime.interrupt_turn().await.expect("cancel sent");
+    runtime.interrupt_turn(None).await.expect("cancel sent");
     let answer = peer.next().await;
     assert_eq!(answer["id"], json!("1"));
     assert_eq!(
@@ -1013,7 +1013,7 @@ async fn an_unanswered_cancel_ends_the_turn_and_abandons_the_process() {
     options.cancel_grace = Duration::from_millis(50);
     let (runtime, mut peer) = started_with(options, "auto").await;
     let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
-    runtime.interrupt_turn().await.expect("cancel sent");
+    runtime.interrupt_turn(None).await.expect("cancel sent");
     peer.expect("session/cancel").await;
     let events = events_until(&runtime, "turn.completed").await;
     assert_eq!(events.last().unwrap().1["state"], "cancelled");
@@ -1039,7 +1039,7 @@ async fn a_cancelled_turns_updates_after_its_end_are_dropped() {
         options.cancel_grace = Duration::from_millis(50);
         let (runtime, mut peer) = started_with(options, "auto").await;
         let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
-        runtime.interrupt_turn().await.expect("cancel sent");
+        runtime.interrupt_turn(None).await.expect("cancel sent");
         peer.expect("session/cancel").await;
         if answered {
             peer.reply(&prompt, json!({ "stopReason": "cancelled" }))
@@ -1071,7 +1071,7 @@ async fn an_answered_cancel_does_not_abandon_the_process() {
     options.cancel_grace = Duration::from_millis(100);
     let (runtime, mut peer) = started_with(options, "auto").await;
     let (_receipt, prompt) = begin_turn(&runtime, &mut peer).await;
-    runtime.interrupt_turn().await.expect("cancel sent");
+    runtime.interrupt_turn(None).await.expect("cancel sent");
     peer.expect("session/cancel").await;
     peer.reply(&prompt, json!({ "stopReason": "cancelled" }))
         .await;
@@ -1081,6 +1081,60 @@ async fn an_answered_cancel_does_not_abandon_the_process() {
             .await
             .is_err()
     );
+}
+
+/// A late stop for a finished turn leaves the running turn alone: no `session/cancel`, and the
+/// turn completes normally even past the cancel grace period.
+#[tokio::test]
+async fn a_late_stop_for_a_finished_turn_leaves_the_running_turn_alone() {
+    let mut options = options("full-access");
+    options.cancel_grace = Duration::from_millis(50);
+    let (runtime, mut peer) = started_with(options, "auto").await;
+    let (first, prompt) = begin_turn(&runtime, &mut peer).await;
+    let finished = first.turn_id.clone();
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    events_until(&runtime, "turn.completed").await;
+    first.completion().await.expect("the first turn finishes");
+
+    let (second, prompt) = begin_turn(&runtime, &mut peer).await;
+    assert_ne!(second.turn_id, finished);
+    runtime
+        .interrupt_turn(Some(&finished))
+        .await
+        .expect("a stale stop is no error");
+    assert!(peer.silent().await, "no session/cancel for a finished turn");
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    let events = events_until(&runtime, "turn.completed").await;
+    assert_eq!(events.last().unwrap().1["state"], "completed");
+    second
+        .completion()
+        .await
+        .expect("the running turn finishes");
+    assert!(
+        timeout(Duration::from_millis(200), runtime.abandoned())
+            .await
+            .is_err(),
+        "no stop timer was armed"
+    );
+}
+
+/// A stop that names the running turn still stops it.
+#[tokio::test]
+async fn a_stop_naming_the_active_turn_stops_it() {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+    runtime
+        .interrupt_turn(Some(&receipt.turn_id))
+        .await
+        .expect("cancel sent");
+    let cancel = peer.expect("session/cancel").await;
+    assert_eq!(cancel["params"]["sessionId"], SESSION);
+    peer.reply(&prompt, json!({ "stopReason": "cancelled" }))
+        .await;
+    let events = events_until(&runtime, "turn.completed").await;
+    assert_eq!(events.last().unwrap().1["state"], "cancelled");
 }
 
 #[tokio::test]
@@ -1148,7 +1202,7 @@ async fn secret_markers_stay_out_of_logs() {
         .await;
     events_until(&runtime, "turn.completed").await;
     let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
-    runtime.interrupt_turn().await.unwrap();
+    runtime.interrupt_turn(None).await.unwrap();
     runtime.abandoned().await;
     tracing::info!("the capture saw the run");
 
@@ -1250,7 +1304,7 @@ async fn requests_after_a_cancel_are_refused_even_once_the_turn_was_abandoned() 
     options.cancel_grace = Duration::from_millis(50);
     let (runtime, mut peer) = started_with(options, "auto").await;
     let (_receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
-    runtime.interrupt_turn().await.expect("cancel sent");
+    runtime.interrupt_turn(None).await.expect("cancel sent");
     peer.expect("session/cancel").await;
     peer.permission(allow_or_deny()).await;
     expect_refused_permission(&mut peer, json!("1")).await;
@@ -1680,7 +1734,7 @@ async fn a_prompt_that_was_never_written_ends_its_turn() {
     );
     let events = events_until(&runtime, "turn.completed").await;
     assert_eq!(events.last().unwrap().1["state"], "failed");
-    timeout(Duration::from_secs(1), runtime.interrupt_turn())
+    timeout(Duration::from_secs(1), runtime.interrupt_turn(None))
         .await
         .expect("in time")
         .expect("nothing to cancel");
