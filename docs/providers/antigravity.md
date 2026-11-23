@@ -56,15 +56,15 @@ activity, and approval requests like the other chat providers.
 
 - **Approval required:** BiBCode sets the CLI's `default` mode and refuses to
   start the session if the CLI does not confirm it.
+- **Auto-accept edits:** BiBCode sets the CLI's `accept-edits` mode. The CLI
+  edits files without asking and still asks before it runs a command.
+- **Full access:** BiBCode sets the CLI's `auto` mode. The CLI then runs tools
+  without asking.
 
 If the CLI has not finished starting the session within 60 seconds, the chat
 shows "Antigravity is taking longer than usual to start. One of its MCP servers
 may not be responding; run `agy mcp list` in a terminal to see which one." and
 BiBCode keeps waiting; see [Starting a provider](README.md#starting-a-provider).
-- **Auto-accept edits:** BiBCode sets the CLI's `accept-edits` mode. The CLI
-  edits files without asking and still asks before it runs a command.
-- **Full access:** BiBCode sets the CLI's `auto` mode. The CLI then runs tools
-  without asking.
 
 BiBCode never answers a permission request for you, in any mode. A request the
 CLI sends is always shown to you. When you change the mode while the agent is
