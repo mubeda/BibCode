@@ -3322,11 +3322,15 @@ Requests also settle without an answer:
 
 - **The user stops it.** A turn interrupt or a `thread.session.stop` expires
   the thread's open requests in the same commit (`reason: "stopped"`), for
-  every provider. An interrupt that names a turn reaches only that turn: it
-  expires the requests recorded for that turn, and a request with no turn only
-  while the named turn is the session's active turn. A late Stop for a finished
-  turn therefore keeps the running turn's requests open and does not hold its
-  queue, as providers ignore a Stop for a turn that is not running.
+  every provider. One rule guards a late Stop: an interrupt is stale when it
+  names a turn and the session's active turn is a different one. A stale
+  interrupt expires no request, holds no queue, does not ask a running
+  compaction to stop, and the provider supervisor answers it without calling
+  the driver, whose interrupt would otherwise stop the turn running now. Any
+  other interrupt, one naming the active turn, one sent while no turn is
+  active, or one naming no turn, expires every open request on the thread,
+  whatever turn a request was recorded under: a Codex child agent asks under
+  its own turn, and OpenCode keeps the turn of a request asked before a resume.
 - **An in-process provider's session ends.** A `thread.session-set` to
   `error`, `interrupted`, `stopped` or `idle` that moves a Codex or Claude
   session out of `running` or `starting` (read in the same transaction)
@@ -3854,7 +3858,9 @@ they compact are not guarded.
 **Stop.** `thread.turn.interrupt` is admitted without a running turn. In its
 transaction a `requested` row settles `interrupted` (nothing was sent); a
 `running` or `unresolved` row gets `stop_requested`, the runtime interrupts its
-turn, and the row settles `interrupted` when that turn or its session ends.
+turn, and the row settles `interrupted` when that turn or its session ends. A
+stale interrupt, one naming a turn other than the session's active turn, does
+neither.
 
 **Restart.** Startup reconciliation, which treats every provider session as
 ended when BiBCode stopped, settles every unsettled row `interrupted` before
