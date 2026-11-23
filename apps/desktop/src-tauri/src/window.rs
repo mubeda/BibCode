@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Runtime, Size, Webview,
-    Window,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Runtime, Size, Window,
     menu::{Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder},
 };
 
@@ -41,7 +40,8 @@ pub(crate) fn main_window<R: Runtime>(app: &AppHandle<R>) -> Option<Window<R>> {
 }
 
 /// The main window's own webview, found whether or not preview webviews share its window.
-pub(crate) fn main_webview<R: Runtime>(app: &AppHandle<R>) -> Option<Webview<R>> {
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn main_webview<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::Webview<R>> {
     app.get_webview(MAIN_WINDOW_LABEL)
 }
 const MENU_ID_OPEN_SETTINGS: &str = "bibcode:open-settings";
