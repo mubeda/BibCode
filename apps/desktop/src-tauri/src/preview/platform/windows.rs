@@ -362,6 +362,50 @@ impl PlatformWebviewOps for WindowsWebviewOps {
     }
 }
 
+/// See `super::return_focus`. Runs on the UI thread ahead of the hide or close queued after it.
+/// WebView2 leaves Win32 focus in the preview's window tree when it hides, so keys must be moved
+/// out first unless they already sit in another shown webview (the main one or another preview).
+pub fn return_focus(webview: &tauri::Webview) {
+    use tauri::Manager;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, GetForegroundWindow, IsChild,
+    };
+
+    let app = webview.app_handle().clone();
+    let result = webview.with_webview(move |platform| {
+        let mut container = windows::Win32::Foundation::HWND::default();
+        // SAFETY: Tauri invokes this closure on the UI thread that owns the live controller and
+        // its windows; `container` is a valid out parameter.
+        let preview_holds_focus = unsafe {
+            if platform.controller().ParentWindow(&mut container).is_err() {
+                return;
+            }
+            let focus = GetFocus();
+            let root = GetAncestor(container, GA_ROOT);
+            if focus.is_invalid() {
+                // In front with no focus window, keys reach the bare frame (a "ding"); in the
+                // background, activation restores focus and there is nothing to take.
+                GetForegroundWindow() == root
+            } else {
+                // In the preview or on the bare frame, keys have no shown page to reach.
+                focus == container || IsChild(container, focus).as_bool() || focus == root
+            }
+        };
+        if !preview_holds_focus {
+            return;
+        }
+        if let Some(main) = crate::window::main_webview(&app)
+            && let Err(error) = main.set_focus()
+        {
+            tracing::warn!("failed to return focus to the main webview: {error}");
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!("failed to reach the preview webview to return its focus: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;

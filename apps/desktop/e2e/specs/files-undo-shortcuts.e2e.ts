@@ -1356,8 +1356,8 @@ async function measurePreviewPaint(): Promise<void> {
       sized: true,
       closed: "closed",
     });
-    // Asserted where it was found; elsewhere the evidence shows whether the bug exists there.
-    if (platform === "linux") expect(focusedAfter).toBe(true);
+    // Asserted where it was found; on macOS the evidence shows whether the bug exists there.
+    if (platform !== "mac") expect(focusedAfter).toBe(true);
   } finally {
     reports.close();
   }
