@@ -362,7 +362,7 @@ async fn cursor_runtime_matches_approval_and_cancel_traces() {
         .expect("cancel join")
         .expect("cancel turn");
     assert_eq!(returned_cancel_turn_id, cancel_turn_id);
-    runtime.interrupt_turn().await.expect("interrupt");
+    runtime.interrupt_turn(None).await.expect("interrupt");
     let mut cancel_events = vec![cancel_started.stable_view(), request_opened.stable_view()];
     cancel_events.extend(runtime.collect_events(2).await);
     normalize_turn_ids(&mut cancel_events, &cancel_turn_id, "turn-10");
@@ -371,7 +371,7 @@ async fn cursor_runtime_matches_approval_and_cancel_traces() {
 
     peer_task.await.expect("peer");
     runtime
-        .interrupt_turn()
+        .interrupt_turn(None)
         .await
         .expect("interrupt without an active turn is a no-op");
     let failed_turn = runtime
