@@ -39,10 +39,14 @@ so resuming, restarting, rewinding and compacting never fail because a start
 was slow.
 
 **Stop**, stopping the session, deleting the chat and closing a chat panel end a
-start that has not finished: BiBCode stops the provider process, and the message
-that was waiting is settled as stopped, never sent again and not shown as an
-error. Stopping BiBCode ends it too; that message was not sent and waits for the
-next start.
+start that has not finished, and a launch whose start returned but that has not
+yet kept its session: BiBCode stops the provider process, and the message that
+was waiting is settled as stopped, never sent again and not shown as an error.
+**Stop** on a message that is still being sent dismisses that message and ends
+only the start for it; a start for another message keeps going. A message
+dismissed after its start finished, before it reached the provider, is not
+sent. Stopping BiBCode ends a start too; that message was not sent and waits for
+the next start.
 
 BiBCode starts one provider session at a time. While one start waits, other
 chats' provider commands wait behind it until it finishes or is stopped.

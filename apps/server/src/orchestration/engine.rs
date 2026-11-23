@@ -2058,9 +2058,10 @@ impl LaunchStops {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Stops the thread's launch whose start has not returned. A stop for a dismissed message
-    /// (`target`) ends only the launch for that message, never the launch of another message the
-    /// worker claimed; a plain stop ends any launch.
+    /// Stops the thread's launch that has not kept its session yet, whether its start has
+    /// returned or not. A stop for a dismissed message (`target`) ends only the launch for
+    /// that message, never the launch of another message the worker claimed; a plain stop ends
+    /// any launch.
     pub(crate) fn stop(&self, thread_id: &str, target: Option<&str>) -> LaunchStopResult {
         let stops = self.lock();
         match stops.get(thread_id) {
@@ -2082,9 +2083,10 @@ impl LaunchStops {
     }
 }
 
-/// Ends a provider session launch whose start has not returned. The supervisor awaits every
-/// start in its one queue, so a stop of the thread, or the server's shutdown, reaches the start
-/// here instead of waiting behind it.
+/// Ends a provider session launch until it keeps its session: during its start, and after the
+/// start returned while it applies options and publishes the session. The supervisor awaits every launch in its one queue, so a
+/// stop of the thread, or the server's shutdown, reaches the launch here instead of waiting
+/// behind it. A targeted stop matches only the launch for its own message.
 #[derive(Clone, Default)]
 pub(crate) struct LaunchStop {
     token: CancellationToken,
@@ -3200,7 +3202,7 @@ impl OrchestrationEngine {
         })
     }
 
-    /// The registry that stops this engine's provider launches whose start has not returned.
+    /// The registry that stops this engine's provider launches that have not kept their session.
     pub(crate) fn launch_stops(&self) -> LaunchStops {
         self.launch_stops.clone()
     }
