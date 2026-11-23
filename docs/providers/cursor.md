@@ -59,7 +59,8 @@ Cursor.
 A Cursor turn that receives no update at all for five minutes, while it waits
 on neither the user nor a tool Cursor reports running, shows the notice
 "Cursor has sent nothing for 5 minutes. It may be waiting for you to sign in to
-Cursor in your browser; otherwise stop the turn if it seems stuck." The
+Cursor in your browser, or one of its MCP servers may not be responding;
+otherwise stop the turn if it seems stuck." The
 turn keeps running; BiBCode never ends it by itself, and the notice clears when
 Cursor sends its next update. A tool Cursor reports only as pending, or as
 finished in any way, does not pause that clock.
@@ -72,7 +73,16 @@ cancelled and BiBCode stops the Cursor process, as a requested stop rather than
 a crash, so nothing the old prompt still produces can reach the next message;
 the next message starts Cursor again and resumes the session. BiBCode also stops
 the process when Cursor does not take a prompt within 30 seconds; a prompt it
-did not read at all is sent again, one it may have partly read is not.
+did not read at all is sent again, one it may have partly read is not. A prompt
+you stopped is never sent again, even if Cursor never read it.
+
+Cursor waits silently for an MCP server that never connects. If Cursor has not
+finished starting the session within 60 seconds, BiBCode stops it and shows
+"Cursor did not finish starting. One of its MCP servers may not be responding;
+run `cursor-agent mcp list` in a terminal to see which one." The waiting
+message was not sent and is sent again later. Model discovery has its own,
+shorter limits, so the model picker still lists models when Cursor does not
+answer.
 
 Cursor slash commands, skills, and agents are discovered from the server-side
 workspace environment. Skills include `.cursor/skills`, `.agents/skills`,

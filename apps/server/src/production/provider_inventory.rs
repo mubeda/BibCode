@@ -3404,6 +3404,27 @@ done
         assert_eq!(models.len(), 1);
     }
 
+    /// A Cursor that answers nothing at all, as when one of its MCP servers never connects, is
+    /// given up at the discovery deadline: the probe yields no list, so the snapshot keeps the
+    /// plain fallback models instead of waiting on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cursor_that_never_answers_leaves_the_fallback_models() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let executable = temp.path().join("cursor-agent");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+        );
+        let models = timeout(
+            CURSOR_DISCOVERY_TIMEOUT + Duration::from_secs(5),
+            probe_cursor_models(&executable, Some("silent"), None, &[], temp.path(), &[]),
+        )
+        .await
+        .expect("the discovery deadline ends the probe");
+        assert!(models.is_none(), "{models:?}");
+    }
+
     #[cfg(unix)]
     fn write_version_fixture(directory: &Path, name: &str, version: &str) -> std::path::PathBuf {
         let executable = directory.join(name);

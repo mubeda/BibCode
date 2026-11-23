@@ -24,6 +24,18 @@ probes the configured executable and reports installation, authentication, and
 model discovery independently; a driver being supported does not guarantee
 that its local CLI is installed or ready.
 
+## Starting a provider
+
+A provider CLI can wait silently while it starts, for example on one of its MCP
+servers that never connects. Every provider therefore has two minutes to start;
+Cursor and Antigravity have 60 seconds of their own, which end first. When the
+time runs out, BiBCode stops the process, records the session as failed, and
+shows that the provider did not finish starting, with the command that lists
+its MCP servers and their state where the CLI has one (for example
+`codex mcp list` or `cursor-agent mcp list`). The message that was waiting was
+not sent, so BiBCode tries it again a limited number of times; after the last
+try it fails with that message.
+
 ## Tools and Claude Code's own updates
 
 BiBCode also keeps one command-line tool that is not an agent provider up to

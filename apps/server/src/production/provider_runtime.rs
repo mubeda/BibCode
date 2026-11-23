@@ -143,6 +143,44 @@ const PROVIDER_STREAM_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Providers normally settle an interrupt within a second or two.
 const PROVIDER_INTERRUPT_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long any provider may take to start before BiBCode stops it. A CLI can wait silently for
+/// an MCP server that never connects; the single supervisor actor awaits every launch, so an
+/// unbounded start stalls every session. Cursor's and Antigravity's own 60-second limits fire
+/// first.
+const PROVIDER_START_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The error of a start that did not finish within `deadline`, naming the provider and, when its
+/// CLI has one, the command that shows which MCP server does not answer.
+fn start_timeout_error(provider: &str, deadline: Duration) -> ProviderRuntimeError {
+    let within = match deadline.as_secs() {
+        seconds if seconds >= 120 => format!("{} minutes", seconds / 60),
+        seconds => format!("{seconds} seconds"),
+    };
+    let mut detail = format!(
+        "{} did not finish starting within {within}.",
+        provider_display_name(provider)
+    );
+    // Each command checked with `<cli> mcp --help` on the installed CLI; Grok's was not.
+    let check = match provider {
+        "claudeAgent" | "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        "antigravity" => Some("agy"),
+        "cursor" => Some("cursor-agent"),
+        _ => None,
+    };
+    if let Some(cli) = check {
+        detail.push_str(&format!(
+            " One of its MCP servers may not be responding; run `{cli} mcp list` in a terminal to \
+             see which one."
+        ));
+    }
+    ProviderRuntimeError::Provider {
+        provider: provider.to_owned(),
+        detail,
+    }
+}
+
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
 const CLAUDE_CONTROL_RESPONSE_CAPACITY: usize = 128;
@@ -406,6 +444,10 @@ impl ProviderDeliveryHandle {
 
 pub trait ProviderDriver: Send + Sync {
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>>;
+    /// How long `start` may take before the launch stops the driver and fails as not sent.
+    fn start_deadline(&self) -> Duration {
+        PROVIDER_START_TIMEOUT
+    }
     /// Whether `start`'s activity capabilities are all this process will report. When false, a
     /// startup `ActivityCapabilities::none()` means "not known yet": a restarted session keeps
     /// what its previous process reported until the new one reports its own.
@@ -3209,6 +3251,9 @@ mod workspace_loss_tests {
         mode_release: Arc<Notify>,
         /// The first launch reports its process retired while set, and refuses settings.
         first_launch_retired: Arc<AtomicBool>,
+        /// `start` never returns while set, as a CLI waiting on an MCP server that never
+        /// connects, and the start deadline is shortened.
+        start_hangs: Arc<AtomicBool>,
         launches: Arc<AtomicUsize>,
         launch_index: usize,
     }
@@ -3230,8 +3275,19 @@ mod workspace_loss_tests {
     }
 
     impl ProviderDriver for LossDriver {
+        fn start_deadline(&self) -> Duration {
+            if self.start_hangs.load(Ordering::SeqCst) {
+                Duration::from_millis(200)
+            } else {
+                PROVIDER_START_TIMEOUT
+            }
+        }
+
         fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
             Box::pin(async {
+                if self.start_hangs.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
                 Ok(StartedSession {
                     resume_cursor: Some(json!({"threadId":"loss-native-session"})),
                     ..StartedSession::default()
@@ -3932,6 +3988,64 @@ mod workspace_loss_tests {
     /// A session whose process was retired (a Cursor stop the CLI ignored) is launched again for
     /// the next message, even one that changes the model: it never reaches the retired process,
     /// so it is delivered, not rejected.
+    /// A start that never returns is stopped at the deadline: the driver is shut down, the
+    /// runtime is recorded as failed with a message naming the provider and its MCP check, and
+    /// the message waiting on the launch is not sent, so it is retried.
+    #[tokio::test]
+    async fn a_start_that_never_returns_is_stopped_at_its_deadline() {
+        let f = Fixture::new(false).await;
+        f.driver.start_hangs.store(true, Ordering::SeqCst);
+        let error = timeout(
+            Duration::from_secs(5),
+            f.supervisor.launch(f.launch.clone()),
+        )
+        .await
+        .expect("the deadline ends the launch")
+        .expect_err("the start did not finish");
+        let expected = "Codex did not finish starting within 0 seconds. One of its MCP servers \
+                        may not be responding; run `codex mcp list` in a terminal to see which one.";
+        assert!(
+            matches!(&error, ProviderRuntimeError::Provider { provider, detail }
+                if provider == "codex" && detail == expected),
+            "{error:?}"
+        );
+        assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        let runtime = f
+            .engine
+            .repositories()
+            .get_provider_session_runtime("t1".into())
+            .await
+            .unwrap()
+            .expect("runtime recorded");
+        assert_eq!(runtime.status, "error");
+        assert!(
+            matches!(
+                launch_failure_outcome(&error, "launch"),
+                ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ),
+            "not sent, so retried"
+        );
+    }
+
+    #[test]
+    fn a_start_timeout_names_the_mcp_check_only_where_the_cli_has_one() {
+        let detail = |provider: &str| match start_timeout_error(provider, PROVIDER_START_TIMEOUT) {
+            ProviderRuntimeError::Provider { detail, .. } => detail,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            detail("claudeAgent"),
+            "Claude did not finish starting within 2 minutes. One of its MCP servers may not be \
+             responding; run `claude mcp list` in a terminal to see which one."
+        );
+        assert!(detail("opencode").contains("`opencode mcp list`"));
+        assert!(detail("antigravity").contains("`agy mcp list`"));
+        assert_eq!(
+            detail("grok"),
+            "Grok did not finish starting within 2 minutes."
+        );
+    }
+
     #[tokio::test]
     async fn the_next_message_after_a_retired_process_relaunches_the_session() {
         use crate::production::turn_delivery::TurnDeliveryService;
@@ -10182,7 +10296,18 @@ async fn launch_session(
     driver
         .set_agent_activity_enabled(activity_enabled_at_launch)
         .await?;
-    let started = match driver.start().await {
+    let start_deadline = driver.start_deadline();
+    let started = match tokio::time::timeout(start_deadline, driver.start())
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                thread_id = %request.thread_id,
+                provider = %request.provider,
+                deadline_secs = start_deadline.as_secs(),
+                "a provider did not finish starting before its deadline; stopping it"
+            );
+            Err(start_timeout_error(&request.provider, start_deadline))
+        }) {
         Ok(started) => started,
         Err(error) => {
             let _ = driver.shutdown().await;
@@ -29692,6 +29817,63 @@ done
             captured.take().is_empty(),
             "a requested stop is not a crash"
         );
+    }
+
+    /// A Cursor that never answers `session/new`, as when one of its MCP servers never
+    /// connects, is stopped at the start deadline with an error that names the check, and the
+    /// launch fails as not sent, so the message is retried.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cursor_that_never_finishes_starting_is_stopped_at_the_deadline() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let executable = executable_fixture(
+            &temp,
+            "cursor-never-starts",
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#,
+        );
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(&temp, "cursor");
+        request.binary_path = executable.to_string_lossy().into_owned();
+        let driver = super::CursorDriver::spawn(
+            request,
+            factory.attachments.clone(),
+            factory.attribution.clone(),
+        )
+        .await
+        .expect("the fixture spawns");
+        driver.runtime.set_start_timeout(Duration::from_millis(300));
+        let error = timeout(Duration::from_secs(5), driver.start())
+            .await
+            .expect("the deadline ends the start")
+            .expect_err("session/new was never answered");
+        assert!(
+            matches!(&error, super::ProviderRuntimeError::Provider { detail, .. }
+                if detail == "Cursor did not finish starting. One of its MCP servers may not be \
+                              responding; run `cursor-agent mcp list` in a terminal to see which \
+                              one."),
+            "{error:?}"
+        );
+        assert!(
+            matches!(
+                super::launch_failure_outcome(&error, "launch"),
+                super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ),
+            "not sent, so retried"
+        );
+        timeout(Duration::from_secs(5), async {
+            while driver.child.lock().await.id().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the child was stopped and reaped");
     }
 
     #[tokio::test]

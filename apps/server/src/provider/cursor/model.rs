@@ -15,6 +15,11 @@ pub(crate) const CONTEXT_LABEL: &str = "Context";
 pub(crate) const FAST_LABEL: &str = "Fast";
 pub(crate) const THINKING_LABEL: &str = "Thinking";
 
+/// A turn that clears its options asks for the model's defaults, which the session no longer
+/// offers.
+const CLEARED_OPTIONS_UNAVAILABLE_REFUSAL: &str = "This model's default options are no longer available. Choose its options, or choose another \
+     model.";
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorAboutResult {
@@ -330,15 +335,18 @@ pub fn resolve_bracketed_model_options(
         wanted.push((keys, label, value));
     }
     let baseline = baseline.filter(|baseline| resolve_acp_base_model_id(baseline) == base);
+    let advertised = advertised_values(descriptor)
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    // The baseline was read before later switches: it is a value to send only while the latest
+    // answer still advertises it.
     let candidates = baseline
+        .filter(|baseline| advertised.iter().any(|value| value == baseline))
         .into_iter()
         .map(str::to_owned)
         .chain(std::iter::once(current.to_owned()))
-        .chain(
-            advertised_values(descriptor)
-                .into_iter()
-                .filter_map(|value| value.as_str().map(str::to_owned)),
-        )
+        .chain(advertised)
         .filter(|value| resolve_acp_base_model_id(value) == base)
         .collect::<Vec<_>>();
     let holds = |value: &str, (keys, _, wanted): &(&[&str], &str, String)| {
@@ -363,6 +371,16 @@ pub fn resolve_bracketed_model_options(
         })
     };
     let holds_all = |value: &&String| wanted.iter().all(|option| holds(value, option));
+    if let Some(baseline) = baseline
+        && wanted.is_empty()
+        && !candidates.iter().any(|value| keeps_baseline(value))
+    {
+        // Cleared options go back to the baseline, which no advertised value holds any more.
+        return Err(RefusedOption::new(
+            format!("Cursor model config option does not advertise the baseline value {baseline}"),
+            CLEARED_OPTIONS_UNAVAILABLE_REFUSAL,
+        ));
+    }
     if let Some(value) = candidates
         .iter()
         .filter(holds_all)
@@ -395,77 +413,71 @@ pub fn build_capabilities_from_config_options(options: &Value) -> Value {
     let Some(options) = options.as_array() else {
         return json!({ "optionDescriptors": [] });
     };
-    let mut descriptors = Vec::new();
-    let reasoning_source = options
+    let descriptors = published_options(options)
+        .into_iter()
+        .map(|(id, default_label, option)| {
+            let label = option_label(option, default_label);
+            match id {
+                "reasoning" | "contextWindow" => select_descriptor(
+                    id,
+                    label,
+                    option
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                    option.get("currentValue").and_then(Value::as_str),
+                ),
+                _ => boolean_descriptor(id, label, option.get("currentValue")),
+            }
+        })
+        .collect::<Vec<_>>();
+    json!({ "optionDescriptors": descriptors })
+}
+
+/// The config options the descriptors publish, each with its descriptor id and default label, at
+/// most one per descriptor: Reasoning first, then Context, Fast and Thinking as listed. Every
+/// other option is the CLI's own and is left out.
+fn published_options(options: &[Value]) -> Vec<(&'static str, &'static str, &Value)> {
+    fn category(option: &Value) -> Option<&str> {
+        option.get("category").and_then(Value::as_str)
+    }
+    fn id(option: &Value) -> Option<&str> {
+        option.get("id").and_then(Value::as_str)
+    }
+    let reasoning = options
         .iter()
-        .find(|option| {
-            matches!(
-                option.get("category").and_then(Value::as_str),
-                Some("model_option")
-            ) && option.get("id").and_then(Value::as_str) == Some("effort")
+        .find(|option| category(option) == Some("model_option") && id(option) == Some("effort"))
+        .or_else(|| {
+            options.iter().find(|option| {
+                category(option) == Some("thought_level")
+                    && id(option).is_some_and(|id| REASONING_KEYS.contains(&id))
+            })
         })
         .or_else(|| {
             // Cursor lists Thinking as a `thought_level` too; it is the on/off option below.
             options.iter().find(|option| {
-                option.get("category").and_then(Value::as_str) == Some("thought_level")
-                    && option.get("id").and_then(Value::as_str) != Some("thinking")
+                category(option) == Some("thought_level") && id(option) != Some("thinking")
             })
         });
-    if let Some(reasoning) = reasoning_source {
-        descriptors.push(select_descriptor(
-            "reasoning",
-            reasoning
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(REASONING_LABEL),
-            reasoning
-                .get("options")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-            reasoning.get("currentValue").and_then(Value::as_str),
-        ));
-    }
+    let mut published = reasoning
+        .map(|option| ("reasoning", REASONING_LABEL, option))
+        .into_iter()
+        .collect::<Vec<_>>();
     for option in options {
-        match (
-            option.get("category").and_then(Value::as_str),
-            option.get("id").and_then(Value::as_str),
-        ) {
-            (Some("model_config"), Some("context")) => descriptors.push(select_descriptor(
-                "contextWindow",
-                option
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(CONTEXT_LABEL),
-                option
-                    .get("options")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
-                option.get("currentValue").and_then(Value::as_str),
-            )),
-            (Some("model_config"), Some("fast")) => descriptors.push(boolean_descriptor(
-                "fastMode",
-                option
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(FAST_LABEL),
-                option.get("currentValue"),
-            )),
+        let (descriptor, label) = match (category(option), id(option)) {
+            (Some("model_config"), Some("context")) => ("contextWindow", CONTEXT_LABEL),
+            (Some("model_config"), Some("fast")) => ("fastMode", FAST_LABEL),
             (Some("model_config" | "thought_level"), Some("thinking")) => {
-                descriptors.push(boolean_descriptor(
-                    "thinking",
-                    option
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or(THINKING_LABEL),
-                    option.get("currentValue"),
-                ))
+                ("thinking", THINKING_LABEL)
             }
-            _ => {}
+            _ => continue,
+        };
+        if !published.iter().any(|(id, _, _)| *id == descriptor) {
+            published.push((descriptor, label, option));
         }
     }
-    json!({ "optionDescriptors": descriptors })
+    published
 }
 
 /// Resolves a turn's options into Cursor config updates, checked against what the session
@@ -1012,8 +1024,11 @@ fn carries(params: &[(&str, &str)], id: &str, value: &str) -> bool {
 /// combination some advertised value holds is published; the runtime reads an omitted option as
 /// no constraint. A narrowed option's current value is one it keeps.
 fn narrow_config_options(options: Vec<Value>, carriers: &[&[(&str, &str)]]) -> Vec<Value> {
-    let narrowed = options
+    // Only the options the descriptors publish take part: one the CLI keeps to itself could
+    // otherwise win the search below and drop a published one.
+    let narrowed = published_options(&options)
         .into_iter()
+        .map(|(_, _, option)| option.clone())
         .filter_map(|mut option| {
             let id = option.get("id").and_then(Value::as_str)?.to_owned();
             let carried = |value: &str| carriers.iter().any(|params| carries(params, &id, value));
@@ -1078,7 +1093,8 @@ fn narrow_config_options(options: Vec<Value>, carriers: &[&[(&str, &str)]]) -> V
             })
         })
     };
-    // Largest first, earlier options first among sets of one size; a model has a handful.
+    // Largest first, earlier options first among sets of one size. At most four options are
+    // published, so the masks stay few and the shift cannot overflow.
     let count = narrowed.len();
     let mut masks = (0..1u32 << count).collect::<Vec<_>>();
     masks.sort_by_key(|mask| {
@@ -1487,6 +1503,122 @@ mod tests {
         assert!(
             resolve_advertised_model_value(&json!({ "id": "model", "category": "model" }), "x")
                 .is_err()
+        );
+    }
+
+    fn published(options: Vec<Value>, advertised: &[String]) -> Vec<String> {
+        let list = json!({ "models": [{ "value": "m", "name": "M", "configOptions": options }] });
+        let models = discover_models_with_advertised_values(&list, &[], advertised).unwrap();
+        models[0].capabilities["optionDescriptors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|descriptor| {
+                let values = descriptor["options"].as_array().map_or_else(
+                    || "on/off".to_owned(),
+                    |choices| {
+                        choices
+                            .iter()
+                            .map(|choice| choice["id"].as_str().unwrap())
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    },
+                );
+                format!("{}={values}", descriptor["id"].as_str().unwrap())
+            })
+            .collect()
+    }
+
+    fn option(id: &str, category: &str, values: &[&str]) -> Value {
+        json!({
+            "id": id, "category": category, "type": "select", "currentValue": values[0],
+            "options": values.iter().map(|value| json!({ "value": value })).collect::<Vec<_>>()
+        })
+    }
+
+    /// Only the options the descriptors publish take part in narrowing: an option the CLI keeps
+    /// to itself never drops a published one. Every (effort, verbosity) and (effort, fast) pair
+    /// is advertised, not every triple.
+    #[test]
+    fn narrowing_ignores_options_the_descriptors_do_not_publish() {
+        let advertised = [
+            "m[effort=low,verbosity=a,fast=false]",
+            "m[effort=low,verbosity=b,fast=true]",
+            "m[effort=high,verbosity=a,fast=false]",
+            "m[effort=high,verbosity=b,fast=true]",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            published(
+                vec![
+                    option("effort", "model_option", &["low", "high"]),
+                    option("verbosity", "model_option", &["a", "b"]),
+                    option("fast", "model_config", &["false", "true"]),
+                ],
+                &advertised
+            ),
+            ["reasoning=low|high", "fastMode=on/off"]
+        );
+    }
+
+    /// A CLI-only `variant` listed before `reasoning` does not take Reasoning's place.
+    #[test]
+    fn a_cli_only_option_listed_first_does_not_hide_reasoning() {
+        let advertised = [
+            "m[variant=x,reasoning=low]",
+            "m[variant=x,reasoning=high]",
+            "m[variant=y,reasoning=low]",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            published(
+                vec![
+                    option("variant", "thought_level", &["x", "y"]),
+                    option("reasoning", "thought_level", &["low", "high"]),
+                ],
+                &advertised
+            ),
+            ["reasoning=low|high"]
+        );
+    }
+
+    /// Forty options the CLI keeps to itself, every one carried, before the effort: the subset
+    /// search never sees them, so its mask cannot overflow.
+    #[test]
+    fn many_unpublished_options_do_not_overflow_the_narrowing() {
+        let carried = (0..40)
+            .map(|index| format!("o{index}=v"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let advertised = ["low", "high"].map(|effort| format!("m[{carried},effort={effort}]"));
+        let mut options = (0..40)
+            .map(|index| option(&format!("o{index}"), "model_option", &["v"]))
+            .collect::<Vec<_>>();
+        options.push(option("effort", "model_option", &["low", "high"]));
+        assert_eq!(published(options, &advertised), ["reasoning=low|high"]);
+    }
+
+    /// Cleared options go back to the baseline only while the latest answer still advertises a
+    /// value that holds it; otherwise they are refused, and the stale baseline is never sent.
+    #[test]
+    fn cleared_options_refuse_a_baseline_the_session_no_longer_advertises() {
+        let descriptor = json!({
+            "id": "model", "category": "model", "currentValue": "m[reasoning=high]",
+            "options": [{ "value": "m[reasoning=high]" }, { "value": "m[reasoning=max]" }]
+        });
+        let refused =
+            resolve_bracketed_model_options(&descriptor, &json!([]), Some("m[reasoning=medium]"))
+                .expect_err("medium is no longer advertised");
+        assert_eq!(refused.refusal, CLEARED_OPTIONS_UNAVAILABLE_REFUSAL);
+        // A baseline still advertised is restored.
+        let descriptor = json!({
+            "id": "model", "category": "model", "currentValue": "m[reasoning=high]",
+            "options": [{ "value": "m[reasoning=medium]" }, { "value": "m[reasoning=high]" }]
+        });
+        assert_eq!(
+            resolve_bracketed_model_options(&descriptor, &json!([]), Some("m[reasoning=medium]"))
+                .unwrap(),
+            Some(json!("m[reasoning=medium]"))
         );
     }
 }
