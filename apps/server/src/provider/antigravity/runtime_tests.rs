@@ -114,7 +114,6 @@ fn options(runtime_mode: &str) -> AntigravitySessionOptions {
         model: None,
         resume_session_id: None,
         cancel_grace: Duration::from_secs(5),
-        start_timeout: Duration::from_secs(3),
         control_timeout: Duration::from_secs(3),
         initial_options: Vec::new(),
     }
@@ -338,34 +337,33 @@ async fn the_handshake_speaks_protocol_one_and_never_authenticates() {
     assert!(peer.silent().await);
 }
 
+/// A slow start is never given up here: the launch shows a notice and only a stop ends it. A
+/// start whose answers come late completes normally.
 #[tokio::test]
-async fn a_silent_peer_cannot_stall_the_start() {
-    let mut options = options("full-access");
-    options.start_timeout = Duration::from_millis(100);
-    let (runtime, mut peer) = connect(options.clone());
-    let start = spawn_start(&runtime);
-    peer.expect("initialize").await;
-    let error = finish(start).await.expect_err("an unanswered initialize");
-    assert!(
-        matches!(error, AntigravityRuntimeError::StartTimedOut),
-        "{error:?}"
-    );
-
-    // The deadline covers the whole start, the session open included.
-    let (runtime, mut peer) = connect(options);
+async fn a_slow_peer_keeps_the_start_waiting_until_it_answers() {
+    let (runtime, mut peer) = connect(options("full-access"));
     let start = spawn_start(&runtime);
     let initialize = peer.expect("initialize").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !start.is_finished(),
+        "an unanswered initialize keeps waiting"
+    );
     peer.reply(
         &initialize,
         initialize_result("1.5.13", 1, all_capabilities()),
     )
     .await;
-    peer.expect("session/new").await;
-    let error = finish(start).await.expect_err("an unanswered session/new");
+    let new = peer.expect("session/new").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        matches!(error, AntigravityRuntimeError::StartTimedOut),
-        "{error:?}"
+        !start.is_finished(),
+        "an unanswered session/new keeps waiting"
     );
+    peer.reply(&new, session_result(SESSION, standard_options("default")))
+        .await;
+    answer_mode(&mut peer, "auto").await;
+    assert_eq!(finish(start).await.unwrap(), SESSION);
 }
 
 #[tokio::test]
@@ -1592,10 +1590,9 @@ async fn a_silent_control_request_ends_in_time_and_unconfirms_the_mode() {
 }
 
 #[tokio::test]
-async fn the_initial_thinking_level_is_written_inside_the_start_deadline() {
+async fn the_initial_thinking_level_is_written_during_the_start() {
     let level_low = || vec![json!({ "id": "reasoning", "value": "low" })];
     let mut withheld = options("full-access");
-    withheld.start_timeout = Duration::from_millis(300);
     withheld.initial_options = level_low();
     let (runtime, mut peer) = connect(withheld);
     let start = spawn_start(&runtime);
@@ -1610,12 +1607,13 @@ async fn the_initial_thinking_level_is_written_inside_the_start_deadline() {
         .await;
     let level = peer.expect("session/set_config_option").await;
     assert_eq!(level["params"]["configId"], "thought_level");
-    // Withheld: the start deadline, not the supervisor, ends the wait.
-    let error = finish(start).await.expect_err("a silent level write");
+    // Withheld: the start keeps waiting; only a stop of the launch ends it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        matches!(error, AntigravityRuntimeError::StartTimedOut),
-        "{error:?}"
+        !start.is_finished(),
+        "a silent level write keeps the start waiting"
     );
+    start.abort();
 
     // Acknowledged: the supervisor's later write of the same level writes nothing.
     let mut acknowledged = options("full-access");

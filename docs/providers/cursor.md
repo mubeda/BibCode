@@ -51,7 +51,10 @@ saved from an older catalog, is refused before the turn is sent with a message
 naming it and saying to choose another option, as is a model the session does
 not offer.
 Older CLIs that advertise plain values and separate options keep working the
-same way. Auto, and a thread with no model selected, sends the session's
+same way. Clearing a model's options goes back to the values Cursor offered when
+the session started. When Cursor no longer offers those values, it keeps the
+ones it uses now, BiBCode sends no change, and the chat shows "Cursor no longer
+offers this model's previous default options, so it keeps its current ones." Auto, and a thread with no model selected, sends the session's
 advertised `default[...]` value, so it never runs the model the CLI last
 remembered; a session that advertises no default value leaves the choice to
 Cursor.
@@ -77,12 +80,12 @@ did not read at all is sent again, one it may have partly read is not. A prompt
 you stopped is never sent again, even if Cursor never read it.
 
 Cursor waits silently for an MCP server that never connects. If Cursor has not
-finished starting the session within 60 seconds, BiBCode stops it and shows
-"Cursor did not finish starting. One of its MCP servers may not be responding;
-run `cursor-agent mcp list` in a terminal to see which one." The waiting
-message was not sent and is sent again later. Model discovery has its own,
-shorter limits, so the model picker still lists models when Cursor does not
-answer.
+finished starting the session within 60 seconds, the chat shows "Cursor is
+taking longer than usual to start. One of its MCP servers may not be
+responding; run `cursor-agent mcp list` in a terminal to see which one." and
+BiBCode keeps waiting; see [Starting a provider](README.md#starting-a-provider).
+Model discovery has its own, shorter limits, so the model picker still lists
+models when Cursor does not answer.
 
 Cursor slash commands, skills, and agents are discovered from the server-side
 workspace environment. Skills include `.cursor/skills`, `.agents/skills`,

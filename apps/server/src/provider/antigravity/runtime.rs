@@ -44,8 +44,9 @@ const THINKING_LEVEL_LABEL: &str = "Thinking level";
 /// How long a cancelled turn may run before the runtime gives up on the process (D-A10).
 pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(10);
 
-/// How long the handshake and session open may take. A live open answered in a few seconds.
-pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the handshake and session open may take before the chat shows that Antigravity is
+/// slow to start. A live open answered in a few seconds. The start keeps waiting.
+pub const START_NOTICE_DELAY: Duration = Duration::from_secs(60);
 
 /// How long a configuration write on a running session may take. The CLI answers them at once
 /// (measured); the bound keeps a wedged CLI from holding the shared provider supervisor.
@@ -60,11 +61,9 @@ pub struct AntigravitySessionOptions {
     pub model: Option<String>,
     pub resume_session_id: Option<String>,
     pub cancel_grace: Duration,
-    /// Bounds the whole start, so a silent or wedged CLI cannot hold the launch forever.
-    pub start_timeout: Duration,
     /// Bounds each configuration request (model, thinking level, mode).
     pub control_timeout: Duration,
-    /// The thread's options (the thinking level), written during the start, inside its deadline.
+    /// The thread's options (the thinking level), written during the start.
     pub initial_options: Vec<Value>,
 }
 
@@ -94,11 +93,6 @@ pub enum AntigravityRuntimeError {
         "Antigravity did not switch to its `{mode}` mode, so BiBCode stopped the chat to keep your permission setting. Run `agy update`, then try again."
     )]
     ModeUnavailable { mode: String },
-    /// The CLI did not finish the handshake and session open in time. It may be transient.
-    #[error(
-        "Antigravity did not answer while the chat was starting. Send the message again; if it keeps happening, check that `agy acp` runs in a terminal."
-    )]
-    StartTimedOut,
     /// A configuration request went unanswered; the CLI's mode is unknown until rewritten.
     #[error(
         "Antigravity did not answer a settings change in time. Send the message again; if it keeps happening, stop the chat and start it again."
@@ -128,7 +122,6 @@ impl AntigravityRuntimeError {
             Self::SignInRequired => "sign_in_required",
             Self::UnsupportedVersion { .. } => "unsupported_version",
             Self::ModeUnavailable { .. } => "mode_unavailable",
-            Self::StartTimedOut => "start_timeout",
             Self::ControlTimedOut => "control_timeout",
             Self::SessionMismatch => "session_mismatch",
             Self::UnsupportedOption(_) => "unsupported_option",
@@ -301,15 +294,7 @@ impl AntigravitySessionRuntime {
     /// Initializes, checks the CLI, opens the session (resume, else load, else new), then
     /// writes the model, the thinking level and the mode. Returns the ACP session id.
     pub async fn start(&self) -> Result<String, AntigravityRuntimeError> {
-        let result = tokio::time::timeout(self.inner.options.start_timeout, self.start_session())
-            .await
-            .unwrap_or_else(|_| {
-                tracing::warn!(
-                    provider = PROVIDER,
-                    "the provider did not finish starting in time"
-                );
-                Err(AntigravityRuntimeError::StartTimedOut)
-            });
+        let result = self.start_session().await;
         if let Err(error) = &result {
             if matches!(
                 error,
@@ -323,7 +308,7 @@ impl AntigravitySessionRuntime {
                     .start_lost_connection
                     .store(true, Ordering::SeqCst);
             }
-            // The timeout drops the start mid-way: no session id may survive it.
+            // A start that failed mid-way: no session id may survive it.
             let mut gate = self.inner.gate.lock().await;
             gate.session_id = None;
             gate.unconfirm();
