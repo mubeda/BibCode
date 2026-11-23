@@ -1371,10 +1371,16 @@ function fileTabXPath(fileName: string): string {
 /** The source view's state once Files shows the file again, after the preview had its place. */
 async function readFilesAfterPreview(fileName: string): Promise<EditorState> {
   await browser.$(fileTabXPath(fileName)).click();
+  // The remounted editor shows its text before the toolbar learns its history, so both callers'
+  // history (an undo or redo step) is waited for; a history really lost stays empty and fails.
   await browser
-    .waitUntil(async () => (await readState("source", fileName)).text.length > 0, {
-      timeout: 10_000,
-    })
+    .waitUntil(
+      async () => {
+        const state = await readState("source", fileName);
+        return state.text.length > 0 && (state.canUndo || state.canRedo);
+      },
+      { timeout: 10_000 },
+    )
     .catch(() => undefined);
   return readState("source", fileName);
 }

@@ -48,9 +48,10 @@ flowchart TB
   the desktop wraps the main webview in a `GtkOverlay` with a pass-through
   `GtkFixed` layer and places preview views there
   (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). A Linux preview
-  takes GTK keyboard focus when it is created; before it hides or closes, the
-  host hands focus back to the main webview if the preview held it, because
-  GTK leaves the window with no focus widget otherwise. WebKitGTK binds no key
+  takes GTK keyboard focus when it is created, and moving it into the overlay
+  layer can drop that focus, leaving the window with no focus widget. Before a
+  preview hides or closes, the host hands focus back to the main webview unless
+  another shown webview holds it. WebKitGTK binds no key
   to a text field's undo, so the host also gives preview pages on Linux the
   Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y text-field chords the app's own fields get
   (#408) through an initialization script in the main frame. On macOS a native
