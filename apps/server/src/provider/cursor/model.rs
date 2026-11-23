@@ -1532,10 +1532,10 @@ mod tests {
     }
 
     /// Only the options the descriptors publish take part in narrowing: an option the CLI keeps
-    /// to itself never drops a published one, and any number of them is safe.
+    /// to itself never drops a published one. Every (effort, verbosity) and (effort, fast) pair
+    /// is advertised, not every triple.
     #[test]
     fn narrowing_ignores_options_the_descriptors_do_not_publish() {
-        // Every (effort, verbosity) and (effort, fast) pair is advertised, not every triple.
         let advertised = [
             "m[effort=low,verbosity=a,fast=false]",
             "m[effort=low,verbosity=b,fast=true]",
@@ -1554,8 +1554,11 @@ mod tests {
             ),
             ["reasoning=low|high", "fastMode=on/off"]
         );
+    }
 
-        // A CLI-only `variant` listed before `reasoning` does not take Reasoning's place.
+    /// A CLI-only `variant` listed before `reasoning` does not take Reasoning's place.
+    #[test]
+    fn a_cli_only_option_listed_first_does_not_hide_reasoning() {
         let advertised = [
             "m[variant=x,reasoning=low]",
             "m[variant=x,reasoning=high]",
@@ -1572,8 +1575,12 @@ mod tests {
             ),
             ["reasoning=low|high"]
         );
+    }
 
-        // Forty options the CLI keeps to itself, every one carried, before the effort.
+    /// Forty options the CLI keeps to itself, every one carried, before the effort: the subset
+    /// search never sees them, so its mask cannot overflow.
+    #[test]
+    fn many_unpublished_options_do_not_overflow_the_narrowing() {
         let carried = (0..40)
             .map(|index| format!("o{index}=v"))
             .collect::<Vec<_>>()
