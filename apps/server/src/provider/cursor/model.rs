@@ -242,6 +242,44 @@ pub fn resolve_advertised_model_value(
         })
 }
 
+/// A model saved as a bracketed value, such as `grok-4.7[context=256k,reasoning_effort=high]`,
+/// for a session that advertises plain model values: its base and its parameters as the turn
+/// options they mean, which the runtime checks against the session like any other option.
+/// `None` for a plain saved model, a session that advertises bracketed values itself, or a base
+/// the session does not advertise, which is then refused under the saved name as before.
+pub fn split_saved_bracketed_model(options: &[Value], model: &str) -> Option<(String, Vec<Value>)> {
+    let descriptor = acp_model_descriptor(options)?;
+    if acp_model_values_are_bracketed(options) {
+        return None;
+    }
+    let (base, params) = bracketed_model_value(model.trim())?;
+    if !advertised_values(descriptor).contains(&json!(base)) {
+        return None;
+    }
+    let updates = params
+        .into_iter()
+        .map(|(key, value)| {
+            let on_off = |value: &str| match value {
+                "true" => json!(true),
+                "false" => json!(false),
+                // Not on/off: the option resolver refuses it.
+                other => json!(other),
+            };
+            match key {
+                key if REASONING_KEYS.contains(&key) => {
+                    json!({ "id": "reasoning", "value": value })
+                }
+                "context" => json!({ "id": "contextWindow", "value": value }),
+                "fast" => json!({ "id": "fastMode", "value": on_off(value) }),
+                "thinking" => json!({ "id": "thinking", "value": on_off(value) }),
+                // An unknown parameter is refused as an option the session does not support.
+                key => json!({ "id": key, "value": value }),
+            }
+        })
+        .collect();
+    Some((base.to_owned(), updates))
+}
+
 /// A turn's options checked against a session that folds options into its model values: the
 /// advertised value with the current model's base whose parameters hold every requested option,
 /// the current value first. `Ok(None)` when the current value already holds them, `Ok(Some)` with
@@ -1046,6 +1084,13 @@ pub fn discover_models_with_advertised_values(
         if trimmed.is_empty() || seen.contains(trimmed) {
             continue;
         }
+        // Over a plain session a bracketed custom model runs as its listed base plus options.
+        if !advertised.is_empty()
+            && bracketed.is_empty()
+            && seen.contains(&resolve_acp_base_model_id(trimmed))
+        {
+            continue;
+        }
         let offered = bracketed.is_empty()
             || advertised
                 .iter()
@@ -1547,6 +1592,143 @@ mod tests {
         assert_eq!(
             resolve_advertised_model_value(&descriptor, "m").unwrap(),
             json!("m[effort=extra-high,fast=false]")
+        );
+    }
+
+    /// A thread or custom model saved as a bracketed value before the parameterized picker meets a
+    /// session that advertises plain names: it is its base model plus its parameters as separate
+    /// options, each refused only when the session does not advertise it.
+    #[test]
+    fn a_saved_bracketed_model_is_its_base_and_options_on_a_plain_session() {
+        let select = |id: &str, category: &str, values: &[&str], current: &str| {
+            json!({
+                "id": id, "category": category, "type": "select", "currentValue": current,
+                "options": values.iter().map(|value| json!({ "value": value })).collect::<Vec<_>>()
+            })
+        };
+        let plain = [select(
+            "model",
+            "model",
+            &["default", "gpt-5.4-nano", "grok-4.7"],
+            "default",
+        )];
+        assert_eq!(
+            split_saved_bracketed_model(&plain, "gpt-5.4-nano[reasoning=medium]"),
+            Some((
+                "gpt-5.4-nano".to_owned(),
+                vec![json!({ "id": "reasoning", "value": "medium" })]
+            ))
+        );
+        let (base, grok) = split_saved_bracketed_model(
+            &plain,
+            "grok-4.7[context=256k,reasoning_effort=high,fast=true,thinking=false]",
+        )
+        .expect("a bracketed saved model splits");
+        assert_eq!(base, "grok-4.7");
+        assert_eq!(
+            grok,
+            [
+                json!({ "id": "contextWindow", "value": "256k" }),
+                json!({ "id": "reasoning", "value": "high" }),
+                json!({ "id": "fastMode", "value": true }),
+                json!({ "id": "thinking", "value": false }),
+            ]
+        );
+        assert_eq!(
+            resolve_advertised_model_value(&plain[0], &base).unwrap(),
+            json!("grok-4.7")
+        );
+        // Plain saved models, and sessions that advertise bracketed values, resolve as before.
+        assert_eq!(split_saved_bracketed_model(&plain, "grok-4.7"), None);
+        // A base the session does not advertise is refused under its saved name.
+        assert_eq!(
+            split_saved_bracketed_model(&plain, "mine[reasoning=high]"),
+            None
+        );
+        let bracketed = [select(
+            "model",
+            "model",
+            &["gpt-5.4-nano[reasoning=medium]"],
+            "gpt-5.4-nano[reasoning=medium]",
+        )];
+        assert_eq!(
+            split_saved_bracketed_model(&bracketed, "gpt-5.4-nano[reasoning=medium]"),
+            None
+        );
+
+        // Once the base model is set, its parameters are checked as the session's options.
+        let session = json!([
+            plain[0],
+            select("context", "model_config", &["256k", "500k"], "256k"),
+            select(
+                "reasoning_effort",
+                "thought_level",
+                &["low", "medium", "high", "xhigh"],
+                "medium"
+            ),
+            select("fast", "model_config", &["false", "true"], "false"),
+        ]);
+        let (_, advertised) = split_saved_bracketed_model(
+            &plain,
+            "grok-4.7[context=256k,reasoning_effort=high,fast=true]",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_acp_config_updates(&session, &Value::Array(advertised)).unwrap(),
+            [
+                json!({ "configId": "context", "value": "256k" }),
+                json!({ "configId": "reasoning_effort", "value": "high" }),
+                json!({ "configId": "fast", "value": "true" }),
+            ]
+        );
+        let (_, unadvertised) =
+            split_saved_bracketed_model(&plain, "grok-4.7[context=1m,reasoning_effort=high]")
+                .unwrap();
+        assert_eq!(
+            resolve_acp_config_updates(&session, &Value::Array(unadvertised))
+                .unwrap_err()
+                .refusal,
+            "Context 1m is not supported by the selected model. Choose another option for this model."
+        );
+    }
+
+    /// Over a plain session, a custom model saved bracketed is not published again beside its
+    /// listed base model; one without a plain equivalent stays the user's entry.
+    #[test]
+    fn a_custom_bracketed_model_over_a_plain_session_is_not_a_duplicate() {
+        let list = json!({ "models": [
+            { "value": "grok-4.7", "name": "Grok 4.7", "configOptions": [] }
+        ] });
+        let custom = [
+            "grok-4.7[context=256k,reasoning_effort=high,fast=true]".to_owned(),
+            "mine[reasoning=high]".to_owned(),
+        ];
+        let plain = ["default".to_owned(), "grok-4.7".to_owned()];
+        let slugs = |advertised: &[String]| {
+            discover_models_with_advertised_values(&list, &custom, advertised)
+                .unwrap()
+                .into_iter()
+                .map(|model| (model.slug, model.is_custom))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            slugs(&plain),
+            [
+                ("grok-4.7".to_owned(), false),
+                ("mine[reasoning=high]".to_owned(), true)
+            ]
+        );
+        // A bracketed session keeps today's behaviour: only advertised custom values appear.
+        let bracketed = ["grok-4.7[context=256k,reasoning_effort=high,fast=true]".to_owned()];
+        assert_eq!(
+            slugs(&bracketed),
+            [
+                ("grok-4.7".to_owned(), false),
+                (
+                    "grok-4.7[context=256k,reasoning_effort=high,fast=true]".to_owned(),
+                    true
+                )
+            ]
         );
     }
 

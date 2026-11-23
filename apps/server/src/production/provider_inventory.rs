@@ -3314,6 +3314,35 @@ done
         assert_eq!(descriptors[1]["id"], "contextWindow", "{descriptors}");
         assert_eq!(ids(&descriptors[1]), ["256k", "500k"]);
         assert_eq!(descriptors[2]["id"], "fastMode", "{descriptors}");
+
+        // A custom model saved bracketed is not listed again beside its plain base model; one
+        // with no plain equivalent stays the user's entry.
+        let custom = [
+            "grok-4.7[context=256k,reasoning_effort=high,fast=true]".to_owned(),
+            "mine[reasoning=high]".to_owned(),
+        ];
+        let models = probe_cursor_models(
+            &executable,
+            Some("2026.11.22"),
+            None,
+            &custom,
+            temp.path(),
+            &[],
+        )
+        .await
+        .expect("the fixture lists models");
+        let listed = models
+            .iter()
+            .map(|model| (model["slug"].as_str(), model["isCustom"].as_bool()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            [
+                (Some("grok-4.7"), Some(false)),
+                (Some("mine[reasoning=high]"), Some(true))
+            ],
+            "{models:?}"
+        );
     }
 
     /// A CLI that never answers the session read still publishes its model list, unnarrowed.
