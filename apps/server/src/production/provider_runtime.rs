@@ -1526,6 +1526,35 @@ impl ProviderRuntimeSupervisor {
         &self,
         command: OrchestrationCommand,
     ) -> Result<(), ProviderRuntimeError> {
+        self.handle_orchestration_for(command, None).await
+    }
+
+    /// Interrupts the thread after a server-side cancel committed: the Dismiss of
+    /// `dismissed_message_id`, or a panel's archive (`None`), which stops all of its work.
+    pub(crate) async fn interrupt_after_cancel(
+        &self,
+        command_id: String,
+        thread_id: String,
+        created_at: String,
+        dismissed_message_id: Option<&str>,
+    ) -> Result<(), ProviderRuntimeError> {
+        self.handle_orchestration_for(
+            OrchestrationCommand::ThreadTurnInterrupt {
+                command_id: format!("{command_id}:provider-interrupt"),
+                thread_id,
+                turn_id: None,
+                created_at,
+            },
+            dismissed_message_id,
+        )
+        .await
+    }
+
+    async fn handle_orchestration_for(
+        &self,
+        command: OrchestrationCommand,
+        launch_target: Option<&str>,
+    ) -> Result<(), ProviderRuntimeError> {
         // A stop ends a start that has not returned first: the queue awaits that start. A launch
         // has no turn yet, so an interrupt naming a turn (a late Stop, a compaction's own
         // interrupt) is not aimed at it.
@@ -1536,7 +1565,7 @@ impl ProviderRuntimeSupervisor {
                 ..
             }
             | OrchestrationCommand::ThreadSessionStop { thread_id, .. } => {
-                self.launch_stops.stop(thread_id)
+                self.launch_stops.stop(thread_id, launch_target)
             }
             _ => false,
         };
@@ -4471,6 +4500,106 @@ mod workspace_loss_tests {
             TurnDeliveryState::Dismissed
         );
         f.shutdown().await;
+    }
+
+    /// Dismissing a stuck message A commits, wakes the worker, and only then sends its follow-up
+    /// interrupt. The worker may claim the next message B and start B's launch in between; that
+    /// interrupt must not stop B's launch, which would settle B as stopped although the user
+    /// only stopped A.
+    #[tokio::test]
+    async fn a_dismiss_follow_up_does_not_stop_the_next_message_launch() {
+        let f = Fixture::new(false).await;
+        let _ = f.claimed_delivery("stuck-a").await;
+        f.dismiss("stuck-a").await;
+        f.driver.options_hang.store(true, Ordering::SeqCst);
+        let (command, row) = f.claimed_delivery("next-b").await;
+        let delivery = f.deliver_frozen(command, row);
+        timeout(Duration::from_secs(5), f.driver.options_entered.notified())
+            .await
+            .expect("B's launch is applying its options");
+        let follow_up = tokio::spawn({
+            let supervisor = f.supervisor.clone();
+            async move {
+                supervisor
+                    .interrupt_after_cancel(
+                        "dismiss-stuck-a".into(),
+                        "t1".into(),
+                        BEFORE_LOSS.into(),
+                        Some("stuck-a"),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        f.driver.options_release.notify_one();
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("B's delivery ends")
+            .unwrap();
+        let _ = timeout(Duration::from_secs(5), follow_up)
+            .await
+            .expect("the follow-up ends");
+        assert_ne!(
+            outcome,
+            ProviderDeliveryOutcome::StoppedUnsent,
+            "B was dropped"
+        );
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 1, "B was sent");
+        assert_eq!(
+            f.delivery_state("stuck-a").await,
+            TurnDeliveryState::Dismissed
+        );
+        assert_ne!(
+            f.delivery_state("next-b").await,
+            TurnDeliveryState::Dismissed
+        );
+        f.shutdown().await;
+    }
+
+    /// A plain Stop, and the follow-up of a Dismiss of the launching message itself, still end
+    /// a launch made for a durable delivery.
+    #[tokio::test]
+    async fn a_plain_stop_or_own_dismiss_still_stops_a_delivery_launch() {
+        for own_dismiss in [false, true] {
+            let f = Fixture::new(false).await;
+            f.driver.options_hang.store(true, Ordering::SeqCst);
+            let (command, row) = f.claimed_delivery("launching").await;
+            let delivery = f.deliver_frozen(command, row);
+            timeout(Duration::from_secs(5), f.driver.options_entered.notified())
+                .await
+                .expect("the launch is applying its options");
+            let stop = tokio::spawn({
+                let supervisor = f.supervisor.clone();
+                async move {
+                    supervisor
+                        .interrupt_after_cancel(
+                            "stop".into(),
+                            "t1".into(),
+                            BEFORE_LOSS.into(),
+                            own_dismiss.then_some("launching"),
+                        )
+                        .await
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            f.driver.options_release.notify_one();
+            let outcome = timeout(Duration::from_secs(5), delivery)
+                .await
+                .expect("the delivery ends")
+                .unwrap();
+            assert_eq!(
+                outcome,
+                ProviderDeliveryOutcome::StoppedUnsent,
+                "{own_dismiss}"
+            );
+            timeout(Duration::from_secs(5), stop)
+                .await
+                .expect("the stop ends")
+                .unwrap()
+                .expect("the stop reports no error");
+            assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0, "{own_dismiss}");
+            f.shutdown().await;
+        }
     }
 
     impl Fixture {
@@ -11174,7 +11303,10 @@ async fn launch_session(
     // held by another chat's file restore could start again (#279). Registered until the launch
     // ends, so a restore that marks the thread meanwhile refuses instead.
     let launch_registration = engine
-        .begin_session_launch(&request.thread_id)
+        .begin_session_launch(
+            &request.thread_id,
+            frozen_delivery.map(|row| row.message_id.as_str()),
+        )
         .map_err(|detail| {
             tracing::warn!(thread_id = %request.thread_id, "a provider session launch was refused: another chat restores files in its checkout");
             ProviderRuntimeError::Provider {

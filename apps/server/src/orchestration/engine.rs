@@ -2049,10 +2049,14 @@ impl LaunchStops {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Stops the thread's launch whose start has not returned. Whether one was in flight.
-    pub(crate) fn stop(&self, thread_id: &str) -> bool {
+    /// Stops the thread's launch whose start has not returned. Whether one was stopped. A stop
+    /// for a dismissed message (`target`) ends only the launch for that message, never the
+    /// launch of the next message the worker claimed meanwhile; a plain stop ends any launch.
+    pub(crate) fn stop(&self, thread_id: &str, target: Option<&str>) -> bool {
         let stops = self.lock();
-        let stop = stops.get(thread_id);
+        let stop = stops
+            .get(thread_id)
+            .filter(|stop| target.is_none() || stop.message_id.as_deref() == target);
         if let Some(stop) = stop {
             stop.token.cancel();
         }
@@ -2075,6 +2079,8 @@ impl LaunchStops {
 pub(crate) struct LaunchStop {
     token: CancellationToken,
     shutdown: Arc<AtomicBool>,
+    /// The message whose delivery this launch is for; `None` for a rewind, compaction or restart.
+    message_id: Option<String>,
 }
 
 impl LaunchStop {
@@ -3162,18 +3168,21 @@ impl OrchestrationEngine {
 
     /// Registers a provider session launch of the thread, or refuses it while a file restore of
     /// another chat in its checkout holds the thread. See `CheckoutRestore::hold_threads`.
-    pub(crate) fn begin_session_launch(&self, thread_id: &str) -> Result<SessionLaunch, String> {
+    /// `message_id` names the message whose delivery needs this launch, if any.
+    pub(crate) fn begin_session_launch(
+        &self,
+        thread_id: &str,
+        message_id: Option<&str>,
+    ) -> Result<SessionLaunch, String> {
         let mut holds = self.lock_restore_holds();
         if holds.held.contains_key(thread_id) {
             return Err(RESTORING_FILES_DETAIL.to_owned());
         }
         *holds.launching.entry(thread_id.to_owned()).or_default() += 1;
-        let stop = self
-            .launch_stops
-            .lock()
-            .entry(thread_id.to_owned())
-            .or_default()
-            .clone();
+        let mut stops = self.launch_stops.lock();
+        let stop = stops.entry(thread_id.to_owned()).or_default();
+        stop.message_id = message_id.map(str::to_owned);
+        let stop = stop.clone();
         Ok(SessionLaunch {
             engine: self.clone(),
             thread_id: thread_id.to_owned(),
