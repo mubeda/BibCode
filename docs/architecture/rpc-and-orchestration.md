@@ -3325,8 +3325,12 @@ Requests also settle without an answer:
   every provider. One rule guards a late Stop: an interrupt is stale when it
   names a turn and the session's active turn is a different one. A stale
   interrupt expires no request, holds no queue, does not ask a running
-  compaction to stop, and the provider supervisor answers it without calling
-  the driver, whose interrupt would otherwise stop the turn running now. Any
+  compaction to stop, and is not routed to the provider supervisor, whose
+  driver would otherwise stop the turn running now. The engine reads the
+  active turn inside the interrupt's own transaction and returns its decision
+  to the RPC layer with the dispatch result; the supervisor, which reads the
+  session later, never judges it again, and a live interrupt always reaches
+  the driver. Any
   other interrupt, one naming the active turn, one sent while no turn is
   active, or one naming no turn, expires every open request on the thread,
   whatever turn a request was recorded under: a Codex child agent asks under

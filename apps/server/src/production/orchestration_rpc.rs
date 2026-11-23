@@ -885,6 +885,13 @@ async fn dispatch_prepared_command(
             {
                 tracing::warn!(%error, "provider interrupt failed after cancelling provider work");
             }
+        } else if result.stale_interrupt {
+            // The engine judged this Stop stale in its commit: it names a turn that is no longer
+            // active, and most providers would interrupt whatever runs now.
+            tracing::info!(
+                thread_id = command.aggregate_ref().1,
+                "a Stop for a turn that is no longer active was not sent to the provider"
+            );
         } else if !is_delivery_resolution && !route_before_admission {
             route_orchestration_command(
                 &provider.provider,
@@ -6849,6 +6856,201 @@ mod tests {
             .await
             .expect("provider stops");
         engine.shutdown().await;
+    }
+
+    /// A late Stop naming finished turn A, committed while the projected session reads
+    /// `at_commit` and handled by the supervisor once it reads `at_supervisor`. Returns the
+    /// driver's interrupt calls and the requests the Stop expired.
+    async fn late_stop_case(
+        at_commit: (&str, Option<&str>),
+        at_supervisor: (&str, Option<&str>),
+    ) -> (usize, i64) {
+        let engine = migrated_engine().await;
+        let state = tempfile::tempdir().expect("provider state");
+        let session = |id: &str, (status, turn): (&str, Option<&str>)| {
+            decode_command(json!({
+                "type":"thread.session.set", "commandId":id, "threadId":"t",
+                "session":{"threadId":"t", "status":status, "providerName":"codex",
+                    "activeTurnId":turn, "lastError":null, "updatedAt":CREATED_AT},
+                "createdAt":CREATED_AT
+            }))
+        };
+        for command in [
+            json!({
+                "type":"project.create", "commandId":"late-project", "projectId":"late-project",
+                "title":"Late Project", "workspaceRoot":state.path(),
+                "defaultModelSelection":null, "createdAt":CREATED_AT
+            }),
+            json!({
+                "type":"thread.create", "commandId":"late-thread", "threadId":"t",
+                "projectId":"late-project", "title":"t", "kind":"workspace",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "interactionMode":"default",
+                "branch":null, "worktreePath":null, "createdAt":CREATED_AT
+            }),
+        ] {
+            engine
+                .dispatch(decode_command(command))
+                .await
+                .expect("fixture command");
+        }
+        let probe = Arc::new(ModelMutationProbe::default());
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(ModelMutationProbeFactory(probe.clone())),
+            ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            SupervisorOptions::default(),
+        ));
+        provider
+            .launch(ProviderLaunchRequest {
+                thread_id: "t".to_owned(),
+                activity_causal_revision: 0,
+                provider: "codex".to_owned(),
+                provider_label: "Codex".to_owned(),
+                provider_instance_id: Some("codex".to_owned()),
+                binary_path: "probe".to_owned(),
+                cwd: state.path().to_path_buf(),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                model: Some("gpt-5".to_owned()),
+                options: Vec::new(),
+                custom_models: Vec::new(),
+                service_tier: None,
+                effort: None,
+                agent: None,
+                resume_cursor: None,
+                environment: Default::default(),
+                endpoint: None,
+                server_password: None,
+                mcp: None,
+                codex_home: None,
+                open_url: None,
+                host_thread_id: None,
+                side_chat_host_thread_id: None,
+                code_review: false,
+            })
+            .await
+            .expect("provider launches");
+        let registration = ProviderRegistration {
+            provider: provider.clone(),
+            settings_root: state.path().to_path_buf(),
+            attachments: AttachmentMaterializer::new(state.path().join("attachments")),
+            turn_delivery: Arc::new(TurnDeliveryService::start_with_router(
+                engine.clone(),
+                1,
+                Arc::new(|_| Box::pin(async { Ok(()) })),
+            )),
+            uploads: test_upload_registry(),
+        };
+        // Turn A settled; turn B asked for an approval.
+        for (id, value) in [
+            ("a-running", ("running", Some("turn-a"))),
+            ("a-ready", ("ready", None)),
+            ("commit", at_commit),
+        ] {
+            engine.dispatch(session(id, value)).await.expect("session");
+        }
+        engine
+            .dispatch(decode_command(json!({
+                "type":"thread.activity.append", "commandId":"provider:b-approval",
+                "threadId":"t", "createdAt":CREATED_AT,
+                "activity":{"id":"b-approval", "tone":"approval", "kind":"approval.requested",
+                    "summary":"approval", "payload":{"requestId":"b-approval","requestKind":"command"},
+                    "turnId":"turn-b", "createdAt":CREATED_AT}
+            })))
+            .await
+            .expect("approval");
+
+        // The supervisor is busy, so the Stop waits for it after the engine committed it.
+        let pause = probe.pause_next_set_model();
+        let busy = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                provider
+                    .handle_orchestration(decode_command(json!({
+                        "type":"thread.meta.update", "commandId":"busy", "threadId":"t",
+                        "modelSelection":{"instanceId":"codex","model":"gpt-5.1"}
+                    })))
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.notified())
+            .await
+            .expect("the supervisor is busy");
+        let stop = tokio::spawn({
+            let engine = engine.clone();
+            let registration = registration.clone();
+            async move {
+                dispatch_prepared_for_test(
+                    &engine,
+                    Some(registration),
+                    decode_command(json!({
+                        "type":"thread.turn.interrupt", "commandId":"late-stop", "threadId":"t",
+                        "turnId":"turn-a", "createdAt":CREATED_AT
+                    })),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !engine
+                .repositories()
+                .get_command_receipt("late-stop".to_owned())
+                .await
+                .expect("receipt read")
+                .is_some_and(|receipt| receipt.status == "accepted")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the Stop commits");
+        engine
+            .dispatch(session("supervisor", at_supervisor))
+            .await
+            .expect("session");
+        pause.release.notify_one();
+        busy.await.expect("busy joins").expect("model set");
+        stop.await
+            .expect("stop joins")
+            .expect("the Stop is accepted");
+        let expired = engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM projection_thread_activities WHERE thread_id = 't' AND kind LIKE '%.expired'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .expect("expiries");
+        registration.turn_delivery.shutdown().await;
+        provider.shutdown().await.expect("provider stops");
+        engine.shutdown().await;
+        (probe.interrupt_calls.load(Ordering::SeqCst), expired)
+    }
+
+    #[tokio::test]
+    async fn a_stop_the_engine_judged_live_reaches_the_driver_whatever_runs_later() {
+        // Mutation caught: the supervisor reading turn B running after the engine, which read no
+        // active turn, expired B's approval, and skipping the driver, so Claude keeps waiting
+        // on an approval the UI removed.
+        let (interrupts, expired) =
+            late_stop_case(("ready", None), ("running", Some("turn-b"))).await;
+        assert_eq!((interrupts, expired), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_stop_the_engine_judged_stale_never_reaches_the_driver() {
+        // Mutation caught: the supervisor reading no active turn after the engine judged the
+        // Stop stale against running turn B, and interrupting the turn that runs next.
+        let (interrupts, expired) =
+            late_stop_case(("running", Some("turn-b")), ("ready", None)).await;
+        assert_eq!((interrupts, expired), (0, 0));
     }
 
     #[tokio::test]

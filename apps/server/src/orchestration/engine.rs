@@ -1007,6 +1007,9 @@ pub struct DispatchResult {
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// The engine judged this interrupt stale in its commit, so it must reach no provider.
+    #[serde(skip)]
+    pub stale_interrupt: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2628,6 +2631,7 @@ impl OrchestrationEngine {
             thread_id: Some(thread_id),
             project_id: None,
             disposition: Some(disposition),
+            stale_interrupt: false,
         }))
     }
 
@@ -4040,6 +4044,7 @@ async fn process_envelope(
                         }),
                     project_id,
                     disposition: replay_adoption.map(|result| result.1),
+                    stale_interrupt: false,
                 },
                 accepted_new: false,
             });
@@ -4100,6 +4105,7 @@ async fn process_envelope(
                         thread_id: None,
                         project_id: None,
                         disposition: None,
+                        stale_interrupt: false,
                     },
                     accepted_new: true,
                 });
@@ -4172,6 +4178,7 @@ async fn process_envelope(
                     thread_id: canonical_default_thread_id(model, &existing_project_id),
                     project_id: Some(existing_project_id),
                     disposition: None,
+                    stale_interrupt: false,
                 },
                 accepted_new: true,
             });
@@ -4320,6 +4327,7 @@ async fn process_envelope(
                 }),
             project_id,
             disposition: adoption_result.map(|result| result.1),
+            stale_interrupt: persisted.stale_interrupt,
         },
         accepted_new: true,
     })
@@ -6495,6 +6503,7 @@ fn required_command_string(
 struct PersistCommandOutcome {
     committed: VecDeque<OrchestrationEvent>,
     result_sequence: i64,
+    stale_interrupt: bool,
 }
 
 const STALE_QUEUED_DELIVERY: &str = "Queued delivery changed before promotion or steering.";
@@ -6627,9 +6636,11 @@ async fn persist_command(
             let mut hold = hold;
             let mut expiry = expiry;
             let mut compaction_step = compaction_step;
+            let mut stale_interrupt = false;
             if let Some((thread_id, named)) = &named_interrupt
                 && interrupt_is_stale(Some(named), active_turn_of_tx(&transaction, thread_id)?.as_deref())
             {
+                stale_interrupt = true;
                 hold = None;
                 expiry = None;
                 compaction_step = None;
@@ -6849,6 +6860,7 @@ async fn persist_command(
             Ok(Ok(PersistCommandOutcome {
                 committed,
                 result_sequence,
+                stale_interrupt,
             }))
         })
         .await
@@ -8292,7 +8304,7 @@ fn request_expiry_summary(kind: &str) -> &'static str {
 
 /// Whether a Stop naming `named` is stale: the session's active turn is a different one. Any
 /// other Stop ends the running turn, and every request still open on the thread with it.
-pub(crate) fn interrupt_is_stale(named: Option<&str>, active: Option<&str>) -> bool {
+fn interrupt_is_stale(named: Option<&str>, active: Option<&str>) -> bool {
     matches!((named, active), (Some(named), Some(active)) if named != active)
 }
 
