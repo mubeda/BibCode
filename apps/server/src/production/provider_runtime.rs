@@ -3317,6 +3317,12 @@ mod workspace_loss_tests {
         /// never connects, and the start notice shows sooner.
         start_hangs: Arc<AtomicBool>,
         start_release: Arc<Notify>,
+        /// `set_options` signals `options_entered`, then waits for `options_release` while set,
+        /// as a Cursor `session/set_config_option` or a Codex `model/list` that withholds its
+        /// answer.
+        options_hang: Arc<AtomicBool>,
+        options_entered: Arc<Notify>,
+        options_release: Arc<Notify>,
         launches: Arc<AtomicUsize>,
         launch_index: usize,
         /// The text of every turn delivered, and the outcomes the next deliveries answer.
@@ -3528,7 +3534,13 @@ mod workspace_loss_tests {
             &self,
             _: Vec<Value>,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async {
+                if self.options_hang.load(Ordering::SeqCst) {
+                    self.options_entered.notify_one();
+                    self.options_release.notified().await;
+                }
+                Ok(())
+            })
         }
 
         fn rollback(
@@ -4204,6 +4216,160 @@ mod workspace_loss_tests {
             assert_eq!(f.last_error().await, None, "{stop}: the notice clears");
             f.shutdown().await;
         }
+    }
+
+    /// Stop pressed while the started session's options are still being applied ends the launch
+    /// once they return: the session is shut down and never kept, so the message the user
+    /// stopped is settled as stopped and never sent.
+    #[tokio::test]
+    async fn a_stop_during_slow_options_settles_the_delivery_unsent() {
+        let f = Fixture::new(false).await;
+        f.driver.options_hang.store(true, Ordering::SeqCst);
+        let delivery = tokio::spawn({
+            let supervisor = f.supervisor.clone();
+            let engine = f.engine.clone();
+            let root = f._root.path().to_path_buf();
+            async move {
+                deliver_orchestration_turn(
+                    &supervisor,
+                    &engine,
+                    &root,
+                    turn("slow-options", false),
+                    "slow-options-key".into(),
+                )
+                .await
+            }
+        });
+        timeout(Duration::from_secs(5), f.driver.options_entered.notified())
+            .await
+            .expect("the start returned and options are being applied");
+        let stop = tokio::spawn({
+            let supervisor = f.supervisor.clone();
+            let engine = f.engine.clone();
+            let root = f._root.path().to_path_buf();
+            async move {
+                route_orchestration_command(
+                    &supervisor,
+                    &engine,
+                    &root,
+                    serde_json::from_value(json!({
+                        "type":"thread.turn.interrupt","commandId":"stop","threadId":"t1",
+                        "createdAt":BEFORE_LOSS,
+                    }))
+                    .unwrap(),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        f.driver.options_release.notify_one();
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("the delivery ends")
+            .unwrap();
+        assert_eq!(outcome, ProviderDeliveryOutcome::StoppedUnsent);
+        timeout(Duration::from_secs(5), stop)
+            .await
+            .expect("Stop ends")
+            .unwrap()
+            .expect("Stop reports no error");
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0, "nothing was sent");
+        assert_eq!(
+            f.driver.launches.load(Ordering::SeqCst),
+            1,
+            "never relaunched"
+        );
+        assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        f.shutdown().await;
+    }
+
+    impl Fixture {
+        /// Launches with a start that returns at once and options that wait for
+        /// `options_release`, once the options are being applied.
+        async fn launch_with_hanging_options(
+            &self,
+        ) -> JoinHandle<Result<(), ProviderRuntimeError>> {
+            self.driver.options_hang.store(true, Ordering::SeqCst);
+            let supervisor = self.supervisor.clone();
+            let launch = self.launch.clone();
+            let handle = tokio::spawn(async move { supervisor.launch(launch).await });
+            timeout(
+                Duration::from_secs(5),
+                self.driver.options_entered.notified(),
+            )
+            .await
+            .expect("options are being applied");
+            handle
+        }
+    }
+
+    /// Stop, stopping the session and deleting the thread each end a launch whose options never
+    /// return, as they end a start that never returns.
+    #[tokio::test]
+    async fn a_stop_ends_options_that_never_return() {
+        for stop in ["interrupt", "session-stop", "delete"] {
+            let f = Fixture::new(false).await;
+            let launch = f.launch_with_hanging_options().await;
+            let command: OrchestrationCommand = serde_json::from_value(match stop {
+                "interrupt" => {
+                    json!({"type":"thread.turn.interrupt","commandId":"stop","threadId":"t1","createdAt":BEFORE_LOSS})
+                }
+                "session-stop" => {
+                    json!({"type":"thread.session.stop","commandId":"stop","threadId":"t1","createdAt":BEFORE_LOSS})
+                }
+                _ => json!({"type":"thread.delete","commandId":"stop","threadId":"t1"}),
+            })
+            .unwrap();
+            timeout(
+                Duration::from_secs(5),
+                route_orchestration_command(
+                    &f.supervisor,
+                    &f.engine,
+                    &f._root.path().to_path_buf(),
+                    command,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{stop} waited behind the options"))
+            .unwrap_or_else(|error| panic!("{stop} reported {error:?}"));
+            let error = timeout(Duration::from_secs(5), launch)
+                .await
+                .unwrap_or_else(|_| panic!("{stop} did not end the launch"))
+                .unwrap()
+                .expect_err("the launch was stopped");
+            assert!(
+                matches!(&error, ProviderRuntimeError::LaunchStopped { thread_id } if thread_id == "t1"),
+                "{stop}: {error:?}"
+            );
+            assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1, "{stop}");
+            f.shutdown().await;
+        }
+    }
+
+    /// The server's shutdown ends a launch whose options never return, mapped as a shutdown
+    /// that ended a start: nothing was sent.
+    #[tokio::test]
+    async fn shutdown_ends_options_that_never_return() {
+        let f = Fixture::new(false).await;
+        let launch = f.launch_with_hanging_options().await;
+        timeout(Duration::from_secs(5), f.supervisor.shutdown())
+            .await
+            .expect("the shutdown is not stuck behind the options")
+            .unwrap();
+        let error = timeout(Duration::from_secs(5), launch)
+            .await
+            .expect("the shutdown ends the launch")
+            .unwrap()
+            .expect_err("the launch was stopped");
+        assert!(matches!(error, ProviderRuntimeError::Shutdown), "{error:?}");
+        assert!(
+            matches!(
+                launch_failure_outcome(&error, "launch"),
+                ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+            ),
+            "{error:?}"
+        );
+        f.engine.shutdown().await;
     }
 
     /// The delivery a hung start was for: Stop settles it as stopped (never sent again, so
@@ -10538,6 +10704,67 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
 /// The session state a start notice replaced: status, active turn, error and its class.
 type SessionBeforeNotice = (String, Option<String>, Option<String>, Option<String>);
 
+/// What a stopped launch answers: the server's shutdown, or the user's stop of the thread.
+fn launch_stop_error(
+    request: &ProviderLaunchRequest,
+    stop: &crate::orchestration::engine::LaunchStop,
+) -> ProviderRuntimeError {
+    if stop.by_shutdown() {
+        ProviderRuntimeError::Shutdown
+    } else {
+        ProviderRuntimeError::LaunchStopped {
+            thread_id: request.thread_id.clone(),
+        }
+    }
+}
+
+/// Awaits `work` unless the launch is stopped first; a launch already stopped never polls it.
+async fn unless_launch_stopped<T>(
+    request: &ProviderLaunchRequest,
+    stop: &crate::orchestration::engine::LaunchStop,
+    work: impl Future<Output = T>,
+) -> Result<T, ProviderRuntimeError> {
+    tokio::select! {
+        biased;
+        () = stop.stopped() => Err(launch_stop_error(request, stop)),
+        value = work => Ok(value),
+    }
+}
+
+/// Ends a launch stopped after its start returned, as a stopped start ends: the started session
+/// is shut down and never kept, and the runtime records the stop. Answers the stop's error.
+async fn end_stopped_launch(
+    engine: &OrchestrationEngine,
+    request: &ProviderLaunchRequest,
+    driver: &dyn ProviderDriver,
+    resume_cursor: Option<Value>,
+    context_handoff: bool,
+    error: ProviderRuntimeError,
+) -> ProviderRuntimeError {
+    tracing::info!(
+        thread_id = %request.thread_id,
+        provider = %request.provider,
+        shutdown = matches!(error, ProviderRuntimeError::Shutdown),
+        "a provider launch was stopped after its start returned"
+    );
+    let _ = driver.shutdown().await;
+    if let Err(persist_error) = persist_runtime(
+        &engine.repositories(),
+        request,
+        "error",
+        resume_cursor,
+        runtime_payload_with_context_handoff(
+            Some(json!({ "error": error.to_string() })),
+            context_handoff,
+        ),
+    )
+    .await
+    {
+        tracing::warn!(%persist_error, thread_id = %request.thread_id, "could not record a stopped launch");
+    }
+    error
+}
+
 /// Awaits the driver's start. Past the driver's notice delay the thread shows that the provider
 /// is slow to start, and the start keeps waiting: a slow start may still finish. Only a stop of
 /// the thread, or the server's shutdown, ends a start that does not return. The notice clears
@@ -10564,13 +10791,7 @@ async fn start_with_notice(
                     shutdown = stop.by_shutdown(),
                     "a provider start was stopped before it finished"
                 );
-                break Err(if stop.by_shutdown() {
-                    ProviderRuntimeError::Shutdown
-                } else {
-                    ProviderRuntimeError::LaunchStopped {
-                        thread_id: request.thread_id.clone(),
-                    }
-                });
+                break Err(launch_stop_error(request, stop));
             }
             () = &mut notice_delay, if notice_due => {
                 notice_due = false;
@@ -10820,20 +11041,56 @@ async fn launch_session(
             thread_id: request.thread_id,
         });
     }
+    // Until the session is kept, a stop of the thread or the server's shutdown still ends the
+    // launch: every await below races it, and the started session is shut down, never kept.
+    let stop = launch_registration.stop();
     let released = match frozen_delivery {
         Some(row) if resume_lost && row.provider_session_id.is_some() => {
-            match release_frozen_delivery(&engine.repositories(), &request, row).await {
-                Ok(released) => released,
-                Err(error) => {
+            match unless_launch_stopped(
+                &request,
+                stop,
+                release_frozen_delivery(&engine.repositories(), &request, row),
+            )
+            .await
+            {
+                Ok(Ok(released)) => released,
+                Ok(Err(error)) => {
                     let _ = driver.shutdown().await;
                     return Err(error);
+                }
+                Err(stopped) => {
+                    return Err(end_stopped_launch(
+                        engine,
+                        &request,
+                        driver.as_ref(),
+                        started.resume_cursor.clone(),
+                        context_handoff,
+                        stopped,
+                    )
+                    .await);
                 }
             }
         }
         _ => None,
     };
     let context_handoff = context_handoff || resume_lost;
-    let options_result = driver.set_options(request.options.clone()).await;
+    let stopped_launch = |stopped| {
+        end_stopped_launch(
+            engine,
+            &request,
+            driver.as_ref(),
+            started.resume_cursor.clone(),
+            context_handoff,
+            stopped,
+        )
+    };
+    let options_result =
+        match unless_launch_stopped(&request, stop, driver.set_options(request.options.clone()))
+            .await
+        {
+            Ok(result) => result,
+            Err(stopped) => return Err(stopped_launch(stopped).await),
+        };
     record_option_reconciliation(
         operational_log,
         &request,
@@ -10887,27 +11144,45 @@ async fn launch_session(
     });
     if let Some(effective_activity_capabilities) = effective_activity_capabilities
         && activity_controller.snapshot().enabled
-        && let Err(error) = ensure_live_activity_scope(
-            activity,
+    {
+        match unless_launch_stopped(
             &request,
-            &activity_lifecycle,
-            &effective_activity_capabilities,
-            format!("supervisor:launch-live:{activity_lifecycle_id}"),
+            stop,
+            ensure_live_activity_scope(
+                activity,
+                &request,
+                &activity_lifecycle,
+                &effective_activity_capabilities,
+                format!("supervisor:launch-live:{activity_lifecycle_id}"),
+            ),
         )
         .await
-    {
-        tracing::warn!(%error, "activity scope unavailable; continuing provider session");
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "activity scope unavailable; continuing provider session");
+            }
+            Err(stopped) => return Err(stopped_launch(stopped).await),
+        }
     }
     let pending_context_handoff = Arc::new(AtomicBool::new(context_handoff));
     let resume_refusal_recorded = Arc::new(AtomicBool::new(false));
-    persist_runtime(
-        &engine.repositories(),
+    match unless_launch_stopped(
         &request,
-        "ready",
-        started.resume_cursor.clone(),
-        runtime_payload_with_context_handoff(started.runtime_payload.clone(), context_handoff),
+        stop,
+        persist_runtime(
+            &engine.repositories(),
+            &request,
+            "ready",
+            started.resume_cursor.clone(),
+            runtime_payload_with_context_handoff(started.runtime_payload.clone(), context_handoff),
+        ),
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result?,
+        Err(stopped) => return Err(stopped_launch(stopped).await),
+    }
     // A resumed OpenCode session may hold asks BiBCode never recorded, shown only once its
     // event stream has read them: queued messages wait for that read to finish (#187).
     let ask_recovery = (crate::orchestration::EXTERNALLY_RESUMABLE_PROVIDERS
@@ -10915,13 +11190,38 @@ async fn launch_session(
         && request.resume_cursor.is_some()
         && !resume_lost)
         .then(|| engine.hold_promotion_for_ask_recovery(&request.thread_id));
-    dispatch_session_state(engine, &request, "ready", None, None, None).await?;
-    if resume_lost {
-        append_context_handoff_activity(engine, &request).await;
+    match unless_launch_stopped(
+        &request,
+        stop,
+        dispatch_session_state(engine, &request, "ready", None, None, None),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(stopped) => return Err(stopped_launch(stopped).await),
+    }
+    if resume_lost
+        && let Err(stopped) = unless_launch_stopped(
+            &request,
+            stop,
+            append_context_handoff_activity(engine, &request),
+        )
+        .await
+    {
+        return Err(stopped_launch(stopped).await);
     }
 
     if !activity_controller.snapshot().enabled {
-        activity_control.write().await.take();
+        match unless_launch_stopped(&request, stop, activity_control.write()).await {
+            Ok(mut control) => {
+                control.take();
+            }
+            Err(stopped) => return Err(stopped_launch(stopped).await),
+        }
+    }
+    // The last chance to stop: past it the session is kept and its event pump runs.
+    if let Err(stopped) = unless_launch_stopped(&request, stop, std::future::ready(())).await {
+        return Err(stopped_launch(stopped).await);
     }
 
     let cancellation = CancellationToken::new();
