@@ -25856,7 +25856,7 @@ lines.on("line", (line) => {
     case "session/new":
       result = {
         sessionId: "cursor-session",
-        configOptions: [{ id: "model", category: "model", currentValue: "test-model" }],
+        configOptions: [{ id: "model", category: "model", options: [{ value: "test-model" }] }],
         modes: {
           currentModeId: "ask",
           availableModes: [

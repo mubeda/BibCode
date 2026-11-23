@@ -7321,9 +7321,11 @@ mod tests {
         for index in 0..1100 {
             contents.push_str(&format!("\tentry{index} = {value}\n"));
         }
+        // Git reads a backslash in an unquoted config value as an escape, so a Windows path is
+        // written with forward slashes, which Git accepts there too.
         contents.push_str(&format!(
             "[remote \"origin\"]\n\tpushurl = {}\n",
-            other.path().to_string_lossy()
+            other.path().to_string_lossy().replace('\\', "/")
         ));
         std::fs::write(&config, contents).expect("padded config");
 
@@ -7889,7 +7891,8 @@ mod transfer_gate_tests {
         type Change = (&'static str, fn(&Harness));
         let changes: [Change; 4] = [
             ("checked out in another worktree", |harness| {
-                let held = harness.cwd.join("held");
+                // Git refuses a `\\?\` path as a worktree destination.
+                let held = without_verbatim_prefix(harness.cwd.join("held"));
                 git(
                     &harness.cwd,
                     &["worktree", "add", "-q", &held.to_string_lossy(), "topic"],
