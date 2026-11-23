@@ -35,6 +35,25 @@ pub fn place_child(webview: &tauri::Webview, x: f64, y: f64, width: f64, height:
     }
 }
 
+/// See `super::return_focus`. Runs on the GTK thread ahead of the hide or close
+/// queued after it; `is_focus` holds whether or not the window is active.
+pub fn return_focus(webview: &tauri::Webview) {
+    let app = webview.app_handle().clone();
+    let result = webview.with_webview(move |platform| {
+        if !platform.inner().is_focus() {
+            return;
+        }
+        if let Some(main) = crate::window::main_webview(&app)
+            && let Err(error) = main.set_focus()
+        {
+            tracing::warn!("failed to return focus to the main webview: {error}");
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!("failed to reach the preview webview to return its focus: {error}");
+    }
+}
+
 pub(super) fn place_in_preview_layer(
     child: &gtk::Widget,
     x: f64,

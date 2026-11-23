@@ -40,7 +40,7 @@ pub(crate) fn main_window<R: Runtime>(app: &AppHandle<R>) -> Option<Window<R>> {
 }
 
 /// The main window's own webview, found whether or not preview webviews share its window.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn main_webview<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::Webview<R>> {
     app.get_webview(MAIN_WINDOW_LABEL)
 }
