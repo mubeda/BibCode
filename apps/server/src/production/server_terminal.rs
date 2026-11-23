@@ -1416,8 +1416,14 @@ async fn readmit_input(
     revision: u64,
 ) -> Result<(), Value> {
     match acquire_terminal_input(Some(availability), thread_id).await {
-        Ok(admission) => {
-            terminal.readmit_input(input_id, revision, admission.map(input_admission));
+        Ok(Some(admission)) => {
+            terminal.readmit_input(input_id, revision, Some(input_admission(admission)));
+            Ok(())
+        }
+        // The server terminal has no workspace. `Ok(None)` is that success, not a failed
+        // admission. Passing `None` to `readmit_input` would seal the keyboard.
+        Ok(None) => {
+            terminal.retain_input_admission(input_id, revision);
             Ok(())
         }
         // A newer round superseded this one; its result decides.

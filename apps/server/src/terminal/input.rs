@@ -412,6 +412,32 @@ impl TerminalInputRegistry {
         true
     }
 
+    /// Records that re-admission round `revision` kept the session's current admission.
+    /// The session stays open. A terminal with no workspace succeeds with no admission;
+    /// sealing it would close input that was opened that way. A result older than one
+    /// already applied, or than the latest round started for the session, is ignored.
+    pub(super) fn retain_admission(&self, input_id: &str, revision: u64) -> bool {
+        let Some(lease) = self
+            .0
+            .lock()
+            .expect("terminal input registry")
+            .leases
+            .get(input_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let mut current = lease.admission.lock().expect("terminal input admission");
+        if revision <= current.revision || revision < current.pending {
+            return false;
+        }
+        current.revision = revision;
+        drop(current);
+        lease.admission_changed.notify_waiters();
+        lease.changed.notify_waiters();
+        true
+    }
+
     /// Whether the session is still registered and not sealed.
     pub(super) fn check_open(&self, input_id: &str) -> Result<(), TerminalInputError> {
         let lease = self

@@ -963,6 +963,69 @@ async fn wait_for_live_sessions(fixture: &Fixture, count: usize) {
     .expect("live session count");
 }
 
+/// Re-admitting the server terminal must leave its keyboard open. It has no workspace, so
+/// the round's admission is `None`. That used to take the seal path and drop every later
+/// keystroke until input was attached again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_terminal_readmission_keeps_keyboard_input() {
+    let mut fixture = Fixture::start().await;
+    let home = fixture.root.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    success(
+        fixture
+            .request("terminal.open", server_terminal_open(&home))
+            .await,
+    );
+    let input = success(
+        fixture
+            .request(
+                "terminal.beginInput",
+                json!({"threadId": "server-terminal", "terminalId": "server-terminal", "attachmentSequence": 0}),
+            )
+            .await,
+    )["inputId"]
+        .as_str()
+        .expect("input id")
+        .to_owned();
+    let availability = fixture
+        .services
+        .workspace_admission
+        .clone()
+        .expect("workspace admission");
+    let (revision, sessions) = fixture
+        .services
+        .terminal
+        .start_input_readmission(crate::terminal::InputReadmissionScope::Session(&input));
+    assert!(
+        sessions.iter().any(|(id, _)| id == &input),
+        "the server terminal's input is in the round: {sessions:?}"
+    );
+    super::readmit_input(
+        &fixture.services.terminal,
+        &availability,
+        "server-terminal",
+        &input,
+        revision,
+    )
+    .await
+    .expect("readmission");
+    success(
+        fixture
+            .request(
+                "terminal.writeInput",
+                json!({
+                    "threadId": "server-terminal",
+                    "terminalId": "server-terminal",
+                    "inputId": input,
+                    "sequence": 0,
+                    "data": "a",
+                }),
+            )
+            .await,
+    );
+    fixture.shutdown().await;
+}
+
 /// A thread row with the server terminal's id (#378), live or deleted, left by an older server
 /// that accepted it, neither lends the server terminal a workspace nor stops it opening, even
 /// when that row's workspace is unavailable and ordinary admission refuses it.

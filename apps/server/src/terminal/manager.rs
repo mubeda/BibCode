@@ -4007,6 +4007,12 @@ impl TerminalManager {
         self.inner.input.readmit(input_id, revision, admission)
     }
 
+    /// Applies round `revision` without changing the session's admission or sealing it.
+    /// A terminal that has no workspace re-admits this way: no admission is success.
+    pub(crate) fn retain_input_admission(&self, input_id: &str, revision: u64) -> bool {
+        self.inner.input.retain_admission(input_id, revision)
+    }
+
     /// Whether the input session is still registered and not sealed.
     pub(crate) fn check_input_open(&self, input_id: &str) -> Result<(), TerminalError> {
         self.inner
