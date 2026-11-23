@@ -466,28 +466,7 @@ pub fn build_capabilities_from_config_options(options: &Value) -> Value {
 /// most one per descriptor: Reasoning first, then Context, Fast and Thinking as listed. Every
 /// other option is the CLI's own and is left out.
 fn published_options(options: &[Value]) -> Vec<(&'static str, &'static str, &Value)> {
-    fn category(option: &Value) -> Option<&str> {
-        option.get("category").and_then(Value::as_str)
-    }
-    fn id(option: &Value) -> Option<&str> {
-        option.get("id").and_then(Value::as_str)
-    }
-    let reasoning = options
-        .iter()
-        .find(|option| category(option) == Some("model_option") && id(option) == Some("effort"))
-        .or_else(|| {
-            options.iter().find(|option| {
-                category(option) == Some("thought_level")
-                    && id(option).is_some_and(|id| REASONING_KEYS.contains(&id))
-            })
-        })
-        .or_else(|| {
-            // Cursor lists Thinking as a `thought_level` too; it is the on/off option below.
-            options.iter().find(|option| {
-                category(option) == Some("thought_level") && id(option) != Some("thinking")
-            })
-        });
-    let mut published = reasoning
+    let mut published = reasoning_option(options)
         .map(|option| ("reasoning", REASONING_LABEL, option))
         .into_iter()
         .collect::<Vec<_>>();
@@ -505,6 +484,49 @@ fn published_options(options: &[Value]) -> Vec<(&'static str, &'static str, &Val
         }
     }
     published
+}
+
+fn category(option: &Value) -> Option<&str> {
+    option.get("category").and_then(Value::as_str)
+}
+
+fn id(option: &Value) -> Option<&str> {
+    option.get("id").and_then(Value::as_str)
+}
+
+/// The option the descriptors publish as Reasoning, whatever the session calls it: `effort`,
+/// `reasoning` or `reasoning_effort`.
+fn reasoning_option(options: &[Value]) -> Option<&Value> {
+    options
+        .iter()
+        .find(|option| category(option) == Some("model_option") && id(option) == Some("effort"))
+        .or_else(|| {
+            options.iter().find(|option| {
+                category(option) == Some("thought_level")
+                    && id(option).is_some_and(|id| REASONING_KEYS.contains(&id))
+            })
+        })
+        .or_else(|| {
+            // Cursor lists Thinking as a `thought_level` too; it is the on/off option.
+            options.iter().find(|option| {
+                category(option) == Some("thought_level") && id(option) != Some("thinking")
+            })
+        })
+}
+
+/// `xhigh` and `extra-high` name one Reasoning value: send the one the option advertises.
+fn advertised_reasoning_value<'a>(descriptor: &Value, value: &'a str) -> &'a str {
+    let alias = match value {
+        "xhigh" => "extra-high",
+        "extra-high" => "xhigh",
+        _ => return value,
+    };
+    let advertised = advertised_values(descriptor);
+    if !advertised.contains(&json!(value)) && advertised.contains(&json!(alias)) {
+        alias
+    } else {
+        value
+    }
 }
 
 /// Resolves a turn's options into Cursor config updates, checked against what the session
@@ -532,29 +554,25 @@ pub fn resolve_acp_config_updates(
     for update in updates {
         let (config_id, value) = match update.get("id").and_then(Value::as_str) {
             Some("reasoning") => {
-                let (config_id, descriptor) = if let Some(descriptor) =
-                    options.iter().find(|option| {
-                        option.get("category").and_then(Value::as_str) == Some("model_option")
-                            && option.get("id").and_then(Value::as_str) == Some("effort")
-                    }) {
-                    ("effort", descriptor)
-                } else {
-                    (
+                // The same option the descriptors publish as Reasoning; without one, the
+                // lookup below refuses as before.
+                let descriptor = match reasoning_option(options) {
+                    Some(descriptor) => descriptor,
+                    None => requested_config_option(
+                        options,
                         "reasoning",
-                        requested_config_option(
-                            options,
-                            "reasoning",
-                            "thought_level",
-                            REASONING_LABEL,
-                        )?,
-                    )
+                        &["thought_level"],
+                        REASONING_LABEL,
+                    )?,
                 };
+                let config_id = id(descriptor).unwrap_or("reasoning");
                 let label = option_label(descriptor, REASONING_LABEL);
                 ensure_select_config_option(descriptor, config_id)
                     .map_err(RefusedOption::unusable)?;
                 let (requested, value) = match update.get("value") {
-                    Some(Value::String(value)) if value == "xhigh" => (value, json!("extra-high")),
-                    Some(Value::String(value)) => (value, json!(value)),
+                    Some(Value::String(value)) => {
+                        (value, json!(advertised_reasoning_value(descriptor, value)))
+                    }
                     None => {
                         return Err(RefusedOption::new(
                             "Cursor reasoning option is missing a value",
@@ -578,7 +596,7 @@ pub fn resolve_acp_config_updates(
             }
             Some("contextWindow") => {
                 let descriptor =
-                    requested_config_option(options, "context", "model_config", CONTEXT_LABEL)?;
+                    requested_config_option(options, "context", &["model_config"], CONTEXT_LABEL)?;
                 let label = option_label(descriptor, CONTEXT_LABEL);
                 ensure_select_config_option(descriptor, "context")
                     .map_err(RefusedOption::unusable)?;
@@ -599,7 +617,7 @@ pub fn resolve_acp_config_updates(
             }
             Some("fastMode") => {
                 let descriptor =
-                    requested_config_option(options, "fast", "model_config", FAST_LABEL)?;
+                    requested_config_option(options, "fast", &["model_config"], FAST_LABEL)?;
                 let label = option_label(descriptor, FAST_LABEL);
                 ensure_select_config_option(descriptor, "fast").map_err(RefusedOption::unusable)?;
                 let value = update
@@ -616,8 +634,12 @@ pub fn resolve_acp_config_updates(
                 ("fast", value)
             }
             Some("thinking") => {
-                let descriptor =
-                    requested_config_option(options, "thinking", "model_config", THINKING_LABEL)?;
+                let descriptor = requested_config_option(
+                    options,
+                    "thinking",
+                    &["model_config", "thought_level"],
+                    THINKING_LABEL,
+                )?;
                 let label = option_label(descriptor, THINKING_LABEL);
                 ensure_select_config_option(descriptor, "thinking")
                     .map_err(RefusedOption::unusable)?;
@@ -792,25 +814,27 @@ pub fn acp_config_option_current_value(
         })
 }
 
-fn supported_baseline_config_options(options: &[Value]) -> Vec<(&'static str, &'static str)> {
-    let mut supported = Vec::new();
-    if options.iter().any(|option| {
-        option.get("id").and_then(Value::as_str) == Some("effort")
-            && option.get("category").and_then(Value::as_str) == Some("model_option")
-    }) {
-        supported.push(("effort", "model_option"));
-    } else if options.iter().any(|option| {
-        option.get("id").and_then(Value::as_str) == Some("reasoning")
-            && option.get("category").and_then(Value::as_str) == Some("thought_level")
-    }) {
-        supported.push(("reasoning", "thought_level"));
+/// The config id and category of each option a turn can set, found as the resolver finds them,
+/// so an option the turn sets is never also restored.
+fn supported_baseline_config_options(options: &[Value]) -> Vec<(&str, &str)> {
+    fn id_and_category(option: &Value) -> Option<(&str, &str)> {
+        Some((id(option)?, category(option)?))
     }
+    let mut supported = reasoning_option(options)
+        .and_then(id_and_category)
+        .into_iter()
+        .collect::<Vec<_>>();
     for config_id in ["context", "fast", "thinking"] {
-        if options.iter().any(|option| {
-            option.get("id").and_then(Value::as_str) == Some(config_id)
-                && option.get("category").and_then(Value::as_str) == Some("model_config")
-        }) {
-            supported.push((config_id, "model_config"));
+        if let Some(found) = options
+            .iter()
+            .filter_map(id_and_category)
+            .find(|(id, category)| {
+                *id == config_id
+                    && (*category == "model_config"
+                        || (config_id == "thinking" && *category == "thought_level"))
+            })
+        {
+            supported.push(found);
         }
     }
     supported
@@ -845,7 +869,7 @@ fn acp_config_option_baseline_value(options: &[Value], config_id: &str) -> Resul
 fn requested_config_option<'a>(
     options: &'a [Value],
     config_id: &str,
-    category: &str,
+    categories: &[&str],
     label: &str,
 ) -> Result<&'a Value, RefusedOption> {
     let descriptor = options
@@ -857,7 +881,7 @@ fn requested_config_option<'a>(
                 unsupported_option_refusal(label),
             )
         })?;
-    if descriptor.get("category").and_then(Value::as_str) != Some(category) {
+    if !category(descriptor).is_some_and(|category| categories.contains(&category)) {
         return Err(RefusedOption::unusable(format!(
             "Cursor config option {config_id} has an unsupported category"
         )));
@@ -1669,6 +1693,217 @@ mod tests {
             resolve_bracketed_model_options(&descriptor, &json!([]), Some("m[reasoning=medium]"))
                 .unwrap(),
             Some(json!("m[reasoning=medium]"))
+        );
+    }
+
+    /// `option` with `current` as its current value.
+    fn option_at(id: &str, category: &str, values: &[&str], current: &str) -> Value {
+        let mut option = option(id, category, values);
+        option["currentValue"] = json!(current);
+        option
+    }
+
+    /// The separate options `cursor-agent acp` 2026.11.22 advertises in parameterized mode, after
+    /// the model is set: Grok 4.7, GPT-5.5, GPT-5.6 and a Claude model with Thinking.
+    fn grok(reasoning: &str, context: &str, fast: &str) -> Value {
+        json!([
+            option_at("context", "model_config", &["256k", "500k"], context),
+            option_at(
+                "reasoning_effort",
+                "thought_level",
+                &["low", "medium", "high", "xhigh"],
+                reasoning
+            ),
+            option_at("fast", "model_config", &["false", "true"], fast),
+        ])
+    }
+
+    fn gpt(values: &[&str], reasoning: &str) -> Value {
+        json!([
+            option_at("context", "model_config", &["272k", "1m"], "272k"),
+            option_at("reasoning", "thought_level", values, reasoning),
+            option_at("fast", "model_config", &["false", "true"], "false"),
+        ])
+    }
+
+    const GPT_5_5: &[&str] = &["none", "low", "medium", "high", "extra-high"];
+    const GPT_5_6: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+
+    fn claude(thinking: &str, effort: &str) -> Value {
+        json!([
+            option_at("thinking", "thought_level", &["false", "true"], thinking),
+            option_at("context", "model_config", &["300k", "1m"], "300k"),
+            option_at(
+                "effort",
+                "thought_level",
+                &["low", "medium", "high", "xhigh", "max"],
+                effort
+            ),
+            option_at("fast", "model_config", &["false", "true"], "false"),
+        ])
+    }
+
+    fn resolved(options: &Value, updates: Value) -> Vec<(String, String)> {
+        resolve_acp_config_updates(options, &updates)
+            .expect("resolved")
+            .iter()
+            .map(|update| {
+                (
+                    update["configId"].as_str().unwrap().to_owned(),
+                    update["value"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(id, value)| ((*id).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    /// Each option resolves to the config id the session advertises, with a value it advertises:
+    /// `xhigh` stays `xhigh` where the session lists it and becomes `extra-high` where it does not.
+    #[test]
+    fn parameterized_sessions_resolve_each_option_to_its_advertised_id_and_value() {
+        let grok = grok("high", "256k", "true");
+        for (requested, sent) in [("low", "low"), ("xhigh", "xhigh")] {
+            assert_eq!(
+                resolved(&grok, json!([{ "id": "reasoning", "value": requested }])),
+                pairs(&[("reasoning_effort", sent)])
+            );
+        }
+        assert_eq!(
+            resolved(
+                &grok,
+                json!([
+                    { "id": "contextWindow", "value": "500k" },
+                    { "id": "fastMode", "value": false }
+                ])
+            ),
+            pairs(&[("context", "500k"), ("fast", "false")])
+        );
+        assert_eq!(
+            resolved(
+                &gpt(GPT_5_5, "medium"),
+                json!([{ "id": "reasoning", "value": "xhigh" }])
+            ),
+            pairs(&[("reasoning", "extra-high")])
+        );
+        assert_eq!(
+            resolved(
+                &gpt(GPT_5_6, "medium"),
+                json!([{ "id": "reasoning", "value": "xhigh" }])
+            ),
+            pairs(&[("reasoning", "xhigh")])
+        );
+        assert_eq!(
+            resolved(
+                &claude("true", "high"),
+                json!([
+                    { "id": "reasoning", "value": "max" },
+                    { "id": "thinking", "value": false }
+                ])
+            ),
+            pairs(&[("effort", "max"), ("thinking", "false")])
+        );
+    }
+
+    /// A value the session does not advertise is still refused, before anything is sent.
+    #[test]
+    fn parameterized_sessions_refuse_values_they_do_not_advertise() {
+        let refusal = |options: Value, updates: Value| {
+            resolve_acp_config_updates(&options, &updates)
+                .map(|_| ())
+                .map_err(|refused| refused.refusal)
+                .err()
+        };
+        assert_eq!(
+            refusal(
+                grok("high", "256k", "true"),
+                json!([{ "id": "reasoning", "value": "max" }])
+            ),
+            Some(unsupported_option_refusal("Reasoning max"))
+        );
+        assert_eq!(
+            refusal(
+                gpt(GPT_5_5, "medium"),
+                json!([{ "id": "reasoning", "value": "max" }])
+            ),
+            Some(unsupported_option_refusal("Reasoning max"))
+        );
+        assert_eq!(
+            refusal(
+                grok("high", "256k", "true"),
+                json!([{ "id": "contextWindow", "value": "1m" }])
+            ),
+            Some(unsupported_option_refusal("Context 1m"))
+        );
+    }
+
+    /// Options a turn leaves out go back to the session's baseline, under the same config ids the
+    /// turn's own options resolve to, so a requested option is never reset right after it is set.
+    #[test]
+    fn parameterized_sessions_restore_the_baseline_of_options_a_turn_leaves_out() {
+        let restored = |latest: Value, baseline: Value, updates: Value| {
+            let (updates, kept) =
+                resolve_acp_config_updates_with_baseline(&latest, &baseline, &updates)
+                    .expect("resolved");
+            assert!(!kept);
+            updates
+                .iter()
+                .map(|update| {
+                    (
+                        update["configId"].as_str().unwrap().to_owned(),
+                        update["value"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let baseline = grok("high", "256k", "true");
+        assert_eq!(
+            restored(grok("low", "500k", "false"), baseline.clone(), json!([])),
+            pairs(&[
+                ("reasoning_effort", "high"),
+                ("context", "256k"),
+                ("fast", "true")
+            ])
+        );
+        assert_eq!(
+            restored(
+                grok("high", "256k", "true"),
+                baseline,
+                json!([{ "id": "reasoning", "value": "low" }])
+            ),
+            pairs(&[("reasoning_effort", "low")])
+        );
+        assert_eq!(
+            restored(
+                gpt(GPT_5_5, "extra-high"),
+                gpt(GPT_5_5, "medium"),
+                json!([])
+            ),
+            pairs(&[("reasoning", "medium")])
+        );
+        assert_eq!(
+            restored(claude("false", "max"), claude("true", "high"), json!([])),
+            pairs(&[("effort", "high"), ("thinking", "true")])
+        );
+    }
+
+    /// The inventory publishes every option a parameterized session lists for Grok 4.7.
+    #[test]
+    fn plain_advertised_values_publish_every_listed_option() {
+        let options = grok("high", "256k", "true").as_array().unwrap().clone();
+        let advertised = ["default", "grok-4.7", "gpt-5.5"].map(str::to_owned);
+        assert_eq!(
+            published(options, &advertised),
+            [
+                "reasoning=low|medium|high|xhigh",
+                "contextWindow=256k|500k",
+                "fastMode=on/off"
+            ]
         );
     }
 }
