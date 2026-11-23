@@ -903,13 +903,20 @@ impl AntigravitySessionRuntime {
     /// Cancels the active turn: answers its pending approvals with `cancelled` (the ACP rule),
     /// sends `session/cancel`, and, if the CLI does not end the prompt within the grace period,
     /// completes the turn as cancelled and signals [`Self::abandoned`] so the driver stops the
-    /// process (D-A10).
-    pub async fn interrupt_turn(&self) -> Result<(), AntigravityRuntimeError> {
+    /// process (D-A10). With `requested`, only when it is that turn: a late stop for a turn that
+    /// already ended must not stop the next one.
+    pub async fn interrupt_turn(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<(), AntigravityRuntimeError> {
         let (turn_id, session_id) = {
             let mut gate = self.inner.gate.lock().await;
             let Some(turn_id) = gate.active_turn.clone() else {
                 return Ok(());
             };
+            if requested.is_some_and(|requested| requested != turn_id) {
+                return Ok(());
+            }
             // From here no request of this turn is answered with anything but `cancelled`.
             gate.cancelled_turn = Some(turn_id.clone());
             for (request_id, pending) in gate.take_pending(&turn_id) {
