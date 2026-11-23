@@ -33,7 +33,7 @@ use super::{
         acp_model_values_are_bracketed, advertised_auto_model_value,
         cleared_options_lose_the_baseline, resolve_acp_config_updates_with_baseline,
         resolve_acp_default_model_config, resolve_advertised_model_value,
-        resolve_bracketed_model_options,
+        resolve_bracketed_model_options, split_saved_bracketed_model,
     },
 };
 
@@ -224,6 +224,9 @@ struct RuntimeInner {
     config_options: Mutex<Vec<Value>>,
     baseline_config_options: Mutex<Vec<Value>>,
     default_model_config: Mutex<Option<(String, Value)>>,
+    /// The options a model saved bracketed carries, set as separate options on a session that
+    /// advertises plain model values; a turn's own option of the same id takes precedence.
+    saved_model_options: Mutex<Vec<Value>>,
     configuration_uncertain: Mutex<Option<String>>,
     mode_state: Mutex<Option<Value>>,
     runtime_mode: Mutex<String>,
@@ -302,6 +305,7 @@ impl CursorSessionRuntime {
             config_options: Mutex::new(Vec::new()),
             baseline_config_options: Mutex::new(Vec::new()),
             default_model_config: Mutex::new(None),
+            saved_model_options: Mutex::new(Vec::new()),
             configuration_uncertain: Mutex::new(None),
             mode_state: Mutex::new(None),
             runtime_mode: Mutex::new(runtime_mode),
@@ -521,6 +525,7 @@ impl CursorSessionRuntime {
 
     pub async fn set_model(&self, model: &str) -> Result<(), CursorRuntimeError> {
         self.ensure_usable().await?;
+        let mut saved_options = Vec::new();
         let (config_id, value) = if model.trim().eq_ignore_ascii_case("default") {
             self.inner
                 .default_model_config
@@ -536,12 +541,22 @@ impl CursorSessionRuntime {
         } else {
             let options = self.inner.config_options.lock().await.clone();
             let Some(descriptor) = acp_model_descriptor(&options) else {
+                self.inner.saved_model_options.lock().await.clear();
                 return Ok(());
             };
             let Some(config_id) = descriptor.get("id").and_then(Value::as_str) else {
+                self.inner.saved_model_options.lock().await.clear();
                 return Ok(());
             };
-            let value = resolve_advertised_model_value(descriptor, model)
+            // A model saved bracketed before the parameterized picker is its base plus options.
+            let model = match split_saved_bracketed_model(&options, model) {
+                Some((base, carried)) => {
+                    saved_options = carried;
+                    base
+                }
+                None => model.to_owned(),
+            };
+            let value = resolve_advertised_model_value(descriptor, &model)
                 .map_err(CursorRuntimeError::UnsupportedOption)?;
             (config_id.to_owned(), value)
         };
@@ -550,25 +565,41 @@ impl CursorSessionRuntime {
             .await?;
         *self.inner.config_options.lock().await = options.clone();
         *self.inner.baseline_config_options.lock().await = options;
+        *self.inner.saved_model_options.lock().await = saved_options;
         Ok(())
     }
 
     pub async fn set_options(&self, options: Vec<Value>) -> Result<(), CursorRuntimeError> {
         self.ensure_usable().await?;
         let mut current = self.inner.config_options.lock().await.clone();
+        // The saved model's own options first, each unless the turn requests that option itself.
+        let mut saved = self.inner.saved_model_options.lock().await.clone();
+        saved.retain(|saved| !options.iter().any(|option| option["id"] == saved["id"]));
+        let options = saved.into_iter().chain(options).collect::<Vec<_>>();
         if acp_model_values_are_bracketed(&current) {
             return self.set_bracketed_options(&current, options).await;
         }
-        let baseline = self.inner.baseline_config_options.lock().await.clone();
-        let (updates, kept) = resolve_acp_config_updates_with_baseline(
-            &Value::Array(current.clone()),
-            &Value::Array(baseline),
-            &Value::Array(options),
-        )
-        .map_err(CursorRuntimeError::UnsupportedOption)?;
+        let baseline = Value::Array(self.inner.baseline_config_options.lock().await.clone());
+        let options = Value::Array(options);
         let session_id = self.provider_session_id().await?;
-        let mut applied = Vec::new();
-        for update in updates {
+        let mut applied: Vec<(String, Value)> = Vec::new();
+        let kept = loop {
+            // The whole batch is checked before the first write, and again against each of
+            // Cursor's acknowledgements, which can withdraw a value an earlier write made
+            // unavailable. A refusal sends nothing more; earlier writes stay applied.
+            let (updates, kept) = resolve_acp_config_updates_with_baseline(
+                &Value::Array(current.clone()),
+                &baseline,
+                &options,
+            )
+            .map_err(CursorRuntimeError::UnsupportedOption)?;
+            let Some(update) = updates.into_iter().find(|update| {
+                !applied
+                    .iter()
+                    .any(|(written, _)| update["configId"] == written.as_str())
+            }) else {
+                break kept;
+            };
             let config_id = update["configId"]
                 .as_str()
                 .expect("resolved ACP config updates have a string config id");
@@ -600,7 +631,7 @@ impl CursorSessionRuntime {
                     return Err(error);
                 }
             }
-        }
+        };
         if kept {
             self.note_kept_options().await;
         }
@@ -3200,6 +3231,239 @@ mod tests {
                 .await
                 .is_err(),
             "nothing else was sent"
+        );
+    }
+
+    /// Starts a parameterized Grok session for the saved `model` and returns it once the model
+    /// write, which must send `grok-4.7`, is acknowledged.
+    async fn started_parameterized_grok(
+        model: &str,
+    ) -> (
+        CursorSessionRuntime,
+        Lines<BufReader<DuplexStream>>,
+        DuplexStream,
+    ) {
+        let (runtime, mut requests, mut responses) = runtime_with_model(None, model);
+        let start = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.start().await }
+        });
+        answer(&mut requests, &mut responses, "initialize", json!({})).await;
+        answer(&mut requests, &mut responses, "authenticate", json!({})).await;
+        let mut opened = parameterized_grok("high", "true");
+        opened[0]["currentValue"] = json!("default");
+        answer(
+            &mut requests,
+            &mut responses,
+            "session/new",
+            json!({ "sessionId": "cursor-session", "configOptions": [opened[0]] }),
+        )
+        .await;
+        let write = answer(
+            &mut requests,
+            &mut responses,
+            "session/set_config_option",
+            json!({ "configOptions": parameterized_grok("high", "true") }),
+        )
+        .await;
+        assert_eq!(
+            (&write["configId"], &write["value"]),
+            (&json!("model"), &json!("grok-4.7"))
+        );
+        start.await.unwrap().expect("started");
+        (runtime, requests, responses)
+    }
+
+    /// Each option write is checked against Cursor's latest acknowledgement: when setting
+    /// Reasoning low narrows Context to 256k, the requested 500k is refused, not sent.
+    #[tokio::test]
+    async fn an_option_the_previous_acknowledgement_withdrew_is_refused_unsent() {
+        let (runtime, mut requests, mut responses) = started_parameterized_grok("grok-4.7").await;
+        let set = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .set_options(vec![
+                        json!({ "id": "reasoning", "value": "low" }),
+                        json!({ "id": "contextWindow", "value": "500k" }),
+                    ])
+                    .await
+            }
+        });
+        let mut narrowed = parameterized_grok("low", "true");
+        narrowed[1]["options"] = json!([{ "value": "256k" }]);
+        let reasoning = answer(
+            &mut requests,
+            &mut responses,
+            "session/set_config_option",
+            json!({ "configOptions": narrowed }),
+        )
+        .await;
+        assert_eq!(
+            (&reasoning["configId"], &reasoning["value"]),
+            (&json!("reasoning_effort"), &json!("low"))
+        );
+        let error = timeout(Duration::from_secs(2), set)
+            .await
+            .expect("the batch ended without another write")
+            .unwrap()
+            .expect_err("Context 500k is no longer advertised");
+        assert_eq!(
+            error.option_refusal(),
+            Some(
+                "Context 500k is not supported by the selected model. Choose another option for this model."
+            )
+        );
+        assert!(
+            timeout(Duration::from_millis(100), requests.next_line())
+                .await
+                .is_err(),
+            "nothing else was sent"
+        );
+    }
+
+    /// A baseline value an acknowledgement withdraws mid-batch is not restored: Cursor keeps its
+    /// current value and the chat says so, as when the session no longer offers it at the start.
+    #[tokio::test]
+    async fn a_baseline_the_previous_acknowledgement_withdrew_is_kept() {
+        let (runtime, mut requests, mut responses) = started_parameterized_grok("grok-4.7").await;
+        let mut on_500k = parameterized_grok("high", "true");
+        on_500k[1]["currentValue"] = json!("500k");
+        let set = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .set_options(vec![json!({ "id": "contextWindow", "value": "500k" })])
+                    .await
+            }
+        });
+        answer(
+            &mut requests,
+            &mut responses,
+            "session/set_config_option",
+            json!({ "configOptions": on_500k }),
+        )
+        .await;
+        set.await.unwrap().expect("500k applied");
+
+        let set = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .set_options(vec![json!({ "id": "reasoning", "value": "low" })])
+                    .await
+            }
+        });
+        let mut narrowed = parameterized_grok("low", "true");
+        narrowed[1]["currentValue"] = json!("500k");
+        narrowed[1]["options"] = json!([{ "value": "500k" }]);
+        let reasoning = answer(
+            &mut requests,
+            &mut responses,
+            "session/set_config_option",
+            json!({ "configOptions": narrowed }),
+        )
+        .await;
+        assert_eq!(reasoning["configId"], "reasoning_effort");
+        set.await.unwrap().expect("Context keeps 500k");
+        assert!(
+            timeout(Duration::from_millis(100), requests.next_line())
+                .await
+                .is_err(),
+            "the withdrawn 256k was not sent"
+        );
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let event = runtime.next_event().await.expect("event");
+                if event.event_type == "session.notice" {
+                    assert_eq!(event.payload["message"], CLEARED_OPTIONS_KEPT_NOTE);
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the kept options are noted");
+    }
+
+    /// A model saved bracketed before the parameterized picker sets its base model, then its
+    /// parameters as separate options; an option the turn requests overrides the saved one.
+    #[tokio::test]
+    async fn a_saved_bracketed_model_sets_its_base_then_its_options() {
+        let (runtime, mut requests, mut responses) =
+            started_parameterized_grok("grok-4.7[context=500k,reasoning_effort=low,fast=true]")
+                .await;
+        let set = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .set_options(vec![json!({ "id": "fastMode", "value": false })])
+                    .await
+            }
+        });
+        let mut sent = Vec::new();
+        for ack in [
+            {
+                let mut ack = parameterized_grok("high", "true");
+                ack[1]["currentValue"] = json!("500k");
+                ack
+            },
+            {
+                let mut ack = parameterized_grok("low", "true");
+                ack[1]["currentValue"] = json!("500k");
+                ack
+            },
+            {
+                let mut ack = parameterized_grok("low", "false");
+                ack[1]["currentValue"] = json!("500k");
+                ack
+            },
+        ] {
+            let write = answer(
+                &mut requests,
+                &mut responses,
+                "session/set_config_option",
+                json!({ "configOptions": ack }),
+            )
+            .await;
+            sent.push((write["configId"].clone(), write["value"].clone()));
+        }
+        set.await.unwrap().expect("options applied");
+        assert_eq!(
+            sent,
+            [
+                (json!("context"), json!("500k")),
+                (json!("reasoning_effort"), json!("low")),
+                (json!("fast"), json!("false")),
+            ]
+        );
+        assert!(
+            timeout(Duration::from_millis(100), requests.next_line())
+                .await
+                .is_err(),
+            "nothing else was sent"
+        );
+    }
+
+    /// A saved parameter the session does not advertise is refused before any option is sent.
+    #[tokio::test]
+    async fn a_saved_bracketed_parameter_the_session_does_not_advertise_is_refused() {
+        let (runtime, mut requests, _responses) =
+            started_parameterized_grok("grok-4.7[context=1m,reasoning_effort=low]").await;
+        let error = runtime
+            .set_options(Vec::new())
+            .await
+            .expect_err("Context 1m is not advertised");
+        assert_eq!(
+            error.option_refusal(),
+            Some(
+                "Context 1m is not supported by the selected model. Choose another option for this model."
+            )
+        );
+        assert!(
+            timeout(Duration::from_millis(100), requests.next_line())
+                .await
+                .is_err(),
+            "nothing was sent"
         );
     }
 

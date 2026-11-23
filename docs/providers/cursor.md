@@ -43,7 +43,14 @@ to xhigh, `context` 256k or 500k, and `fast`), and BiBCode sets each option on
 its own, so the picker offers every value the CLI lists, Grok 4.7 Low included.
 BiBCode finds Reasoning under the name the session gives it (`effort`,
 `reasoning` or `reasoning_effort`) and sends Extra High as `xhigh` or
-`extra-high`, whichever the model advertises.
+`extra-high`, whichever the model advertises. Setting one option can change
+which values Cursor offers for the next, so BiBCode checks each option against
+Cursor's latest answer before sending it: a value that answer no longer offers
+is refused, and the options already set stay set. A thread or custom model saved
+in the bracketed form, such as `grok-4.7[context=256k,reasoning_effort=high]`,
+runs on these CLIs as its plain model with those values as separate options,
+each checked like any other; an option the turn chooses itself wins. The picker
+does not list such a custom model again beside its plain model.
 
 As a fallback, a Cursor CLI that ignores the request advertises one value per
 model with its options folded in, such as `gpt-5.4-nano[reasoning=medium]`, and
