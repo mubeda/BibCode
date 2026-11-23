@@ -1563,7 +1563,7 @@ impl ProviderRuntimeSupervisor {
         // A stop ends a start that has not returned first: the queue awaits that start. A launch
         // has no turn yet, so an interrupt naming a turn (a late Stop, a compaction's own
         // interrupt) is not aimed at it.
-        let stopped_launch = match &command {
+        let launch = match &command {
             OrchestrationCommand::ThreadTurnInterrupt {
                 thread_id,
                 turn_id: None,
@@ -1572,8 +1572,14 @@ impl ProviderRuntimeSupervisor {
             | OrchestrationCommand::ThreadSessionStop { thread_id, .. } => {
                 self.launch_stops.stop(thread_id, launch_target)
             }
-            _ => false,
+            _ => crate::orchestration::engine::LaunchStopResult::NoLaunch,
         };
+        // Another message's launch is in flight, so the thread has no session the dismissed
+        // message could run in. Queued, the interrupt would wait behind that start.
+        if launch == crate::orchestration::engine::LaunchStopResult::OtherMessage {
+            return Ok(());
+        }
+        let stopped_launch = launch == crate::orchestration::engine::LaunchStopResult::Stopped;
         let result = self
             .request(|response| SupervisorMessage::Handle {
                 command: Box::new(command),
@@ -4545,15 +4551,17 @@ mod workspace_loss_tests {
                     .await
             }
         });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The Dismiss answers at once: it never waits behind the other message's launch.
+        timeout(Duration::from_secs(2), follow_up)
+            .await
+            .expect("the Dismiss follow-up answers while the other launch runs")
+            .unwrap()
+            .expect("the Dismiss follow-up reports no error");
         f.driver.options_release.notify_one();
         let outcome = timeout(Duration::from_secs(5), delivery)
             .await
             .expect("B's delivery ends")
             .unwrap();
-        let _ = timeout(Duration::from_secs(5), follow_up)
-            .await
-            .expect("the follow-up ends");
         assert_ne!(
             outcome,
             ProviderDeliveryOutcome::StoppedUnsent,
@@ -4597,15 +4605,17 @@ mod workspace_loss_tests {
                     .await
             }
         });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The Dismiss answers at once: it never waits behind the other message's launch.
+        timeout(Duration::from_secs(2), follow_up)
+            .await
+            .expect("the Dismiss follow-up answers while the other launch runs")
+            .unwrap()
+            .expect("the Dismiss follow-up reports no error");
         f.driver.options_release.notify_one();
         let outcome = timeout(Duration::from_secs(5), delivery)
             .await
             .expect("A's delivery ends")
             .unwrap();
-        let _ = timeout(Duration::from_secs(5), follow_up)
-            .await
-            .expect("the follow-up ends");
         assert_ne!(
             outcome,
             ProviderDeliveryOutcome::StoppedUnsent,
@@ -4644,7 +4654,14 @@ mod workspace_loss_tests {
                 .supervisor
                 .launch_stops
                 .stop("t1", Some(if own { "reconciling" } else { "another" }));
-            assert_eq!(stopped, own);
+            assert_eq!(
+                stopped,
+                if own {
+                    crate::orchestration::engine::LaunchStopResult::Stopped
+                } else {
+                    crate::orchestration::engine::LaunchStopResult::OtherMessage
+                }
+            );
             if !own {
                 f.driver.start_release.notify_one();
             }

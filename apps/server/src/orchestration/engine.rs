@@ -2038,6 +2038,15 @@ struct RestoreHolds {
     admitted: HashMap<String, usize>,
 }
 
+/// What `LaunchStops::stop` found for the thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchStopResult {
+    NoLaunch,
+    Stopped,
+    /// A launch for another message is in flight; it was left running.
+    OtherMessage,
+}
+
 /// How each launching thread's start is ended from outside the provider supervisor's queue.
 #[derive(Clone, Default)]
 pub(crate) struct LaunchStops(Arc<StdMutex<HashMap<String, LaunchStop>>>);
@@ -2049,18 +2058,19 @@ impl LaunchStops {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Stops the thread's launch whose start has not returned. Whether one was stopped. A stop
-    /// for a dismissed message (`target`) ends only the launch for that message, never the
-    /// launch of the next message the worker claimed meanwhile; a plain stop ends any launch.
-    pub(crate) fn stop(&self, thread_id: &str, target: Option<&str>) -> bool {
+    /// Stops the thread's launch whose start has not returned. A stop for a dismissed message
+    /// (`target`) ends only the launch for that message, never the launch of another message the
+    /// worker claimed; a plain stop ends any launch.
+    pub(crate) fn stop(&self, thread_id: &str, target: Option<&str>) -> LaunchStopResult {
         let stops = self.lock();
-        let stop = stops
-            .get(thread_id)
-            .filter(|stop| target.is_none() || stop.message_id.as_deref() == target);
-        if let Some(stop) = stop {
-            stop.token.cancel();
+        match stops.get(thread_id) {
+            None => LaunchStopResult::NoLaunch,
+            Some(stop) if target.is_none() || stop.message_id.as_deref() == target => {
+                stop.token.cancel();
+                LaunchStopResult::Stopped
+            }
+            Some(_) => LaunchStopResult::OtherMessage,
         }
-        stop.is_some()
     }
 
     /// Stops every launch in flight because the server shuts down: nothing was sent.
