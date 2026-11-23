@@ -866,7 +866,7 @@ async fn probe_one_snapshot(
                     snapshot(
                         definition,
                         true,
-                        version,
+                        redact_secret_version(version, &definition.secret_values),
                         "error",
                         json!({ "status": "unknown" }),
                         default_models,
@@ -997,11 +997,15 @@ async fn probe_one_snapshot(
                     models = discovered;
                     rich_metadata = RichMetadataOutcome::Succeeded;
                 }
+                // `about` returns before the shared check below. Its version, or the
+                // `--version` line when `about` has none, is still a published field.
+                let published_version =
+                    redact_secret_version(about.version.or(version), &definition.secret_values);
                 return ProviderProbeResult::new(
                     snapshot_owned_message(
                         definition,
                         installed,
-                        about.version.or(version),
+                        published_version,
                         status,
                         auth,
                         models,
@@ -1160,14 +1164,9 @@ async fn probe_one_snapshot(
 
     // A CLI that echoes its environment can print a secret shaped like a release number. The
     // raw text is checked, since the parser drops a leading `v` (`v1.2.3` publishes `1.2.3`).
-    let leaks_secret = raw_versions.iter().any(|raw| {
-        definition.secret_values.iter().any(|secret| {
-            raw.contains(secret.as_str())
-                || secret
-                    .strip_prefix('v')
-                    .is_some_and(|bare| !bare.is_empty() && raw.contains(bare))
-        })
-    });
+    let leaks_secret = raw_versions
+        .iter()
+        .any(|raw| text_holds_secret(raw, &definition.secret_values));
     let version = version.filter(|_| !leaks_secret);
     let mut result = ProviderProbeResult::new(
         snapshot(
@@ -2759,6 +2758,21 @@ fn first_line(stdout: &str, stderr: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A stored secret, or the remainder of one after a leading `v`, inside text that would be
+/// published. The leading `v` is included because a version parser may drop it.
+fn text_holds_secret(raw: &str, secrets: &[String]) -> bool {
+    secrets.iter().any(|secret| {
+        raw.contains(secret.as_str())
+            || secret
+                .strip_prefix('v')
+                .is_some_and(|bare| !bare.is_empty() && raw.contains(bare))
+    })
+}
+
+fn redact_secret_version(version: Option<String>, secrets: &[String]) -> Option<String> {
+    version.filter(|value| !text_holds_secret(value, secrets))
+}
+
 /// The first line of a version check. Antigravity's never comes from stderr, where the CLI
 /// may write anything.
 fn version_line(driver: &str, output: &CommandOutput) -> Option<String> {
@@ -3756,6 +3770,140 @@ done
                 );
             }
         }
+    }
+
+    /// Cursor's `about` probe returns before the shared version check. A CLI that prints a
+    /// stored secret as `cliVersion`, or as `--version` when `about` has no version, must not
+    /// publish it. A real `cliVersion` is kept when only `--version` echoes the secret.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cursor_probe_does_not_publish_a_version_that_holds_a_stored_secret() {
+        const MARKER: &str = "test-marker-secret-4417";
+        const DOTTED: &str = "v987.654.321";
+        let root = tempfile::tempdir().expect("inventory root");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let cases = [
+            (
+                "about-version",
+                MARKER,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2026.11.23'; exit 0 ;;\n  about) printf '%s\\n' '{{\"cliVersion\":\"'$CURSOR_KEY'\",\"userEmail\":\"user@example.test\"}}'; exit 0 ;;\nesac\nexit 1\n"
+                ),
+                None,
+            ),
+            (
+                "version-fallback",
+                MARKER,
+                "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' \"$CURSOR_KEY\"; exit 0 ;;\n  about) printf '%s\\n' 'User Email user@example.test'; exit 0 ;;\nesac\nexit 1\n".to_owned(),
+                None,
+            ),
+            (
+                "clean-about",
+                MARKER,
+                "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' \"$CURSOR_KEY\"; exit 0 ;;\n  about) printf '%s\\n' '{\"cliVersion\":\"2026.11.23\",\"userEmail\":\"user@example.test\"}'; exit 0 ;;\nesac\nexit 1\n".to_owned(),
+                Some("2026.11.23"),
+            ),
+            (
+                "v-prefixed",
+                DOTTED,
+                "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2026.11.23'; exit 0 ;;\n  about) printf '%s\\n' '{\"cliVersion\":\"'$CURSOR_KEY'\",\"userEmail\":\"user@example.test\"}'; exit 0 ;;\nesac\nexit 1\n".to_owned(),
+                None,
+            ),
+        ];
+        for (name, secret, script, expected_version) in cases {
+            let executable = root.path().join(format!("cursor-agent-{name}"));
+            crate::test_support::executable_fixture::write_executable(&executable, &script);
+            let settings = json!({
+                "enableProviderUpdateChecks": false,
+                "providerInstances": {
+                    "cursor": {
+                        "driver": "cursor",
+                        "enabled": true,
+                        "config": { "binaryPath": executable },
+                        "environment": [
+                            { "name": "CURSOR_KEY", "value": secret, "sensitive": true },
+                            { "name": "HOME", "value": home, "sensitive": false }
+                        ]
+                    }
+                }
+            });
+            for providers in [
+                probe(
+                    &settings,
+                    Some("cursor"),
+                    root.path(),
+                    &ProviderMaintenance::new(),
+                )
+                .await,
+                probe_full(
+                    &settings,
+                    Some("cursor"),
+                    root.path(),
+                    &ProviderMaintenance::new(),
+                    None,
+                )
+                .await,
+            ] {
+                let published = serde_json::to_string(&providers[0].snapshot).expect("snapshot");
+                assert!(
+                    !published.contains(secret),
+                    "{name}: a stored secret was published: {published}"
+                );
+                if secret.starts_with('v') {
+                    let bare = &secret[1..];
+                    assert!(
+                        !bare.is_empty() && !published.contains(bare),
+                        "{name}: a stored secret was published without its leading v: {published}"
+                    );
+                }
+                assert_eq!(
+                    providers[0].snapshot["version"].as_str(),
+                    expected_version,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// The quick OpenCode probe returns an unsupported version before the shared check. A
+    /// secret shaped like a release number (`123.456.789`, major 123) must not be published.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_quick_opencode_probe_does_not_publish_a_version_that_holds_a_stored_secret() {
+        const DOTTED: &str = "123.456.789";
+        let root = tempfile::tempdir().expect("inventory root");
+        let executable = root.path().join("opencode");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' \"$OPENCODE_KEY\"; exit 0; fi\nexit 1\n",
+        );
+        let settings = json!({
+            "enableProviderUpdateChecks": false,
+            "providerInstances": {
+                "opencode": {
+                    "driver": "opencode",
+                    "enabled": true,
+                    "config": { "binaryPath": executable },
+                    "environment": [{ "name": "OPENCODE_KEY", "value": DOTTED, "sensitive": true }]
+                }
+            }
+        });
+        let providers = probe(
+            &settings,
+            Some("opencode"),
+            root.path(),
+            &ProviderMaintenance::new(),
+        )
+        .await;
+        let snapshot = &providers[0].snapshot;
+        let published = serde_json::to_string(snapshot).expect("snapshot");
+        assert!(
+            !published.contains(DOTTED),
+            "a stored secret was published: {published}"
+        );
+        assert!(snapshot["version"].is_null(), "{snapshot}");
+        assert_eq!(snapshot["status"], "error");
     }
 
     /// An OpenCode 2 server's catalogs, as captured from 2.0.29, behind its `/api/info`.
