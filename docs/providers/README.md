@@ -33,7 +33,8 @@ time runs out, BiBCode stops the process, records the session as failed, and
 shows that the provider did not finish starting, with the command that lists
 its MCP servers and their state where the CLI has one (for example
 `codex mcp list` or `cursor-agent mcp list`). The message that was waiting was
-not sent, so BiBCode sends it again once the provider starts.
+not sent, so BiBCode tries it again a limited number of times; after the last
+try it fails with that message.
 
 ## Tools and Claude Code's own updates
 

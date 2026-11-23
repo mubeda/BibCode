@@ -15,6 +15,11 @@ pub(crate) const CONTEXT_LABEL: &str = "Context";
 pub(crate) const FAST_LABEL: &str = "Fast";
 pub(crate) const THINKING_LABEL: &str = "Thinking";
 
+/// A turn that clears its options asks for the model's defaults, which the session no longer
+/// offers.
+const CLEARED_OPTIONS_UNAVAILABLE_REFUSAL: &str = "This model's default options are no longer available. Choose its options, or choose another \
+     model.";
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorAboutResult {
@@ -370,11 +375,11 @@ pub fn resolve_bracketed_model_options(
         && wanted.is_empty()
         && !candidates.iter().any(|value| keeps_baseline(value))
     {
-        // Cleared options go back to the baseline, which no advertised value holds any more:
-        // refused as a separate option's unadvertised baseline is.
-        return Err(RefusedOption::unusable(format!(
-            "Cursor model config option does not advertise the baseline value {baseline}"
-        )));
+        // Cleared options go back to the baseline, which no advertised value holds any more.
+        return Err(RefusedOption::new(
+            format!("Cursor model config option does not advertise the baseline value {baseline}"),
+            CLEARED_OPTIONS_UNAVAILABLE_REFUSAL,
+        ));
     }
     if let Some(value) = candidates
         .iter()
@@ -1604,7 +1609,7 @@ mod tests {
         let refused =
             resolve_bracketed_model_options(&descriptor, &json!([]), Some("m[reasoning=medium]"))
                 .expect_err("medium is no longer advertised");
-        assert_eq!(refused.refusal, crate::provider::unusable_options_refusal());
+        assert_eq!(refused.refusal, CLEARED_OPTIONS_UNAVAILABLE_REFUSAL);
         // A baseline still advertised is restored.
         let descriptor = json!({
             "id": "model", "category": "model", "currentValue": "m[reasoning=high]",
