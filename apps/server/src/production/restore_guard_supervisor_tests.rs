@@ -173,6 +173,7 @@ async fn an_idle_sibling_session_is_suspended_and_no_path_reopens_it_during_the_
                 fixture.launch("t1", "claude", None),
                 context_handoff,
                 None,
+                None,
                 false,
             )
             .await

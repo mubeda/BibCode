@@ -757,10 +757,15 @@ async fn dispatch_prepared_command(
         OrchestrationCommand::ThreadTurnDeliveryResolve {
             command_id,
             thread_id,
+            message_id,
             action: TurnDeliveryResolutionAction::Dismiss,
             created_at,
-            ..
-        } => Some((command_id.clone(), thread_id.clone(), created_at.clone())),
+        } => Some((
+            command_id.clone(),
+            thread_id.clone(),
+            created_at.clone(),
+            Some(message_id.clone()),
+        )),
         // Closing a chat panel archives it. The server stops its work, including a delivery
         // claimed but not yet visible to clients as a running session.
         OrchestrationCommand::ThreadArchive {
@@ -772,7 +777,7 @@ async fn dispatch_prepared_command(
             .await
             .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
             .filter(|thread| thread.kind == "panel")
-            .map(|_| (command_id.clone(), thread_id.clone(), now_iso())),
+            .map(|_| (command_id.clone(), thread_id.clone(), now_iso(), None)),
         _ => None,
     };
     let is_delivery_resolution = matches!(
@@ -868,15 +873,12 @@ async fn dispatch_prepared_command(
         && accepted_new.load(Ordering::Acquire)
         && should_route
     {
-        if let Some((command_id, thread_id, created_at)) = delivery_cancellation {
+        if let Some((command_id, thread_id, created_at, dismissed)) = delivery_cancellation {
+            // Only the dismissed message's launch is stopped: the worker, woken at the commit,
+            // may already be launching the next message.
             let result = provider
                 .provider
-                .handle_orchestration(OrchestrationCommand::ThreadTurnInterrupt {
-                    command_id: format!("{command_id}:provider-interrupt"),
-                    thread_id,
-                    turn_id: None,
-                    created_at,
-                })
+                .interrupt_after_cancel(command_id, thread_id, created_at, dismissed.as_deref())
                 .await;
             if let Err(error) = result
                 && !matches!(error, ProviderRuntimeError::SessionNotFound { .. })

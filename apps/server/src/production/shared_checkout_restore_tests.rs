@@ -959,7 +959,7 @@ async fn a_sibling_that_starts_writing_after_planning_is_caught_before_the_rewin
 #[tokio::test]
 async fn a_launch_in_flight_makes_the_restore_refuse() {
     let fixture = Fixture::new().await;
-    let launch = fixture.engine.begin_session_launch("b").unwrap();
+    let launch = fixture.engine.begin_session_launch("b", None).unwrap();
     let failure = fixture.revert("a", 1, "full", None).await.unwrap_err();
     assert!(
         detail(&failure).contains("is starting its session"),
@@ -970,13 +970,17 @@ async fn a_launch_in_flight_makes_the_restore_refuse() {
     let gate = fixture.provider.pause_at(Stage::Prepare);
     let outcome = fixture.request_revert("a", 1, "full", None).await;
     entered(&gate).await;
-    let refused = fixture.engine.begin_session_launch("b").err().unwrap();
+    let refused = fixture
+        .engine
+        .begin_session_launch("b", None)
+        .err()
+        .unwrap();
     assert!(refused.contains("restoring files"), "{refused}");
     // The restoring thread's own reopen is not held.
-    assert!(fixture.engine.begin_session_launch("a").is_ok());
+    assert!(fixture.engine.begin_session_launch("a", None).is_ok());
     gate.release.notify_one();
     outcome.await.unwrap().unwrap();
-    assert!(fixture.engine.begin_session_launch("b").is_ok());
+    assert!(fixture.engine.begin_session_launch("b", None).is_ok());
     fixture.shutdown().await;
 }
 
