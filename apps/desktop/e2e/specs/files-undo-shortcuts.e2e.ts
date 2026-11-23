@@ -546,6 +546,7 @@ function cellName({ view, direction, path, chord, redoAfter, edit }: Cell): stri
 async function measureCell(cell: Cell): Promise<void> {
   const name = `undo-${cellName(cell)}`;
   const fileName = await openFreshFile(cell.view, name);
+  if (cell.path !== "driver") await giveNativeFocus(editorQuery(cell.view));
   const unseededText = (await readState(cell.view, fileName)).text;
   // A formatting step shows in the text as the heading's own block, so it is read from the HTML.
   const marker = cell.edit === "format" ? "<h2" : cell.view === "source" ? "kq" : "kqv";
@@ -666,6 +667,7 @@ async function measureCell(cell: Cell): Promise<void> {
  */
 async function measureTwoSteps(view: View, path: InputPath): Promise<void> {
   const fileName = await openFreshFile(view, `undo-two-steps-${view}-${path}`);
+  await giveNativeFocus(editorQuery(view));
   await placeCaretAtEnd(view, fileName);
   typeNative("kq");
   await browser.waitUntil(async () => (await readState(view, fileName)).text.includes("kq"));
@@ -700,6 +702,7 @@ async function measureTwoSteps(view: View, path: InputPath): Promise<void> {
  */
 async function measureCommentIndependence(path: InputPath, direction: Direction): Promise<void> {
   const fileName = await openFreshFile("source", `undo-comment-${path}-${direction}`);
+  await giveNativeFocus(sourceHostSelector);
   await placeCaretAtEnd("source", fileName);
   typeNative("kq");
   await browser.waitUntil(async () => (await readState("source", fileName)).text.includes("kq"));
@@ -828,6 +831,9 @@ async function measureTextField(
       area.focus();
     }, probeTextareaId);
   }
+  if (path !== "driver") {
+    await giveNativeFocus(kind === "composer" ? composerSelector : `#${probeTextareaId}`);
+  }
   if (path === "driver") {
     if (kind === "composer") await browser.$(composerSelector).addValue("cmpq");
     else await browser.$(`#${probeTextareaId}`).addValue("cmpq");
@@ -876,6 +882,7 @@ async function recordTerminalChord(sent: Chord = "primary+z"): Promise<void> {
   await openCenterTerminal();
   const input = await browser.$(".xterm-helper-textarea");
   await input.waitForExist();
+  await giveNativeFocus(".xterm");
   await browser.execute(() =>
     document.querySelector<HTMLElement>(".xterm-helper-textarea")?.focus(),
   );
@@ -998,6 +1005,7 @@ function nativeClickAtScreen(screen: { x: number; y: number; scale: number }): v
  */
 async function measureLinkField(path: InputPath): Promise<void> {
   const fileName = await openFreshFile("rendered", `undo-link-${path}`);
+  await giveNativeFocus(richEditorSelector);
   await placeCaretAtEnd("rendered", fileName);
   typeNative("kqv");
   await browser.waitUntil(async () => (await readState("rendered", fileName)).text.includes("kqv"));
@@ -1324,9 +1332,18 @@ async function measurePreviewPaint(): Promise<void> {
   });
   const reports = await startPreviewReports();
   try {
+    const focusedBefore = await browser.execute(() => document.hasFocus());
     await armPreviewObserver(fileName, reports.url, "paint");
     await browser.$('button[aria-label="Open file in preview browser"]').click();
     const closed = await awaitPreviewClosed(reports);
+    // The preview took keyboard focus when it opened; closing it must hand focus back.
+    const focusedAfter = await browser
+      .waitUntil(() => browser.execute(() => document.hasFocus()), { timeout: 3_000 })
+      .then(
+        () => true,
+        () => false,
+      );
+    recordEvidence({ cell: "preview-close-returns-focus", focusedBefore, focusedAfter });
     const result = await checkPreviewPaint(
       fileName,
       await new Promise<PreviewReport | undefined>((resolve) =>
@@ -1339,6 +1356,8 @@ async function measurePreviewPaint(): Promise<void> {
       sized: true,
       closed: "closed",
     });
+    // Asserted where it was found; elsewhere the evidence shows whether the bug exists there.
+    if (platform === "linux") expect(focusedAfter).toBe(true);
   } finally {
     reports.close();
   }
@@ -1352,10 +1371,16 @@ function fileTabXPath(fileName: string): string {
 /** The source view's state once Files shows the file again, after the preview had its place. */
 async function readFilesAfterPreview(fileName: string): Promise<EditorState> {
   await browser.$(fileTabXPath(fileName)).click();
+  // The remounted editor shows its text before the toolbar learns its history, so both callers'
+  // history (an undo or redo step) is waited for; a history really lost stays empty and fails.
   await browser
-    .waitUntil(async () => (await readState("source", fileName)).text.length > 0, {
-      timeout: 10_000,
-    })
+    .waitUntil(
+      async () => {
+        const state = await readState("source", fileName);
+        return state.text.length > 0 && (state.canUndo || state.canRedo);
+      },
+      { timeout: 10_000 },
+    )
     .catch(() => undefined);
   return readState("source", fileName);
 }
@@ -1430,6 +1455,32 @@ async function centreOf(query: string): Promise<{ x: number; y: number }> {
   }, query);
   if (!centre) throw new Error(`Nothing visible matched ${query}.`);
   return centre;
+}
+
+/** The editing host of the `view` view, for a native click into it. */
+function editorQuery(view: View): string {
+  return view === "source" ? sourceHostSelector : richEditorSelector;
+}
+
+/**
+ * Clicks the centre of `query` natively, as a person does before typing. GTK keyboard focus moves
+ * only with a real click: a WebDriver click or `element.focus()` leaves it where it was, such as
+ * in a preview webview an earlier cell opened, and native keys then reach nothing. Callers still
+ * place focus and the caret through the page afterwards, since the click moves the caret.
+ */
+async function giveNativeFocus(query: string): Promise<void> {
+  // shortcut: Linux only, the platform where native focus was found lost; widen if another shows it.
+  if (platform !== "linux") return;
+  const centre = await centreOf(query);
+  // The calibration click is the focusing click; a second one lands it on target if it was off.
+  const offset = await measureNativeClickOffset(centre);
+  if (Math.hypot(offset.x, offset.y) > 4) {
+    nativeClickAtScreen(await screenPointOf({ x: centre.x + offset.x, y: centre.y + offset.y }));
+  }
+  await browser.waitUntil(() => browser.execute(() => document.hasFocus()), {
+    timeout: 3_000,
+    timeoutMsg: `The native click on ${query} did not give the main webview keyboard focus.`,
+  });
 }
 
 /**
@@ -1525,6 +1576,7 @@ async function measurePreviewFallback(path: InputPath): Promise<void> {
     extension: "html",
     content: previewProbePage(reports.url),
   });
+  await giveNativeFocus(sourceHostSelector);
   await placeCaretAtEnd("source", fileName);
   typeNative("kq");
   await browser.waitUntil(async () => (await readState("source", fileName)).text.includes("kq"));

@@ -3956,13 +3956,16 @@ sizes. Cover relevant:
   with `SendKeys` through PowerShell, opens **Edit** with F10 when UI
   Automation finds no menu item, and clicks through `user32`. On Linux it uses
   `xdotool` under Xvfb and has no menu cells, because the Linux Edit menu has
-  no Undo or Redo item. Native cells cover two steps undone one at a time,
+  no Undo or Redo item. GTK keyboard focus follows only a real click, so each
+  Linux native cell first clicks its target natively and fails if the main
+  page still lacks focus, rather than typing into nothing. Native cells cover two steps undone one at a time,
   redo with two pending redo entries, a formatting step, the chat composer, a
   plain textarea, the inline comment field, the Link URL field, and the
   terminal keeping Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y off macOS. A driver cell
   opens a local HTML file in the preview browser and fails unless the page
   loads and its native screenshot shows the probe page's colour over the whole
-  slot. While the preview's child webview is open the embedded WebDriver finds
+  slot, and, on Linux, unless the main page has keyboard focus again once the
+  preview closed. While the preview's child webview is open the embedded WebDriver finds
   no window, so the page reports the preview's events to the spec over a
   loopback endpoint and closes that webview before WebDriver resumes. Native
   cells then type into the preview page and undo there, and, on macOS, check

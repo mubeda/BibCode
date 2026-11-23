@@ -518,11 +518,13 @@ impl Drop for CreationLease {
         // Drop must stay best-effort and must never replace an active panic.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(webview) = self.child.as_ref() {
+                super::platform::return_focus(webview);
                 let _ = webview.close();
             } else if self.creation_attempted {
                 // The label was absent before add_child and remains reserved by
                 // this incarnation, so a newly registered child is ours.
                 if let Some(webview) = self.app.webviews().get(&self.label) {
+                    super::platform::return_focus(webview);
                     let _ = webview.close();
                 }
             }
@@ -983,6 +985,13 @@ pub fn create_tab(
             }
         });
 
+    // shortcut: main frame only, so a text field inside an iframe keeps a dead Ctrl+Z; use
+    // `initialization_script_for_all_frames` if pages in frames need it.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.initialization_script(include_str!("linux_text_field_undo.js"));
+    }
+
     // Preview browsing data is isolated from the main application session and,
     // per environment, from other environments' previews.
     #[cfg(target_os = "macos")]
@@ -1085,6 +1094,7 @@ pub fn create_tab(
                 if snapshot.1 {
                     webview.show()
                 } else {
+                    super::platform::return_focus(&webview);
                     webview.hide()
                 }
             });
@@ -1260,6 +1270,7 @@ pub fn set_bounds(
         if current.visible {
             current.webview.show().map_err(|error| error.to_string())?;
         } else {
+            super::platform::return_focus(&current.webview);
             current.webview.hide().map_err(|error| error.to_string())?;
         }
 
@@ -1309,7 +1320,10 @@ pub fn close_tab(app: &AppHandle, tab_id: &str) -> Result<(), String> {
     let close_result = app
         .webviews()
         .get(&label)
-        .map(|webview| webview.close().map_err(|error| error.to_string()))
+        .map(|webview| {
+            super::platform::return_focus(webview);
+            webview.close().map_err(|error| error.to_string())
+        })
         .unwrap_or(Ok(()));
 
     let mut registry = state.0.lock().map_err(|error| error.to_string())?;
