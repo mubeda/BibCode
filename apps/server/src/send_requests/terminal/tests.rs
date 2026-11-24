@@ -169,6 +169,21 @@ impl Fixture {
         self.request(request_id).await.state
     }
 
+    /// A stream on thread `api` that has sent its snapshot. It subscribes to changes
+    /// before the snapshot, so every change after this returns reaches it as an upsert.
+    async fn subscribed(&self) -> tokio::sync::mpsc::Receiver<crate::rpc::RpcStreamChunk> {
+        let mut stream =
+            self.service
+                .subscribe(&person(), Some("api".to_owned()), CancellationToken::new());
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+            .await
+            .expect("the snapshot")
+            .expect("the stream stays open")
+            .expect("not an error");
+        assert_eq!(snapshot[0]["type"], "snapshot");
+        stream
+    }
+
     async fn until_state(&self, request_id: &str, state: SendState) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while self.state(request_id).await != state {
@@ -858,10 +873,7 @@ async fn cancel_racing_a_pointer_paste_has_exactly_one_winner() {
 async fn a_subscribed_stream_sees_every_terminal_transition_without_a_reload() {
     let fixture = fixture(true).await;
     fixture.start();
-    let mut stream =
-        fixture
-            .service
-            .subscribe(&person(), Some("api".to_owned()), CancellationToken::new());
+    let mut stream = fixture.subscribed().await;
     let mut states = Vec::new();
     let mut next_state = async || loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.recv())
@@ -995,10 +1007,7 @@ async fn a_server_restart_fails_open_terminal_requests() {
 async fn generation_end_is_published_to_a_subscribed_stream() {
     let fixture = fixture(true).await;
     fixture.start();
-    let mut stream =
-        fixture
-            .service
-            .subscribe(&person(), Some("api".to_owned()), CancellationToken::new());
+    let mut stream = fixture.subscribed().await;
     fixture.send(review("r1")).await.unwrap();
     fixture.end("term-1", End::Close);
     let state = tokio::time::timeout(Duration::from_secs(5), async {
