@@ -1,5 +1,44 @@
 # Changelog
 
+## [v0.18.0] - 2026-11-24
+
+BiBCode v0.18.0 adds Antigravity AI Terminal and ACP chat support, remote branch deletion in the Git Manager, desktop and keyboard undo/redo in the Files editor and preview browser, Cursor's parameterized model picker, a Linux software-rendering option for WebKitGTK compositor hangs, and fixes provider startup cancellation, late Stop handling, preview focus return, and AppImage packaging. This release includes PRs #420 and #423 since v0.17.0.
+
+### Antigravity
+
+- Added Antigravity as an AI Terminal and ACP chat provider, with model and effort selection and an opt-in usage indicator in the agent status bar. (#399)
+- BiBCode never answers Antigravity permission requests automatically: full access uses the CLI's own `auto` mode, auto-accept-edits uses `accept-edits`, and approval-required uses `default`, with each mode confirmed by the CLI.
+- The Antigravity settings card states Google's written position on third-party CLI wrappers on consumer plans, surfaces disabled-account errors distinctly, and reports BiBCode's real version in the ACP handshake.
+
+### Git Manager and Source Control
+
+- Delete a remote branch from the Git Manager branch list. Deletion refuses unsafe configurations (non-standard fetch refspecs, multiple URLs, `pushurl`/`pushInsteadOf`, remote groups, nested remote names, symbolic refs, truncated git output, or `GIT_CONFIG` overrides) and pushes with `--force-with-lease` against the displayed tip. Covers block reasons in dialogs, toolbar sign-in, tag/branch disambiguation, remote default-branch protection, upstream selection, MCP check ordering, and `/HEAD`-suffixed names. (#397, #401–#407)
+- **View PR** opens the in-app PR/MR panel when targeting the current repository, while **Open PR in browser** keeps the external browser action. (#400)
+
+### Files editor and preview
+
+- Undo and redo work from keyboard shortcuts and the desktop **Edit** menu across macOS, Windows, and Linux, including `Ctrl+Z` in Linux text fields and inside the preview browser. (#398, #408)
+- Closing a preview returns keyboard focus to the main window on Linux and Windows instead of leaving focus on the bare window frame.
+- Preview webview calls on macOS no longer leak native retains, the preview browser renders in packaged E2E builds, the main window remains discoverable after opening a preview, and packaged E2E runs no longer probe real host tools. (#409, #410, #417, #418)
+
+### Providers and Stop reliability
+
+- Cursor chats now request the CLI's parameterized model picker so every listed model and option (such as effort or fast variants) can be selected while sending only session-advertised values; older CLIs keep the bracketed fallback and saved bracketed selections remain openable. A stopped Cursor turn ends once and is never resent, and 5 minutes of silence displays a status notice while continuing to wait. (#416)
+- Slow provider starts display a notice after 60 s (Cursor, Antigravity) or 120 s (other providers) while continuing to wait. Stop, closing a session, deleting a thread, and shutdown cancel a hung start cleanly without resending or reporting a spurious error.
+- Dismissing a queued message cancels only that message's start, and a message dismissed after freezing for delivery is not sent.
+- A late Stop naming an already-finished turn is resolved once when committed—returning done without reaching the provider, expiring requests, holding the queue, or disturbing compaction.
+- Claude AI Terminals keep status hooks on Claude Code up to 2.1.330.
+
+### Desktop and Linux packaging
+
+- Added a Linux software-rendering setting to mitigate WebKitGTK compositor hangs on affected GPUs. (#411)
+- `bibcode://` links launch from an extracted Linux AppDir, foreign AppImage library paths are not inherited, and AppImage helper tooling respects `CARGO_TARGET_DIR`. (#412, #413, #415)
+- Cancellation now interrupts supervised subprocess spawn retries on macOS and Linux, and prevents queued Windows spawns from starting (an already-running Windows `CreateProcess` still finishes before the child is stopped). (#414)
+
+### CI and tests
+
+- Seeded packaged upgrade builds drop workspace and patched `portable-pty` Cargo fingerprints between sequential builds so shared target reuse never mixes checkouts, and the racing terminal send-request cancel test counts writes before initiating the send. (#423)
+
 ## [v0.17.0] - 2026-11-19
 
 BiBCode v0.17.0 adds Send to agent and agent messaging, approval, question and plan-review cards for Claude chats, read-only Codex chat reviews, a "Codex default" model that follows Codex's own choice, the server's own terminal and new branch and merge actions in the Git Manager, and fixes a Claude turn that stayed "running" after a background task, a chat timeline that jumped to the top and a blank PDF preview on macOS. This release includes PRs #370, #373, #379 and #387 since v0.16.0.
