@@ -2166,6 +2166,34 @@ export async function prepareSeededUpgradeBuild(
   await assertSeededUpgradeBuildVersion(input);
 }
 
+/**
+ * The protected baseline is the candidate's source stamped with the previous-stable version, so
+ * it shares that build's workspace crate versions, and Cargo's mtime check took previous-stable's
+ * server as fresh and linked it into the protected build. Dropping only the workspace crates'
+ * fingerprints rebuilds them from this checkout while registry dependencies stay shared.
+ */
+export async function dropWorkspaceFingerprints(
+  cargoTargetDirectory: string,
+  platform: SeededUpgradePlatform,
+  arch: SeededUpgradeArch,
+): Promise<void> {
+  const fingerprints = NodePath.join(
+    cargoTargetDirectory,
+    seededUpgradeRustTarget(platform, arch),
+    "release",
+    ".fingerprint",
+  );
+  const entries = await NodeFS.promises.readdir(fingerprints).catch(() => []);
+  for (const entry of entries) {
+    if (/^bibcode-(server|desktop)-[0-9a-f]+$/.test(entry)) {
+      await NodeFS.promises.rm(NodePath.join(fingerprints, entry), {
+        recursive: true,
+        force: true,
+      });
+    }
+  }
+}
+
 const buildPackagedApplication = async (input: {
   readonly arch: SeededUpgradeArch;
   readonly artifactDirectory: string;
@@ -2190,6 +2218,7 @@ const buildPackagedApplication = async (input: {
   );
   // Tauri adds to an existing bundle directory, so clear only it; Cargo's state stays reusable.
   await NodeFS.promises.rm(sharedBundle, { recursive: true, force: true });
+  await dropWorkspaceFingerprints(input.cargoTargetDirectory, input.platform, input.arch);
   await runTimedBuildCommand({
     artifactDirectory: input.artifactDirectory,
     command: seededUpgradeVitePlusExecutable,

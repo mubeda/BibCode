@@ -375,7 +375,10 @@ server versions describe the same build. The calling checkout is not rewritten.
 
 The three packages compile sequentially into one shared Cargo target under the
 isolated run root; the workflow's cached repository `target` does not warm it.
-The later builds reuse the first build's registry dependencies, and after each
+The later builds reuse the first build's registry dependencies. Before each
+build the harness drops the workspace crates' Cargo fingerprints, because the
+protected baseline and previous-stable share a version and Cargo would otherwise
+link one checkout's server into the other's package. After each
 build the harness renames its whole bundle directory into that build's own
 artifact root, so packages never mix. The macOS packaging children have a 90-minute bound, Windows
 children 60 minutes, and Linux children 45 minutes. Each checkout's frozen dependency install retains
