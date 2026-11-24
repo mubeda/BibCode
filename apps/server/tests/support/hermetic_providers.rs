@@ -1,8 +1,8 @@
 //! Test-only settings that keep provider probing, provider update checks, and
 //! hosting-CLI discovery confined to fixtures.
 //!
-//! No test may resolve `claude`, `codex`, `opencode`, `cursor-agent`, or
-//! `grok` from the host's real `PATH`, and no test may reach the network for
+//! No test may resolve `claude`, `codex`, `opencode`, `cursor-agent`, `grok`,
+//! or `agy` from the host's real `PATH`, and no test may reach the network for
 //! a version/update check. See `docs/testing/README.md`.
 //!
 //! Integration binaries include this file with
@@ -25,8 +25,14 @@ use serde_json::{Map, Value, json};
 /// Keep this list checked against the server's settings and inventory by
 /// `test_support::tests::hermetic_helper_pins_every_provider_driver_the_server_defines_as_built_in`,
 /// which fails if a driver is added or removed without updating this list.
-pub(crate) const BUILTIN_PROVIDER_DRIVERS: &[&str] =
-    &["codex", "claudeAgent", "cursor", "grok", "opencode"];
+pub(crate) const BUILTIN_PROVIDER_DRIVERS: &[&str] = &[
+    "codex",
+    "claudeAgent",
+    "cursor",
+    "grok",
+    "opencode",
+    "antigravity",
+];
 
 /// An absolute, absent path in a test-owned sandbox. Executable resolution
 /// must not fall back to PATH when this path is missing.
@@ -50,7 +56,7 @@ pub(crate) fn missing_hosting_executable_dir(sandbox: &Path) -> PathBuf {
 }
 
 /// Settings that explicitly preserve the built-in enabled defaults (Codex,
-/// Claude, Cursor, and OpenCode enabled; Grok disabled) in both settings readers,
+/// Claude, Cursor, and OpenCode enabled; Grok and Antigravity disabled) in both settings readers,
 /// while pinning each legacy `binaryPath` to [`missing_provider_executable`] and
 /// disabling the update check that would otherwise call registry.npmjs.org /
 /// downloads.claude.ai.
@@ -70,6 +76,7 @@ pub(crate) fn hermetic_provider_settings(sandbox: &Path) -> Value {
         ("cursor", true),
         ("grok", false),
         ("opencode", true),
+        ("antigravity", false),
     ] {
         providers.insert(
             driver.to_owned(),

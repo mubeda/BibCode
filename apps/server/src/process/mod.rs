@@ -10,6 +10,8 @@ pub(crate) mod supervised;
 #[cfg(windows)]
 mod windows_job;
 
+#[cfg(target_os = "linux")]
+pub use appimage::appimage_bundle_overrides;
 pub use appimage::{ChildCommand, EnvironmentInheritance, isolate_appimage_environment};
 
 #[cfg(windows)]

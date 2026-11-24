@@ -253,8 +253,9 @@ When Claude reports no models there, BiBCode offers its built-in catalog, which
 lists only the options above. A turn whose options the session refuses, for
 example one saved while an older catalog offered another option, is not retried:
 its delivery fails once and the thread shows **Delivery failed** with the
-reason, such as "Fast Mode is not supported by the selected model." Choose
-another model or option, then send the message again.
+reason, such as "Fast Mode is not supported by the selected model. Choose
+another option for this model." Choose another model or option, then send the
+message again.
 
 ## Approvals and questions
 

@@ -3322,7 +3322,19 @@ Requests also settle without an answer:
 
 - **The user stops it.** A turn interrupt or a `thread.session.stop` expires
   the thread's open requests in the same commit (`reason: "stopped"`), for
-  every provider.
+  every provider. One rule guards a late Stop: an interrupt is stale when it
+  names a turn and the session's active turn is a different one. A stale
+  interrupt expires no request, holds no queue, does not ask a running
+  compaction to stop, and is not routed to the provider supervisor, whose
+  driver would otherwise stop the turn running now. The engine reads the
+  active turn inside the interrupt's own transaction and returns its decision
+  to the RPC layer with the dispatch result; the supervisor, which reads the
+  session later, never judges it again, and a live interrupt always reaches
+  the driver. Any
+  other interrupt, one naming the active turn, one sent while no turn is
+  active, or one naming no turn, expires every open request on the thread,
+  whatever turn a request was recorded under: a Codex child agent asks under
+  its own turn, and OpenCode keeps the turn of a request asked before a resume.
 - **An in-process provider's session ends.** A `thread.session-set` to
   `error`, `interrupted`, `stopped` or `idle` that moves a Codex or Claude
   session out of `running` or `starting` (read in the same transaction)
@@ -3407,7 +3419,8 @@ send the message later (OpenCode answering 408 or 429) leaves it definitely not
 sent too; its next attempt waits for the backoff and for any `Retry-After` it
 named, capped at 30 seconds. The delivery detail is what the turn shows, so every one is plain text from a single
 formatter that names the provider by its instance label, never by a driver id:
-the refusal itself, such as "Fast Mode is not supported by the selected model.";
+the refusal itself, such as "Fast Mode is not supported by the selected model.
+Choose another option for this model.";
 for a spawn failure, that the provider could not start and why; for an uncertain
 delivery, that the Claude instance never confirmed a written message, or that
 BiBCode can't check after a restart whether a provider without exact
@@ -3849,7 +3862,9 @@ they compact are not guarded.
 **Stop.** `thread.turn.interrupt` is admitted without a running turn. In its
 transaction a `requested` row settles `interrupted` (nothing was sent); a
 `running` or `unresolved` row gets `stop_requested`, the runtime interrupts its
-turn, and the row settles `interrupted` when that turn or its session ends.
+turn, and the row settles `interrupted` when that turn or its session ends. A
+stale interrupt, one naming a turn other than the session's active turn, does
+neither.
 
 **Restart.** Startup reconciliation, which treats every provider session as
 ended when BiBCode stopped, settles every unsettled row `interrupted` before
@@ -5545,6 +5560,37 @@ environment's cache.
 boolean `force`. Omitting `force`, or sending `false`, uses the normal refresh
 throttle; `force: true` starts an explicit fetch even inside that interval.
 The default preserves compatibility for older clients.
+
+Antigravity reports its account quota as several groups (one per model family,
+each with a 5-hour and a weekly window), carried in the snapshot's optional
+`windowGroups`. Its snapshot appears in a response only when the request names
+`antigravity`: both `server.getProviderUsage` (optional `providers` input) and
+`server.refreshProviderUsage` answer a request that omits the list, and the
+usage nested in the Codex reset result, with Claude and Codex alone, so an older
+client never receives a provider it cannot decode. The status bar asks for
+Antigravity in its own request and read, with its own pending state, and stops
+polling a server whose answer has no Antigravity entry. The server runs one
+Antigravity attempt at a time as a task no caller owns: every request that
+arrives while it runs (forced or not) waits for that attempt, the result is
+committed once even when every caller went away, and a cancelled caller never
+stops the CLI. Automatic refreshes run the CLI at most once per five minutes,
+counted from the end of an attempt that ran the usage command; a result that
+ran nothing (instance off, CLI missing, version not confirmed) starts no
+cooldown. A forced refresh bypasses the cooldown. The global 30-second throttle
+covers Claude and Codex only, also inside a request that names Antigravity too.
+The CLI runs only when the default Antigravity instance is on, with that
+instance's environment including its stored secrets, and only after
+`--version` of the same resolved executable proves CLI 1.1.11 or newer; both
+runs get a null stdin. The service owns each attempt: one 20-second deadline
+covers the settings read, both runs and their cleanup, cancels through the
+supervisor so no descendant survives, and stops the task before another attempt
+may start; runtime shutdown closes admission and drains a running attempt
+before process ownership is frozen. The cooldown starts only when the usage
+command was spawned. An executable replaced at its resolved path between the
+version probe and the usage run is not detected: the configured binary is
+trusted as the chat provider trusts it. Antigravity data older than 30 minutes, including data
+retained on an error, is dropped and reads as out of date. The design is in
+`docs/plans/2026-11-21-antigravity-usage-design.md`.
 
 Forced refresh changes admission only. It does not authorize credential
 mutation or account management: provider usage fetchers remain observers of

@@ -102,6 +102,16 @@ describe("StatusBarSettingsSection", () => {
     expect(h.updateSettings).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps the Antigravity opt-in out of the status bar item list", () => {
+    render();
+    const antigravity = control("switch", "Show Antigravity usage");
+    expect(antigravity.props.checked).toBe(false);
+    invoke(antigravity, "onCheckedChange", true);
+    // Its own flag: an older client resets the whole item list when it meets an unknown literal.
+    expect(h.updateSettings).toHaveBeenCalledWith({ showAntigravityUsage: true });
+    expect(DEFAULT_UNIFIED_SETTINGS.statusBarItems).not.toContain("antigravity");
+  });
+
   it("updates indicator visibility in canonical order regardless of interaction order", () => {
     render({
       ...DEFAULT_UNIFIED_SETTINGS,

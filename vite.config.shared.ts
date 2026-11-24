@@ -43,6 +43,9 @@ export const coverageExclude = [
   // Classic browser script evaluated in node:vm by scripts/lib/theme-bootstrap.test.ts;
   // V8 coverage does not attribute those executions to this static asset's file path.
   "apps/web/public/theme-bootstrap.js",
+  // Injected into Linux preview pages and evaluated with new Function by
+  // apps/desktop/e2e/support/linux-text-field-undo.test.ts; V8 cannot attribute that to the file.
+  "apps/desktop/src-tauri/src/preview/linux_text_field_undo.js",
   "apps/web/src/lib/vendor/qrcodegen.ts",
   "apps/web/src/routeTree.gen.ts",
 ] as const;

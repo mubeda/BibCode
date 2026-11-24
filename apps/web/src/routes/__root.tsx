@@ -17,6 +17,7 @@ import { CommandPalette } from "../components/CommandPalette";
 import { AppStatusBar, SlowRequestsStatusBar } from "../components/status-bar/AppStatusBar";
 import { RelayClientInstallDialog } from "../components/cloud/RelayClientInstallDialog";
 import { SshPasswordPromptDialog } from "../components/desktop/SshPasswordPromptDialog";
+import { useEditMenuActions } from "../components/files/editMenuHistory";
 import { ExternalUpdateNotice } from "../components/ExternalUpdateNotice";
 import { UnsavedChangesCloseHost } from "../components/files/UnsavedChangesCloseDialog";
 import { ProviderUpdateLaunchNotification } from "../components/ProviderUpdateLaunchNotification";
@@ -61,6 +62,7 @@ import { useAtomCommand } from "../state/use-atom-command";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import {
   primaryServerConfigAtom,
+  primaryServerKeybindingsAtom,
   primaryServerConfigEventAtom,
   primaryServerWelcomeAtom,
 } from "../state/server";
@@ -181,6 +183,8 @@ export const Route = createRootRoute({
 });
 
 function RootRouteView() {
+  // The Edit menu reaches every route, /pair and sign-in included, so its listener lives here.
+  useEditMenuActions(useAtomValue(primaryServerKeybindingsAtom));
   const presentation = readCurrentEnvironmentPresentationPolicy();
   const pathname = useLocation({ select: (location) => location.pathname });
   const { authGateState } = Route.useRouteContext();

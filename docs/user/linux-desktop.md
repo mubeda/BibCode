@@ -32,3 +32,38 @@ On a Wayland session this uses Xwayland and may bring back the fractional-scalin
 issue. Launch without `BIBCODE_GDK_BACKEND` to restore automatic backend
 selection; remove the variable from your environment or launcher if you saved it
 there.
+
+## Disable GPU compositing
+
+On some Intel integrated GPUs the graphics driver can hang while BiBCode draws
+its window, and on a compositor such as Hyprland that ends the whole desktop
+session. If that happens, turn on **Settings > Appearance > Rendering > Disable
+GPU compositing** and restart BiBCode. The window is then drawn by the CPU,
+which can be slower, so leave it off unless you need it.
+
+The setting applies however BiBCode starts: from the application menu, from the
+binary itself, or from a `bibcode://` link. It is stored as
+`"linuxSoftwareRendering": true` in `~/.bibcode/userdata/desktop-settings.json`
+(under `$BIBCODE_HOME` if you set it). A `BIBCODE_HOME` exported in one shell
+only applies to launches from that shell. If no window can be shown, edit that
+file, or start BiBCode once with the setting forced on:
+
+```sh
+BIBCODE_SOFTWARE_RENDERING=1 /path/to/BiBCode.AppImage
+```
+
+`BIBCODE_SOFTWARE_RENDERING=0` makes BiBCode leave the GPU settings alone for
+that launch. While either value is set, Settings shows the switch as disabled.
+
+With the setting on, BiBCode sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` and
+`WEBKIT_DISABLE_DMABUF_RENDERER=1` for itself before it opens a window. A
+value you exported yourself for either variable is kept as it is, and Settings
+names it: the switch cannot change it until you remove it. Programs
+started from BiBCode's terminals inherit the two variables, so another BiBCode
+started from such a terminal also runs without GPU compositing until you start
+it from elsewhere.
+
+A `bibcode://` link starts BiBCode when it is closed, from the AppImage and
+from an extracted AppDir. Started from an AppDir without its `AppRun`, as the
+link handler does, BiBCode restarts itself through `AppRun`, so it runs as it
+does from the application menu.

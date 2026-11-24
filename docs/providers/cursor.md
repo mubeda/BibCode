@@ -27,7 +27,89 @@ BiBCode starts `cursor-agent acp` and communicates through the Agent Client
 Protocol (ACP). It initializes the connection, authenticates with the
 `cursor_login` method, and creates or loads a Cursor session for the active
 workspace. Provider inventory uses `cursor-agent about` for installation and
-authentication status and queries ACP for available models.
+authentication status and queries ACP for available models. A Cursor that
+reports itself signed in can still require a browser sign-in when it gets a
+prompt: it opens a Cursor sign-in page and sends nothing until you finish it.
+
+The model picker lists each Cursor model once, by its base name, with its
+reasoning, context, fast and thinking options. BiBCode sends the session only a
+model value the session advertises, and only option values it advertises.
+BiBCode asks Cursor for its parameterized model picker
+(`clientCapabilities._meta.parameterizedModelPicker` in `initialize`, both in
+the runtime and in the inventory's session read). Cursor CLIs that honor it,
+such as 2026.11.22, advertise plain model names; once a model is set, the
+session advertises its options separately (for Grok 4.7: `reasoning_effort` low
+to xhigh, `context` 256k or 500k, and `fast`), and BiBCode sets each option on
+its own, so the picker offers every value the CLI lists, Grok 4.7 Low included.
+BiBCode finds Reasoning under the name the session gives it (`effort`,
+`reasoning` or `reasoning_effort`) and sends Extra High as `xhigh` or
+`extra-high`, whichever the model advertises. Setting one option can change
+which values Cursor offers for the next, so BiBCode checks each option against
+Cursor's latest answer before sending it: a value that answer no longer offers
+is refused, and the options already set stay set. A thread or custom model saved
+in the bracketed form, such as `grok-4.7[context=256k,reasoning_effort=high]`,
+runs on these CLIs as its plain model with those values as separate options,
+each checked like any other; an option the turn chooses itself wins. The picker
+does not list such a custom model again beside its plain model.
+
+As a fallback, a Cursor CLI that ignores the request advertises one value per
+model with its options folded in, such as `gpt-5.4-nano[reasoning=medium]`, and
+rejects a plain model name; BiBCode then sends that advertised value. With these
+CLIs the picker offers each model only the
+option values an advertised value carries, and only options it can offer
+together: when the CLI advertises some combinations of two options but not
+others, such as High reasoning only with Fast on, the picker shows one of them
+and Cursor's advertised value decides the other. A model the CLI advertises as a
+plain value, such as Auto, keeps its place without options, and a custom model
+appears only when the CLI advertises it. Older CLIs that advertise plain values
+and separate options work as the parameterized picker does.
+
+In every mode, provider inventory opens one empty Cursor session per CLI
+version, model list and instance environment to read the advertised values
+(Cursor does not list empty sessions); refreshes at the same time share that one
+read, and a read that fails is not tried again for a few minutes, while the
+model list is published without it. An option value the session does not
+advertise, such as one saved from an older catalog, is refused before the turn
+is sent with a message naming it and saying to choose another option, as is a
+model the session does not offer. Clearing a model's options goes back to the
+values Cursor offered when the session started. When Cursor no longer offers
+those values, it keeps the ones it uses now, BiBCode sends no change, and the
+chat shows "Cursor no longer offers this model's previous default options, so it
+keeps its current ones." Auto, and a thread with no model selected, sends the
+session's advertised Auto value (`default`, or `default[...]` in the fallback),
+so it never runs the model the CLI last remembered; a session that advertises no
+default value leaves the choice to Cursor.
+
+A Cursor turn that receives no update at all for five minutes, while it waits
+on neither the user nor a tool Cursor reports running, shows the notice
+"Cursor has sent nothing for 5 minutes. It may be waiting for you to sign in to
+Cursor in your browser, or one of its MCP servers may not be responding;
+otherwise stop the turn if it seems stuck." The
+turn keeps running; BiBCode never ends it by itself, and the notice clears when
+Cursor sends its next update. A tool Cursor reports only as pending, or as
+finished in any way, does not pause that clock.
+
+After **Stop**, BiBCode drops everything Cursor still sends for that turn: no
+text, plan or to-do update appears, no approval or question opens, and a late
+permission request or question is answered as cancelled, never approved. If
+Cursor does not end the stopped turn within ten seconds, the turn ends as
+cancelled and BiBCode stops the Cursor process, as a requested stop rather than
+a crash, so nothing the old prompt still produces can reach the next message;
+the next message starts Cursor again and resumes the session. BiBCode also stops
+the process when Cursor does not take a prompt within 30 seconds; a prompt it
+did not read at all is sent again, one it may have partly read is not. A prompt
+you stopped is never sent again, even if Cursor never read it. A **Stop** that
+names a turn stops only that turn: a late Stop for a turn that already ended
+leaves the next turn alone, so that turn is not cancelled and a prompt Cursor
+has not read yet can still be sent.
+
+Cursor waits silently for an MCP server that never connects. If Cursor has not
+finished starting the session within 60 seconds, the chat shows "Cursor is
+taking longer than usual to start. One of its MCP servers may not be
+responding; run `cursor-agent mcp list` in a terminal to see which one." and
+BiBCode keeps waiting; see [Starting a provider](README.md#starting-a-provider).
+Model discovery has its own, shorter limits, so the model picker still lists
+models when Cursor does not answer.
 
 Cursor slash commands, skills, and agents are discovered from the server-side
 workspace environment. Skills include `.cursor/skills`, `.agents/skills`,

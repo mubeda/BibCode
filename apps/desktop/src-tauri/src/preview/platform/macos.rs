@@ -43,10 +43,10 @@ fn with_wk<T: Send + 'static>(
     let (tx, rx) = mpsc::sync_channel::<T>(1);
     webview
         .with_webview(move |platform| {
-            // SAFETY: On macOS `PlatformWebview::inner()` is the live WKWebView
-            // pointer, and Tauri invokes this closure on the main/UI thread.
-            let wk: &WKWebView = unsafe { &*platform.inner().cast() };
-            let _ = tx.send(f(wk));
+            let Some(wk) = crate::macos_webview::take_platform_webview(platform) else {
+                return;
+            };
+            let _ = tx.send(f(&wk));
         })
         .map_err(|error| PreviewPlatformError::Unavailable(error.to_string()))?;
     rx.recv_timeout(PLATFORM_CALL_TIMEOUT)
@@ -64,9 +64,10 @@ impl PlatformWebviewOps for MacosWebviewOps {
         let (tx, rx) = mpsc::sync_channel::<Result<String, PreviewPlatformError>>(1);
         webview
             .with_webview(move |platform| {
-                // SAFETY: See `with_wk`; Tauri owns the WKWebView and runs the
-                // closure on the main/UI thread.
-                let wk: &WKWebView = unsafe { &*platform.inner().cast() };
+                let Some(wk) = crate::macos_webview::take_platform_webview(platform) else {
+                    return;
+                };
+                let wk: &WKWebView = &wk;
                 let ns_script = NSString::from_str(&script);
                 let handler = RcBlock::new(move |result: *mut AnyObject, error: *mut NSError| {
                     let outcome = if !error.is_null() {
@@ -139,9 +140,10 @@ impl PlatformWebviewOps for MacosWebviewOps {
         let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>, PreviewPlatformError>>(1);
         webview
             .with_webview(move |platform| {
-                // SAFETY: See `with_wk`; Tauri owns the WKWebView and runs the
-                // closure on the main/UI thread.
-                let wk: &WKWebView = unsafe { &*platform.inner().cast() };
+                let Some(wk) = crate::macos_webview::take_platform_webview(platform) else {
+                    return;
+                };
+                let wk: &WKWebView = &wk;
                 let Some(main_thread) = MainThreadMarker::new() else {
                     let _ = tx.send(Err(PreviewPlatformError::Unavailable(
                         "snapshot was not scheduled on the main thread".to_string(),
@@ -208,10 +210,13 @@ impl PlatformWebviewOps for MacosWebviewOps {
         let (tx, rx) = mpsc::sync_channel::<()>(1);
         webview
             .with_webview(move |platform| {
-                // SAFETY: See `with_wk`; all WKWebView and WebKit data-store
-                // access remains inside Tauri's main/UI-thread closure.
+                let Some(wk) = crate::macos_webview::take_platform_webview(platform) else {
+                    return;
+                };
+                // SAFETY: all WKWebView and WebKit data-store access remains inside Tauri's
+                // main/UI-thread closure.
                 unsafe {
-                    let wk: &WKWebView = &*platform.inner().cast();
+                    let wk: &WKWebView = &wk;
                     let store = wk.configuration().websiteDataStore();
                     let mut types: Vec<&NSString> = Vec::new();
                     if kinds.cookies {

@@ -440,6 +440,44 @@ describe("ProviderSessionDefaultsControls", () => {
     expect(entries("Switch")[0]?.disabled).toBe(true);
   });
 
+  it("names the CLI's own default when Antigravity has no catalog and no saved default", () => {
+    const markup = render(
+      baseProps({ driver: ProviderDriverKind.make("antigravity"), models: [], value: undefined }),
+    );
+
+    expect(markup).toContain("CLI default");
+    expect(markup).not.toContain("Unavailable here");
+    expect(entries("Select")[0]?.disabled).toBe(true);
+  });
+
+  it("says the Antigravity Terminal keeps an unlisted saved model while chats fall back", () => {
+    const markup = render(
+      baseProps({
+        driver: ProviderDriverKind.make("antigravity"),
+        models: [{ slug: "model-alpha", name: "Model Alpha", isCustom: false, capabilities: null }],
+        value: { model: "model-beta" },
+      }),
+    );
+
+    expect(markup).toContain(
+      "Not in the current model list. New chats use model-alpha. The terminal still starts with model-beta.",
+    );
+    expect(markup).not.toContain("new sessions will use");
+  });
+
+  it("names no chat model for a saved Antigravity default while the model list is empty", () => {
+    const markup = render(
+      baseProps({
+        driver: ProviderDriverKind.make("antigravity"),
+        models: [],
+        value: { model: "model-beta" },
+      }),
+    );
+
+    expect(markup).toContain("The model list is not loaded. The terminal starts with model-beta.");
+    expect(markup).not.toContain("New chats use");
+  });
+
   it("keeps the full control row mounted when model capabilities change", async () => {
     const mounted = await mount(
       baseProps({ driver: OPENCODE, models: richModels, value: richValue }),

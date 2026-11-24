@@ -23,14 +23,24 @@ const DESTINATION: &str = concat!("https:", "//github.com/owner/repo.git");
 struct RemoteRunner {
     urls: String,
     stderr: String,
+    /// When set, `ls-remote` succeeds with this output and only the push fails.
+    ls_remote: Option<String>,
+    /// What `rev-parse` reports for the local tracking ref.
+    tracking_tip: String,
     requests: Mutex<Vec<ProcessRequest>>,
 }
 
 impl RemoteRunner {
     fn new(urls: &str, stderr: &str) -> Arc<Self> {
+        Self::checked(urls, stderr, None, "")
+    }
+
+    fn checked(urls: &str, stderr: &str, ls_remote: Option<&str>, tracking_tip: &str) -> Arc<Self> {
         Arc::new(Self {
             urls: urls.to_owned(),
             stderr: stderr.to_owned(),
+            ls_remote: ls_remote.map(str::to_owned),
+            tracking_tip: tracking_tip.to_owned(),
             requests: Mutex::default(),
         })
     }
@@ -57,7 +67,7 @@ fn is_network(request: &ProcessRequest) -> bool {
     !request.operation.starts_with("GitManager.signIn")
         && arguments(request)
             .iter()
-            .any(|arg| matches!(arg.as_str(), "fetch" | "pull" | "push"))
+            .any(|arg| matches!(arg.as_str(), "fetch" | "pull" | "push" | "ls-remote"))
 }
 
 impl GitProcessRunner for RemoteRunner {
@@ -68,6 +78,34 @@ impl GitProcessRunner for RemoteRunner {
     ) -> BoxGitProcessFuture<'a> {
         let (exit_code, stdout, stderr) = if request.operation == "GitManager.signIn.remoteUrls" {
             (0, self.urls.clone(), String::new())
+        } else if request.operation == "GitManager.branchUpstream" {
+            // `topic` tracks `topic` on `origin`, as Git's upstream fields report it.
+            (
+                0,
+                "refs/heads/topic\torigin\trefs/heads/topic\n".to_owned(),
+                String::new(),
+            )
+        } else if request.operation == "GitManager.remoteBranchDeleteCheck.config" {
+            // `git config -z --list`: each URL line as `remote.origin.url`, the standard fetch.
+            let mut list = self
+                .urls
+                .lines()
+                .map(|url| format!("remote.origin.url\n{url}\0"))
+                .collect::<String>();
+            list.push_str("remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0");
+            (0, list, String::new())
+        } else if request.operation == "GitManager.remoteBranchDeleteCheck.trackingSymref" {
+            (1, String::new(), String::new())
+        } else if request.operation == "GitManager.branchDeleteTip" {
+            (0, format!("{TIP}\n"), String::new())
+        } else if request.operation == "GitManager.remoteBranchDeleteCheck.trackingRef" {
+            let found = !self.tracking_tip.is_empty();
+            (i32::from(!found), self.tracking_tip.clone(), String::new())
+        } else if let (Some(stdout), true) = (
+            &self.ls_remote,
+            arguments(&request).iter().any(|arg| arg == "ls-remote"),
+        ) {
+            (0, stdout.clone(), String::new())
         } else if is_network(&request) {
             (128, String::new(), self.stderr.clone())
         } else {
@@ -152,7 +190,8 @@ fn eligible_requests() -> Vec<(GitManagerOperationRequest, &'static str, &'stati
                 "_tag": "branch-delete", "name": "topic", "force": false, "deleteRemote": true
             })),
             "push",
-            "remote-branch-delete",
+            // The remote check failed before the local delete, so the whole delete resumes.
+            "branch-delete",
         ),
     ]
 }
@@ -204,11 +243,143 @@ async fn each_eligible_operation_reports_sign_in_required_once_without_retrying(
         assert_eq!(sign_in.resume["expectedDestination"], DESTINATION);
         assert_eq!(runner.network_spawns(), 1, "{operation}: no retry");
         if matches!(request, GitManagerOperationRequest::BranchDelete { .. }) {
-            assert_eq!(sign_in.resume["remote"], "origin");
-            assert_eq!(sign_in.resume["branch"], "topic");
+            assert_eq!(sign_in.resume["name"], "topic");
+            assert_eq!(sign_in.resume["deleteRemote"], true);
+            assert_eq!(sign_in.resume["force"], false);
+            // The approved target is frozen beside the address (#397 round 3).
+            assert_eq!(sign_in.resume["expectedTip"], TIP);
+            assert_eq!(sign_in.resume["expectedRemote"], "origin");
+            assert_eq!(sign_in.resume["expectedRemoteBranch"], "topic");
         }
         // The resume request decodes as an ordinary request.
         serde_json::from_value::<GitManagerOperationRequest>(sign_in.resume).expect("resume");
+    }
+}
+
+/// #397: a remote delete reads the remote with `ls-remote` before it pushes. A sign-in that
+/// refusal needs is offered from that read, and nothing is deleted locally or remotely.
+#[tokio::test]
+async fn a_remote_delete_offers_sign_in_from_its_ls_remote_check() {
+    for request in [
+        request(json!({"_tag": "remote-branch-delete", "remote": "origin", "branch": "topic"})),
+        request(json!({
+            "_tag": "branch-delete", "name": "topic", "force": false, "deleteRemote": true
+        })),
+    ] {
+        let runner = RemoteRunner::new(DESTINATION, GCM_STDERR);
+        let error = run(&runner, &request, CredentialPrompt::OfferSignIn)
+            .await
+            .expect_err("GCM refused");
+        let operation = request.operation();
+        assert_eq!(error.code, "sign-in-required", "{operation}");
+        let spawned = runner
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(arguments)
+            .collect::<Vec<_>>();
+        let network = spawned
+            .iter()
+            .filter(|args| {
+                args.iter()
+                    .any(|arg| matches!(arg.as_str(), "ls-remote" | "push"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(network.len(), 1, "{operation}: {spawned:?}");
+        assert!(
+            network[0].iter().any(|arg| arg == "ls-remote"),
+            "{operation}"
+        );
+        assert!(
+            !spawned
+                .iter()
+                .any(|args| args.iter().any(|arg| arg == "-d" || arg == "-D")),
+            "{operation}: the local branch is not deleted before the check passes"
+        );
+
+        // Without an offer the check keeps Git's own classification (#397 review finding 9).
+        let runner = RemoteRunner::new(DESTINATION, GCM_STDERR);
+        let error = run(&runner, &request, CredentialPrompt::Never)
+            .await
+            .expect_err("GCM refused");
+        assert_eq!(error.code, "authentication", "{operation}");
+    }
+}
+
+const TIP: &str = "1111111111111111111111111111111111111111";
+
+fn advertised(head: &str, topic_tip: &str) -> String {
+    format!("ref: refs/heads/{head}\tHEAD\n{TIP}\tHEAD\n{topic_tip}\trefs/heads/topic\n")
+}
+
+/// #397 round 2 (ruling A): once the remote check passed and the local branch is deleted, a
+/// sign-in the push needs resumes the remote delete only, frozen to the approved destination.
+#[tokio::test]
+async fn a_delete_whose_push_needs_sign_in_resumes_the_remote_delete_only() {
+    let runner = RemoteRunner::checked(DESTINATION, GCM_STDERR, Some(&advertised("main", TIP)), "");
+    let request = request(json!({
+        "_tag": "branch-delete", "name": "topic", "force": false, "deleteRemote": true
+    }));
+    let error = run(&runner, &request, CredentialPrompt::OfferSignIn)
+        .await
+        .expect_err("GCM refused the push");
+
+    assert_eq!(error.code, "sign-in-required");
+    let resume = error.sign_in.expect("offer").resume;
+    assert_eq!(resume["_tag"], "remote-branch-delete");
+    assert_eq!(resume["remote"], "origin");
+    assert_eq!(resume["branch"], "topic");
+    assert_eq!(resume["expectedDestination"], DESTINATION);
+    let spawned = runner.requests.lock().expect("requests").clone();
+    assert!(
+        spawned
+            .iter()
+            .any(|request| arguments(request).iter().any(|arg| arg == "-d")),
+        "the local branch was deleted before the push"
+    );
+}
+
+/// #397 round 2 (Antigravity 11): a resumed remote delete checks the remote again, and refuses
+/// a branch that became the default or moved since the sign-in was offered.
+#[tokio::test]
+async fn a_resumed_remote_delete_checks_the_remote_again() {
+    let resumed = |tag: &str| {
+        let mut value = if tag == "branch-delete" {
+            json!({
+                "_tag": tag, "name": "topic", "force": true, "deleteRemote": true,
+                "expectedTip": TIP, "expectedRemote": "origin", "expectedRemoteBranch": "topic"
+            })
+        } else {
+            json!({"_tag": tag, "remote": "origin", "branch": "topic"})
+        };
+        value["expectedDestination"] = json!(DESTINATION);
+        request(value)
+    };
+    for tag in ["remote-branch-delete", "branch-delete"] {
+        for (ls_remote, tracking, code) in [
+            (advertised("topic", TIP), "", "default-branch"),
+            (
+                advertised("main", TIP),
+                "2222222222222222222222222222222222222222",
+                "remote-branch-changed",
+            ),
+        ] {
+            let runner = RemoteRunner::checked(DESTINATION, GCM_STDERR, Some(&ls_remote), tracking);
+            let error = run(&runner, &resumed(tag), CredentialPrompt::Never)
+                .await
+                .expect_err("the check refuses");
+            assert_eq!(error.code, code, "{tag}");
+            let spawned = runner.requests.lock().expect("requests").clone();
+            assert!(
+                !spawned.iter().any(|request| {
+                    arguments(request)
+                        .iter()
+                        .any(|arg| matches!(arg.as_str(), "push" | "-d" | "-D"))
+                }),
+                "{tag} {code}: nothing is deleted"
+            );
+        }
     }
 }
 

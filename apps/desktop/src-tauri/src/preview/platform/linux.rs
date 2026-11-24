@@ -35,6 +35,45 @@ pub fn place_child(webview: &tauri::Webview, x: f64, y: f64, width: f64, height:
     }
 }
 
+/// See `super::return_focus`. Runs on the GTK thread ahead of the hide or close
+/// queued after it. Keys must not be left without a shown webview to go to:
+/// moving the focused preview into the overlay layer can already have dropped
+/// its focus, so the window's focus is checked, not only the preview's.
+pub fn return_focus(webview: &tauri::Webview) {
+    use tauri::Manager;
+
+    let app = webview.app_handle().clone();
+    let result = webview.with_webview(move |platform| {
+        let preview: gtk::Widget = platform.inner().upcast();
+        let window_focus = preview
+            .toplevel()
+            .and_then(|toplevel| toplevel.downcast::<gtk::Window>().ok())
+            .map(|window| window.focused_widget());
+        let preview_holds_focus = match window_focus {
+            Some(None) => true,
+            // Anything but another shown webview (the main one, or a preview in use) is
+            // no place for keys either.
+            Some(Some(focus)) => {
+                focus == preview
+                    || focus.is_ancestor(&preview)
+                    || !(focus.is::<webkit2gtk::WebView>() && focus.is_visible())
+            }
+            None => preview.is_focus(),
+        };
+        if !preview_holds_focus {
+            return;
+        }
+        if let Some(main) = crate::window::main_webview(&app)
+            && let Err(error) = main.set_focus()
+        {
+            tracing::warn!("failed to return focus to the main webview: {error}");
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!("failed to reach the preview webview to return its focus: {error}");
+    }
+}
+
 pub(super) fn place_in_preview_layer(
     child: &gtk::Widget,
     x: f64,

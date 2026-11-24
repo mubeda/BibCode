@@ -630,6 +630,53 @@ async fn stop_during_the_compaction_wins_even_if_it_completes() {
 }
 
 #[tokio::test]
+async fn a_late_stop_for_a_finished_turn_does_not_stop_the_compaction() {
+    // Mutation caught: a delayed Stop naming the failed turn marking the compaction running
+    // under its own turn stop-requested, so its success settles as interrupted.
+    let engine = engine().await;
+    delivered_turn(&engine, "failed", "turn-1", near_full()).await;
+    fail_at_limit(&engine, "failure", "turn-1", before_output()).await;
+    let recovery = only_compaction(&engine).await;
+    engine
+        .start_thread_compaction(&recovery.compaction_id, TIME)
+        .await
+        .unwrap();
+    session(
+        &engine,
+        "running",
+        "compaction-running",
+        Some("compaction-turn"),
+    )
+    .await;
+    let stop = |id: &str, turn: &str| {
+        command(
+            json!({"type":"thread.turn.interrupt", "commandId":id, "threadId":"t", "turnId":turn, "createdAt":TIME}),
+        )
+    };
+    engine.dispatch(stop("late-stop", "turn-1")).await.unwrap();
+    let running = engine
+        .thread_compaction(&recovery.compaction_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.state, "running");
+    assert!(!running.stop_requested);
+    engine
+        .dispatch(stop("stop", "compaction-turn"))
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .thread_compaction(&recovery.compaction_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .stop_requested
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_unsettled_compaction_holds_claims_and_promotion() {
     let engine = engine().await;
     session(&engine, "ready", "ready", None).await;

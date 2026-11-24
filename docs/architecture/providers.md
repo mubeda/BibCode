@@ -1,6 +1,6 @@
 # Provider architecture
 
-BiBCode currently supports Codex, Claude, Cursor, and OpenCode. A provider
+BiBCode currently supports Codex, Claude, Cursor, Antigravity, and OpenCode. A provider
 instance binds a driver to its configured executable, options, readiness state,
 and instance metadata. Commands identify the instance rather than
 reconstructing driver state in the client.
@@ -8,7 +8,8 @@ reconstructing driver state in the client.
 Built-in provider settings defaults come from one server table. Both the control
 plane and the runtime settings reader fill missing fields from it, so a partial
 `providers.<driver>` object means the same thing everywhere. Codex, Claude,
-Cursor, and OpenCode are enabled by default; Grok is disabled. Explicitly saved
+Cursor, and OpenCode are enabled by default; Antigravity (Preview) and Grok are
+disabled. Explicitly saved
 values, including `enabled: false`, are preserved.
 
 `supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
@@ -186,7 +187,8 @@ id. The server stamps the same label as `displayName` in every provider
 snapshot, so the web shows the server's name and never derives its own. The
 field stays optional for older servers, whose unnamed instances then show the
 driver's name. A refusal is its plain
-sentence, such as "Fast Mode is not supported by the selected model." or "gpt-5
+sentence, such as "Fast Mode is not supported by the selected model. Choose another
+option for this model." or "gpt-5
 is not available in Work Codex.", built from shared helpers that name an option
 by the label its descriptor shows, and by its id only for an option the driver
 does not take. A Cursor configuration BiBCode can't work with reads "BiBCode
@@ -212,13 +214,14 @@ No identity or label is inferred from a description.
 Each driver translates between the common orchestration model and its native
 protocol:
 
-| Provider | Native integration                             | Steer                 | Checkpoint revert       | Activity support                                                                           |
-| -------- | ---------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
-| Codex    | Codex App Server JSON-RPC                      | `turn/steer`          | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
-| Claude   | Claude stream-JSON CLI and authenticated hooks | Stream-JSON user line | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
-| Cursor   | Agent Client Protocol                          | Unsupported           | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
-| Grok     | Agent Client Protocol                          | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
-| OpenCode | OpenCode server/events API                     | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Provider    | Native integration                                              | Steer                 | Checkpoint revert       | Activity support                                                                           |
+| ----------- | --------------------------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
+| Codex       | Codex App Server JSON-RPC                                       | `turn/steer`          | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Claude      | Claude stream-JSON CLI and authenticated hooks                  | Stream-JSON user line | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
+| Cursor      | Agent Client Protocol                                           | Unsupported           | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
+| Antigravity | `agy acp`, Agent Client Protocol (Preview, disabled by default) | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
+| Grok        | Agent Client Protocol                                           | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
+| OpenCode    | OpenCode server/events API                                      | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
 
 Codex, Cursor, and Grok keep the provider's JSON-RPC request ID for their wire
 response. BiBCode gives each approval or question an opaque request ID scoped
@@ -544,7 +547,11 @@ Idle suspension must never stop work the provider still runs:
   arms the next one. When the driver emits `turn.started` only for turns the
   provider reported running (Codex for each `turn/started`, Claude for a turn it
   starts itself), the session is also projected `running` with that turn unless
-  it already reads so. Cursor, OpenCode, and Grok announce a turn before BiBCode
+  it already reads so. Antigravity and Cursor are projected the same way: each
+  announces a prompt as it writes it and ends every announced turn, an unsent
+  one included, with `turn.completed`, while its delivery is accepted only when
+  ACP answers the prompt, at the end of the turn, too late to mark it running.
+  Such a late acceptance publishes nothing. OpenCode and Grok announce a turn before BiBCode
   sends it, so their announcement does not change the projection: a send that
   fails reports no completion (OpenCode settles a turn whose request it never
   accepted, a 4xx refusal or a connection that never opened, with a `cancelled`
@@ -619,6 +626,17 @@ the runtime row becomes `suspended` with its resume cursor (unless the thread is
 deleted), so the next message after a restart resumes the same native
 conversation. Explicit stop, thread deletion, and provider restart still delete
 the row.
+
+**Stop** names the turn it stops. When the session's active turn is a
+different one, the Stop is stale. The orchestration engine decides this once,
+inside the Stop's commit, and the RPC layer then sends a stale Stop to no
+supervisor, so a late Stop never cancels the next turn, for every provider. A
+Stop the engine judged live reaches the driver, whatever the supervisor reads
+by then. Claude, OpenCode and Grok interrupt whatever runs, so they stop the
+turn whose requests the commit expired. Codex, Cursor and Antigravity aim the
+interrupt at the named turn and ignore it when another one runs by then. The
+supervisor makes no second stale check; its own interrupts (a compaction's
+turn, a Dismiss or a panel archive) are never stale.
 
 **Stop** has a deadline. When the projection shows a running turn and Stop
 names that turn (or no turn), the supervisor arms a 10-second interrupt deadline before asking the driver to

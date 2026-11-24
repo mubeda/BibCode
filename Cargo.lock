@@ -459,6 +459,7 @@ dependencies = [
  "bibcode-server",
  "block2",
  "cairo-rs",
+ "dirs",
  "futures-util",
  "gtk",
  "if-addrs",

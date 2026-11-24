@@ -100,6 +100,8 @@ import { DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
 import { joinWorkspacePath } from "./files/FileTreeContextMenu.logic";
 import {
   buildMenuItems,
+  canShowPullRequestInPanel,
+  isPullRequestInOtherRepository,
   type DefaultBranchConfirmableAction,
   requiresDefaultBranchConfirmation,
   resolveDefaultBranchActionDialogCopy,
@@ -139,7 +141,7 @@ import { GIT_MANAGER_STASH_MERGE_DISABLED_REASON } from "./gitManager/gitManager
 import { GitManagerInProgressStrip } from "./gitManager/GitManagerInProgressStrip";
 import { GitManagerMergeDialog } from "./gitManager/merge/GitManagerMergeDialog";
 import { GitManagerOperationBanner } from "./gitManager/toolbar/GitManagerOperationBanner";
-import { canOpenPullRequestInPanel } from "./pullRequests/pullRequestsAvailability";
+import { usePullRequestsContextQuery } from "./pullRequests/usePullRequestsContextQuery";
 import { SourceControlMergeChanges } from "./SourceControlMergeChanges";
 import { CodeReviewInstructionsDialog } from "./sourceControl/CodeReviewInstructionsDialog";
 import { CodeReviewProjectPromptDialog } from "./sourceControl/CodeReviewProjectPromptDialog";
@@ -421,17 +423,33 @@ export default function SourceControlPanel({
     [codeReviewMenuReviewers, codeReviewScope, status],
   );
 
+  // The panel can show the request only on a host that has it, with the setting on and a server
+  // that reads pull requests. Otherwise View PR opens the browser.
+  const openPrUrl = status?.pr?.state === "open" ? status.pr.url : null;
+  const panelSupported = canShowPullRequestInPanel({
+    enabled: pullRequestsEnabled,
+    pullRequestsReads: capabilities?.pullRequestsReads === true,
+    providerKind: status?.sourceControlProvider?.kind ?? "unknown",
+  });
+  // The panel addresses the checkout's origin, while the request lookup may have used another
+  // repository. Until the context is known, the panel opens and explains itself.
+  const { query: pullRequestsContext } = usePullRequestsContextQuery({
+    environmentId,
+    cwd: gitCwd,
+    enabled: panelSupported && openPrUrl !== null,
+  });
+  const panelRepository =
+    pullRequestsContext.data?.status === "available" ? pullRequestsContext.data.repository : null;
+  const canOpenInPanel =
+    panelSupported &&
+    !(openPrUrl !== null && isPullRequestInOtherRepository(openPrUrl, panelRepository));
   // Legacy servers (no staging areas) keep the chat-header cascade
   // (commit_push-first, commit-by-filePaths). The primary button and dropdown
   // below fork on `hasAreas`: this pair drives the legacy branch unchanged.
   const quickAction = useMemo(
-    () => resolveQuickAction(status, isBusy, isDefaultRef, hasPrimaryRemote),
-    [status, isBusy, isDefaultRef, hasPrimaryRemote],
+    () => resolveQuickAction(status, isBusy, isDefaultRef, hasPrimaryRemote, canOpenInPanel),
+    [status, isBusy, isDefaultRef, hasPrimaryRemote, canOpenInPanel],
   );
-  const canOpenInPanel = canOpenPullRequestInPanel({
-    enabled: pullRequestsEnabled,
-    providerKind: status?.sourceControlProvider?.kind ?? "unknown",
-  });
   const menuItems = useMemo(
     () => buildMenuItems(status, isBusy, hasPrimaryRemote, canOpenInPanel),
     [status, isBusy, hasPrimaryRemote, canOpenInPanel],
@@ -1036,12 +1054,13 @@ export default function SourceControlPanel({
 
   const onPrimaryAction = useCallback(() => {
     if (quickAction.kind === "open_pr") return openPr();
+    if (quickAction.kind === "open_pr_panel") return openPrInPanel();
     if (quickAction.kind === "run_pull") return void runPull();
     if (quickAction.kind === "run_action" && quickAction.action) {
       return void runGitAction(quickAction.action);
     }
     // open_publish / show_hint: no-op here (surfaced as disabled below).
-  }, [openPr, quickAction, runGitAction, runPull]);
+  }, [openPr, openPrInPanel, quickAction, runGitAction, runPull]);
 
   // Commit-first ladder dispatch (staging-area servers). Commit-family actions
   // route through runGitAction, which holds the ledger guard (commit the staged
@@ -1063,9 +1082,12 @@ export default function SourceControlPanel({
       case "open_pr":
         openPr();
         return;
+      case "open_pr_panel":
+        openPrInPanel();
+        return;
       // publish / sync_hint / none: disabled below, no-op here.
     }
-  }, [primaryAction, runGitAction, runStage, runPull, openPr, groups]);
+  }, [primaryAction, runGitAction, runStage, runPull, openPr, openPrInPanel, groups]);
 
   const onScMenuItem = useCallback(
     (item: SourceControlMenuItem) => {
@@ -1774,8 +1796,9 @@ export default function SourceControlPanel({
           }}
           onDone={(request) => {
             if (
-              canOpenPullRequestInPanel({
+              canShowPullRequestInPanel({
                 enabled: pullRequestsEnabled,
+                pullRequestsReads: capabilities?.pullRequestsReads === true,
                 providerKind: request.provider,
               })
             )

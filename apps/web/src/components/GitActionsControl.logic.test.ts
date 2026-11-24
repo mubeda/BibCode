@@ -4,6 +4,8 @@ import { assert, describe, it } from "vite-plus/test";
 import {
   buildGitActionProgressStages,
   buildMenuItems,
+  canShowPullRequestInPanel,
+  isPullRequestInOtherRepository,
   requiresDefaultBranchConfirmation,
   resolveAutoFeatureBranchName,
   resolveDefaultBranchActionDialogCopy,
@@ -75,7 +77,58 @@ describe("when: ref is clean and has an open PR", () => {
     assert.deepInclude(quick, { kind: "open_pr", label: "View PR", disabled: false });
   });
 
-  it("buildMenuItems offers opening the PR in the thread's panel only when asked", () => {
+  it("resolveQuickAction opens the PR in the panel when the panel can show it", () => {
+    const pr = {
+      number: 10,
+      title: "Open PR",
+      url: "https://example.com/pr/10",
+      baseRef: "main",
+      headRef: "feature/test",
+      state: "open",
+    } as const;
+    assert.deepInclude(resolveQuickAction(status({ pr }), false, false, true, true), {
+      kind: "open_pr_panel",
+      label: "View PR",
+      disabled: false,
+    });
+    assert.deepInclude(resolveQuickAction(status({ pr }), false, false, true, false), {
+      kind: "open_pr",
+      label: "View PR",
+    });
+    const gitlab = status({
+      pr,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    assert.deepInclude(resolveQuickAction(gitlab, false, false, true, true), {
+      kind: "open_pr_panel",
+      label: "View MR",
+    });
+  });
+
+  it("resolveQuickAction opens the PR in the panel when there is no upstream", () => {
+    const pr = {
+      number: 10,
+      title: "Open PR",
+      url: "https://example.com/pr/10",
+      baseRef: "main",
+      headRef: "feature/test",
+      state: "open",
+    } as const;
+    for (const hasPrimaryRemote of [true, false]) {
+      assert.deepInclude(
+        resolveQuickAction(
+          status({ hasUpstream: false, aheadCount: 0, pr }),
+          false,
+          false,
+          hasPrimaryRemote,
+          true,
+        ),
+        { kind: "open_pr_panel", label: "View PR" },
+      );
+    }
+  });
+
+  it("buildMenuItems puts View PR in the panel and keeps a browser item only when asked", () => {
     const withPr = status({
       pr: {
         number: 11,
@@ -86,24 +139,38 @@ describe("when: ref is clean and has an open PR", () => {
         state: "open",
       },
     });
-    assert.notInclude(
-      buildMenuItems(withPr, false).map((item) => item.id),
-      "pr_panel",
+    assert.deepEqual(
+      buildMenuItems(withPr, false)
+        .filter((item) => item.icon === "pr")
+        .map(({ label, kind }) => ({ label, kind })),
+      [{ label: "View PR", kind: "open_pr" }],
     );
-    assert.deepInclude(buildMenuItems(withPr, false, true, true).at(-1), {
-      id: "pr_panel",
-      label: "Open PR in panel",
-      disabled: false,
-      icon: "pr",
-      kind: "open_pr_panel",
-    });
+    assert.deepEqual(
+      buildMenuItems(withPr, false, true, true)
+        .filter((item) => item.icon === "pr")
+        .map(({ label, kind, disabled }) => ({ label, kind, disabled })),
+      [
+        { label: "View PR", kind: "open_pr_panel", disabled: false },
+        { label: "Open PR in browser", kind: "open_pr", disabled: false },
+      ],
+    );
     assert.notInclude(
-      buildMenuItems(status(), false, true, true).map((item) => item.id),
-      "pr_panel",
+      buildMenuItems(status(), false, true, true).map((item) => item.label),
+      "Open PR in browser",
+    );
+    const gitlab = status({
+      pr: withPr.pr,
+      sourceControlProvider: { kind: "gitlab", name: "GitLab", baseUrl: "https://gitlab.test" },
+    });
+    assert.deepEqual(
+      buildMenuItems(gitlab, false, true, true)
+        .filter((item) => item.icon === "pr")
+        .map((item) => item.label),
+      ["View MR", "Open MR in browser"],
     );
   });
 
-  it("buildMenuItems disables opening the PR in the panel while busy", () => {
+  it("buildMenuItems disables both PR items while busy", () => {
     const withPr = status({
       pr: {
         number: 11,
@@ -114,10 +181,11 @@ describe("when: ref is clean and has an open PR", () => {
         state: "open",
       },
     });
-    assert.deepInclude(buildMenuItems(withPr, true, true, true).at(-1), {
-      id: "pr_panel",
-      disabled: true,
-    });
+    const prItems = buildMenuItems(withPr, true, true, true).filter((item) => item.icon === "pr");
+    assert.deepEqual(
+      prItems.map((item) => item.disabled),
+      [true, true],
+    );
   });
 
   it("buildMenuItems disables commit/push and enables open PR", () => {
@@ -1209,5 +1277,48 @@ describe("resolveAutoFeatureBranchName", () => {
   it("falls back to feature/update when no preferred name is provided", () => {
     const ref = resolveAutoFeatureBranchName(["main"]);
     assert.equal(ref, "feature/update");
+  });
+});
+
+describe("canShowPullRequestInPanel", () => {
+  it("needs the setting, a supported host and the server's pullRequestsReads", () => {
+    const base = { enabled: true, pullRequestsReads: true, providerKind: "github" } as const;
+    assert.isTrue(canShowPullRequestInPanel(base));
+    assert.isFalse(canShowPullRequestInPanel({ ...base, enabled: false }));
+    assert.isFalse(canShowPullRequestInPanel({ ...base, pullRequestsReads: false }));
+    assert.isFalse(canShowPullRequestInPanel({ ...base, providerKind: "bitbucket" }));
+    assert.isFalse(canShowPullRequestInPanel({ ...base, providerKind: "azure-devops" }));
+  });
+});
+
+describe("isPullRequestInOtherRepository", () => {
+  it("is true only when the pull request URL names a different repository", () => {
+    assert.isFalse(
+      isPullRequestInOtherRepository("https://github.test/team/repo/pull/9", "team/repo"),
+    );
+    assert.isFalse(
+      isPullRequestInOtherRepository("https://github.test/Team/Repo/pull/9", "team/repo"),
+    );
+    assert.isTrue(
+      isPullRequestInOtherRepository("https://github.test/upstream/repo/pull/9", "fork/repo"),
+    );
+    assert.isFalse(
+      isPullRequestInOtherRepository(
+        "https://gitlab.test/group/sub/proj/-/merge_requests/4",
+        "group/sub/proj",
+      ),
+    );
+    assert.isTrue(
+      isPullRequestInOtherRepository(
+        "https://gitlab.test/group/other/-/merge_requests/4",
+        "group/sub/proj",
+      ),
+    );
+  });
+
+  it("cannot tell, and says false, for an unknown repository or an unrecognised URL", () => {
+    assert.isFalse(isPullRequestInOtherRepository("https://github.test/team/repo/pull/9", null));
+    assert.isFalse(isPullRequestInOtherRepository("not a url", "team/repo"));
+    assert.isFalse(isPullRequestInOtherRepository("https://host.test/x/y", "team/repo"));
   });
 });

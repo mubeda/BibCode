@@ -3945,6 +3945,43 @@ sizes. Cover relevant:
   and a second copy with the same name gets a new name), the **More formatting**
   menu, and that a file with a footnote or an `.mdx` file shows the read-only
   notice;
+- Files undo and redo: the packaged `files-undo-shortcuts` spec is in the
+  default list. Without `BIBCODE_E2E_NATIVE_INPUT=1` it only dispatches chords
+  inside the webview, which proves the editors' own bindings and not the
+  native menu or keyboard path. With it, the spec sends real operating-system
+  input, so run it only in a lab session nobody is using. On macOS it types
+  with System Events keystrokes and clicks **Edit → Undo** and **Redo** and
+  points with `osascript`; the runner needs Accessibility and Automation
+  permission, an unlocked session and the app frontmost. On Windows it types
+  with `SendKeys` through PowerShell, opens **Edit** with F10 when UI
+  Automation finds no menu item, and clicks through `user32`. On Linux it uses
+  `xdotool` under Xvfb and has no menu cells, because the Linux Edit menu has
+  no Undo or Redo item. GTK keyboard focus follows only a real click, so each
+  Linux native cell first clicks its target natively and fails if the main
+  page still lacks focus, rather than typing into nothing. Native cells cover two steps undone one at a time,
+  redo with two pending redo entries, a formatting step, the chat composer, a
+  plain textarea, the inline comment field, the Link URL field, and the
+  terminal keeping Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y off macOS. A driver cell
+  opens a local HTML file in the preview browser and fails unless the page
+  loads and its native screenshot shows the probe page's colour over the whole
+  slot, and, on Linux, unless the main page has keyboard focus again once the
+  preview closed. While the preview's child webview is open the embedded WebDriver finds
+  no window, so the page reports the preview's events to the spec over a
+  loopback endpoint and closes that webview before WebDriver resumes. Native
+  cells then type into the preview page and undo there, and, on macOS, check
+  that with a preview open Edit → Undo still reaches the Files editor and
+  closing the window with an unsaved edit still asks. On macOS these cells click
+  with a window-server mouse event posted through `osascript`, because System
+  Events' accessibility click does not reach the preview webview. Run it alone with
+  `BIBCODE_E2E_SPEC=./specs/files-undo-shortcuts.e2e.ts`, once with and once
+  without `BIBCODE_E2E_NATIVE_INPUT=1`, both with `BIBCODE_E2E_PROFILER=1`. Each
+  cell's result and the events that reached the page are in
+  `files-undo-matrix.jsonl` in the artifact directory;
+- Isolated tools: every packaged run starts a fixture `codegraph` from the
+  fixture's shim directory, which the fixture HOME's login profiles keep first
+  on `PATH` after the app hydrates it from a login shell. Each start is logged
+  to `tool-probes.log` in the artifact directory. The run fails when it
+  completes unless that log shows the fixture's `codegraph --version` probe;
 - Appearance themes: the packaged `appearance-themes` spec proves that the left
   panel marks its repository, checkout and chat levels in Light and in Tokyo
   Night, that clicking the Matrix Dark row in Light mode switches to Dark and

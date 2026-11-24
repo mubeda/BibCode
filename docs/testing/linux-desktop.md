@@ -529,6 +529,16 @@ inside it reaches the page. Record a screenshot per backend after the split
 drag. A preview that does not follow its panel is a product failure; record
 the backend, scale, and step that broke it.
 
+Keyboard focus: GTK moves keyboard focus between webviews only on a real
+click or a host `set_focus`. A WebDriver click, `element.focus()` or the X
+window focus does not move it, and `document.hasFocus()` in the main page
+shows where it is. Open a preview, close or hide it without clicking, and
+type: the keys must reach the app, because the host hands focus back to the
+main webview when a focused preview hides or closes. In the preview, type in a
+text field and press Ctrl+Z: the field must undo. Packaged native-input cells
+click their target natively before typing for the same reason, so they do not
+depend on which cell ran before them.
+
 The placement itself is covered by an ignored unit test that needs a display;
 run it per backend before the manual steps:
 
@@ -548,6 +558,63 @@ file-preview row, and no gateway listener opens on the server for the preview
 (`ss -ltnp` on the server). An environment whose server lacks the capability,
 or whose first preview this session was created before it gained it, keeps the
 gateway.
+
+### Disable GPU compositing setting
+
+The setting (`linuxSoftwareRendering` in `desktop-settings.json`, override
+`BIBCODE_SOFTWARE_RENDERING`) makes `main` set
+`WEBKIT_DISABLE_COMPOSITING_MODE=1` and `WEBKIT_DISABLE_DMABUF_RENDERER=1`.
+`/proc/<pid>/environ` of the desktop process shows only the environment it
+started with, so it cannot show these. Read them from a WebKit child process,
+which starts after `main` ran:
+
+```sh
+for pid in $(pgrep -f WebKitWebProcess); do
+  tr '\0' '\n' < "/proc/$pid/environ" | grep -E '^WEBKIT_DISABLE_(COMPOSITING_MODE|DMABUF_RENDERER)=' || echo "$pid: neither"
+done
+```
+
+With isolated `HOME` and XDG roots, and the Profiler on, check each case and
+that the window renders:
+
+- Setting on: both variables are present. Setting off or missing: neither.
+- `BIBCODE_SOFTWARE_RENDERING=1` with the setting off sets both;
+  `BIBCODE_SOFTWARE_RENDERING=0` with it on sets neither.
+- `WEBKIT_DISABLE_COMPOSITING_MODE=0` exported with the setting on keeps `0`
+  and sets only `WEBKIT_DISABLE_DMABUF_RENDERER=1`. Settings then says this
+  launch asks WebKit to draw without GPU compositing (either variable other
+  than `0` counts), and names the exported variable as one the switch cannot
+  change. Both variables exported: the switch has no effect, and the row says
+  so.
+- Cold start without `AppRun` (#412): with the app closed, run the `Exec` line
+  of the generated `$XDG_DATA_HOME/applications/bibcode-desktop-handler.desktop`
+  with a `bibcode://` URL from `/` and from the home folder, for an extracted
+  AppDir and for the AppImage, with the setting on and off. The window renders,
+  `readlink /proc/<pid>/exe` of each WebKit child points into the AppDir, and
+  the desktop process runs under `AppRun` (its environment has `APPDIR`, and
+  `readlink /proc/<pid>/cwd` is the AppDir's `usr`). With the setting on, the WebKit children
+  hold both variables. In a container without FUSE, the AppImage handler needs
+  `APPIMAGE_EXTRACT_AND_RUN=1` in the caller's environment. A system WebKitGTK
+  under `/usr/lib/<triple>` can make a start from `/` look fine on an unfixed
+  build, because the rewritten helper path then resolves to the system's
+  helpers; check the `exe` link.
+- With the setting on, turn it off in Settings and use **Restart now**: the new
+  process's WebKit children have neither variable. Under Xvfb, start Xvfb and
+  the session bus yourself instead of through `xvfb-run` and
+  `dbus-run-session`, which end with the first process and leave the restarted
+  one without a display.
+- A malformed `desktop-settings.json` starts with neither variable, logs
+  `could not read the software rendering setting`, and the log line
+  `software rendering start-up decision` records every start, in `server.log`
+  of a release build too (they are written once the in-process server has
+  started). A launch outside `AppRun` from an AppDir restarts through `AppRun`; only
+  if that fails does it log `could not restart through the AppDir's AppRun`.
+  Started with another extracted AppDir's `APPDIR` and its paths in
+  `LD_LIBRARY_PATH`, `PATH` and `XDG_DATA_DIRS` (#413), a terminal's environment
+  holds none of that AppDir's entries.
+
+Record the bundled WebKitGTK version (the `libwebkit2gtk-4.1.so.0.*` file name
+under `usr/lib`) with the result.
 
 ### GTK light/dark theme
 

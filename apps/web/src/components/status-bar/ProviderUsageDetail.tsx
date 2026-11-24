@@ -19,7 +19,11 @@ import {
 } from "../ui/alert-dialog";
 import { Button } from "../ui/button";
 import { ProviderUsageWindowMeter } from "./ProviderUsageWindowMeter";
-import type { ProviderUsageViewModel } from "./providerUsagePresentation";
+import {
+  NOT_FETCHED_MESSAGE,
+  providerUsageLabel,
+  type ProviderUsageViewModel,
+} from "./providerUsagePresentation";
 
 export type ConsumeCodexRateLimitReset = (
   requestId: string,
@@ -58,7 +62,7 @@ const NOTICE_TEXT_CLASS: Record<ResetNotice["tone"], string> = {
 };
 
 function providerLabel(provider: ProviderUsageViewModel["provider"]): string {
-  return provider === "claude" ? "Claude" : "Codex";
+  return providerUsageLabel(provider) ?? "Provider";
 }
 
 function resetFailureMessage(error: unknown): string {
@@ -68,7 +72,25 @@ function resetFailureMessage(error: unknown): string {
   return "Could not reset Codex rate limits. Try again.";
 }
 
+// The server's own sentence says why Antigravity has no data (CLI too old, API-key sign-in, ...);
+// its stale-snapshot message is generic, so it gets this one.
+const GENERIC_STALE_MESSAGE = "Provider usage snapshot is stale.";
+const ANTIGRAVITY_STALE_COPY = "Antigravity usage is out of date. It will be tried again.";
+const ANTIGRAVITY_LOADING_COPY = "Reading Antigravity usage...";
+
 function providerStateCopy(viewModel: ProviderUsageViewModel): string | null {
+  if (viewModel.provider === "antigravity") {
+    // Without data, show only the sentence: retained meters belong to an error that kept data.
+    if (viewModel.error === NOT_FETCHED_MESSAGE) return ANTIGRAVITY_LOADING_COPY;
+    if (viewModel.error !== null) {
+      const sentence =
+        viewModel.error === GENERIC_STALE_MESSAGE ? ANTIGRAVITY_STALE_COPY : viewModel.error;
+      return viewModel.groups.length > 0 && viewModel.status === "error"
+        ? `Showing last available usage. ${sentence}`
+        : sentence;
+    }
+    return viewModel.groups.length > 0 ? null : ANTIGRAVITY_LOADING_COPY;
+  }
   if (viewModel.error !== null) {
     return viewModel.windows.length > 0
       ? `Showing last available usage. ${viewModel.error}`
@@ -109,8 +131,10 @@ export function ProviderUsageDetail({
   const [resetNotice, setResetNotice] = useState<ResetNotice | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
 
-  const updatedAt = DateTime.formatIso(viewModel.updatedAt);
+  const updatedAt = viewModel.updatedAt === null ? null : DateTime.formatIso(viewModel.updatedAt);
   const stateCopy = providerStateCopy(viewModel);
+  // A loading sentence is progress, not a warning.
+  const stateIsProgress = stateCopy === ANTIGRAVITY_LOADING_COPY || viewModel.error === null;
   const pending = isAttemptPending || isResetting;
   const canReset =
     viewModel.provider === "codex" &&
@@ -168,15 +192,28 @@ export function ProviderUsageDetail({
             <p className="mt-0.5 text-muted-foreground">{viewModel.plan.label} plan</p>
           ) : null}
         </div>
-        <p className="shrink-0 text-muted-foreground text-xs">
-          Updated{" "}
-          <time dateTime={updatedAt} title={updatedAt}>
-            {formatRelativeTimeLabel(updatedAt)}
-          </time>
-        </p>
+        {updatedAt === null ? null : (
+          <p className="shrink-0 text-muted-foreground text-xs">
+            Updated{" "}
+            <time dateTime={updatedAt} title={updatedAt}>
+              {formatRelativeTimeLabel(updatedAt)}
+            </time>
+          </p>
+        )}
       </div>
 
-      {viewModel.detailedWindows.length > 0 ? (
+      {viewModel.groups.length > 0 ? (
+        <div className="space-y-3">
+          {viewModel.groups.map((group) => (
+            <section aria-label={group.label} className="space-y-2" key={group.id}>
+              <h3 className="font-medium text-foreground text-xs">{group.label}</h3>
+              {group.windows.map((window) => (
+                <ProviderUsageWindowMeter key={window.key} variant="detail" window={window} />
+              ))}
+            </section>
+          ))}
+        </div>
+      ) : viewModel.detailedWindows.length > 0 ? (
         <div className="space-y-3">
           {viewModel.detailedWindows.map((window) => (
             <ProviderUsageWindowMeter key={window.key} variant="detail" window={window} />
@@ -188,7 +225,7 @@ export function ProviderUsageDetail({
         <p
           aria-atomic="true"
           aria-live="polite"
-          className={viewModel.error === null ? "text-muted-foreground" : "text-warning"}
+          className={stateIsProgress ? "text-muted-foreground" : "text-warning"}
           role="status"
         >
           {stateCopy}

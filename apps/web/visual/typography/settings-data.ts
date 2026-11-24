@@ -246,6 +246,7 @@ export const usageViewModel: ProviderUsageViewModel = {
   windows: [usageWindow],
   detailedWindows: [usageWindow],
   compactWindows: [usageWindow],
+  groups: [],
   plan: { value: "fixture", label: "Fixture" },
   credits: {
     availableCount: 1,

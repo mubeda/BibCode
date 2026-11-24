@@ -133,6 +133,7 @@ const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
+const ANTIGRAVITY_DRIVER_KIND = ProviderDriverKind.make("antigravity");
 
 /**
  * Codex's "no model chosen": the request names no model and Codex runs its own recommended one.
@@ -219,4 +220,5 @@ export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>>
   [CURSOR_DRIVER_KIND]: "Cursor",
   [GROK_DRIVER_KIND]: "Grok",
   [OPENCODE_DRIVER_KIND]: "OpenCode",
+  [ANTIGRAVITY_DRIVER_KIND]: "Antigravity",
 };

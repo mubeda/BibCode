@@ -789,6 +789,160 @@ async fn stopping_a_turn_expires_its_requests() {
     assert_eq!(open_requests(&engine, &thread_id).await, (0, 0));
 }
 
+/// Runs turn A to `ready`, then turn B to an open approval, a question, a request with no turn
+/// of its own and one recorded under a child agent's turn, as a provider reports them.
+async fn finished_turn_then_open_requests(engine: &OrchestrationEngine, thread_id: &str) {
+    let set = |status: &str, turn: Value| {
+        command(json!({
+            "type":"thread.session.set",
+            "commandId":format!("provider-session:{}", uuid::Uuid::new_v4()),
+            "threadId":thread_id, "createdAt":AT,
+            "session":{
+                "threadId":thread_id, "status":status, "providerName":"codex",
+                "runtimeMode":"approval-required", "activeTurnId":turn,
+                "lastError":null, "updatedAt":AT
+            }
+        }))
+    };
+    for (status, turn) in [
+        ("running", json!("turn-a")),
+        ("ready", Value::Null),
+        ("running", json!("turn-b")),
+    ] {
+        engine.dispatch(set(status, turn)).await.expect("session");
+    }
+    for (kind, payload, turn) in [
+        (
+            "approval.requested",
+            json!({"requestId":"b-approval","requestKind":"command"}),
+            json!("turn-b"),
+        ),
+        (
+            "user-input.requested",
+            json!({"requestId":"b-question","questions":[]}),
+            json!("turn-b"),
+        ),
+        (
+            "approval.requested",
+            json!({"requestId":"turnless","requestKind":"command"}),
+            Value::Null,
+        ),
+        // A Codex child agent asks under its own turn while the parent's turn B runs.
+        (
+            "approval.requested",
+            json!({"requestId":"child-approval","requestKind":"command"}),
+            json!("child-turn"),
+        ),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        engine
+            .dispatch(command(json!({
+                "type":"thread.activity.append", "commandId":format!("provider:{id}"),
+                "threadId":thread_id, "createdAt":AT,
+                "activity":{
+                    "id":id, "tone":"approval", "kind":kind, "summary":kind,
+                    "payload":payload, "turnId":turn, "createdAt":AT
+                }
+            })))
+            .await
+            .expect("activity");
+    }
+    assert_eq!(open_requests(engine, thread_id).await, (3, 1));
+}
+
+async fn interrupt(engine: &OrchestrationEngine, thread_id: &str, turn: Option<&str>) {
+    let mut value = json!({
+        "type":"thread.turn.interrupt", "commandId":"stop", "threadId":thread_id, "createdAt":AT
+    });
+    if let Some(turn) = turn {
+        value["turnId"] = json!(turn);
+    }
+    engine.dispatch(command(value)).await.expect("interrupt");
+}
+
+async fn expiry_payloads(engine: &OrchestrationEngine, thread_id: &str) -> Vec<Value> {
+    let thread_id = thread_id.to_owned();
+    engine
+        .repositories()
+        .database()
+        .call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT payload_json FROM projection_thread_activities WHERE thread_id = ? AND kind LIKE '%.expired' ORDER BY sequence",
+            )?;
+            let payloads = statement
+                .query_map([thread_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(payloads)
+        })
+        .await
+        .expect("expiries")
+        .iter()
+        .map(|payload| serde_json::from_str(payload).expect("payload"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_late_interrupt_for_a_finished_turn_keeps_the_running_turns_requests() {
+    // Mutation caught: a delayed Stop naming finished turn A expiring turn B's approvals, its
+    // child agent's included, which B's provider still waits on: the Stop is stale.
+    let (engine, thread_id) = engine().await;
+    finished_turn_then_open_requests(&engine, &thread_id).await;
+    interrupt(&engine, &thread_id, Some("turn-a")).await;
+    assert_eq!(open_requests(&engine, &thread_id).await, (3, 1));
+    assert!(expiry_payloads(&engine, &thread_id).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_interrupt_naming_the_running_turn_expires_every_open_request() {
+    // Mutation caught: the Stop of the running turn keeping the approval its child agent asked
+    // under the child's own turn id, which nobody can answer once the turn ends.
+    let (engine, thread_id) = engine().await;
+    finished_turn_then_open_requests(&engine, &thread_id).await;
+    interrupt(&engine, &thread_id, Some("turn-b")).await;
+    assert_eq!(open_requests(&engine, &thread_id).await, (0, 0));
+    let payloads = expiry_payloads(&engine, &thread_id).await;
+    assert_eq!(payloads.len(), 4);
+    for payload in payloads {
+        assert_eq!(
+            (&payload["reason"], &payload["sessionStatus"]),
+            (&json!("stopped"), &json!("interrupted"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_interrupt_naming_no_turn_expires_every_open_request() {
+    let (engine, thread_id) = engine().await;
+    finished_turn_then_open_requests(&engine, &thread_id).await;
+    // A request left open by finished turn A as well.
+    activity(
+        &engine,
+        &thread_id,
+        "approval.requested",
+        json!({"requestId":"a-approval","requestKind":"command"}),
+    )
+    .await;
+    assert_eq!(open_requests(&engine, &thread_id).await, (4, 1));
+    interrupt(&engine, &thread_id, None).await;
+    assert_eq!(open_requests(&engine, &thread_id).await, (0, 0));
+    assert_eq!(expiry_payloads(&engine, &thread_id).await.len(), 5);
+}
+
+#[tokio::test]
+async fn a_named_interrupt_with_no_active_turn_expires_every_open_request() {
+    // Mutation caught: a Stop naming a turn other than the one a request was recorded under (an
+    // OpenCode request kept from before a resume) leaving it open when no turn is active.
+    let (engine, thread_id) = engine().await;
+    session(&engine, &thread_id, "running", AT).await;
+    session(&engine, &thread_id, "ready", AT).await;
+    // Recorded under turn-1, shown again after the resume while no turn runs.
+    ask_both(&engine, &thread_id).await;
+    assert_eq!(open_requests(&engine, &thread_id).await, (1, 1));
+    interrupt(&engine, &thread_id, Some("resumed-turn")).await;
+    assert_eq!(open_requests(&engine, &thread_id).await, (0, 0));
+    assert_eq!(expiry_payloads(&engine, &thread_id).await.len(), 2);
+}
+
 #[tokio::test]
 async fn a_settled_session_settling_again_or_relaunching_expires_nothing() {
     let (engine, thread_id) = engine().await;

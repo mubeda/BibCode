@@ -556,6 +556,20 @@ describe("ClientSettings usage status bar", () => {
     });
   });
 
+  it("keeps the Antigravity opt-in its own boolean, off by default, with the item list untouched", () => {
+    expect(decodeClientSettings({}).showAntigravityUsage).toBe(false);
+    const settings = decodeClientSettings({
+      showAntigravityUsage: true,
+      statusBarItems: ["claude"],
+    });
+    expect(settings.showAntigravityUsage).toBe(true);
+    expect(settings.statusBarItems).toEqual(["claude"]);
+    // An unknown item literal resets the list (the downgrade hazard the separate flag avoids).
+    expect(
+      decodeClientSettings({ statusBarItems: ["claude", "antigravity"] }).statusBarItems,
+    ).toEqual(["claude", "codex", "resource-usage"]);
+  });
+
   it("decodes valid usage status bar overrides", () => {
     expect(
       decodeClientSettings({

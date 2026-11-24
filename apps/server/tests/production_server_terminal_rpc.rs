@@ -1016,6 +1016,7 @@ async fn provider_usage_refresh_rpc_forces_a_fetch_only_when_requested() {
                             session: None,
                             weekly: None,
                             fable_weekly: None,
+                            window_groups: Vec::new(),
                             plan_type: None,
                             rate_limit_reset_credits: None,
                             updated_at: now,
@@ -1067,6 +1068,137 @@ async fn provider_usage_refresh_rpc_forces_a_fetch_only_when_requested() {
             .await,
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    })
+    .catch_unwind()
+    .await;
+
+    close_socket(&mut socket).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A fake `agy` (Unix shell) whose answer carries a marker in every free-text field.
+#[cfg(unix)]
+fn fake_antigravity_cli(directory: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let usage = r#"{"status":"SUCCESS","num_turns":0,"response":"PRIVATE-PLAN-MARKER","command":{"name":"usage","data":{"description":"PRIVATE-PLAN-MARKER","groups":[{"name":"PRIVATE-PLAN-MARKER","buckets":[{"id":"gemini-5h","name":"PRIVATE-PLAN-MARKER","window":"5h","remaining_fraction":0.25,"reset_time":"2026-11-22T02:28:19Z"},{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.5,"reset_time":"2026-11-28T21:28:19Z"}]}]}}}"#;
+    let path = directory.join("agy");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 1.5.14; exit 0; fi\nprintf '%s' '{usage}'\necho PRIVATE-PLAN-MARKER >&2\n"
+        ),
+    )
+    .expect("fake agy");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    path
+}
+
+/// Antigravity is answered only when a request names it, on the read and on the refresh, and
+/// its wire shape carries the groups and no free text from the CLI.
+#[cfg(unix)]
+#[tokio::test]
+async fn provider_usage_rpcs_answer_antigravity_only_when_named() {
+    let temp = TempDir::new().expect("temporary directory");
+    let agy = fake_antigravity_cli(temp.path());
+    let settings_root = temp.path().join("settings");
+    std::fs::create_dir_all(&settings_root).expect("settings root");
+    std::fs::write(
+        settings_root.join("settings.json"),
+        json!({
+            "providerInstances": {"antigravity": {
+                "driver": "antigravity",
+                "enabled": true,
+                "config": {"binaryPath": agy.to_string_lossy()}
+            }}
+        })
+        .to_string(),
+    )
+    .expect("settings");
+    // Only the Antigravity fetcher is real; Claude and Codex never touch the host account here.
+    let antigravity = provider_usage::production_fetchers(
+        bibcode_server::server_settings::ProviderSettingsStore::new(&settings_root),
+        None,
+    )
+    .into_iter()
+    .filter(|fetcher| fetcher.provider == provider_usage::ProviderUsageProvider::Antigravity)
+    .collect::<Vec<_>>();
+    assert_eq!(antigravity.len(), 1);
+    let usage = provider_usage::ProviderUsageService::new(
+        antigravity,
+        Arc::new(time::OffsetDateTime::now_utc),
+    );
+    let mut registry = RpcRegistry::empty();
+    register_server_terminal_rpc(&mut registry, fixture_services_with_usage(usage));
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("Rust server starts");
+    let mut socket = Some(open_socket(handle.local_addr()).await);
+
+    let result = AssertUnwindSafe(async {
+        let socket = socket.as_mut().expect("socket");
+        let names = |value: &Value| -> Vec<String> {
+            value["providers"]
+                .as_array()
+                .expect("providers")
+                .iter()
+                .map(|snapshot| snapshot["provider"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let legacy = ["claude", "codex"];
+        let omitted =
+            success_value(request(socket, "1", "server.refreshProviderUsage", json!({})).await);
+        assert_eq!(names(&omitted), legacy);
+        let named = success_value(
+            request(
+                socket,
+                "2",
+                "server.refreshProviderUsage",
+                json!({ "providers": ["antigravity"], "force": true }),
+            )
+            .await,
+        );
+        assert_eq!(names(&named), ["claude", "codex", "antigravity"]);
+        let antigravity = &named["providers"][2];
+        assert_eq!(antigravity["status"], "ok", "{antigravity}");
+        assert_eq!(antigravity["windowGroups"][0]["id"], "gemini");
+        assert_eq!(antigravity["windowGroups"][0]["label"], "Gemini models");
+        assert_eq!(antigravity["windowGroups"][0]["session"]["usedPercent"], 75);
+        assert_eq!(
+            antigravity["windowGroups"][0]["weekly"]["windowMinutes"],
+            10_080
+        );
+        assert!(!named.to_string().contains("PRIVATE-PLAN-MARKER"));
+
+        // Cached now, it still stays out of an answer that does not name it.
+        let read_omitted =
+            success_value(request(socket, "3", "server.getProviderUsage", json!({})).await);
+        assert_eq!(names(&read_omitted), legacy);
+        let read_named = success_value(
+            request(
+                socket,
+                "4",
+                "server.getProviderUsage",
+                json!({ "providers": ["antigravity"] }),
+            )
+            .await,
+        );
+        assert_eq!(names(&read_named), ["claude", "codex", "antigravity"]);
+        assert_eq!(read_named["providers"][2]["status"], "ok");
+        assert!(!read_named.to_string().contains("PRIVATE-PLAN-MARKER"));
+        let refresh_omitted = success_value(
+            request(
+                socket,
+                "5",
+                "server.refreshProviderUsage",
+                json!({ "force": true }),
+            )
+            .await,
+        );
+        assert_eq!(names(&refresh_omitted), legacy);
     })
     .catch_unwind()
     .await;

@@ -38,6 +38,7 @@ export const PROVIDER_OPTIONS: Array<{
   { value: ProviderDriverKind.make("opencode"), label: "OpenCode", available: true },
   { value: ProviderDriverKind.make("cursor"), label: "Cursor", available: true },
   { value: ProviderDriverKind.make("grok"), label: "Grok", available: true },
+  { value: ProviderDriverKind.make("antigravity"), label: "Antigravity", available: true },
 ];
 
 export type WorkLogToolLifecycleStatus =

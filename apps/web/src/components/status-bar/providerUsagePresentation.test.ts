@@ -2,7 +2,10 @@ import type { ServerProviderUsageSnapshot } from "@bibcode/contracts";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildProviderUsageViewModel } from "./providerUsagePresentation";
+import {
+  buildProviderUsageViewModel,
+  providerUsageRelativeLabelKey,
+} from "./providerUsagePresentation";
 
 const now = DateTime.makeUnsafe("2026-07-07T18:00:00.000Z");
 const updatedAt = DateTime.makeUnsafe("2026-07-07T17:59:00.000Z");
@@ -31,6 +34,7 @@ function providerSnapshot(
       resetsAt: null,
       resetDescription: null,
     },
+    windowGroups: [],
     planType: null,
     rateLimitResetCredits: null,
     updatedAt,
@@ -131,5 +135,88 @@ describe("providerUsagePresentation", () => {
     expect(vm.plan?.label).toBe("Chatgpt Plus");
     expect(vm.plan?.value).toBe("  chatgpt plus  ");
     expect(snapshot.planType).toBe("  chatgpt plus  ");
+  });
+});
+
+describe("window groups", () => {
+  const groupWindow = (usedPercent: number, minutes: number, resetsAt: string | null) => ({
+    usedPercent,
+    windowMinutes: minutes,
+    resetsAt: resetsAt === null ? null : DateTime.makeUnsafe(resetsAt),
+    resetDescription: null,
+  });
+  const antigravity = providerSnapshot({
+    provider: "antigravity",
+    session: null,
+    weekly: null,
+    fableWeekly: null,
+    windowGroups: [
+      {
+        id: "gemini",
+        label: "Gemini models",
+        session: groupWindow(3, 300, "2026-07-07T18:05:00.000Z"),
+        weekly: groupWindow(1, 10080, null),
+      },
+      {
+        id: "third-party",
+        label: "Claude and GPT models",
+        session: groupWindow(90, 300, null),
+        weekly: null,
+      },
+    ],
+  });
+
+  it("flattens every group window and compacts to the tightest one", () => {
+    const vm = buildProviderUsageViewModel(antigravity, { now });
+    expect(vm.windows.map((window) => window.label)).toEqual([
+      "Gemini 5-hour",
+      "Gemini weekly",
+      "Claude/GPT 5-hour",
+    ]);
+    expect(vm.windows.map((window) => window.key)).toEqual([
+      "gemini-session",
+      "gemini-weekly",
+      "third-party-session",
+    ]);
+    expect(vm.compactWindows.map((window) => window.label)).toEqual(["Claude/GPT 5-hour"]);
+    // The bar shows the tightest window in detailed mode too; the popover shows the groups.
+    expect(vm.detailedWindows).toEqual(vm.compactWindows);
+    expect(
+      vm.groups.map((group) => [group.label, group.windows.map((window) => window.label)]),
+    ).toEqual([
+      ["Gemini models", ["5-hour", "Weekly"]],
+      ["Claude and GPT models", ["5-hour"]],
+    ]);
+  });
+
+  it("drops the meters of an expired or unavailable snapshot and keeps an error's", () => {
+    for (const status of ["unavailable", "fetching", "idle"] as const) {
+      const vm = buildProviderUsageViewModel({ ...antigravity, status }, { now });
+      expect([vm.windows, vm.groups, vm.detailedWindows]).toEqual([[], [], []]);
+    }
+    const retained = buildProviderUsageViewModel({ ...antigravity, status: "error" }, { now });
+    expect(retained.groups).toHaveLength(2);
+  });
+
+  it("shows no update time for the server's not-fetched placeholder", () => {
+    const vm = buildProviderUsageViewModel(
+      {
+        ...antigravity,
+        status: "unavailable",
+        windowGroups: [],
+        error: "Provider usage has not been fetched yet.",
+      },
+      { now },
+    );
+    expect(vm.updatedAt).toBeNull();
+  });
+
+  it("keys the countdown cache on group windows, so an expired reset changes the key", () => {
+    const before = providerUsageRelativeLabelKey([antigravity], now);
+    const after = providerUsageRelativeLabelKey(
+      [antigravity],
+      DateTime.makeUnsafe("2026-07-07T18:30:00.000Z"),
+    );
+    expect(before).not.toBe(after);
   });
 });

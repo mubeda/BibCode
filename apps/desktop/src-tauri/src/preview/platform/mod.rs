@@ -30,6 +30,19 @@ pub fn place_child(webview: &tauri::Webview, x: f64, y: f64, width: f64, height:
     let _ = (webview, x, y, width, height);
 }
 
+/// Call before a preview webview hides or closes: if it holds keyboard focus,
+/// the main webview takes it back. GTK and WebView2 need this: a hidden or
+/// destroyed focus widget or window leaves keys going nowhere until a click.
+/// macOS is unmeasured and unchanged.
+pub fn return_focus(webview: &tauri::Webview) {
+    #[cfg(target_os = "linux")]
+    linux::return_focus(webview);
+    #[cfg(target_os = "windows")]
+    windows::return_focus(webview);
+    #[cfg(target_os = "macos")]
+    let _ = webview;
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct ClearDataKinds {

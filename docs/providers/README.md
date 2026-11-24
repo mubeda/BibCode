@@ -2,12 +2,13 @@
 
 BiBCode currently supports these coding-agent providers:
 
-| Provider                  | Default state | Native integration        | Activity                                              |
-| ------------------------- | ------------- | ------------------------- | ----------------------------------------------------- |
-| [Codex](./codex.md)       | Enabled       | Codex App Server JSON-RPC | Structured chat and conditional terminal observation. |
-| [Claude](./claude.md)     | Enabled       | Stream-JSON CLI and hooks | Capability-gated chat and terminal observation.       |
-| [OpenCode](./opencode.md) | Enabled       | HTTP and server events    | Structured chat and conditional terminal observation. |
-| [Cursor](./cursor.md)     | Enabled       | Agent Client Protocol     | Chat; no structured activity in protocol v2.          |
+| Provider                        | Default state      | Native integration        | Activity                                              |
+| ------------------------------- | ------------------ | ------------------------- | ----------------------------------------------------- |
+| [Codex](./codex.md)             | Enabled            | Codex App Server JSON-RPC | Structured chat and conditional terminal observation. |
+| [Claude](./claude.md)           | Enabled            | Stream-JSON CLI and hooks | Capability-gated chat and terminal observation.       |
+| [OpenCode](./opencode.md)       | Enabled            | HTTP and server events    | Structured chat and conditional terminal observation. |
+| [Cursor](./cursor.md)           | Enabled            | Agent Client Protocol     | Chat; no structured activity in protocol v2.          |
+| [Antigravity](./antigravity.md) | Disabled (Preview) | Agent Client Protocol     | Chat and terminal; no structured activity.            |
 
 The legacy Grok driver is intentionally not exposed as a supported provider:
 it is omitted from Settings and from chat/terminal action menus even if an old
@@ -22,6 +23,33 @@ binary, environment, display name, and driver-specific options. The server
 probes the configured executable and reports installation, authentication, and
 model discovery independently; a driver being supported does not guarantee
 that its local CLI is installed or ready.
+
+## Starting a provider
+
+A provider CLI can wait silently while it starts, for example on one of its MCP
+servers that never connects. A slow start may still finish, so BiBCode never
+stops a provider for starting slowly. When a provider has not started after two
+minutes (60 seconds for Cursor and Antigravity), the thread shows, while it is
+still connecting, "<Provider> is taking longer than usual to start. One of its
+MCP servers may not be responding; run `<cli> mcp list` in a terminal to see
+which one." The command is named only for CLIs that have one (`claude`,
+`codex`, `opencode`, `agy`, `cursor-agent`). BiBCode keeps waiting, and the
+notice clears once the start ends; a start that then finishes goes on normally,
+so resuming, restarting, rewinding and compacting never fail because a start
+was slow.
+
+**Stop**, stopping the session, deleting the chat and closing a chat panel end a
+start that has not finished, and a launch whose start returned but that has not
+yet kept its session: BiBCode stops the provider process, and the message that
+was waiting is settled as stopped, never sent again and not shown as an error.
+**Stop** on a message that is still being sent dismisses that message and ends
+only the start for it; a start for another message keeps going. A message
+dismissed after its start finished, before it reached the provider, is not
+sent. Stopping BiBCode ends a start too; that message was not sent and waits for
+the next start.
+
+BiBCode starts one provider session at a time. While one start waits, other
+chats' provider commands wait behind it until it finishes or is stopped.
 
 ## Tools and Claude Code's own updates
 
@@ -80,7 +108,7 @@ forever. A server's progress also shows in **Settings → Connections**.
 The chat menu combines the selected provider's user skills with skills from the
 active repository or worktree. User skills outside the repository remain
 available even when the repository has no skills. Use `$` for Codex and `/` for
-Claude, Cursor, and OpenCode. Each provider's native visibility and name
+Claude, Cursor, Antigravity, and OpenCode. Each provider's native visibility and name
 precedence apply; disabled or non-invocable native skills are not suggestions.
 Like `@` for files and agents, `$` and `/` open the menu at the start of any
 word, mid-prompt too, while BiBCode's own `:` actions open it only at the start

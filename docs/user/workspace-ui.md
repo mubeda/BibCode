@@ -5,7 +5,8 @@ navigates agents and project/worktree threads, the center panel runs chats and
 terminals, and the right panel hosts project tools.
 
 The bottom status bar shows Claude and Codex usage for the environment selected
-in the left rail. Selecting a remote server changes both the displayed account
+in the left rail, and Antigravity usage when you turn that item on in the status
+bar settings (off by default; see [Antigravity](../providers/antigravity.md)). Selecting a remote server changes both the displayed account
 usage and the target of refresh or usage-reset actions. A server that has not
 returned usage does not borrow the local server's values.
 
@@ -1227,7 +1228,12 @@ The toolbar has three segments:
    branch creates and checks out a local branch with that upstream. If its
    local name already exists, checkout stops and asks you to select or rename
    that local branch; existing work is never replaced. Remote rows offer
-   checkout only. Use **Fetch** to discover branches added on the remote.
+   checkout and **Delete**; before deleting, BiBCode asks the remote for its
+   default branch and refuses to delete it, but the default, or a branch turned
+   into a pointer to another branch, can change between that check and the
+   delete, so the hosting service's own branch protection is the last line.
+   A remote with custom fetch or push settings is refused; delete its branches
+   with git on the command line. Use **Fetch** to discover branches added on the remote.
    **New branch** starts from the checked-out branch (or the current HEAD
    commit when HEAD is detached), never from the repository default; its
    **From** field shows that source and searches every local and remote branch
@@ -1965,8 +1971,11 @@ action, against the thread's checkout:
 
 - **Done** in the Source Control panel's create dialog opens the request it
   created or found.
-- **Open MR in panel** (**Open PR in panel** on GitHub) next to **View MR** in
-  the Source Control panel's menu opens the branch's open request.
+- **View MR** (**View PR** on GitHub) in the Source Control panel opens the
+  branch's open request in the panel. **Open MR in browser** (**Open PR in
+  browser**) in the same menu opens it on the hosting service instead. When the
+  panel cannot show the request (the Pull Requests setting is off, the provider
+  is unsupported, or the server is too old), **View MR** opens the browser.
 - **Open beside a thread…** on the full Pull Requests page lists the project's
   threads, those on the request's branch first, and opens the request in the
   one you choose. With no thread to choose, it is disabled and says why.

@@ -1413,6 +1413,57 @@ describe("ChatComposer rendering", () => {
     expect(activePlan["className"]).toContain("text-foreground");
   });
 
+  it("shows an Antigravity chat's advertised model, its thinking levels and Plan (R13)", () => {
+    const antigravityInstanceId = ProviderInstanceId.make("antigravity");
+    const level = (ids: ReadonlyArray<string>) => ({
+      id: "reasoning",
+      label: "Thinking level",
+      type: "select" as const,
+      options: ids.map((id) => ({ id, label: `Level ${id}`, isDefault: id === "low" })),
+    });
+    const antigravityProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: antigravityInstanceId,
+      driver: ProviderDriverKind.make("antigravity"),
+      displayName: "Antigravity",
+      slashCommands: [],
+      skills: [],
+      agents: [],
+      models: [
+        {
+          slug: "model-alpha",
+          name: "Model Alpha",
+          isCustom: false,
+          capabilities: { optionDescriptors: [level(["low", "high"])] },
+        },
+        {
+          slug: "model-beta",
+          name: "Model Beta",
+          isCustom: false,
+          capabilities: { optionDescriptors: [level(["low", "high", "xhigh"])] },
+        },
+      ],
+    };
+    const selection = {
+      instanceId: antigravityInstanceId,
+      model: "model-beta",
+      options: [{ id: "reasoning", value: "xhigh" }],
+    };
+
+    const { markup, spies } = renderComposer({
+      providerStatuses: [codexProvider, antigravityProvider],
+      providerBindingInstanceId: antigravityInstanceId,
+      activeProjectDefaultModelSelection: selection,
+      activeThreadModelSelection: selection,
+    });
+
+    expect(markup).toContain('data-instance="antigravity"');
+    expect(markup).toContain('data-model="model-beta"');
+    expect(markup).toContain('aria-label="Reasoning effort: Level xhigh"');
+    (captureByLabel("Button", "Enable plan mode")["onClick"] as () => void)();
+    expect(spies.toggleInteractionMode).toHaveBeenCalledOnce();
+  });
+
   it("keeps runtime controls icon-only at compact and regular widths", () => {
     const { spies } = renderComposer({ runtimeMode: "auto-accept-edits" });
 

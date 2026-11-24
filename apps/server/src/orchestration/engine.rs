@@ -1007,6 +1007,9 @@ pub struct DispatchResult {
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// The engine judged this interrupt stale in its commit, so it must reach no provider.
+    #[serde(skip)]
+    pub stale_interrupt: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2038,6 +2041,75 @@ struct RestoreHolds {
     admitted: HashMap<String, usize>,
 }
 
+/// What `LaunchStops::stop` found for the thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchStopResult {
+    NoLaunch,
+    Stopped,
+    /// A launch for another message is in flight; it was left running.
+    OtherMessage,
+}
+
+/// How each launching thread's start is ended from outside the provider supervisor's queue.
+#[derive(Clone, Default)]
+pub(crate) struct LaunchStops(Arc<StdMutex<HashMap<String, LaunchStop>>>);
+
+impl LaunchStops {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, LaunchStop>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Stops the thread's launch that has not kept its session yet, whether its start has
+    /// returned or not. A stop for a dismissed message (`target`) ends only the launch for
+    /// that message, never the launch of another message the worker claimed; a plain stop ends
+    /// any launch.
+    pub(crate) fn stop(&self, thread_id: &str, target: Option<&str>) -> LaunchStopResult {
+        let stops = self.lock();
+        match stops.get(thread_id) {
+            None => LaunchStopResult::NoLaunch,
+            Some(stop) if target.is_none() || stop.message_id.as_deref() == target => {
+                stop.token.cancel();
+                LaunchStopResult::Stopped
+            }
+            Some(_) => LaunchStopResult::OtherMessage,
+        }
+    }
+
+    /// Stops every launch in flight because the server shuts down: nothing was sent.
+    pub(crate) fn stop_all_for_shutdown(&self) {
+        for stop in self.lock().values() {
+            stop.shutdown.store(true, Ordering::SeqCst);
+            stop.token.cancel();
+        }
+    }
+}
+
+/// Ends a provider session launch until it keeps its session: during its start, and after the
+/// start returned while it applies options and publishes the session. The supervisor awaits every launch in its one queue, so a
+/// stop of the thread, or the server's shutdown, reaches the launch here instead of waiting
+/// behind it. A targeted stop matches only the launch for its own message.
+#[derive(Clone, Default)]
+pub(crate) struct LaunchStop {
+    token: CancellationToken,
+    shutdown: Arc<AtomicBool>,
+    /// The message whose delivery this launch is for; `None` for a rewind, compaction or restart.
+    message_id: Option<String>,
+}
+
+impl LaunchStop {
+    /// Resolves once the launch is stopped.
+    pub(crate) async fn stopped(&self) {
+        self.token.cancelled().await;
+    }
+
+    /// Whether the server's shutdown, not the user, stopped the launch.
+    pub(crate) fn by_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+}
+
 fn decrement(counts: &mut HashMap<String, usize>, thread_id: &str) {
     if let Some(count) = counts.get_mut(thread_id) {
         *count -= 1;
@@ -2051,12 +2123,23 @@ fn decrement(counts: &mut HashMap<String, usize>, thread_id: &str) {
 pub(crate) struct SessionLaunch {
     engine: OrchestrationEngine,
     thread_id: String,
+    stop: LaunchStop,
+}
+
+impl SessionLaunch {
+    /// Ends this launch's start when the thread is stopped or the server shuts down.
+    pub(crate) fn stop(&self) -> &LaunchStop {
+        &self.stop
+    }
 }
 
 impl Drop for SessionLaunch {
     fn drop(&mut self) {
         let mut holds = self.engine.lock_restore_holds();
         decrement(&mut holds.launching, &self.thread_id);
+        if !holds.launching.contains_key(&self.thread_id) {
+            self.engine.launch_stops.lock().remove(&self.thread_id);
+        }
     }
 }
 /// Why a provider session cannot launch while another chat restores files in its checkout.
@@ -2295,6 +2378,7 @@ pub struct OrchestrationEngine {
     thread_turns: ThreadTurnFence,
     checkout_turns: CheckoutTurnFence,
     restore_holds: Arc<StdMutex<RestoreHolds>>,
+    launch_stops: LaunchStops,
     compaction_waiters: CompactionWaiters,
     ask_recovery_holds: AskRecoveryHolds,
     checkpoint_holds: CheckpointHolds,
@@ -2395,6 +2479,7 @@ impl OrchestrationEngine {
             thread_turns: ThreadTurnFence::default(),
             checkout_turns: CheckoutTurnFence::default(),
             restore_holds: Arc::default(),
+            launch_stops: LaunchStops::default(),
             compaction_waiters: CompactionWaiters::default(),
             ask_recovery_holds: AskRecoveryHolds::default(),
             checkpoint_holds: CheckpointHolds::default(),
@@ -2546,6 +2631,7 @@ impl OrchestrationEngine {
             thread_id: Some(thread_id),
             project_id: None,
             disposition: Some(disposition),
+            stale_interrupt: false,
         }))
     }
 
@@ -3098,16 +3184,31 @@ impl OrchestrationEngine {
 
     /// Registers a provider session launch of the thread, or refuses it while a file restore of
     /// another chat in its checkout holds the thread. See `CheckoutRestore::hold_threads`.
-    pub(crate) fn begin_session_launch(&self, thread_id: &str) -> Result<SessionLaunch, String> {
+    /// `message_id` names the message whose delivery needs this launch, if any.
+    pub(crate) fn begin_session_launch(
+        &self,
+        thread_id: &str,
+        message_id: Option<&str>,
+    ) -> Result<SessionLaunch, String> {
         let mut holds = self.lock_restore_holds();
         if holds.held.contains_key(thread_id) {
             return Err(RESTORING_FILES_DETAIL.to_owned());
         }
         *holds.launching.entry(thread_id.to_owned()).or_default() += 1;
+        let mut stops = self.launch_stops.lock();
+        let stop = stops.entry(thread_id.to_owned()).or_default();
+        stop.message_id = message_id.map(str::to_owned);
+        let stop = stop.clone();
         Ok(SessionLaunch {
             engine: self.clone(),
             thread_id: thread_id.to_owned(),
+            stop,
         })
+    }
+
+    /// The registry that stops this engine's provider launches that have not kept their session.
+    pub(crate) fn launch_stops(&self) -> LaunchStops {
+        self.launch_stops.clone()
     }
 
     fn lock_restore_holds(&self) -> std::sync::MutexGuard<'_, RestoreHolds> {
@@ -3943,6 +4044,7 @@ async fn process_envelope(
                         }),
                     project_id,
                     disposition: replay_adoption.map(|result| result.1),
+                    stale_interrupt: false,
                 },
                 accepted_new: false,
             });
@@ -4003,6 +4105,7 @@ async fn process_envelope(
                         thread_id: None,
                         project_id: None,
                         disposition: None,
+                        stale_interrupt: false,
                     },
                     accepted_new: true,
                 });
@@ -4075,6 +4178,7 @@ async fn process_envelope(
                     thread_id: canonical_default_thread_id(model, &existing_project_id),
                     project_id: Some(existing_project_id),
                     disposition: None,
+                    stale_interrupt: false,
                 },
                 accepted_new: true,
             });
@@ -4223,6 +4327,7 @@ async fn process_envelope(
                 }),
             project_id,
             disposition: adoption_result.map(|result| result.1),
+            stale_interrupt: persisted.stale_interrupt,
         },
         accepted_new: true,
     })
@@ -6398,6 +6503,7 @@ fn required_command_string(
 struct PersistCommandOutcome {
     committed: VecDeque<OrchestrationEvent>,
     result_sequence: i64,
+    stale_interrupt: bool,
 }
 
 const STALE_QUEUED_DELIVERY: &str = "Queued delivery changed before promotion or steering.";
@@ -6454,6 +6560,16 @@ async fn persist_command(
                 .unwrap_or_default()
                 .to_owned(),
         )),
+        _ => None,
+    };
+    // A Stop naming a turn other than the active one (a late Stop for a finished turn) is stale:
+    // it holds no queue, expires no request and leaves a running compaction alone.
+    let named_interrupt = match command {
+        OrchestrationCommand::ThreadTurnInterrupt {
+            thread_id,
+            turn_id: Some(turn_id),
+            ..
+        } => Some((thread_id.clone(), turn_id.clone())),
         _ => None,
     };
     let hold = match command {
@@ -6518,6 +6634,17 @@ async fn persist_command(
         .call(move |connection| {
             let transaction = connection.transaction()?;
             let mut hold = hold;
+            let mut expiry = expiry;
+            let mut compaction_step = compaction_step;
+            let mut stale_interrupt = false;
+            if let Some((thread_id, named)) = &named_interrupt
+                && interrupt_is_stale(Some(named), active_turn_of_tx(&transaction, thread_id)?.as_deref())
+            {
+                stale_interrupt = true;
+                hold = None;
+                expiry = None;
+                compaction_step = None;
+            }
             let mut copy_receipts = Vec::new();
             if let Some(step) = compaction_step {
                 let applied = apply_compaction_step_tx(
@@ -6733,6 +6860,7 @@ async fn persist_command(
             Ok(Ok(PersistCommandOutcome {
                 committed,
                 result_sequence,
+                stale_interrupt,
             }))
         })
         .await
@@ -8172,6 +8300,26 @@ fn request_expiry_summary(kind: &str) -> &'static str {
     } else {
         "Question expired"
     }
+}
+
+/// Whether a Stop naming `named` is stale: the session's active turn is a different one. Any
+/// other Stop ends the running turn, and every request still open on the thread with it.
+fn interrupt_is_stale(named: Option<&str>, active: Option<&str>) -> bool {
+    matches!((named, active), (Some(named), Some(active)) if named != active)
+}
+
+fn active_turn_of_tx(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    Ok(transaction
+        .query_row(
+            "SELECT active_turn_id FROM projection_thread_sessions WHERE thread_id = ?",
+            [thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// Activities expiring every request still open on `thread_id` when `cause` proves nobody can

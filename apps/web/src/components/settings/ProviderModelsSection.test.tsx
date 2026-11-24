@@ -244,6 +244,8 @@ describe("rendering", () => {
   it("passes the driver placeholder to the input, falling back to model-slug", () => {
     render(baseProps({ driverKind: CODEX }));
     expect(ui.find("Input").placeholder).toBe("gpt-6.7-codex-ultra-preview");
+    render(baseProps({ driverKind: ProviderDriverKind.make("antigravity") }));
+    expect(ui.find("Input").placeholder).toBe("gemini-4-neon-high");
     render(baseProps({ driverKind: null }));
     expect(ui.find("Input").placeholder).toBe("model-slug");
   });

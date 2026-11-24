@@ -1,8 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
+    future::Future,
+    hash::{Hash, Hasher},
     path::Path,
     process::Stdio,
+    sync::{Arc, PoisonError},
     time::Duration,
 };
 
@@ -16,10 +19,18 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    diagnostics::profiler::exits::{self, Exited, Watch},
+    diagnostics::{
+        AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
+        ProcessRegistration, ProcessRegistrationMetadata, RegistrationSource,
+    },
     git::{OutputPolicy, ProcessRequest, ProcessRunner},
     process::{
         Platform, configure_supervised_background_command_wrap,
-        supervised::{log_cleanup_failures, terminate_and_wait},
+        supervised::{
+            StopPolicy, SupervisedOverflow, SupervisedRunRequest, log_cleanup_failures,
+            run_supervised_with_spawn_observer, terminate_and_wait,
+        },
     },
     production::provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
     production::provider_runtime::{
@@ -36,7 +47,23 @@ mod capabilities;
 pub(crate) use capabilities::discover_capabilities;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
 const CURSOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const CURSOR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long the session that reads Cursor's advertised model values may take; a CLI that does
+/// not answer still publishes its model list.
+#[cfg(not(test))]
+const CURSOR_SESSION_READ_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CURSOR_SESSION_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+/// The close is courtesy: the catalog is already read and the child stops next.
+const ANTIGRAVITY_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// BiBCode's own words: the CLI's error text never reaches the snapshot.
+/// An instance whose stored sensitive value could not be read is not probed.
+const ANTIGRAVITY_MISSING_SECRET_MESSAGE: &str = "A saved environment value of this instance could not be read, so it was not checked. Save the instance's environment again.";
+const ANTIGRAVITY_SIGN_IN_MESSAGE: &str = "Antigravity is not signed in. Open an Antigravity Terminal and run `agy`, or run `agy acp --login`.";
 const CLAUDE_CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(45);
 const CLAUDE_SKILLS_TIMEOUT: Duration = Duration::from_secs(10);
 const CLAUDE_CAPABILITY_PROBE_ARGS: [&str; 12] = [
@@ -75,6 +102,10 @@ struct ProviderDefinition {
     endpoint: Option<String>,
     server_password: Option<String>,
     environment: Vec<(OsString, OsString)>,
+    /// A sensitive variable is still redacted: its stored value could not be supplied.
+    missing_secret: bool,
+    /// The supplied values of sensitive variables: never part of a published version.
+    secret_values: Vec<String>,
 }
 
 struct ProviderSessionDefaults {
@@ -103,18 +134,39 @@ struct ClaudeProbeMetadata {
     skills_loaded: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RichMetadataOutcome {
+    #[default]
     NotRequested,
     Succeeded,
     Failed,
 }
 
-#[derive(Clone, Debug)]
+/// What a probe learned about the reads only an Antigravity session gives (sign-in, its
+/// message, the probed catalog).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SessionReads {
+    /// No session was opened (a quick probe, a reused catalog): the last reads stay, while the
+    /// launch inputs are those they were read with.
+    #[default]
+    NotRead,
+    /// A session answered: its reads replace the last ones.
+    Read,
+    /// The CLI failed its version check, a session could not be opened, or the launch inputs
+    /// changed: nothing from the last reads stays.
+    Lost,
+}
+
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderProbeResult {
     pub(crate) snapshot: Value,
     pub(crate) rich_metadata: RichMetadataOutcome,
     pub(crate) models_authoritative: bool,
+    pub(crate) session_reads: SessionReads,
+    /// A digest of the binary path and environment the probe launched with.
+    pub(crate) launch_inputs: u64,
+    /// [`Self::launch_inputs`] with the configured custom models: what a reused catalog keys on.
+    pub(crate) catalog_inputs: u64,
 }
 
 impl ProviderProbeResult {
@@ -123,6 +175,7 @@ impl ProviderProbeResult {
             snapshot,
             rich_metadata,
             models_authoritative: rich_metadata == RichMetadataOutcome::Succeeded,
+            ..Self::default()
         }
     }
 
@@ -138,16 +191,74 @@ pub(crate) async fn probe(
     cwd: &Path,
     maintenance: &ProviderMaintenance,
 ) -> Vec<ProviderProbeResult> {
-    probe_inner(settings, selected, cwd, false, maintenance).await
+    probe_inner(
+        settings,
+        selected,
+        cwd,
+        false,
+        maintenance,
+        None,
+        &HashSet::new(),
+    )
+    .await
 }
 
+/// Probes with the slow capabilities too. `attribution` attributes the processes the probe
+/// starts, when the runtime has attached a registry.
 pub(crate) async fn probe_full(
     settings: &Value,
     selected: Option<&str>,
     cwd: &Path,
     maintenance: &ProviderMaintenance,
+    attribution: Option<&ProcessAttributionRegistry>,
 ) -> Vec<ProviderProbeResult> {
-    probe_inner(settings, selected, cwd, true, maintenance).await
+    probe_full_reusing(
+        settings,
+        selected,
+        cwd,
+        maintenance,
+        attribution,
+        &HashSet::new(),
+    )
+    .await
+}
+
+/// [`probe_full`] that keeps the last ACP catalog of the instances in `reuse` instead of
+/// probing it again (see [`antigravity_catalog_inputs`]).
+pub(crate) async fn probe_full_reusing(
+    settings: &Value,
+    selected: Option<&str>,
+    cwd: &Path,
+    maintenance: &ProviderMaintenance,
+    attribution: Option<&ProcessAttributionRegistry>,
+    reuse: &HashSet<String>,
+) -> Vec<ProviderProbeResult> {
+    probe_inner(
+        settings,
+        selected,
+        cwd,
+        true,
+        maintenance,
+        attribution,
+        reuse,
+    )
+    .await
+}
+
+/// The enabled Antigravity instances, each with the inputs of its catalog read (a digest: the
+/// environment carries the stored secrets). An Antigravity probe opens a session in the user's
+/// account, so after a signed-in read with these same inputs a full refresh within the refresh
+/// TTL may reuse its catalog. Cursor's model list is always read again; the session it opens to
+/// read the advertised model values is opened once per CLI and model list.
+pub(crate) fn antigravity_catalog_inputs(settings: &Value) -> HashMap<String, u64> {
+    definitions(settings)
+        .into_iter()
+        .filter(|definition| definition.driver == "antigravity" && definition.enabled)
+        .map(|definition| {
+            let inputs = catalog_inputs(&definition);
+            (definition.instance_id, inputs)
+        })
+        .collect()
 }
 
 async fn probe_inner(
@@ -156,6 +267,8 @@ async fn probe_inner(
     cwd: &Path,
     include_slow_capabilities: bool,
     maintenance: &ProviderMaintenance,
+    attribution: Option<&ProcessAttributionRegistry>,
+    reuse: &HashSet<String>,
 ) -> Vec<ProviderProbeResult> {
     let checks_enabled = settings
         .get("enableProviderUpdateChecks")
@@ -166,12 +279,15 @@ async fn probe_inner(
             .into_iter()
             .filter(|definition| selected.is_none_or(|id| id == definition.instance_id))
             .map(|definition| {
+                let reuse_catalog = reuse.contains(&definition.instance_id);
                 probe_one(
                     definition,
                     cwd,
                     include_slow_capabilities,
                     checks_enabled,
                     maintenance,
+                    attribution,
+                    reuse_catalog,
                 )
             }),
     )
@@ -183,10 +299,10 @@ fn provider_is_enabled(driver: &str, configured: bool) -> bool {
 }
 
 fn default_provider_binary(driver: &str) -> &str {
-    if driver == "cursor" {
-        "cursor-agent"
-    } else {
-        driver
+    match driver {
+        "cursor" => "cursor-agent",
+        "antigravity" => "agy",
+        other => other,
     }
 }
 
@@ -237,15 +353,10 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                             .map(str::to_owned),
                         enabled: provider_is_enabled(
                             driver,
-                            instance
-                                .get("enabled")
-                                .and_then(Value::as_bool)
-                                .or_else(|| {
-                                    legacy_settings
-                                        .and_then(|value| value.get("enabled"))
-                                        .and_then(Value::as_bool)
-                                })
-                                .unwrap_or(true),
+                            crate::server_settings::provider_instance_enabled(
+                                settings,
+                                instance_id,
+                            ),
                         ),
                         binary_path: string_setting(config, "binaryPath")
                             .or_else(|| string_setting(legacy_settings, "binaryPath"))
@@ -269,16 +380,31 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                             .filter(|value| !value.is_empty())
                             .map(str::to_owned),
                         environment: provider_environment(instance),
+                        missing_secret: instance
+                            .get("environment")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .any(|entry| entry["valueRedacted"] == true),
+                        secret_values: secret_values(instance),
                     }
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
-    for driver in ["codex", "claudeAgent", "cursor", "grok", "opencode"] {
+    for driver in [
+        "codex",
+        "claudeAgent",
+        "cursor",
+        "grok",
+        "opencode",
+        "antigravity",
+    ] {
+        // A configured instance may own a built-in's id from before that driver existed.
         if definitions
             .iter()
-            .any(|definition| definition.driver == driver)
+            .any(|definition| definition.driver == driver || definition.instance_id == driver)
         {
             continue;
         }
@@ -288,12 +414,10 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
             instance_id: driver.to_owned(),
             driver: driver.to_owned(),
             display_name: None,
+            // Raw settings carry no defaults; Antigravity must stay off until enabled.
             enabled: provider_is_enabled(
                 driver,
-                driver_settings
-                    .and_then(|value| value.get("enabled"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
+                crate::server_settings::provider_instance_enabled(settings, driver),
             ),
             binary_path: string_setting(driver_settings, "binaryPath")
                 .unwrap_or_else(|| default_provider_binary(driver))
@@ -311,6 +435,8 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
             environment: Vec::new(),
+            missing_secret: false,
+            secret_values: Vec::new(),
         });
     }
     definitions
@@ -373,6 +499,20 @@ fn string_array(value: Option<&Value>, name: &str) -> Option<Vec<String>> {
     )
 }
 
+/// The values of the instance's sensitive variables that were supplied (not redacted).
+fn secret_values(instance: &Value) -> Vec<String> {
+    instance
+        .get("environment")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["sensitive"] == true && entry["valueRedacted"] != true)
+        .filter_map(|entry| entry.get("value").and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn provider_environment(instance: &Value) -> Vec<(OsString, OsString)> {
     let environment = instance
         .get("environment")
@@ -414,17 +554,44 @@ async fn probe_one(
     include_slow_capabilities: bool,
     checks_enabled: bool,
     maintenance: &ProviderMaintenance,
+    attribution: Option<&ProcessAttributionRegistry>,
+    reuse_catalog: bool,
 ) -> ProviderProbeResult {
     // A driver this build does not ship has no binary to look up or version to advise on.
     if !definition.available {
         return unavailable_result(&definition);
     }
     let target = maintenance_target_from_definition(&definition);
-    let mut result = probe_one_snapshot(&definition, cwd, include_slow_capabilities).await;
+    let mut result = probe_one_snapshot(
+        &definition,
+        cwd,
+        include_slow_capabilities,
+        attribution,
+        reuse_catalog,
+    )
+    .await;
+    result.launch_inputs = launch_inputs(&definition);
+    result.catalog_inputs = catalog_inputs(&definition);
     maintenance
         .enrich_snapshot(&target, &mut result.snapshot, checks_enabled)
         .await;
     result
+}
+
+/// A digest of what a probe and a chat launch with: the binary path and the environment.
+fn launch_inputs(definition: &ProviderDefinition) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    (&definition.binary_path, &definition.environment).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The launch inputs and the custom models: a catalog read with other ones is read again.
+fn catalog_inputs(definition: &ProviderDefinition) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    (launch_inputs(definition), &definition.custom_models).hash(&mut hasher);
+    hasher.finish()
 }
 
 fn maintenance_target_from_definition(
@@ -479,7 +646,7 @@ pub(crate) async fn probe_maintenance_target_version(
         version_output
             .as_ref()
             .filter(|output| output.success)
-            .and_then(|output| first_line(&output.stdout, &output.stderr)),
+            .and_then(|output| version_line(&target.driver, output)),
     );
     if target.driver != "cursor" {
         return version;
@@ -518,10 +685,14 @@ pub(crate) fn unsupported_instances(settings: &Value) -> Vec<ProviderProbeResult
         .collect()
 }
 
+/// `reuse_catalog` skips Antigravity's session probe:
+/// the last one stays through the merge.
 async fn probe_one_snapshot(
     definition: &ProviderDefinition,
     cwd: &Path,
     include_slow_capabilities: bool,
+    attribution: Option<&ProcessAttributionRegistry>,
+    reuse_catalog: bool,
 ) -> ProviderProbeResult {
     if !definition.available {
         return unavailable_result(definition);
@@ -728,12 +899,19 @@ async fn probe_one_snapshot(
         );
     }
 
-    let version_output =
-        run_command(&executable, &["--version"], cwd, &definition.environment).await;
+    let version_output = if definition.driver == "antigravity" {
+        run_antigravity_version(&executable, cwd, &definition.environment, attribution).await
+    } else {
+        run_command(&executable, &["--version"], cwd, &definition.environment).await
+    };
     let version = version_output
         .as_ref()
-        .and_then(|output| first_line(&output.stdout, &output.stderr));
-    let version = normalize_provider_version(&definition.driver, version);
+        // A failed Antigravity `--version` may print anything, an account included.
+        .filter(|output| output.success || definition.driver != "antigravity")
+        .and_then(|output| version_line(&definition.driver, output));
+    // The peer's own text, before any parsing could strip what identifies a stored secret.
+    let mut raw_versions = version.iter().cloned().collect::<Vec<_>>();
+    let mut version = normalize_provider_version(&definition.driver, version);
     let mut installed = version_output.is_some();
     let mut status = match version_output.as_ref() {
         Some(output) if output.success => "ready",
@@ -753,6 +931,12 @@ async fn probe_one_snapshot(
     };
 
     let mut versioned_model_catalog = false;
+    // A CLI that fails its version check keeps nothing an earlier session read.
+    let mut session_reads = if version_output.as_ref().is_some_and(|output| output.success) {
+        SessionReads::NotRead
+    } else {
+        SessionReads::Lost
+    };
     match definition.driver.as_str() {
         "codex" => {
             if include_slow_capabilities
@@ -802,6 +986,7 @@ async fn probe_one_snapshot(
                 if include_slow_capabilities
                     && let Some(discovered) = probe_cursor_models(
                         &executable,
+                        about.version.as_deref(),
                         definition.endpoint.as_deref(),
                         &definition.custom_models,
                         cwd,
@@ -916,10 +1101,75 @@ async fn probe_one_snapshot(
         "grok" if version_output.as_ref().is_some_and(|output| output.success) => {
             rich_metadata = RichMetadataOutcome::Succeeded;
         }
+        "antigravity"
+            if include_slow_capabilities
+                && !reuse_catalog
+                && version_output.as_ref().is_some_and(|output| output.success) =>
+        {
+            // A stored secret that could not be read: probing without it would read another
+            // account than the chat launches with (which refuses to start), so nothing is read.
+            let catalog = if definition.missing_secret {
+                message = Some(ANTIGRAVITY_MISSING_SECRET_MESSAGE);
+                None
+            } else {
+                probe_antigravity_catalog(
+                    &definition.instance_id,
+                    &executable,
+                    &definition.custom_models,
+                    &definition.environment,
+                    attribution,
+                )
+                .await
+            };
+            // A session that could not be opened or answered keeps nothing an earlier one read.
+            session_reads = if catalog.is_some() {
+                SessionReads::Read
+            } else {
+                SessionReads::Lost
+            };
+            match catalog {
+                Some(AntigravityCatalog::Session {
+                    models: discovered,
+                    version: agent_version,
+                }) => {
+                    auth = json!({ "status": "authenticated" });
+                    if let Some(agent_version) = agent_version {
+                        if let Some(release) = release_version(&agent_version) {
+                            version = Some(release);
+                        }
+                        raw_versions.push(agent_version);
+                    }
+                    // A reply that listed no model keeps the last catalog until the next probe.
+                    if let Some(discovered) = discovered {
+                        models = discovered;
+                        rich_metadata = RichMetadataOutcome::Succeeded;
+                    }
+                }
+                Some(AntigravityCatalog::SignInRequired) => {
+                    // Still ready: the terminal is where the user signs in.
+                    auth = json!({ "status": "unauthenticated" });
+                    message = Some(ANTIGRAVITY_SIGN_IN_MESSAGE);
+                    // The signed-out account's catalog is gone with it.
+                    versioned_model_catalog = true;
+                }
+                None => {}
+            }
+        }
         _ => {}
     }
 
-    let result = ProviderProbeResult::new(
+    // A CLI that echoes its environment can print a secret shaped like a release number. The
+    // raw text is checked, since the parser drops a leading `v` (`v1.2.3` publishes `1.2.3`).
+    let leaks_secret = raw_versions.iter().any(|raw| {
+        definition.secret_values.iter().any(|secret| {
+            raw.contains(secret.as_str())
+                || secret
+                    .strip_prefix('v')
+                    .is_some_and(|bare| !bare.is_empty() && raw.contains(bare))
+        })
+    });
+    let version = version.filter(|_| !leaks_secret);
+    let mut result = ProviderProbeResult::new(
         snapshot(
             definition,
             installed,
@@ -934,6 +1184,7 @@ async fn probe_one_snapshot(
         ),
         rich_metadata,
     );
+    result.session_reads = session_reads;
     if versioned_model_catalog {
         result.with_authoritative_models()
     } else {
@@ -1481,8 +1732,601 @@ async fn probe_codex(
     result
 }
 
+enum AntigravityCatalog {
+    /// A session opened, so the CLI is signed in. `models` is `None` when the reply listed no
+    /// model; `version` is the handshake's raw `agentInfo.version`, checked against the stored
+    /// secrets before it is parsed.
+    Session {
+        models: Option<Vec<Value>>,
+        version: Option<String>,
+    },
+    SignInRequired,
+}
+
+/// An inventory probe's child, stopped and reaped however the probe ends. A probe dropped
+/// mid-way signals the whole process group at once and hands only the reap to the runtime, so
+/// a reap task dropped unpolled, or no runtime at all, leaves no descendant running. The
+/// attribution ends after the reap.
+struct ProbeChild {
+    child: Option<Box<dyn ChildWrapper>>,
+    registration: Option<ProcessRegistration>,
+}
+
+impl ProbeChild {
+    async fn stop(mut self) {
+        // Kept in place while it stops: a cancelled stop leaves the reap to `Drop`.
+        if let Some(child) = self.child.as_mut() {
+            stop_supervised_child(&mut **child).await;
+        }
+        self.child = None;
+    }
+
+    /// The exit status of a child that ended on its own, waiting up to a second for it; `None`
+    /// while it runs.
+    async fn exited_on_its_own(&self) -> Option<std::process::ExitStatus> {
+        let child = self.child.as_deref()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(status) = crate::process::exited_status(child) {
+                return Some(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl Drop for ProbeChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // The group kill, sent here rather than from a task that may never run.
+        let _ = child.start_kill();
+        let registration = self.registration.take();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                stop_supervised_child(&mut *child).await;
+                drop(registration);
+            });
+        }
+    }
+}
+
+/// Ends an ACP probe's transport however the probe ends: the writer task, which owns the
+/// agent's stdin, stops at once, and the readers end when the agent's output closes.
+struct AcpProbeTransport(cursor::AcpJsonRpcConnection);
+
+impl AcpProbeTransport {
+    /// Spawns the transport and discards the agent's notifications, requests and stderr as
+    /// they arrive: the probe reads only responses.
+    fn spawn<R, W, E>(stdout: R, stdin: W, stderr: E) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+        E: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let (connection, mut incoming) = cursor::AcpJsonRpcConnection::spawn(
+            stdout,
+            stdin,
+            stderr,
+            cursor::AcpConnectionConfig::default(),
+        );
+        tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+        Self(connection)
+    }
+}
+
+impl Drop for AcpProbeTransport {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+fn warn_antigravity_probe(instance_id: &str, step: &str, failure: &str) {
+    tracing::warn!(
+        instance_id,
+        step,
+        failure,
+        "the Antigravity inventory probe read no models"
+    );
+}
+
+/// The process attribution of an Antigravity inventory child, `None` when the registry refuses.
+fn register_antigravity_probe(
+    registry: &ProcessAttributionRegistry,
+    pid: u32,
+    label: &str,
+) -> Option<ProcessRegistration> {
+    let identity = NativeProcessSampler::process_identity(pid).ok()?;
+    registry
+        .register_identity(
+            identity,
+            ProcessRegistrationMetadata {
+                scope: AttributionScope::External,
+                kind: AttributionKind::Provider,
+                label: label.to_owned(),
+                source: RegistrationSource::Provider,
+                driver: Some("antigravity".to_owned()),
+                survives_shutdown: false,
+            },
+        )
+        .ok()
+}
+
+/// `agy --version`, supervised and attributed while it runs.
+async fn run_antigravity_version(
+    executable: &Path,
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+    attribution: Option<&ProcessAttributionRegistry>,
+) -> Option<CommandOutput> {
+    let launch = prepare_provider_launch(executable, ["--version"]).ok()?;
+    let mut command = Command::new(launch.program);
+    command
+        .args(launch.args)
+        .current_dir(cwd)
+        .envs(environment.iter().cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    sanitize_provider_subprocess_environment(&mut command);
+    let registration = std::sync::Mutex::new(None);
+    let output = run_supervised_with_spawn_observer(
+        SupervisedRunRequest {
+            command,
+            stdin: None,
+            timeout: PROBE_TIMEOUT,
+            cleanup_timeout: Duration::from_secs(2),
+            max_output_bytes: PROBE_OUTPUT_LIMIT,
+            overflow: SupervisedOverflow::Truncate,
+            stop_policy: StopPolicy::Force,
+        },
+        &CancellationToken::new(),
+        |pid| {
+            if let (Some(registry), Some(pid)) = (attribution, pid) {
+                *registration.lock().unwrap_or_else(PoisonError::into_inner) =
+                    register_antigravity_probe(registry, pid, "Antigravity version check");
+            }
+        },
+    )
+    .await
+    .ok()?;
+    let code = output.status.code().unwrap_or(-1);
+    Some(CommandOutput {
+        success: output.status.success(),
+        code,
+        stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr.bytes).into_owned(),
+    })
+}
+
+/// Opens and closes one empty ACP session to read the models, thinking levels, sign-in state
+/// and version. No prompt is sent. A peer that answers another protocol version than 1 gets no
+/// session. Logs carry the step and the error code, never the CLI's text.
+async fn probe_antigravity_catalog(
+    instance_id: &str,
+    executable: &Path,
+    configured_models: &[String],
+    environment: &[(OsString, OsString)],
+    attribution: Option<&ProcessAttributionRegistry>,
+) -> Option<AntigravityCatalog> {
+    // A neutral directory: the probe session must not open a user's checkout.
+    let session_cwd = std::env::temp_dir();
+    let launch = prepare_provider_launch(executable, ["acp"]).ok()?;
+    let mut command = Command::new(launch.program);
+    command
+        .args(launch.args)
+        .current_dir(&session_cwd)
+        .envs(environment.iter().cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    sanitize_provider_subprocess_environment(&mut command);
+    let Ok(mut spawned) = supervised_command(command).spawn() else {
+        warn_antigravity_probe(instance_id, "launch", "could not start");
+        return None;
+    };
+    let started = std::time::Instant::now();
+    let pid = spawned.id();
+    let pipes = (
+        spawned.stdout().take(),
+        spawned.stdin().take(),
+        spawned.stderr().take(),
+    );
+    let registration = match attribution {
+        Some(registry) => {
+            let registration = pid.and_then(|pid| {
+                register_antigravity_probe(registry, pid, "Antigravity inventory probe")
+            });
+            if registration.is_none() {
+                stop_supervised_child(&mut *spawned).await;
+                warn_antigravity_probe(instance_id, "launch", "could not attribute the process");
+                return None;
+            }
+            registration
+        }
+        None => None,
+    };
+    let child = ProbeChild {
+        child: Some(spawned),
+        registration,
+    };
+    let (Some(stdout), Some(stdin), Some(stderr)) = pipes else {
+        child.stop().await;
+        return None;
+    };
+    let transport = AcpProbeTransport::spawn(stdout, stdin, stderr);
+    let connection = &transport.0;
+    let handshake = timeout(ANTIGRAVITY_DISCOVERY_TIMEOUT, async {
+        let initialize = connection
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false,
+                    },
+                    "clientInfo": { "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") },
+                }),
+            )
+            .await?;
+        if initialize.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+            return Ok(None);
+        }
+        let session = connection
+            .request(
+                "session/new",
+                json!({ "cwd": session_cwd.to_string_lossy(), "mcpServers": [] }),
+            )
+            .await?;
+        Ok::<_, cursor::acp::AcpProtocolError>(Some((initialize, session)))
+    })
+    .await;
+    let catalog = match handshake {
+        Ok(Ok(Some((initialize, session)))) => {
+            // The catalog is read; the close gets its own short step and never costs it.
+            if let Some(session_id) = session.get("sessionId").and_then(Value::as_str)
+                && antigravity_advertises_close(&initialize)
+            {
+                let close = connection.request("session/close", json!({ "sessionId": session_id }));
+                if timeout(ANTIGRAVITY_CLOSE_TIMEOUT, close).await.is_err() {
+                    warn_antigravity_probe(instance_id, "session/close", "timed out");
+                }
+            }
+            let models = antigravity_models(&session, configured_models);
+            if models.is_none() {
+                warn_antigravity_probe(instance_id, "session/new", "no models in the reply");
+            }
+            Some(AntigravityCatalog::Session {
+                models,
+                version: initialize
+                    .pointer("/agentInfo/version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        }
+        Ok(Ok(None)) => {
+            warn_antigravity_probe(instance_id, "initialize", "unsupported protocol version");
+            None
+        }
+        Ok(Err(cursor::acp::AcpProtocolError::RemoteRequest {
+            code: -32000,
+            message,
+            ..
+        })) if message
+            .trim()
+            .eq_ignore_ascii_case("authentication required") =>
+        {
+            Some(AntigravityCatalog::SignInRequired)
+        }
+        Ok(Err(cursor::acp::AcpProtocolError::RemoteRequest { method, code, .. })) => {
+            warn_antigravity_probe(instance_id, &method, &format!("error {code}"));
+            None
+        }
+        Ok(Err(_)) => {
+            warn_antigravity_probe(instance_id, "probe", "connection failed");
+            // The connection fails when the child dies; one that died on its own is a crash.
+            if exits::watching()
+                && let (Some(pid), Some(status)) = (pid, child.exited_on_its_own().await)
+            {
+                exits::report_exit(
+                    Watch::Failures,
+                    &Exited {
+                        kind: "provider",
+                        label: "antigravity",
+                        exe: &executable.to_string_lossy(),
+                        pid,
+                        started,
+                    },
+                    &status,
+                    false,
+                );
+            }
+            None
+        }
+        Err(_) => {
+            warn_antigravity_probe(instance_id, "probe", "timed out");
+            None
+        }
+    };
+    drop(transport);
+    child.stop().await;
+    catalog
+}
+
+/// Whether `initialize` advertises `session/close`, under either key spelling the CLI writes.
+fn antigravity_advertises_close(initialize: &Value) -> bool {
+    let capabilities = initialize
+        .get("agentCapabilities")
+        .or_else(|| initialize.get("agent_capabilities"));
+    ["sessionCapabilities", "session_capabilities"]
+        .iter()
+        .filter_map(|key| capabilities?.get(key)?.get("close"))
+        .any(|close| !close.is_null() && close != &Value::Bool(false))
+}
+
+/// The first `major.minor.patch` in peer text, `None` when it holds none.
+fn release_version(text: &str) -> Option<String> {
+    text.split(|character: char| !character.is_ascii_digit() && character != '.')
+        .find_map(|token| {
+            let parts = token.split('.').take(3).collect::<Vec<_>>();
+            (parts.len() == 3 && parts.iter().all(|part| !part.is_empty())).then(|| parts.join("."))
+        })
+}
+
+/// The models a `session/new` answer advertises, in the CLI's order with its current model
+/// first (the web picker's default is the first model), then the configured custom models it
+/// does not list. Each model carries its own `reasoning` options: the current model's from the
+/// `thought_level` option, the others' from their effort-suffixed `availableModels` ids, with a
+/// default only where the CLI names one. Without model options the `availableModels` ids are
+/// published unchanged. Repeated models and levels are listed once. `None` when the answer
+/// lists no model.
+fn antigravity_models(session: &Value, configured_models: &[String]) -> Option<Vec<Value>> {
+    let options = session
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // The chat runtime's lookup: what is published here is what a turn can select.
+    let option = |category: &str| {
+        crate::provider::antigravity::runtime::option_by_category(options, category)
+    };
+    let available = unique(
+        session
+            .pointer("/models/availableModels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|model| {
+                let id = model.get("modelId")?.as_str()?;
+                Some((id, model.get("name").and_then(Value::as_str).unwrap_or(id)))
+            }),
+    );
+    let model = option("model");
+    let values = unique(
+        model
+            .and_then(|model| model.get("options"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|option| {
+                let value = option.get("value")?.as_str()?;
+                Some((
+                    value,
+                    option.get("name").and_then(Value::as_str).unwrap_or(value),
+                ))
+            }),
+    );
+    let (mut models, current) = if values.is_empty() {
+        (
+            available
+                .iter()
+                .map(|&(id, name)| antigravity_model(id, name, None, &[]))
+                .collect::<Vec<_>>(),
+            session
+                .pointer("/models/currentModelId")
+                .and_then(Value::as_str),
+        )
+    } else {
+        let thought = option("thought_level");
+        let label = thought
+            .and_then(|thought| thought.get("name"))
+            .and_then(Value::as_str);
+        let known = unique(
+            thought
+                .and_then(|thought| thought.get("options"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    let value = option.get("value")?.as_str()?;
+                    Some((
+                        value,
+                        option.get("name").and_then(Value::as_str).unwrap_or(value),
+                    ))
+                }),
+        );
+        let current_level = thought
+            .and_then(|thought| thought.get("currentValue"))
+            .and_then(Value::as_str);
+        let current = model
+            .and_then(|model| model.get("currentValue"))
+            .and_then(Value::as_str);
+        let models = values
+            .iter()
+            .map(|&(value, name)| {
+                let levels = if Some(value) == current && !known.is_empty() {
+                    known
+                        .iter()
+                        .map(|&(level, label)| (level, label, Some(level) == current_level))
+                        .collect()
+                } else {
+                    antigravity_model_levels(value, &values, &available, &known)
+                };
+                antigravity_model(value, name, label, &levels)
+            })
+            .collect();
+        (models, current)
+    };
+    if models.is_empty() {
+        return None;
+    }
+    if let Some(position) = models
+        .iter()
+        .position(|model| model["slug"].as_str() == current)
+    {
+        models[..=position].rotate_right(1);
+    }
+    let listed = models
+        .iter()
+        .filter_map(|model| model["slug"].as_str().map(str::to_owned))
+        .collect::<HashSet<_>>();
+    let unlisted = configured_models
+        .iter()
+        .filter(|slug| !listed.contains(slug.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    models.extend(custom_models(&unlisted));
+    Some(models)
+}
+
+/// The `(id, name)` pairs in order, each id once.
+fn unique<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(&'a str, &'a str)> {
+    let mut seen = HashSet::new();
+    pairs.filter(|(id, _)| seen.insert(*id)).collect()
+}
+
+/// One catalog model, its thinking levels published as the `reasoning` option under the CLI's
+/// own ids, which a chat sends back as ACP `thought_level` unchanged.
+fn antigravity_model(
+    slug: &str,
+    name: &str,
+    label: Option<&str>,
+    levels: &[(&str, &str, bool)],
+) -> Value {
+    let descriptors = if levels.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({
+            "id": "reasoning",
+            "label": label.unwrap_or(cursor::model::REASONING_LABEL),
+            "type": "select",
+            "options": levels.iter().map(|&(id, label, default)| if default {
+                json!({ "id": id, "label": label, "isDefault": true })
+            } else {
+                json!({ "id": id, "label": label })
+            }).collect::<Vec<_>>(),
+        })]
+    };
+    json!({
+        "slug": slug,
+        "name": name,
+        "isCustom": false,
+        "capabilities": { "optionDescriptors": descriptors },
+    })
+}
+
+/// A model's thinking levels, read from the `availableModels` ids made of its value, `-` and a
+/// level. An id that is itself a model value is that model, never a level. Any other id belongs
+/// to the longest model value it extends, so `alpha-pro-high` is a level of `alpha-pro`, not of
+/// `alpha`. Levels the `thought_level` option lists keep its order and names; others follow in
+/// the CLI's order under their own id. No level is a default.
+fn antigravity_model_levels<'a>(
+    value: &str,
+    values: &[(&'a str, &'a str)],
+    available: &[(&'a str, &'a str)],
+    known: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str, bool)> {
+    let owner = |id: &str| {
+        if values.iter().any(|&(value, _)| value == id) {
+            return None;
+        }
+        values
+            .iter()
+            .map(|&(value, _)| value)
+            .filter(|value| {
+                id.strip_prefix(value)
+                    .is_some_and(|rest| rest.len() > 1 && rest.starts_with('-'))
+            })
+            .max_by_key(|value| value.len())
+    };
+    let known_index = |level: &str| known.iter().position(|&(known, _)| known == level);
+    let mut levels = available
+        .iter()
+        .map(|&(id, _)| id)
+        .filter(|id| owner(id) == Some(value))
+        .map(|id| &id[value.len() + 1..])
+        .collect::<Vec<_>>();
+    levels.sort_by_key(|level| known_index(level).unwrap_or(usize::MAX));
+    levels
+        .into_iter()
+        .map(|level| {
+            let name = known_index(level).map_or(level, |index| known[index].1);
+            (level, name, false)
+        })
+        .collect()
+}
+
+/// How long a failed read of Cursor's advertised model values is remembered before a refresh
+/// opens another session.
+const CURSOR_SESSION_READ_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// One launch environment's read of the model values Cursor advertises in a session.
+enum CursorSessionRead {
+    Read(Vec<String>),
+    Failed(tokio::time::Instant),
+}
+
+/// The model values each Cursor launch environment advertises in a session, by executable,
+/// version, endpoint, model list and instance environment. Reading them opens a session in the
+/// user's Cursor account that ACP cannot close (an empty one, which Cursor does not list), so it
+/// is read once per key: a refresh that finds a read in flight waits for it, and a failed read is
+/// remembered for [`CURSOR_SESSION_READ_BACKOFF`].
+type CursorSessionReads =
+    std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<Option<CursorSessionRead>>>>>;
+static CURSOR_ADVERTISED_MODEL_VALUES: std::sync::OnceLock<CursorSessionReads> =
+    std::sync::OnceLock::new();
+
+/// The advertised values for `key`, read by `read` at most once per key at a time.
+async fn shared_cursor_session_read<F>(key: u64, read: F) -> Vec<String>
+where
+    F: Future<Output = Option<Vec<String>>>,
+{
+    let slot = CURSOR_ADVERTISED_MODEL_VALUES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_default()
+        .clone();
+    let mut slot = slot.lock().await;
+    match &*slot {
+        Some(CursorSessionRead::Read(advertised)) => return advertised.clone(),
+        Some(CursorSessionRead::Failed(at)) if at.elapsed() < CURSOR_SESSION_READ_BACKOFF => {
+            return Vec::new();
+        }
+        _ => {}
+    }
+    match timeout(CURSOR_SESSION_READ_TIMEOUT, read).await {
+        Ok(Some(advertised)) => {
+            *slot = Some(CursorSessionRead::Read(advertised.clone()));
+            advertised
+        }
+        // A session that cannot be read publishes the list as is.
+        _ => {
+            *slot = Some(CursorSessionRead::Failed(tokio::time::Instant::now()));
+            Vec::new()
+        }
+    }
+}
+
 async fn probe_cursor_models(
     executable: &Path,
+    version: Option<&str>,
     endpoint: Option<&str>,
     custom_models: &[String],
     cwd: &Path,
@@ -1504,17 +2348,24 @@ async fn probe_cursor_models(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     sanitize_provider_subprocess_environment(&mut command);
-    let mut child = supervised_command(command).spawn().ok()?;
-    let stdout = child.stdout().take()?;
-    let stdin = child.stdin().take()?;
-    let stderr = child.stderr().take()?;
-    let (connection, _incoming) = cursor::AcpJsonRpcConnection::spawn(
-        stdout,
-        stdin,
-        stderr,
-        cursor::AcpConnectionConfig::default(),
+    let mut spawned = supervised_command(command).spawn().ok()?;
+    let pipes = (
+        spawned.stdout().take(),
+        spawned.stdin().take(),
+        spawned.stderr().take(),
     );
-    let response = timeout(CURSOR_DISCOVERY_TIMEOUT, async {
+    // A refresh that drops this probe still stops the whole group.
+    let child = ProbeChild {
+        child: Some(spawned),
+        registration: None,
+    };
+    let (Some(stdout), Some(stdin), Some(stderr)) = pipes else {
+        child.stop().await;
+        return None;
+    };
+    let transport = AcpProbeTransport::spawn(stdout, stdin, stderr);
+    let connection = &transport.0;
+    let list = timeout(CURSOR_DISCOVERY_TIMEOUT, async {
         connection
             .request(
                 "initialize",
@@ -1523,6 +2374,8 @@ async fn probe_cursor_models(
                     "clientCapabilities": {
                         "fs": { "readTextFile": false, "writeTextFile": false },
                         "terminal": false,
+                        // As the runtime asks, so the session read sees the values it will use.
+                        "_meta": { "parameterizedModelPicker": true },
                     },
                     "clientInfo": { "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") },
                 }),
@@ -1541,9 +2394,41 @@ async fn probe_cursor_models(
     .await
     .ok()
     .flatten();
-    stop_supervised_child(&mut *child).await;
+    // The optional session read starts only once the list is in hand, under its own deadline.
+    let response = match list {
+        Some(list) => {
+            let mut listed = list
+                .get("models")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|model| model.get("value").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            listed.sort_unstable();
+            let mut environment = environment.to_vec();
+            environment.sort();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (executable, version, endpoint, listed, environment).hash(&mut hasher);
+            let advertised = shared_cursor_session_read(hasher.finish(), async {
+                connection
+                    .request(
+                        "session/new",
+                        json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
+                    )
+                    .await
+                    .ok()
+                    .map(|session| cursor::advertised_model_values(&session))
+            })
+            .await;
+            Some((list, advertised))
+        }
+        None => None,
+    };
+    drop(transport);
+    child.stop().await;
+    let (list, advertised) = response?;
     let models =
-        cursor::discover_models_from_list_available_models(&response?, custom_models).ok()?;
+        cursor::discover_models_with_advertised_values(&list, custom_models, &advertised).ok()?;
     serde_json::to_value(models)
         .ok()
         .and_then(|value| value.as_array().cloned())
@@ -1874,8 +2759,24 @@ fn first_line(stdout: &str, stderr: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The first line of a version check. Antigravity's never comes from stderr, where the CLI
+/// may write anything.
+fn version_line(driver: &str, output: &CommandOutput) -> Option<String> {
+    let stderr = if driver == "antigravity" {
+        ""
+    } else {
+        &output.stderr
+    };
+    first_line(&output.stdout, stderr)
+}
+
 fn normalize_provider_version(driver: &str, version: Option<String>) -> Option<String> {
     let version = version?;
+    // Only a release number is published: a CLI that prints anything else (its environment,
+    // a stored secret among it) publishes no version.
+    if driver == "antigravity" {
+        return release_version(&version);
+    }
     if driver != "codex" {
         return Some(version);
     }
@@ -2045,8 +2946,11 @@ fn snapshot_owned_message(
     if matches!(definition.driver.as_str(), "codex" | "claudeAgent") {
         result["supportsMcpStatus"] = json!(true);
     }
-    if matches!(definition.driver.as_str(), "codex" | "claudeAgent")
-        || capabilities.context_window_usage
+    // Antigravity chats report ACP `usage_update` on every CLI the chat accepts.
+    if matches!(
+        definition.driver.as_str(),
+        "codex" | "claudeAgent" | "antigravity"
+    ) || capabilities.context_window_usage
     {
         result["supportsContextWindowUsage"] = json!(true);
     }
@@ -2059,12 +2963,12 @@ fn snapshot_owned_message(
 fn is_builtin_driver(driver: &str) -> bool {
     matches!(
         driver,
-        "codex" | "claudeAgent" | "cursor" | "grok" | "opencode"
+        "codex" | "claudeAgent" | "cursor" | "grok" | "opencode" | "antigravity"
     )
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[cfg(unix)]
@@ -2288,7 +3192,7 @@ done
         check_inventory_probe_appimage_environment(
             "production::provider_inventory::tests::cursor_inventory_probe_ignores_appimage_environment",
             |executable, cwd, environment| async move {
-                probe_cursor_models(&executable, None, &[], &cwd, &environment)
+                probe_cursor_models(&executable, None, None, &[], &cwd, &environment)
                     .await
                     .is_some()
             },
@@ -2312,6 +3216,291 @@ done
                     .is_some()
             },
         );
+    }
+
+    /// A Cursor CLI that folds options into bracketed model values: the inventory publishes only
+    /// what a session advertises, and opens that session once, not on every refresh.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_inventory_publishes_only_advertised_values_and_opens_one_session() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let sessions = temp.path().join("sessions");
+        let executable = temp.path().join("cursor-agent");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=${{line#*\"id\":}}; id=${{id%%[!0-9]*}}
+  case "$line" in
+    *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"method":"cursor/list_available_models"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"models":[{{"value":"m","name":"M","configOptions":[{{"id":"effort","category":"thought_level","type":"select","currentValue":"low","options":[{{"value":"low"}},{{"value":"high"}}]}}]}},{{"value":"gone","name":"Gone","configOptions":[]}}]}}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf 'opened\n' >> '{}'; printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"s","configOptions":[{{"id":"model","category":"model","type":"select","currentValue":"m[effort=high]","options":[{{"value":"m[effort=high]"}}]}}]}}}}\n' "$id" ;;
+  esac
+done
+"#,
+                sessions.display()
+            ),
+        );
+        let custom = ["mine".to_owned()];
+        for _ in 0..2 {
+            let models = probe_cursor_models(
+                &executable,
+                Some("2026.11.22"),
+                None,
+                &custom,
+                temp.path(),
+                &[],
+            )
+            .await
+            .expect("the fixture lists models");
+            assert_eq!(models.len(), 1, "{models:?}");
+            assert_eq!(models[0]["slug"], "m");
+            let reasoning = &models[0]["capabilities"]["optionDescriptors"][0];
+            assert_eq!(reasoning["id"], "reasoning");
+            assert_eq!(
+                reasoning["options"],
+                json!([{ "id": "high", "label": "high", "isDefault": true }])
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&sessions).expect("a session was opened"),
+            "opened\n"
+        );
+    }
+
+    /// A Cursor CLI that switches to plain model names and separate options when BiBCode asks for
+    /// its parameterized model picker: Grok 4.7 publishes every Reasoning and Context value and
+    /// Fast. Without the request the CLI folds one combination into the model value.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_inventory_publishes_every_grok_option_from_a_parameterized_session() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let executable = temp.path().join("cursor-agent");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            r#"#!/bin/sh
+picker=no
+while IFS= read -r line; do
+  id=${line#*\"id\":}; id=${id%%[!0-9]*}
+  case "$line" in
+    *'"method":"initialize"'*'"parameterizedModelPicker":true'*) picker=yes; printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"cursor/list_available_models"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"models":[{"value":"grok-4.7","name":"Grok 4.7","configOptions":[{"id":"context","category":"model_config","type":"select","currentValue":"256k","options":[{"value":"256k"},{"value":"500k"}]},{"id":"reasoning_effort","category":"thought_level","type":"select","currentValue":"high","options":[{"value":"low"},{"value":"medium"},{"value":"high"},{"value":"xhigh"}]},{"id":"fast","category":"model_config","type":"select","currentValue":"true","options":[{"value":"false"},{"value":"true"}]}]}]}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      if [ "$picker" = yes ]; then value='grok-4.7'; else value='grok-4.7[context=256k,reasoning_effort=high,fast=true]'; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"default","options":[{"value":"default"},{"value":"%s"}]}]}}\n' "$id" "$value" ;;
+  esac
+done
+"#,
+        );
+        let models =
+            probe_cursor_models(&executable, Some("2026.11.22"), None, &[], temp.path(), &[])
+                .await
+                .expect("the fixture lists models");
+        assert_eq!(models.len(), 1, "{models:?}");
+        assert_eq!(models[0]["slug"], "grok-4.7");
+        let descriptors = &models[0]["capabilities"]["optionDescriptors"];
+        let ids = |descriptor: &Value| {
+            descriptor["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|choice| choice["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(descriptors[0]["id"], "reasoning", "{descriptors}");
+        assert_eq!(ids(&descriptors[0]), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(descriptors[1]["id"], "contextWindow", "{descriptors}");
+        assert_eq!(ids(&descriptors[1]), ["256k", "500k"]);
+        assert_eq!(descriptors[2]["id"], "fastMode", "{descriptors}");
+
+        // A custom model saved bracketed is not listed again beside its plain base model; one
+        // with no plain equivalent stays the user's entry.
+        let custom = [
+            "grok-4.7[context=256k,reasoning_effort=high,fast=true]".to_owned(),
+            "mine[reasoning=high]".to_owned(),
+        ];
+        let models = probe_cursor_models(
+            &executable,
+            Some("2026.11.22"),
+            None,
+            &custom,
+            temp.path(),
+            &[],
+        )
+        .await
+        .expect("the fixture lists models");
+        let listed = models
+            .iter()
+            .map(|model| (model["slug"].as_str(), model["isCustom"].as_bool()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            [
+                (Some("grok-4.7"), Some(false)),
+                (Some("mine[reasoning=high]"), Some(true))
+            ],
+            "{models:?}"
+        );
+    }
+
+    /// A CLI that never answers the session read still publishes its model list, unnarrowed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_inventory_keeps_the_list_when_the_session_read_hangs() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let executable = temp.path().join("cursor-agent");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=${line#*\"id\":}; id=${id%%[!0-9]*}
+  case "$line" in
+    *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"cursor/list_available_models"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"models":[{"value":"m","name":"M","configOptions":[{"id":"effort","category":"thought_level","type":"select","currentValue":"low","options":[{"value":"low"},{"value":"high"}]}]}]}}\n' "$id" ;;
+  esac
+done
+"#,
+        );
+        let models = probe_cursor_models(&executable, None, None, &[], temp.path(), &[])
+            .await
+            .expect("the list is published without the session read");
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0]["capabilities"]["optionDescriptors"][0]["options"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A Cursor fixture whose `session/new` runs `session` (shell) and counts each call.
+    #[cfg(unix)]
+    fn cursor_session_fixture(
+        directory: &Path,
+        list_delay: &str,
+        session: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let sessions = directory.join("sessions");
+        let executable = directory.join("cursor-agent");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=${{line#*\"id\":}}; id=${{id%%[!0-9]*}}
+  case "$line" in
+    *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"method":"cursor/list_available_models"'*) sleep {list_delay}; printf '{{"jsonrpc":"2.0","id":%s,"result":{{"models":[{{"value":"m","name":"M","configOptions":[{{"id":"effort","category":"thought_level","type":"select","currentValue":"low","options":[{{"value":"low"}},{{"value":"high"}}]}}]}}]}}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf 'opened\n' >> '{sessions}'; {session} ;;
+  esac
+done
+"#,
+                sessions = sessions.display(),
+            ),
+        );
+        (executable, sessions)
+    }
+
+    #[cfg(unix)]
+    const ADVERTISE_HIGH: &str = r#"sleep 0.3; printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s","configOptions":[{"id":"model","category":"model","currentValue":"m[effort=high]","options":[{"value":"m[effort=high]"}]}]}}\n' "$id""#;
+
+    #[cfg(unix)]
+    fn opened(sessions: &Path) -> usize {
+        std::fs::read_to_string(sessions).map_or(0, |text| text.lines().count())
+    }
+
+    /// Two refreshes of one Cursor read one session between them; an instance with another
+    /// environment reads its own, and never gets the first one's options.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_session_reads_are_shared_per_launch_environment() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let (executable, sessions) = cursor_session_fixture(temp.path(), "0", ADVERTISE_HIGH);
+        let probe = |environment: Vec<(OsString, OsString)>| {
+            let executable = executable.clone();
+            let cwd = temp.path().to_path_buf();
+            async move {
+                probe_cursor_models(&executable, Some("shared"), None, &[], &cwd, &environment)
+                    .await
+                    .expect("the fixture lists models")
+            }
+        };
+        let account = |name: &str| vec![(OsString::from("CURSOR_ACCOUNT"), OsString::from(name))];
+        let (first, second) = tokio::join!(probe(account("a")), probe(account("a")));
+        assert_eq!(opened(&sessions), 1, "concurrent refreshes share one read");
+        for models in [first, second] {
+            assert_eq!(
+                models[0]["capabilities"]["optionDescriptors"][0]["options"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        probe(account("b")).await;
+        assert_eq!(
+            opened(&sessions),
+            2,
+            "another environment reads its own session"
+        );
+    }
+
+    /// A failed session read is remembered for a while instead of opening a session on every
+    /// refresh; the model list is published meanwhile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_cursor_session_read_is_not_retried_on_every_refresh() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let (executable, sessions) = cursor_session_fixture(
+            temp.path(),
+            "0",
+            r#"printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"no"}}\n' "$id""#,
+        );
+        for _ in 0..2 {
+            let models =
+                probe_cursor_models(&executable, Some("failing"), None, &[], temp.path(), &[])
+                    .await
+                    .expect("the list is published");
+            assert_eq!(models.len(), 1);
+        }
+        assert_eq!(opened(&sessions), 1);
+    }
+
+    /// A model list that arrives late is kept even when the session read then hangs: the read
+    /// starts only once the list is in hand, under its own deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hung_cursor_session_read_never_discards_a_late_model_list() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let (executable, _sessions) = cursor_session_fixture(temp.path(), "4.5", ":");
+        let models = probe_cursor_models(&executable, Some("late"), None, &[], temp.path(), &[])
+            .await
+            .expect("the late list is published");
+        assert_eq!(models.len(), 1);
+    }
+
+    /// A Cursor that answers nothing at all, as when one of its MCP servers never connects, is
+    /// given up at the discovery deadline: the probe yields no list, so the snapshot keeps the
+    /// plain fallback models instead of waiting on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cursor_that_never_answers_leaves_the_fallback_models() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let executable = temp.path().join("cursor-agent");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+        );
+        let models = timeout(
+            CURSOR_DISCOVERY_TIMEOUT + Duration::from_secs(5),
+            probe_cursor_models(&executable, Some("silent"), None, &[], temp.path(), &[]),
+        )
+        .await
+        .expect("the discovery deadline ends the probe");
+        assert!(models.is_none(), "{models:?}");
     }
 
     #[cfg(unix)]
@@ -2371,6 +3560,7 @@ done
                 Some("cursor-work"),
                 &root,
                 &ProviderMaintenance::new(),
+                None,
             )
             .await;
 
@@ -2509,6 +3699,7 @@ done
             Some("opencode"),
             root.path(),
             &ProviderMaintenance::new(),
+            None,
         )
         .await;
 
@@ -2660,6 +3851,7 @@ done
             Some("remote"),
             sandbox.path(),
             &ProviderMaintenance::new(),
+            None,
         )
         .await;
         server.abort();
@@ -2707,6 +3899,7 @@ done
                 Some("remote"),
                 sandbox.path(),
                 &ProviderMaintenance::new(),
+                None,
             )
             .await;
             server.abort();
@@ -2773,6 +3966,7 @@ done
             Some("remote"),
             root.path(),
             &ProviderMaintenance::new(),
+            None,
         )
         .await;
         server.abort();
@@ -2846,7 +4040,7 @@ done
         });
         let maintenance = ProviderMaintenance::new();
         let quick = probe(&settings, Some("codex"), Path::new("."), &maintenance).await;
-        let full = probe_full(&settings, Some("codex"), Path::new("."), &maintenance).await;
+        let full = probe_full(&settings, Some("codex"), Path::new("."), &maintenance, None).await;
 
         for result in [quick, full] {
             assert_eq!(result[0].rich_metadata, RichMetadataOutcome::NotRequested);
@@ -2891,6 +4085,1193 @@ done
         assert_eq!(explicit_cursor.binary_path, "cursor-agent");
     }
 
+    /// An instance saved without `enabled` is off for the inventory, a chat launch and a
+    /// terminal launch alike when the legacy entry is off or absent (Antigravity's default).
+    #[tokio::test]
+    async fn an_antigravity_instance_without_enabled_is_off_for_every_launch() {
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-enabled-rule");
+        let binary = sandbox.executable_script("agy", "exit 0", "");
+        let instance = json!({
+            "driver": "antigravity",
+            "config": { "binaryPath": binary.to_string_lossy() }
+        });
+        let root = sandbox.path("settings");
+        std::fs::create_dir_all(&root).expect("settings root");
+        for document in [
+            json!({
+                "providers": { "antigravity": { "enabled": false } },
+                "providerInstances": { "antigravity": instance.clone() }
+            }),
+            json!({ "providerInstances": { "antigravity": instance.clone() } }),
+        ] {
+            std::fs::write(root.join("settings.json"), document.to_string()).expect("settings");
+            let inventory = definitions(&document);
+            let listed = inventory
+                .iter()
+                .find(|definition| definition.instance_id == "antigravity")
+                .expect("the instance");
+            assert!(!listed.enabled, "inventory: {document}");
+            let chat = super::super::provider_runtime::resolve_provider_route_settings(
+                &root,
+                "antigravity",
+                None,
+            )
+            .await;
+            assert!(chat.is_err(), "chat launch: {document}");
+            let typed = crate::server_settings::ProviderSettingsStore::new(&root)
+                .get()
+                .await
+                .expect("typed settings");
+            let terminal =
+                crate::provider_terminal::ProviderTerminalInventory::from_settings(&typed);
+            assert!(
+                !terminal.get("antigravity").expect("terminal entry").enabled,
+                "terminal launch: {document}"
+            );
+        }
+    }
+
+    /// Other drivers read a missing instance `enabled` exactly as before: the inventory falls
+    /// back to the legacy entry, while the typed settings (chat and terminal launches) read on.
+    #[tokio::test]
+    async fn a_custom_codex_instance_without_enabled_resolves_as_before() {
+        let sandbox = crate::test_support::TestSandbox::new("codex-enabled-unchanged");
+        let binary = sandbox.executable_script("codex", "exit 0", "");
+        let root = sandbox.path("settings");
+        std::fs::create_dir_all(&root).expect("settings root");
+        let document = json!({
+            "providers": { "codex": { "enabled": false } },
+            "providerInstances": { "codex-work": {
+                "driver": "codex",
+                "config": { "binaryPath": binary.to_string_lossy() }
+            } }
+        });
+        std::fs::write(root.join("settings.json"), document.to_string()).expect("settings");
+        let inventory = definitions(&document);
+        let listed = inventory
+            .iter()
+            .find(|definition| definition.instance_id == "codex-work")
+            .expect("the instance");
+        assert!(!listed.enabled, "the inventory reads the legacy entry");
+        let chat = super::super::provider_runtime::resolve_provider_route_settings(
+            &root,
+            "codex-work",
+            None,
+        )
+        .await;
+        assert!(chat.is_ok(), "a chat launch reads it on");
+        let typed = crate::server_settings::ProviderSettingsStore::new(&root)
+            .get()
+            .await
+            .expect("typed settings");
+        assert!(typed.provider_instances["codex-work"].enabled);
+        let terminal = crate::provider_terminal::ProviderTerminalInventory::from_settings(&typed);
+        assert!(terminal.get("codex-work").expect("terminal entry").enabled);
+    }
+
+    #[test]
+    fn fresh_antigravity_inventory_is_disabled_and_runs_agy_not_its_slug() {
+        let fresh = definitions(&json!({}));
+        let antigravity = fresh
+            .iter()
+            .find(|definition| definition.instance_id == "antigravity")
+            .expect("built-in Antigravity definition");
+        assert!(!antigravity.enabled);
+        assert!(antigravity.available);
+        assert_eq!(antigravity.binary_path, "agy");
+        assert_eq!(default_provider_binary("antigravity"), "agy");
+
+        let custom = definitions(&json!({
+            "providerInstances": {
+                "antigravity_work": { "driver": "antigravity", "enabled": true, "config": {} }
+            }
+        }));
+        let custom = custom
+            .iter()
+            .find(|definition| definition.instance_id == "antigravity_work")
+            .expect("custom Antigravity definition");
+        assert!(custom.enabled);
+        assert!(custom.available, "antigravity is a driver this build ships");
+        assert_eq!(custom.binary_path, "agy");
+    }
+
+    /// Settings with one Antigravity instance whose binary is `binary`, every other built-in
+    /// pinned to an absent executable so the probe touches nothing else.
+    #[cfg(unix)]
+    fn antigravity_probe_settings(sandbox: &Path, binary: &Path, enabled: bool) -> Value {
+        let missing = crate::test_support::hermetic_providers::missing_provider_executable(sandbox);
+        let mut settings =
+            crate::test_support::hermetic_providers::hermetic_provider_settings(sandbox);
+        settings["providerInstances"] = json!({
+            "antigravity": {
+                "driver": "antigravity",
+                "enabled": enabled,
+                "config": { "binaryPath": binary }
+            },
+            "codex": { "driver": "codex", "enabled": false, "config": { "binaryPath": missing } }
+        });
+        settings
+    }
+
+    #[cfg(unix)]
+    async fn probe_antigravity_result(
+        sandbox: &TestSandbox,
+        settings: &Value,
+    ) -> ProviderProbeResult {
+        probe_full(
+            settings,
+            Some("antigravity"),
+            sandbox.root(),
+            &ProviderMaintenance::new(),
+            None,
+        )
+        .await
+        .into_iter()
+        .next()
+        .expect("the Antigravity snapshot")
+    }
+
+    #[cfg(unix)]
+    async fn probe_antigravity(sandbox: &TestSandbox, settings: &Value) -> Value {
+        probe_antigravity_result(sandbox, settings).await.snapshot
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_enabled_antigravity_instance_is_probed_with_version_then_acp() {
+        let sandbox = TestSandbox::new("antigravity-probe");
+        let arguments = sandbox.path("arguments");
+        let binary = sandbox.path("antigravity-cli-fixture");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' '1.5.13'\n",
+                arguments.display()
+            ),
+        );
+
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
+
+        assert_eq!(snapshot["driver"], "antigravity");
+        assert_eq!(snapshot["displayName"], "Antigravity");
+        assert_eq!(snapshot["installed"], true);
+        assert_eq!(snapshot["status"], "ready");
+        assert_eq!(snapshot["version"], "1.5.13");
+        assert_eq!(
+            std::fs::read_to_string(&arguments).expect("the probe ran the binary"),
+            "--version\nacp\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_disabled_antigravity_instance_is_not_probed() {
+        let sandbox = TestSandbox::new("antigravity-disabled");
+        let ran = sandbox.path("ran");
+        let binary = sandbox.path("antigravity-cli-fixture");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+        );
+
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, false),
+        )
+        .await;
+
+        assert_eq!(snapshot["driver"], "antigravity");
+        assert_eq!(snapshot["enabled"], false);
+        assert!(
+            !ran.exists(),
+            "a disabled instance must not start its binary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_probe_failures_follow_the_inventory_rules() {
+        let sandbox = TestSandbox::new("antigravity-probe-failures");
+        let failing = sandbox.path("antigravity-cli-failing");
+        crate::test_support::executable_fixture::write_executable(
+            &failing,
+            format!("#!/bin/sh\nprintf '%s\\n' 'account-{ANTIGRAVITY_MARKER}'\nexit 3\n"),
+        );
+        let failing_snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &failing, true),
+        )
+        .await;
+        assert_eq!(failing_snapshot["driver"], "antigravity");
+        assert_eq!(failing_snapshot["installed"], true);
+        assert_eq!(failing_snapshot["status"], "warning");
+        // A failed `--version` printed no version, whatever its output says.
+        assert_eq!(failing_snapshot["version"], Value::Null);
+        assert!(!failing_snapshot.to_string().contains(ANTIGRAVITY_MARKER));
+
+        let inert = sandbox.path("antigravity-cli-inert");
+        std::fs::write(&inert, "not executable").expect("inert fixture");
+        let inert_snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &inert, true),
+        )
+        .await;
+        assert_eq!(inert_snapshot["driver"], "antigravity");
+        assert_eq!(inert_snapshot["installed"], false);
+    }
+
+    /// Every account value and stray output of the scripted Antigravity peer carries this text,
+    /// so one search proves none of it reached a snapshot or a log.
+    const ANTIGRAVITY_MARKER: &str = "7f3a-secret";
+
+    /// A `session/new` answer shaped like the one measured on CLI 1.5.13, with made-up models:
+    /// a model value that is a prefix of another (`alpha`, `alpha-pro`), effort suffixes out of
+    /// order, a model with no suffixed variant, a model value that ends in a level word, an
+    /// unknown level, a model whose own id reads as another model's level (`epsilon-high`), and
+    /// a repeated model and level. The current model is not listed first.
+    fn antigravity_session() -> Value {
+        json!({
+            "sessionId": "session-1",
+            "models": {
+                "availableModels": [
+                    { "modelId": "alpha-high", "name": "Alpha (High)" },
+                    { "modelId": "alpha-low", "name": "Alpha (Low)" },
+                    { "modelId": "alpha-medium", "name": "Alpha (Medium)" },
+                    { "modelId": "alpha-pro-high", "name": "Alpha Pro (High)" },
+                    { "modelId": "alpha-pro-xhigh", "name": "Alpha Pro (Extra)" },
+                    { "modelId": "alpha-pro-medium", "name": "Alpha Pro (Medium)" },
+                    { "modelId": "alpha-pro-low", "name": "Alpha Pro (Low)" },
+                    { "modelId": "beta-orchestrator", "name": "Beta Orchestrator" },
+                    { "modelId": "gamma-120b-medium", "name": "Gamma 120B (Medium)" },
+                    { "modelId": "delta-max", "name": "Delta (Max)" },
+                    { "modelId": "delta-low", "name": "Delta (Low)" },
+                    { "modelId": "delta-low", "name": "Delta (Low)" },
+                    { "modelId": "epsilon-high", "name": "Epsilon High" },
+                    { "modelId": "epsilon-low", "name": "Epsilon (Low)" }
+                ],
+                "currentModelId": "alpha-pro-high"
+            },
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [{ "id": "default", "name": "Default" }]
+            },
+            "configOptions": [
+                {
+                    "id": "model", "name": "Model", "category": "model", "type": "select",
+                    "currentValue": "alpha-pro",
+                    "options": [
+                        { "value": "alpha", "name": "Alpha" },
+                        { "value": "alpha-pro", "name": "Alpha Pro" },
+                        { "value": "beta-orchestrator", "name": "Beta Orchestrator" },
+                        { "value": "gamma-120b-medium", "name": "Gamma 120B (Medium)" },
+                        { "value": "delta", "name": "Delta" },
+                        { "value": "delta", "name": "Delta" },
+                        { "value": "epsilon", "name": "Epsilon" },
+                        { "value": "epsilon-high", "name": "Epsilon High" }
+                    ]
+                },
+                {
+                    "id": "thought_level", "name": "Thinking Level", "category": "thought_level",
+                    "type": "select", "currentValue": "high",
+                    "options": [
+                        { "value": "low", "name": "Low" },
+                        { "value": "medium", "name": "Medium" },
+                        { "value": "high", "name": "High" },
+                        { "value": "xhigh", "name": "Extra" }
+                    ]
+                },
+                {
+                    "id": "mode", "name": "Mode", "category": "mode", "type": "select",
+                    "currentValue": "default",
+                    "options": [{ "value": "default", "name": "Default" }]
+                }
+            ],
+            "_meta": { "antigravity": { "tier": { "name": format!("plan-{ANTIGRAVITY_MARKER}") } } }
+        })
+    }
+
+    #[cfg(unix)]
+    fn reasoning(options: Value) -> Value {
+        json!({ "optionDescriptors": [
+            { "id": "reasoning", "label": "Thinking Level", "type": "select", "options": options }
+        ] })
+    }
+
+    /// The catalog `antigravity_session` advertises: the current model first, each model with
+    /// its own thinking levels, a default only where the CLI names one.
+    #[cfg(unix)]
+    fn expected_antigravity_models() -> Vec<Value> {
+        let none = json!({ "optionDescriptors": [] });
+        vec![
+            json!({ "slug": "alpha-pro", "name": "Alpha Pro", "isCustom": false,
+                "capabilities": reasoning(json!([
+                    { "id": "low", "label": "Low" },
+                    { "id": "medium", "label": "Medium" },
+                    { "id": "high", "label": "High", "isDefault": true },
+                    { "id": "xhigh", "label": "Extra" }
+                ])) }),
+            json!({ "slug": "alpha", "name": "Alpha", "isCustom": false,
+                "capabilities": reasoning(json!([
+                    { "id": "low", "label": "Low" },
+                    { "id": "medium", "label": "Medium" },
+                    { "id": "high", "label": "High" }
+                ])) }),
+            json!({ "slug": "beta-orchestrator", "name": "Beta Orchestrator", "isCustom": false,
+                "capabilities": none }),
+            json!({ "slug": "gamma-120b-medium", "name": "Gamma 120B (Medium)", "isCustom": false,
+                "capabilities": none }),
+            json!({ "slug": "delta", "name": "Delta", "isCustom": false,
+                "capabilities": reasoning(json!([
+                    { "id": "low", "label": "Low" },
+                    { "id": "max", "label": "max" }
+                ])) }),
+            json!({ "slug": "epsilon", "name": "Epsilon", "isCustom": false,
+                "capabilities": reasoning(json!([{ "id": "low", "label": "Low" }])) }),
+            json!({ "slug": "epsilon-high", "name": "Epsilon High", "isCustom": false,
+                "capabilities": none }),
+        ]
+    }
+
+    /// A scripted `agy`: `--version` prints `version` with a marker on stderr, and `acp` answers
+    /// `initialize` as measured on 1.5.13 (protocol 1, `session/close` advertised under both key
+    /// spellings), then `session/new` with the JSON-RPC member `session_new` (a `result` or an
+    /// `error`), and every other request with an empty result. It logs each request it reads.
+    #[cfg(unix)]
+    pub(crate) fn antigravity_acp_fixture(
+        sandbox: &TestSandbox,
+        name: &str,
+        version: &str,
+        session_new: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        antigravity_acp_peer(
+            sandbox,
+            name,
+            version,
+            &antigravity_initialize(1, "1.5.13", true),
+            session_new,
+            r#""result":{}"#,
+        )
+    }
+
+    /// The JSON-RPC member of an `initialize` answer: `protocol`, `agent_version` as
+    /// `agentInfo.version`, and `session/close` advertised only when `close` is set.
+    #[cfg(unix)]
+    pub(crate) fn antigravity_initialize(
+        protocol: u64,
+        agent_version: &str,
+        close: bool,
+    ) -> String {
+        let session_capabilities = if close {
+            json!({ "close": {}, "resume": {} })
+        } else {
+            json!({ "resume": {} })
+        };
+        format!(
+            r#""result":{}"#,
+            json!({
+                "protocolVersion": protocol,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "sessionCapabilities": session_capabilities,
+                    "session_capabilities": session_capabilities,
+                },
+                "agentInfo": { "name": "antigravity", "version": agent_version },
+                "authMethods": [],
+                "_meta": { "tier": format!("plan-{ANTIGRAVITY_MARKER}") }
+            })
+        )
+    }
+
+    /// [`antigravity_acp_fixture`] with its `initialize` and `session/close` answers given; an
+    /// empty `close` never answers `session/close`.
+    #[cfg(unix)]
+    pub(crate) fn antigravity_acp_peer(
+        sandbox: &TestSandbox,
+        name: &str,
+        version: &str,
+        initialize: &str,
+        session_new: &str,
+        close: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let binary = sandbox.path(name);
+        let requests = sandbox.path(format!("{name}.requests"));
+        let close = if close.is_empty() {
+            "sleep 30".to_owned()
+        } else {
+            format!("body='{close}'")
+        };
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '{version}'; printf '%s\n' 'stderr-{ANTIGRAVITY_MARKER}' >&2; exit 0 ;;
+esac
+printf '%s\n' 'stderr-{ANTIGRAVITY_MARKER}' >&2
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> '{requests}'
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) body='{initialize}' ;;
+    *'"method":"session/new"'*) printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":"{ANTIGRAVITY_MARKER}"}}}}'; body='{session_new}' ;;
+    *'"method":"session/close"'*) {close} ;;
+    *) body='"result":{{}}' ;;
+  esac
+  printf '{{"jsonrpc":"2.0","id":%s,%s}}\n' "$id" "$body"
+done
+"#,
+                requests = requests.display(),
+            ),
+        );
+        (binary, requests)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn antigravity_requests(requests: &Path) -> Vec<Value> {
+        std::fs::read_to_string(requests)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON-RPC request"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn antigravity_methods(requests: &Path) -> Vec<String> {
+        antigravity_requests(requests)
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// Each ACP probe ends its transport with it: the writer task that owns the agent's stdin,
+    /// the readers and the drain of unused messages. Cursor's probe uses the same transport.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_acp_probes_leave_no_transport_task_behind() {
+        let sandbox = TestSandbox::new("antigravity-transport");
+        let (binary, _) = antigravity_acp_fixture(
+            &sandbox,
+            "antigravity-cli-transport",
+            "1.5.13",
+            &format!(r#""result":{}"#, antigravity_session()),
+        );
+        let settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        for _ in 0..5 {
+            let snapshot = probe_antigravity(&sandbox, &settings).await;
+            assert_eq!(snapshot["auth"], json!({ "status": "authenticated" }));
+            let _ = probe_cursor_models(&binary, None, None, &[], sandbox.root(), &[]).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while metrics.num_alive_tasks() > baseline {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} tasks alive after the probes, {baseline} before",
+                metrics.num_alive_tasks()
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A probe child dropped where no runtime runs still has its whole process group stopped:
+    /// `Drop` signals the group itself and hands off only the reap.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_child_dropped_outside_a_runtime_leaves_no_descendant() {
+        let sandbox = TestSandbox::new("antigravity-drop-outside");
+        let pids = sandbox.path("pids");
+        let script = sandbox.path("antigravity-cli-hangs");
+        crate::test_support::executable_fixture::write_executable(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
+                pids.display()
+            ),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let (child, grandchild) = runtime.block_on(async {
+            let mut command = Command::new(&script);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let spawned = supervised_command(command)
+                .spawn()
+                .expect("the fixture starts");
+            let grandchild = loop {
+                if let Ok(text) = std::fs::read_to_string(&pids)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                sleep(Duration::from_millis(20)).await;
+            };
+            (
+                ProbeChild {
+                    child: Some(spawned),
+                    registration: None,
+                },
+                grandchild,
+            )
+        });
+        std::thread::spawn(move || drop(child))
+            .join()
+            .expect("the drop thread");
+        let gone = || {
+            // SAFETY: signal 0 only checks that the pid exists.
+            let result = unsafe { libc::kill(grandchild as libc::pid_t, 0) };
+            result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !gone() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the descendant {grandchild} outlived the dropped probe"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A `session/close` that never answers does not cost the catalog or the sign-in it read:
+    /// the close has its own short step.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stalled_session_close_keeps_the_catalog_and_the_sign_in() {
+        let sandbox = TestSandbox::new("antigravity-close-stalls");
+        let (binary, requests) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-close-stalls",
+            "1.5.13",
+            &antigravity_initialize(1, "1.5.13", true),
+            &format!(r#""result":{}"#, antigravity_session()),
+            "",
+        );
+        let started = tokio::time::Instant::now();
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
+        assert!(started.elapsed() < ANTIGRAVITY_DISCOVERY_TIMEOUT);
+        assert_eq!(snapshot["auth"], json!({ "status": "authenticated" }));
+        assert_eq!(
+            snapshot["models"],
+            Value::Array(expected_antigravity_models())
+        );
+        assert_eq!(
+            antigravity_methods(&requests),
+            ["initialize", "session/new", "session/close"]
+        );
+    }
+
+    /// `session/close` is sent only when `initialize` advertises it, and a session that lists no
+    /// model still proves the CLI is signed in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_close_is_sent_only_when_advertised() {
+        let sandbox = TestSandbox::new("antigravity-close-unadvertised");
+        let (binary, requests) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-no-close",
+            "1.5.13",
+            &antigravity_initialize(1, "1.5.13", false),
+            r#""result":{"sessionId":"session-1"}"#,
+            r#""result":{}"#,
+        );
+        let mut settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        settings["providerInstances"]["antigravity"]["config"]["customModels"] =
+            json!(["custom-one"]);
+        let snapshot = probe_antigravity(&sandbox, &settings).await;
+        assert_eq!(
+            antigravity_methods(&requests),
+            ["initialize", "session/new"]
+        );
+        assert_eq!(snapshot["auth"], json!({ "status": "authenticated" }));
+        assert_eq!(
+            snapshot["models"],
+            Value::Array(custom_models(&["custom-one".to_owned()]))
+        );
+    }
+
+    /// A peer that answers another ACP version gets no session; the instance stays ready for
+    /// the terminal and keeps the version its `--version` printed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_refuses_another_acp_version_and_keeps_the_terminal() {
+        let sandbox = TestSandbox::new("antigravity-protocol-2");
+        let (binary, requests) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-protocol-2",
+            "1.5.13",
+            &antigravity_initialize(2, "1.5.20", true),
+            &format!(r#""result":{}"#, antigravity_session()),
+            r#""result":{}"#,
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
+        assert_eq!(antigravity_methods(&requests), ["initialize"]);
+        assert_eq!(snapshot["status"], "ready");
+        assert_eq!(snapshot["auth"], json!({ "status": "unknown" }));
+        assert_eq!(snapshot["version"], "1.5.13");
+        assert_eq!(snapshot["models"], json!([]));
+    }
+
+    /// The version published is the validated `agentInfo.version` of a protocol 1 handshake;
+    /// text there that is no version leaves the `--version` line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_publishes_the_validated_agent_version() {
+        let sandbox = TestSandbox::new("antigravity-agent-version");
+        let session = format!(r#""result":{}"#, antigravity_session());
+        let (newer, _) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-agent-version",
+            "1.5.13",
+            &antigravity_initialize(1, "1.5.20", true),
+            &session,
+            r#""result":{}"#,
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &newer, true),
+        )
+        .await;
+        assert_eq!(snapshot["version"], "1.5.20");
+
+        let (junk, _) = antigravity_acp_peer(
+            &sandbox,
+            "antigravity-cli-agent-junk",
+            "1.5.13",
+            &antigravity_initialize(1, &format!("build-{ANTIGRAVITY_MARKER}"), true),
+            &session,
+            r#""result":{}"#,
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &junk, true),
+        )
+        .await;
+        assert_eq!(snapshot["version"], "1.5.13");
+        assert!(!snapshot.to_string().contains(ANTIGRAVITY_MARKER));
+    }
+
+    /// An ACP child that dies on its own during the handshake is reported to the Profiler.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_acp_probe_child_that_dies_on_its_own_is_reported() {
+        let captured = crate::diagnostics::profiler::exits::CapturedExits::start();
+        let sandbox = TestSandbox::new("antigravity-child-dies");
+        let binary = sandbox.path("antigravity-cli-dies");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            "#!/bin/sh\ncase \"$1\" in --version) printf '%s\\n' 1.5.13; exit 0 ;; esac\nread -r request\nexit 17\n",
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
+        assert_eq!(snapshot["status"], "ready");
+        let findings = captured.take();
+        assert!(
+            findings.iter().any(
+                |fields| fields.first().map(String::as_str) == Some("provider")
+                    && fields.iter().any(|field| field == "antigravity")
+            ),
+            "{findings:?}"
+        );
+    }
+
+    /// The `--version` child of a full probe is attributed while it runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_antigravity_version_check_is_attributed() {
+        let sandbox = TestSandbox::new("antigravity-version-attributed");
+        let pid = sandbox.path("pid");
+        let binary = sandbox.path("antigravity-cli-slow-version");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) printf '%s\\n' \"$$\" > '{0}.tmp'; mv '{0}.tmp' '{0}'; sleep 1; printf '%s\\n' 1.5.13; exit 0 ;; esac\nexit 0\n",
+                pid.display()
+            ),
+        );
+        let settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        let maintenance = ProviderMaintenance::new();
+        let registry = ProcessAttributionRegistry::new();
+        let watch = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline {
+                if let Ok(text) = std::fs::read_to_string(&pid)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                    && registry
+                        .registered_sources()
+                        .iter()
+                        .any(|(identity, _)| identity.pid == pid)
+                {
+                    return true;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+            false
+        };
+        let (_, attributed) = tokio::join!(
+            probe_full(
+                &settings,
+                Some("antigravity"),
+                sandbox.root(),
+                &maintenance,
+                Some(&registry),
+            ),
+            watch
+        );
+        assert!(attributed, "the version check was not attributed");
+    }
+
+    /// Catalog edge cases outside the measured shape: model options that list nothing fall back
+    /// to `availableModels`; a `thought_level` without a category, or with no options, still
+    /// gives the current model its levels; level ids stay the CLI's own.
+    #[test]
+    fn antigravity_catalog_edge_cases_follow_the_cli() {
+        let fallback = antigravity_models(
+            &json!({
+                "configOptions": [{ "id": "model", "options": [] }],
+                "models": { "availableModels": [{ "modelId": "alpha-high" }],
+                    "currentModelId": "alpha-high" }
+            }),
+            &[],
+        )
+        .expect("a catalog");
+        assert_eq!(fallback[0]["slug"], "alpha-high");
+
+        // The chat runtime's test sends a turn with the level published from these options.
+        let uncategorized = antigravity_models(
+            &json!({
+                "configOptions": crate::provider::antigravity::runtime::uncategorized_level_options()
+            }),
+            &[],
+        )
+        .expect("a catalog");
+        assert_eq!(
+            uncategorized[0]["capabilities"],
+            json!({ "optionDescriptors": [{ "id": "reasoning", "label": "Thinking", "type": "select",
+                "options": [
+                    { "id": "extra-high", "label": "Extra High" },
+                    { "id": "low", "label": "low", "isDefault": true }
+                ] }] })
+        );
+
+        let empty_levels = antigravity_models(
+            &json!({
+                "configOptions": [
+                    { "id": "model", "currentValue": "alpha", "options": [{ "value": "alpha" }] },
+                    { "id": "thought_level", "category": "thought_level", "options": [] }
+                ],
+                "models": { "availableModels": [{ "modelId": "alpha-low" }] }
+            }),
+            &[],
+        )
+        .expect("a catalog");
+        assert_eq!(
+            empty_levels[0]["capabilities"]["optionDescriptors"][0]["options"],
+            json!([{ "id": "low", "label": "low" }])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_full_probe_reads_models_levels_and_sign_in_over_acp() {
+        let sandbox = TestSandbox::new("antigravity-acp");
+        let (binary, requests) = antigravity_acp_fixture(
+            &sandbox,
+            "antigravity-cli-acp",
+            "1.5.13",
+            &format!(r#""result":{}"#, antigravity_session()),
+        );
+        let mut settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        settings["providerInstances"]["antigravity"]["config"]["customModels"] =
+            json!(["custom-one", "alpha"]);
+
+        let snapshot = probe_antigravity(&sandbox, &settings).await;
+
+        assert_eq!(snapshot["status"], "ready");
+        assert_eq!(snapshot["installed"], true);
+        assert_eq!(snapshot["version"], "1.5.13");
+        assert_eq!(snapshot["auth"], json!({ "status": "authenticated" }));
+        assert!(snapshot.get("message").is_none(), "{snapshot}");
+        // The chat reports ACP `usage_update`, so the composer shows its context meter.
+        assert_eq!(snapshot["supportsContextWindowUsage"], true);
+        let mut expected = expected_antigravity_models();
+        expected.extend(custom_models(&["custom-one".to_owned()]));
+        assert_eq!(snapshot["models"], Value::Array(expected));
+        let requests = antigravity_requests(&requests);
+        let methods = requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, ["initialize", "session/new", "session/close"]);
+        assert_eq!(requests[0]["params"]["protocolVersion"], 1);
+        assert_eq!(
+            requests[1]["params"],
+            json!({ "cwd": std::env::temp_dir(), "mcpServers": [] })
+        );
+        assert_eq!(requests[2]["params"], json!({ "sessionId": "session-1" }));
+        assert!(
+            !snapshot.to_string().contains(ANTIGRAVITY_MARKER),
+            "{snapshot}"
+        );
+    }
+
+    /// Without `configOptions` the CLI's `availableModels` ids are published unchanged, effort
+    /// suffix included, because the chat sends them back as they are.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_session_without_config_options_publishes_its_available_models() {
+        let sandbox = TestSandbox::new("antigravity-available-models");
+        let session = json!({
+            "sessionId": "session-1",
+            "models": {
+                "availableModels": [
+                    { "modelId": "alpha-high", "name": "Alpha (High)" },
+                    { "modelId": "alpha-pro-high", "name": "Alpha Pro (High)" }
+                ],
+                "currentModelId": "alpha-pro-high"
+            }
+        });
+        let (binary, _) = antigravity_acp_fixture(
+            &sandbox,
+            "antigravity-cli-models",
+            "1.5.13",
+            &format!(r#""result":{session}"#),
+        );
+
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
+
+        let none = json!({ "optionDescriptors": [] });
+        assert_eq!(
+            snapshot["models"],
+            json!([
+                { "slug": "alpha-pro-high", "name": "Alpha Pro (High)", "isCustom": false,
+                  "capabilities": none },
+                { "slug": "alpha-high", "name": "Alpha (High)", "isCustom": false,
+                  "capabilities": none }
+            ])
+        );
+        assert_eq!(snapshot["auth"], json!({ "status": "authenticated" }));
+    }
+
+    /// The CLI's order is kept when it lists its current model first, as the measured CLI does.
+    #[test]
+    fn antigravity_models_keep_the_cli_order_when_the_current_model_is_first() {
+        let mut session = antigravity_session();
+        session["configOptions"][0]["currentValue"] = json!("alpha");
+        session["models"]["currentModelId"] = json!("alpha-high");
+        let models = antigravity_models(&session, &[]).expect("a catalog");
+        let slugs = models
+            .iter()
+            .map(|model| model["slug"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slugs,
+            [
+                "alpha",
+                "alpha-pro",
+                "beta-orchestrator",
+                "gamma-120b-medium",
+                "delta",
+                "epsilon",
+                "epsilon-high"
+            ]
+        );
+        // `alpha` is now the current model: its levels and default come from `thought_level`.
+        assert_eq!(
+            models[0]["capabilities"]["optionDescriptors"][0]["options"][2],
+            json!({ "id": "high", "label": "High", "isDefault": true })
+        );
+        assert!(antigravity_models(&json!({ "sessionId": "session-1" }), &[]).is_none());
+    }
+
+    /// Only "Authentication required" reads as signed out: another `-32000` leaves the sign-in
+    /// unknown and no sign-in message.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn another_antigravity_server_error_is_not_read_as_signed_out() {
+        let sandbox = TestSandbox::new("antigravity-other-32000");
+        let (binary, _) = antigravity_acp_fixture(
+            &sandbox,
+            "antigravity-cli-other-32000",
+            "1.5.13",
+            r#""error":{"code":-32000,"message":"Rate limited"}"#,
+        );
+        let snapshot = probe_antigravity(
+            &sandbox,
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+        )
+        .await;
+        assert_eq!(snapshot["auth"], json!({ "status": "unknown" }));
+        assert!(snapshot.get("message").is_none(), "{snapshot}");
+    }
+
+    /// `-32000` "Authentication required" reads as signed out while the instance stays ready,
+    /// so the terminal the user signs in with stays available; the CLI's text never shows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_sign_in_failure_reads_unauthenticated_and_ready() {
+        let sandbox = TestSandbox::new("antigravity-sign-in");
+        let (binary, _) = antigravity_acp_fixture(
+            &sandbox,
+            "antigravity-cli-signed-out",
+            "1.5.13",
+            &format!(
+                r#""error":{{"code":-32000,"message":"Authentication required","data":{{"detail":"{ANTIGRAVITY_MARKER}"}}}}"#
+            ),
+        );
+        let mut settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        settings["providerInstances"]["antigravity"]["config"]["customModels"] =
+            json!(["custom-one"]);
+
+        let result = probe_antigravity_result(&sandbox, &settings).await;
+        // The signed-out account's catalog is gone: the merge must not keep the last one.
+        assert!(result.models_authoritative);
+        let snapshot = result.snapshot;
+
+        assert_eq!(snapshot["status"], "ready");
+        assert_eq!(snapshot["auth"], json!({ "status": "unauthenticated" }));
+        assert_eq!(snapshot["message"], ANTIGRAVITY_SIGN_IN_MESSAGE);
+        assert_eq!(
+            snapshot["models"],
+            Value::Array(custom_models(&["custom-one".to_owned()]))
+        );
+        assert!(
+            !snapshot.to_string().contains(ANTIGRAVITY_MARKER),
+            "{snapshot}"
+        );
+    }
+
+    /// Any other failure keeps the custom models and an unknown sign-in, and its log line names
+    /// the step and the error code only. In a process of its own for the log capture.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_antigravity_probe_failure_keeps_custom_models_and_logs_no_peer_text() {
+        let Some(child) = crate::test_support::in_own_process(
+            "production::provider_inventory::tests::an_antigravity_probe_failure_keeps_custom_models_and_logs_no_peer_text",
+        ) else {
+            return;
+        };
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let sandbox = TestSandbox::new("antigravity-probe-error");
+        let (binary, _) = antigravity_acp_fixture(
+            &sandbox,
+            "antigravity-cli-error",
+            "1.5.13",
+            &format!(
+                r#""error":{{"code":-32603,"message":"Internal {ANTIGRAVITY_MARKER}","data":{{"detail":"{ANTIGRAVITY_MARKER}"}}}}"#
+            ),
+        );
+        let mut settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        settings["providerInstances"]["antigravity"]["config"]["customModels"] =
+            json!(["custom-one"]);
+
+        let snapshot = probe_antigravity(&sandbox, &settings).await;
+
+        assert_eq!(snapshot["status"], "ready");
+        assert_eq!(snapshot["auth"], json!({ "status": "unknown" }));
+        assert_eq!(
+            snapshot["models"],
+            Value::Array(custom_models(&["custom-one".to_owned()]))
+        );
+        assert!(
+            !snapshot.to_string().contains(ANTIGRAVITY_MARKER),
+            "{snapshot}"
+        );
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.lines()
+                .any(|line| line.contains("Antigravity inventory probe")
+                    && line.contains("step=\"session/new\"")
+                    && line.contains("failure=\"error -32603\"")),
+            "{text}"
+        );
+        assert!(!text.contains(ANTIGRAVITY_MARKER), "{text}");
+        child.complete();
+    }
+
+    /// The version comes from stdout only: a `--version` that writes only to stderr reports no
+    /// version, in the inventory and in the maintenance check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_antigravity_version_never_takes_a_line_of_stderr() {
+        let sandbox = TestSandbox::new("antigravity-version-stderr");
+        let binary = sandbox.path("antigravity-cli-stderr");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'stderr-{ANTIGRAVITY_MARKER}' >&2\n[ \"$1\" = --version ] || exit 1\n"
+            ),
+        );
+        let settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+
+        let snapshot = probe_antigravity(&sandbox, &settings).await;
+        assert_eq!(snapshot["version"], Value::Null, "{snapshot}");
+        assert!(!snapshot.to_string().contains(ANTIGRAVITY_MARKER));
+
+        let target = maintenance_target(&settings, "antigravity", Some("antigravity"))
+            .expect("the Antigravity target");
+        assert_eq!(
+            probe_maintenance_target_version(&target, sandbox.root()).await,
+            None
+        );
+    }
+
+    /// The quick probe starts no ACP process: it only resolves the executable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_quick_antigravity_probe_starts_no_process() {
+        let sandbox = TestSandbox::new("antigravity-quick");
+        let ran = sandbox.path("ran");
+        let binary = sandbox.path("antigravity-cli-quick");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", ran.display()),
+        );
+        let snapshot = probe(
+            &antigravity_probe_settings(sandbox.root(), &binary, true),
+            Some("antigravity"),
+            sandbox.root(),
+            &ProviderMaintenance::new(),
+        )
+        .await
+        .into_iter()
+        .next()
+        .expect("the Antigravity snapshot")
+        .snapshot;
+        assert_eq!(snapshot["status"], "ready");
+        assert_eq!(snapshot["auth"], json!({ "status": "unknown" }));
+        assert!(!ran.exists(), "the quick probe must start no process");
+    }
+
+    /// A refresh that drops the probe still stops the whole process group and reaps it, and the
+    /// probe's attribution ends with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_antigravity_probe_stops_and_reaps_its_processes() {
+        let sandbox = TestSandbox::new("antigravity-drop");
+        let pids = sandbox.path("pids");
+        let binary = sandbox.path("antigravity-cli-hangs");
+        crate::test_support::executable_fixture::write_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) printf '%s\\n' 1.5.13; exit 0 ;; esac\nsleep 30 &\nprintf '%s %s\\n' \"$$\" \"$!\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nwait\n",
+                pids.display()
+            ),
+        );
+        let settings = antigravity_probe_settings(sandbox.root(), &binary, true);
+        let maintenance = ProviderMaintenance::new();
+        let registry = ProcessAttributionRegistry::new();
+        let probe = probe_full(
+            &settings,
+            Some("antigravity"),
+            sandbox.root(),
+            &maintenance,
+            Some(&registry),
+        );
+        let wait_for_pids = async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pids) {
+                    let mut parts = text.split_whitespace().map(|pid| pid.parse::<u32>());
+                    if let (Some(Ok(root)), Some(Ok(grandchild))) = (parts.next(), parts.next()) {
+                        let attributed =
+                            registry
+                                .registered_sources()
+                                .iter()
+                                .any(|(identity, source)| {
+                                    identity.pid == root
+                                        && *source
+                                            == crate::diagnostics::RegistrationSource::Provider
+                                });
+                        return (root, grandchild, attributed);
+                    }
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        };
+        // `select!` drops the probe future before it returns, as a superseded refresh does.
+        let (root, grandchild, attributed) = tokio::select! {
+            _ = probe => panic!("the probe finished without an answer"),
+            pids = wait_for_pids => pids,
+        };
+        assert!(attributed, "the running probe process is attributed");
+        let gone = |pid: u32| {
+            // SAFETY: signal 0 only checks that the pid exists; a zombie still exists.
+            let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !(gone(root) && gone(grandchild) && registry.registered_sources().is_empty()) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "root gone: {}, grandchild gone: {}, attributed: {:?}",
+                gone(root),
+                gone(grandchild),
+                registry.registered_sources()
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// An instance the user configured under the id `antigravity` before this driver existed
+    /// keeps the id: the built-in default is not synthesized beside it.
+    #[test]
+    fn a_configured_instance_that_owns_the_antigravity_id_is_not_duplicated() {
+        let settings = json!({
+            "providerInstances": {
+                "antigravity": { "driver": "codex", "enabled": true, "config": {} }
+            }
+        });
+        let owners = definitions(&settings)
+            .into_iter()
+            .filter(|definition| definition.instance_id == "antigravity")
+            .map(|definition| definition.driver)
+            .collect::<Vec<_>>();
+        assert_eq!(owners, ["codex"]);
+    }
+
     #[test]
     fn configured_instances_do_not_hide_enabled_legacy_providers() {
         let settings = json!({
@@ -2918,7 +5299,14 @@ done
 
         assert_eq!(
             drivers,
-            ["cursor", "codex", "claudeAgent", "grok", "opencode"]
+            [
+                "cursor",
+                "codex",
+                "claudeAgent",
+                "grok",
+                "opencode",
+                "antigravity"
+            ]
         );
         assert_eq!(
             drivers.iter().filter(|driver| **driver == "cursor").count(),
@@ -3227,6 +5615,8 @@ done
             endpoint: None,
             server_password: None,
             environment: Vec::new(),
+            missing_secret: false,
+            secret_values: Vec::new(),
         };
 
         assert_eq!(
@@ -3389,7 +5779,8 @@ done
                 "claudeAgent": { "enabled": false, "binaryPath": missing },
                 "cursor": { "enabled": false, "binaryPath": missing },
                 "grok": { "enabled": false, "binaryPath": missing },
-                "opencode": { "enabled": false, "binaryPath": missing }
+                "opencode": { "enabled": false, "binaryPath": missing },
+                "antigravity": { "enabled": false, "binaryPath": missing }
             },
             "providerInstances": {
                 "first": {
@@ -3408,7 +5799,7 @@ done
         let maintenance = ProviderMaintenance::new();
         let result = timeout(
             Duration::from_secs(2),
-            probe_full(&settings, None, Path::new("."), &maintenance),
+            probe_full(&settings, None, Path::new("."), &maintenance, None),
         )
         .await;
         server.abort();

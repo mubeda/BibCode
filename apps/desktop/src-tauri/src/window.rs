@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Runtime, Size,
-    WebviewWindow,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Runtime, Size, Window,
     menu::{Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder},
 };
 
@@ -16,8 +15,34 @@ pub const MENU_ACTION_EVENT: &str = "desktop:menu-action";
 pub const MENU_ACTION_OPEN_SETTINGS: &str = "open-settings";
 pub const MENU_ACTION_CHECK_FOR_UPDATES: &str = "check-for-updates";
 pub const MENU_ACTION_CLOSE_SHORTCUT: &str = "close-shortcut";
+#[cfg(target_os = "macos")]
+pub const MENU_ACTION_EDIT_UNDO: &str = "edit-undo";
+#[cfg(target_os = "macos")]
+pub const MENU_ACTION_EDIT_REDO: &str = "edit-redo";
+#[cfg(target_os = "macos")]
+const MENU_ID_EDIT_UNDO: &str = "bibcode:edit-undo";
+#[cfg(target_os = "macos")]
+const MENU_ID_EDIT_REDO: &str = "bibcode:edit-redo";
+/// Id, label and accelerator of the macOS Edit menu's Undo and Redo, which replace the predefined
+/// items: those send `undo:` to WebKit, whose own undo never holds the Files editors' edits.
+#[cfg(target_os = "macos")]
+const EDIT_MENU_ITEMS: [(&str, &str, &str); 2] = [
+    (MENU_ID_EDIT_UNDO, "Undo", "CmdOrCtrl+Z"),
+    (MENU_ID_EDIT_REDO, "Redo", "CmdOrCtrl+Shift+Z"),
+];
 
 pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
+
+/// The main window. Not `get_webview_window`: Tauri leaves out a window that holds more than one
+/// webview, and a preview browser's child webview stays in the main window for the session (#418).
+pub(crate) fn main_window<R: Runtime>(app: &AppHandle<R>) -> Option<Window<R>> {
+    app.get_window(MAIN_WINDOW_LABEL)
+}
+
+/// The main window's own webview, found whether or not preview webviews share its window.
+pub(crate) fn main_webview<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::Webview<R>> {
+    app.get_webview(MAIN_WINDOW_LABEL)
+}
 const MENU_ID_OPEN_SETTINGS: &str = "bibcode:open-settings";
 const MENU_ID_CHECK_FOR_UPDATES: &str = "bibcode:check-for-updates";
 const MENU_ID_CLOSE_SHORTCUT: &str = "bibcode:close-shortcut";
@@ -43,12 +68,19 @@ struct MainWindowState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplicationMenuAction {
     Emit(&'static str),
+    /// Edit > Undo or Redo: the page's action when the main webview has focus, else native.
+    #[cfg(target_os = "macos")]
+    Edit(&'static str),
     CloseWindow,
     Quit,
 }
 
 fn menu_action_for_id(id: &str) -> Option<ApplicationMenuAction> {
     match id {
+        #[cfg(target_os = "macos")]
+        MENU_ID_EDIT_UNDO => Some(ApplicationMenuAction::Edit(MENU_ACTION_EDIT_UNDO)),
+        #[cfg(target_os = "macos")]
+        MENU_ID_EDIT_REDO => Some(ApplicationMenuAction::Edit(MENU_ACTION_EDIT_REDO)),
         MENU_ID_OPEN_SETTINGS => Some(ApplicationMenuAction::Emit(MENU_ACTION_OPEN_SETTINGS)),
         MENU_ID_CHECK_FOR_UPDATES => {
             Some(ApplicationMenuAction::Emit(MENU_ACTION_CHECK_FOR_UPDATES))
@@ -73,14 +105,16 @@ pub fn configure_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Resu
         match menu_action_for_id(event.id().0.as_str()) {
             Some(ApplicationMenuAction::Emit(action)) => {
                 if action == MENU_ACTION_OPEN_SETTINGS
-                    && let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL)
+                    && let Some(window) = main_window(app)
                 {
                     let _ = window.set_focus();
                 }
                 let _ = app.emit(MENU_ACTION_EVENT, action);
             }
+            #[cfg(target_os = "macos")]
+            Some(ApplicationMenuAction::Edit(action)) => run_edit_menu_action(app, action),
             Some(ApplicationMenuAction::CloseWindow) => {
-                if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                if let Some(window) = main_window(app) {
                     let _ = window.close();
                 }
             }
@@ -113,15 +147,18 @@ fn build_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<
         .separator()
         .item(&quit)
         .build()?;
-    let edit = SubmenuBuilder::new(app, "Edit")
-        .undo()
-        .redo()
-        .separator()
-        .cut()
-        .copy()
-        .paste()
-        .select_all()
-        .build()?;
+    #[cfg(target_os = "macos")]
+    let edit = {
+        let [undo, redo] = EDIT_MENU_ITEMS.map(|(id, label, accelerator)| {
+            MenuItemBuilder::with_id(id, label)
+                .accelerator(accelerator)
+                .build(app)
+        });
+        SubmenuBuilder::new(app, "Edit").item(&undo?).item(&redo?)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let edit = SubmenuBuilder::new(app, "Edit").undo().redo();
+    let edit = edit.separator().cut().copy().paste().select_all().build()?;
     let view = SubmenuBuilder::new(app, "View").fullscreen().build()?;
     let window = SubmenuBuilder::new(app, "Window")
         .minimize()
@@ -152,6 +189,66 @@ fn quit_menu_item<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<tauri::menu::
     item.build(app)
 }
 
+/// Sends Edit > Undo or Redo to the page when the main webview holds the key window's first
+/// responder, and otherwise sends the native `undo:` or `redo:` up the responder chain, as the
+/// predefined item does, so native panels and the preview webview keep their own undo.
+#[cfg(target_os = "macos")]
+fn run_edit_menu_action<R: Runtime>(app: &AppHandle<R>, action: &'static str) {
+    if main_webview_has_first_responder(app) {
+        match app.emit_to(MAIN_WINDOW_LABEL, MENU_ACTION_EVENT, action) {
+            Ok(()) => return,
+            // The page never got it, so the native action below still runs.
+            Err(error) => {
+                tracing::warn!("failed to send the Edit menu action to the main webview: {error}");
+            }
+        }
+    }
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        tracing::warn!("the Edit menu ran off the main thread; its action was dropped");
+        return;
+    };
+    let selector = if action == MENU_ACTION_EDIT_UNDO {
+        objc2::sel!(undo:)
+    } else {
+        objc2::sel!(redo:)
+    };
+    let application = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    // SAFETY: a nil target makes AppKit walk the responder chain, as the predefined item does.
+    unsafe { application.sendAction_to_from(selector, None, None) };
+}
+
+/// Whether the key window is the main window and its first responder is the main `WKWebView` or a
+/// view inside it. The preview's child webview is a sibling of the main one, so it does not count.
+#[cfg(target_os = "macos")]
+fn main_webview_has_first_responder<R: Runtime>(app: &AppHandle<R>) -> bool {
+    use objc2_app_kit::{NSApplication, NSView};
+
+    let Some(main) = main_webview(app) else {
+        return false;
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<bool>(1);
+    let sent = main.with_webview(move |platform| {
+        // The closure runs on the main thread.
+        let Some(webview) = crate::macos_webview::take_platform_webview(platform) else {
+            let _ = sender.send(false);
+            return;
+        };
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            let _ = sender.send(false);
+            return;
+        };
+        let owns_focus = NSApplication::sharedApplication(mtm)
+            .keyWindow()
+            .filter(|key_window| webview.window().is_some_and(|own| own == *key_window))
+            .and_then(|key_window| key_window.firstResponder())
+            .and_then(|responder| responder.downcast::<NSView>().ok())
+            .is_some_and(|view| view.isDescendantOf(&webview));
+        let _ = sender.send(owns_focus);
+    });
+    // The menu handler runs on the main thread, where Tauri runs this closure at once.
+    sent.is_ok() && receiver.try_recv().unwrap_or(false)
+}
+
 fn window_state_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     Ok(state_dir(app)?.join(WINDOW_STATE_FILE_NAME))
 }
@@ -179,7 +276,7 @@ fn decode_main_window_state(value: Value) -> Result<MainWindowState, String> {
         .map_err(|error| format!("Could not decode Tauri main window state: {error}"))
 }
 
-fn apply_main_window_state<R: Runtime>(window: &WebviewWindow<R>, state: &MainWindowState) {
+fn apply_main_window_state<R: Runtime>(window: &Window<R>, state: &MainWindowState) {
     if let Err(error) = window.set_size(Size::Physical(PhysicalSize {
         width: state.width,
         height: state.height,
@@ -203,7 +300,7 @@ fn apply_main_window_state<R: Runtime>(window: &WebviewWindow<R>, state: &MainWi
 }
 
 fn capture_main_window_state<R: Runtime>(
-    window: &WebviewWindow<R>,
+    window: &Window<R>,
 ) -> Result<Option<MainWindowState>, String> {
     let size = window
         .outer_size()
@@ -294,7 +391,7 @@ pub(crate) fn build_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result
 /// Reports the main window's web content process dying to the profiler. macOS registers its
 /// hook on the app builder instead.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn watch_web_content_process<R: Runtime>(window: &WebviewWindow<R>) {
+fn watch_web_content_process<R: Runtime>(window: &tauri::WebviewWindow<R>) {
     let installed = window.with_webview(|webview| {
         #[cfg(target_os = "linux")]
         crate::webview_exit::watch(&webview.inner());
@@ -326,7 +423,7 @@ pub fn restore_main_window_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), S
             return Ok(());
         }
     };
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+    let Some(window) = main_window(app) else {
         return Ok(());
     };
     apply_main_window_state(&window, &state);
@@ -334,7 +431,7 @@ pub fn restore_main_window_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), S
 }
 
 pub fn persist_main_window_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+    let Some(window) = main_window(app) else {
         return Ok(());
     };
     let Some(state) = capture_main_window_state(&window)? else {
@@ -593,7 +690,7 @@ pub(crate) fn close_guard_for_app<R: Runtime>(app: &AppHandle<R>) -> CloseGuard 
 }
 
 fn ask_web_to_leave<R: Runtime>(app: &AppHandle<R>, request_id: u64, reason: LeaveReason) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+    let Some(window) = main_window(app) else {
         // No page can hold an edit, so leaving loses nothing.
         if let Some(guard) = app.try_state::<CloseGuard>() {
             guard.reply(request_id, CloseReply::Allow, Instant::now());
@@ -646,7 +743,7 @@ fn prompt_close_anyway<R: Runtime>(app: &AppHandle<R>, request_id: u64) {
 fn leave_now<R: Runtime>(app: &AppHandle<R>, reason: LeaveReason) {
     match reason {
         LeaveReason::Close => {
-            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL)
+            if let Some(window) = main_window(app)
                 && let Err(error) = window.destroy()
             {
                 tracing::warn!(%error, "failed to close the main window");
@@ -879,6 +976,40 @@ mod tests {
     }
 
     #[test]
+    fn with_webview_ownership_matches_the_pinned_runtime() {
+        // `macos_webview::take_platform_webview` releases the retains this runtime version hands
+        // over; a newer one lends the pointers, which would make that an over-release on macOS.
+        // Checked on every platform so a bump made on Linux or Windows fails too.
+        let lock = include_str!("../../../../Cargo.lock").replace("\r\n", "\n");
+        assert!(
+            lock.contains("name = \"tauri-runtime-wry\"\nversion = \"2.11.4\""),
+            "tauri-runtime-wry changed: recheck who owns the pointers `with_webview` passes"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_edit_undo_and_redo_are_routed_items_on_macos() {
+        assert_eq!(
+            menu_action_for_id(MENU_ID_EDIT_UNDO),
+            Some(ApplicationMenuAction::Edit(MENU_ACTION_EDIT_UNDO))
+        );
+        assert_eq!(
+            menu_action_for_id(MENU_ID_EDIT_REDO),
+            Some(ApplicationMenuAction::Edit(MENU_ACTION_EDIT_REDO))
+        );
+        assert_eq!(
+            EDIT_MENU_ITEMS,
+            [
+                (MENU_ID_EDIT_UNDO, "Undo", "CmdOrCtrl+Z"),
+                (MENU_ID_EDIT_REDO, "Redo", "CmdOrCtrl+Shift+Z"),
+            ]
+        );
+        assert_eq!(MENU_ACTION_EDIT_UNDO, "edit-undo");
+        assert_eq!(MENU_ACTION_EDIT_REDO, "edit-redo");
+    }
+
+    #[test]
     fn close_request_quit_menu_item_replaces_the_predefined_quit() {
         assert_eq!(
             menu_action_for_id(MENU_ID_QUIT),
@@ -1040,6 +1171,45 @@ mod tests {
     }
 
     #[test]
+    fn main_window_is_found_after_a_child_webview_joins_it() {
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let mut context = mock_context(noop_assets());
+        context.config_mut().identifier =
+            format!("com.bibcode.window-child-tests-{}", std::process::id());
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
+            .build(context)
+            .expect("mock Tauri app");
+        let handle = app.handle();
+        let main = tauri::WebviewWindowBuilder::new(&app, MAIN_WINDOW_LABEL, Default::default())
+            .data_directory(temp.path().join("webview-data"))
+            .build()
+            .expect("mock webview");
+        main.as_ref()
+            .window()
+            .add_child(
+                tauri::webview::WebviewBuilder::new("preview-child", Default::default()),
+                tauri::LogicalPosition::new(0.0, 0.0),
+                tauri::LogicalSize::new(10.0, 10.0),
+            )
+            .expect("mock child webview");
+
+        // Tauri's own lookup drops a window holding two webviews (#418).
+        assert!(handle.get_webview_window(MAIN_WINDOW_LABEL).is_none());
+        assert_eq!(
+            main_window(handle).map(|window| window.label().to_string()),
+            Some(MAIN_WINDOW_LABEL.to_string())
+        );
+        assert_eq!(
+            main_webview(handle).map(|webview| webview.label().to_string()),
+            Some(MAIN_WINDOW_LABEL.to_string())
+        );
+    }
+
+    #[test]
     fn mock_window_exercises_menu_capture_and_restore_helpers() {
         use crate::config::IsolatedTestDataRoot;
         use tauri::test::{mock_builder, mock_context, noop_assets};
@@ -1065,6 +1235,7 @@ mod tests {
             .data_directory(temp.path().join("webview-data"))
             .build()
             .expect("mock webview");
+        let window = window.as_ref().window();
         assert!(
             !local_app_data.exists(),
             "the test leaves nothing in the local app-data folder"

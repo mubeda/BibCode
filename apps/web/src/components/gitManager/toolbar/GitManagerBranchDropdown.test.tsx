@@ -181,7 +181,7 @@ describe("GitManagerBranchDropdown", () => {
     const callbacks = await renderDropdown([
       branch("feature", {
         worktreePath: "/opaque/feature",
-        blocked: [{ operation: "branch-checkout", code: "worktree-checked-out", message }],
+        blocked: [{ operation: "checkout", code: "worktree-checked-out", message }],
       }),
     ]);
     expect(document.body.textContent).toContain("Switch to worktree");
@@ -198,7 +198,7 @@ describe("GitManagerBranchDropdown", () => {
     await renderDropdown([
       branch("main", {
         current: true,
-        blocked: [{ operation: "branch-checkout", code: "current-branch", message }],
+        blocked: [{ operation: "checkout", code: "current-branch", message }],
       }),
     ]);
 
@@ -218,7 +218,7 @@ describe("GitManagerBranchDropdown", () => {
       branch("future", {
         blocked: [
           {
-            operation: "branch-checkout",
+            operation: "checkout",
             code: "future-policy" as never,
             message,
           },
@@ -295,5 +295,168 @@ describe("GitManagerBranchDropdown", () => {
 
     await act(async () => rowButton("Choose a branch to merge into main").click());
     expect(container.textContent).not.toContain("Remote branches");
+  });
+
+  it("offers Delete and no Rename on a remote row", async () => {
+    const onDeleteRemoteBranch = vi.fn();
+    const remote = branch("origin/feature/a");
+    await renderDropdown([], {
+      remoteRefs: [remote],
+      remotes: ["origin"],
+      onDeleteRemoteBranch,
+    });
+
+    expect(container.querySelector('[aria-label="Rename origin/feature/a"]')).toBeNull();
+    const deleteButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Delete remote branch origin/feature/a"]',
+    );
+    expect(deleteButton?.disabled).toBe(false);
+    await act(async () => deleteButton!.click());
+    expect(onDeleteRemoteBranch).toHaveBeenCalledWith(remote);
+  });
+
+  it.each([
+    [
+      "the remote's default branch",
+      branch("upstream/trunk", { isDefault: true }),
+      ["origin", "upstream"],
+      "Delete is blocked: this is the remote's default branch.",
+    ],
+    [
+      "a name two remotes match",
+      branch("team/fork/x"),
+      ["team", "team/fork"],
+      "Delete is blocked: two remotes match this name. Delete it from a terminal.",
+    ],
+  ])(
+    "disables Delete on %s with a visible, described reason",
+    async (_, remote, remotes, reason) => {
+      const onDeleteRemoteBranch = vi.fn();
+      await renderDropdown([], { remoteRefs: [remote], remotes, onDeleteRemoteBranch });
+
+      const deleteButton = container.querySelector<HTMLButtonElement>(
+        `[aria-label="Delete remote branch ${remote.name}"]`,
+      );
+      expect(deleteButton).toMatchObject({ disabled: true, title: reason });
+      expect(container.textContent).toContain(reason);
+      const describedBy = deleteButton!.getAttribute("aria-describedby")!.split(" ");
+      expect(describedBy.map((id) => document.getElementById(id)?.textContent)).toContain(reason);
+      await act(async () => deleteButton!.click());
+      expect(onDeleteRemoteBranch).not.toHaveBeenCalled();
+      // Checkout of the remote row is a different action and stays available.
+      expect(
+        container.querySelector<HTMLButtonElement>(
+          `[aria-label="Check out remote branch ${remote.name}"]`,
+        )?.disabled,
+      ).toBe(false);
+    },
+  );
+
+  const dirty = (operation: string, label: string) => ({
+    operation,
+    code: "dirty-working-tree" as const,
+    message: `${label} is blocked: the working tree has uncommitted changes.`,
+  });
+
+  it("lets a dirty checkout through to the Stash or Bring choice", async () => {
+    const callbacks = await renderDropdown([
+      branch("feature", {
+        blocked: [
+          dirty("checkout", "Checkout"),
+          dirty("merge", "Merge"),
+          dirty("rebase", "Rebase"),
+        ],
+      }),
+    ]);
+
+    expect(rowButton("feature").disabled).toBe(false);
+    await act(async () => rowButton("feature").click());
+    expect(callbacks.onSelectBranch).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "feature" }),
+      false,
+    );
+  });
+
+  it("does not stop checkout for a merge, rebase or push reason", async () => {
+    const callbacks = await renderDropdown([
+      branch("feature", {
+        blocked: [
+          dirty("merge", "Merge"),
+          dirty("rebase", "Rebase"),
+          {
+            operation: "push",
+            code: "no-upstream",
+            message: "Push is blocked: this branch has no upstream.",
+          },
+        ],
+      }),
+    ]);
+
+    expect(rowButton("feature").disabled).toBe(false);
+    expect(document.body.textContent).not.toContain("Merge is blocked");
+    await act(async () => rowButton("feature").click());
+    expect(callbacks.onSelectBranch).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a real checkout block ahead of unrelated reasons", async () => {
+    const message = "Blocked: another Git Manager operation is already running.";
+    const callbacks = await renderDropdown([
+      branch("feature", {
+        blocked: [
+          dirty("merge", "Merge"),
+          { operation: "checkout", code: "operation-in-flight", message },
+        ],
+      }),
+    ]);
+
+    const row = rowButton("feature");
+    expect(row).toMatchObject({ disabled: true, title: message });
+    expect(document.getElementById(row.getAttribute("aria-describedby")!)?.textContent).toBe(
+      message,
+    );
+    await act(async () => row.click());
+    expect(callbacks.onSelectBranch).not.toHaveBeenCalled();
+  });
+
+  it("still redirects a worktree-held branch whose checkout is also dirty", async () => {
+    const callbacks = await renderDropdown([
+      branch("held", {
+        worktreePath: "/opaque/held",
+        blocked: [
+          dirty("checkout", "Checkout"),
+          {
+            operation: "checkout",
+            code: "worktree-checked-out",
+            message: "Checkout is blocked: this branch is already checked out in the worktree.",
+          },
+        ],
+      }),
+    ]);
+
+    await act(async () => rowButton("held").click());
+    expect(callbacks.onSwitchWorktree).toHaveBeenCalledWith("/opaque/held");
+    expect(callbacks.onSelectBranch).not.toHaveBeenCalled();
+  });
+
+  it("in merge mode, blocks a branch with the merge reason only", async () => {
+    const merge = dirty("merge", "Merge");
+    const callbacks = await renderDropdown([
+      branch("main", { current: true }),
+      branch("feature", { blocked: [dirty("checkout", "Checkout"), merge] }),
+      branch("clean", {
+        blocked: [
+          {
+            operation: "push",
+            code: "no-upstream",
+            message: "Push is blocked: this branch has no upstream.",
+          },
+        ],
+      }),
+    ]);
+
+    await act(async () => rowButton("Choose a branch to merge into main").click());
+    expect(rowButton("feature")).toMatchObject({ disabled: true, title: merge.message });
+    await act(async () => rowButton("clean").click());
+    expect(callbacks.onMergeInto).toHaveBeenCalledWith(expect.objectContaining({ name: "clean" }));
   });
 });

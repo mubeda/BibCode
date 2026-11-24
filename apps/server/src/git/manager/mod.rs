@@ -336,9 +336,13 @@ mod telemetry {
             .await
             .expect("branch delete operation");
         repository
-            .git_manager_delete_remote_branch(cwd, "origin", "renamed", &cancellation)
+            .git_manager_delete_remote_branch(cwd, "origin", "renamed", "abc123", &cancellation)
             .await
             .expect("remote branch delete operation");
+        repository
+            .git_manager_remote_heads(cwd, "origin", "renamed", &cancellation)
+            .await
+            .expect("remote branch delete check");
         repository
             .git_manager_fetch(cwd, "origin", &cancellation)
             .await

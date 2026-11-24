@@ -42,6 +42,8 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_set_wsl_backend_enabled,
             desktop_bridge_set_wsl_distro,
             desktop_bridge_set_wsl_only,
+            desktop_bridge_get_linux_software_rendering,
+            desktop_bridge_set_linux_software_rendering,
             desktop_bridge_set_theme,
             desktop_bridge_show_context_menu,
             desktop_bridge_get_update_state,
@@ -197,15 +199,17 @@ pub fn run() {
         #[cfg(unix)]
         backend::install_termination_signal_handler(app_handle.clone(), backend.clone());
         tauri::async_runtime::spawn(async move {
-            match exposure_coordinator
+            let started = exposure_coordinator
                 .run_exclusive(backend.start_default(app_handle))
-                .await
-            {
-                Ok(_config) => {}
-                Err(error) => {
-                    tracing::error!("failed to start Tauri desktop backend: {error}");
-                    backend.record_error(error);
-                }
+                .await;
+            // A release build's log sink exists only once the in-process server tried to
+            // start; a failed start still logs these with the error below.
+            software_rendering::record_startup();
+            #[cfg(target_os = "linux")]
+            appdir_working_directory::record_startup();
+            if let Err(error) = started {
+                tracing::error!("failed to start Tauri desktop backend: {error}");
+                backend.record_error(error);
             }
         });
         Ok(())
@@ -247,6 +251,8 @@ pub fn run() {
         bridge::desktop_bridge_set_wsl_backend_enabled,
         bridge::desktop_bridge_set_wsl_distro,
         bridge::desktop_bridge_set_wsl_only,
+        bridge::desktop_bridge_get_linux_software_rendering,
+        bridge::desktop_bridge_set_linux_software_rendering,
         bridge::desktop_bridge_set_theme,
         bridge::desktop_bridge_show_context_menu,
         bridge::desktop_bridge_get_update_state,
@@ -306,7 +312,7 @@ pub fn run() {
                 }
                 // Mark after backend shutdown, at the last callback before Tauri's relaunch spawn.
                 crate::relaunch::prepare_descriptors_for_relaunch();
-                crate::relaunch::relaunch_outside_service_unit(app_handle);
+                crate::relaunch::relaunch_with_handoff(app_handle);
                 #[cfg(windows)]
                 if !EXIT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
                     end_session(app_handle);
@@ -388,6 +394,10 @@ fn desktop_e2e_logging_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin
         .build()
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod appdir_working_directory;
+#[cfg(target_os = "linux")]
+pub use appdir_working_directory::enter_appdir_usr;
 mod backend;
 mod bridge;
 mod config;
@@ -407,6 +417,8 @@ pub use gstreamer_environment::repair_process_environment as repair_gstreamer_en
 mod linux_text_rendering;
 #[cfg(target_os = "linux")]
 mod linux_theme;
+#[cfg(target_os = "macos")]
+mod macos_webview;
 mod network_interfaces;
 mod preview;
 mod relaunch;
@@ -414,6 +426,9 @@ mod remote_update_delegate;
 mod security;
 mod server_exposure;
 mod shell_environment;
+mod software_rendering;
+#[cfg(target_os = "linux")]
+pub use software_rendering::apply_process_environment as apply_software_rendering_environment;
 pub mod ssh;
 mod tailscale;
 #[cfg(test)]
@@ -493,11 +508,29 @@ mod tests {
         let capability = &config["app"]["security"]["capabilities"][0];
 
         assert_main_webview_only(capability);
+        // The inline capability replaces `capabilities/`, so it repeats every product permission
+        // (#417: without `allow-desktop-preview` the preview never opened in test builds).
+        let production: Value = serde_json::from_str(include_str!("../capabilities/default.json"))
+            .expect("default capability JSON should parse");
+        let granted = capability["permissions"]
+            .as_array()
+            .expect("desktop E2E capability should list permissions");
+        for permission in production["permissions"]
+            .as_array()
+            .expect("default capability should list permissions")
+        {
+            assert!(
+                granted.contains(permission),
+                "desktop E2E capability lacks product permission {permission}",
+            );
+        }
         assert_eq!(
             capability.get("permissions"),
             Some(&serde_json::json!([
                 "allow-desktop-bridge",
+                "allow-desktop-preview",
                 "core:default",
+                "deep-link:default",
                 "wdio:default",
                 "allow-desktop-e2e-lifecycle"
             ]))

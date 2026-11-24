@@ -36,6 +36,7 @@ current behavior.
 - [Claude](./providers/claude.md)
 - [OpenCode](./providers/opencode.md)
 - [Cursor](./providers/cursor.md)
+- [Antigravity](./providers/antigravity.md)
 
 ## Architecture
 

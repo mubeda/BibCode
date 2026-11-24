@@ -6,6 +6,7 @@ import type {
   DesktopBridge,
   DesktopBridgeHostMetadata,
   DesktopEnvironmentBootstrap,
+  DesktopLinuxSoftwareRenderingState,
   DesktopProjectDataStatusChangedEvent,
   DesktopServerExposureState,
   DesktopCloseRequest,
@@ -628,6 +629,16 @@ function createTauriDesktopBridge(
       tauriInvoke<DesktopWslState>("desktop_bridge_set_wsl_distro", { distro }),
     setWslOnly: (enabled) =>
       tauriInvoke<DesktopWslState>("desktop_bridge_set_wsl_only", { enabled }),
+    getLinuxSoftwareRendering: () =>
+      tauriInvokeDesktop<DesktopLinuxSoftwareRenderingState>(
+        "desktop_bridge_get_linux_software_rendering",
+        undefined,
+      ),
+    setLinuxSoftwareRendering: (enabled) =>
+      tauriInvokeDesktop<DesktopLinuxSoftwareRenderingState>(
+        "desktop_bridge_set_linux_software_rendering",
+        { enabled },
+      ),
     pickFolder: (options) => tauriInvokeOr("desktop_bridge_pick_folder", { options }, () => null),
     saveDiagnosticLogs: (filename, bytes) =>
       tauriInvokeDesktop<string | null>("desktop_bridge_save_diagnostic_logs", {

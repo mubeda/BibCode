@@ -47,7 +47,14 @@ flowchart TB
   webviews into the window's content box, where bounds cannot move them, so
   the desktop wraps the main webview in a `GtkOverlay` with a pass-through
   `GtkFixed` layer and places preview views there
-  (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). On macOS a native
+  (`apps/desktop/src-tauri/src/preview/platform/linux.rs`). A Linux preview
+  takes GTK keyboard focus when it is created, and moving it into the overlay
+  layer can drop that focus, leaving the window with no focus widget. Before a
+  preview hides or closes, the host hands focus back to the main webview unless
+  another shown webview holds it. WebKitGTK binds no key
+  to a text field's undo, so the host also gives preview pages on Linux the
+  Ctrl+Z, Shift+Ctrl+Z and Ctrl+Y text-field chords the app's own fields get
+  (#408) through an initialization script in the main frame. On macOS a native
   preview is a view above the webview, so a popup drawn over it would sit under
   it. Sheets and dialogs hide the whole preview; a menu, popover, select or
   combobox leases the popup's rectangle while open, and a preview is hidden
@@ -89,6 +96,19 @@ flowchart TB
     returns `null`, and a failed write rejects with its error text. Only a
     `desktop-e2e` build lets `BIBCODE_E2E_SAVE_TEXT_PATH` replace the picked
     path. The browser keeps its blob link.
+  - **Edit menu Undo and Redo on macOS.** The predefined items send `undo:`,
+    and WebKit's own undo never holds the Files editors' edits, so the host
+    replaces them with custom items (`CmdOrCtrl+Z`, `CmdOrCtrl+Shift+Z`). When
+    the key window is the main window and its first responder is the main
+    `WKWebView` or a view inside it, the host sends `edit-undo` or `edit-redo`
+    on the existing menu action event to the main webview only. Otherwise it
+    sends `undo:` or `redo:` up the responder chain, as the predefined item
+    did, so native panels and the preview webview keep their undo. The web's
+    listener, mounted at the root on every route, runs the history of the
+    focused Files region (the one the toolbar buttons use) when focus is on
+    its editable text and no composition is active, and otherwise runs
+    `document.execCommand`. Windows and Linux keep the predefined items: their
+    chords reach the page as key events.
   - **Asking before leaving.** The main window's close, the BiBCode Quit menu
     item (which replaces the predefined Quit so it can wait), and an update
     install another device requests go through the host's `CloseGuard`. It
@@ -557,7 +577,9 @@ from another extracted AppDir keeps the outer AppDir's paths after its own. This
 supports `squashfs-root/AppRun` on Ubuntu without FUSE, a preset or missing
 `APPDIR`, stacked AppDir and AppImage launches, and launchers that exec
 `usr/bin/bibcode-desktop` directly, while a stray `APPDIR` in an ordinary
-installation changes nothing. Once gated, the policy inspects every variable in
+installation changes nothing. The desktop's start-up handoff to its own
+`AppRun` (#412) drops an inherited `APPDIR`, so before it hands off it strips
+the bundle that `APPDIR` names by the same rules (#413). Once gated, the policy inspects every variable in
 the effective child environment and removes entries under those roots or
 absolute paths containing a stale `.mount_*` component. This covers launcher and plugin additions, including
 Python, Qt, and GStreamer settings, without a fixed path-variable list.
@@ -1744,7 +1766,9 @@ See the [AppImage child environment policy](#appimage-child-environments).
 
 The desktop's `beforeBundleCommand` runs
 `scripts/prepare-tauri-appimage-tools.ts`, which prepares the repository GTK
-and GStreamer plugin wrappers in `target/.tauri` alongside the upstream plugins
+and GStreamer plugin wrappers in `$CARGO_TARGET_DIR/.tauri` (`target/.tauri` when unset; when set, the `target_directory` that
+`cargo metadata` reports in `apps/desktop/src-tauri`, where Tauri runs Cargo, so
+a relative value resolves against that directory) alongside the upstream plugins
 pinned by URL and SHA-256. Tauri runs that hook in both `tauri build` and a
 standalone `tauri bundle`, before linuxdeploy, so the bundler never fetches or
 runs an unpinned plugin copy. Linux Tauri configuration uses that project-local
@@ -1780,6 +1804,17 @@ first and falls back to X11; the override is evaluated when the AppImage
 launches. `BIBCODE_GDK_BACKEND=x11` restores the previous backend selection.
 Preferring native Wayland avoids oversized rendering from integer GTK scaling
 under Xwayland on fractionally scaled Hyprland/Omarchy desktops.
+
+GPU compositing can be turned off on Linux (#411) for machines whose graphics
+driver hangs in WebKitGTK's compositor thread. `main` reads
+`linuxSoftwareRendering` from `desktop-settings.json`, or the
+`BIBCODE_SOFTWARE_RENDERING` override, while the process is still
+single-threaded and after the crash hook, and sets
+`WEBKIT_DISABLE_COMPOSITING_MODE=1` and `WEBKIT_DISABLE_DMABUF_RENDERER=1`
+unless the user exported them. It does this in the binary, not the launcher,
+so every start route gets it. An in-app restart starts the new process
+without the variables BiBCode set (`relaunch.rs`), so turning the setting off
+takes effect. See `docs/plans/2026-11-21-linux-software-rendering-design.md`.
 
 The wrapper also removes the GTK theme lookup and default, and replaces the
 forced `GTK_THEME` export with a conditional export only for a nonempty,

@@ -18,7 +18,7 @@ import {
   type ProviderSessionDefault,
   type ServerProvider,
 } from "@bibcode/contracts";
-import type { DriverOption } from "./providerDriverMeta";
+import { getDriverOption, type DriverOption } from "./providerDriverMeta";
 
 const harness = vi.hoisted(() => {
   type Matcher = (initial: unknown) => boolean;
@@ -339,6 +339,48 @@ describe("header + status", () => {
     render(baseProps({ driverOption: driverOption({ badgeLabel: "Early Access" }) }));
     expect(ui.filter("Badge")).toHaveLength(1);
     expect(ui.find("Badge").children).toBe("Early Access");
+  });
+
+  it("marks the Antigravity chat as a preview and keeps its session defaults", () => {
+    const antigravity = getDriverOption(ProviderDriverKind.make("antigravity"))!;
+    render(
+      baseProps({
+        instanceId: ProviderInstanceId.make("antigravity"),
+        instance: { driver: antigravity.value, enabled: false } as ProviderInstanceConfig,
+        driverOption: antigravity,
+        onSessionDefaultsChange: vi.fn(),
+      }),
+    );
+
+    expect(ui.find("Badge").children).toBe("Chat preview");
+    expect(ui.find("ProviderSessionDefaultsControls")).toMatchObject({
+      driver: antigravity.value,
+      disabled: true,
+    });
+    expect(ui.byLabel("Switch", "Enable Antigravity").checked).toBe(false);
+  });
+
+  it("notes Google's written position once Antigravity is enabled or set up, never blocking it", () => {
+    const antigravity = getDriverOption(ProviderDriverKind.make("antigravity"))!;
+    const note = "Antigravity FAQ says tools that wrap the Antigravity CLI";
+    const card = (enabled: boolean, installed: boolean | undefined) =>
+      render(
+        baseProps({
+          instanceId: ProviderInstanceId.make("antigravity"),
+          instance: { driver: antigravity.value, enabled } as ProviderInstanceConfig,
+          driverOption: antigravity,
+          liveProvider:
+            installed === undefined
+              ? undefined
+              : liveProvider({ driver: antigravity.value, enabled, installed }),
+        }),
+      );
+
+    expect(card(true, undefined)).toContain(note);
+    expect(ui.byLabel("Switch", "Enable Antigravity").disabled).toBeUndefined();
+    expect(card(false, true)).toContain(note);
+    expect(card(false, false)).not.toContain(note);
+    expect(render(baseProps())).not.toContain(note);
   });
 
   it("falls back to the driver-option icon when the driver kind is invalid", () => {

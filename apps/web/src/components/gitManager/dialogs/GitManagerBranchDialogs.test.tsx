@@ -159,7 +159,7 @@ describe("GitManagerBranchDialogs", () => {
           dialog={{
             kind: "rename",
             branch: branch("feature", {
-              blocked: [{ operation: "branch-rename", code: "worktree-checked-out", message }],
+              blocked: [{ operation: "rename-branch", code: "worktree-checked-out", message }],
             }),
           }}
           errorMessage={null}
@@ -318,6 +318,321 @@ describe("GitManagerBranchDialogs", () => {
     await act(async () => deleteButton.click());
 
     expect(submissions).toEqual([{ kind: "delete", name: "old-feature", deleteRemote: false }]);
+  });
+
+  async function renderBranchDialog(
+    dialog: React.ComponentProps<typeof GitManagerBranchDialogs>["dialog"],
+  ) {
+    const submissions: GitManagerBranchDialogSubmission[] = [];
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={dialog}
+          errorMessage={null}
+          refs={[]}
+          remoteRefs={[]}
+          onClose={() => undefined}
+          onSubmit={(submission) => {
+            submissions.push(submission);
+            return Promise.resolve();
+          }}
+        />,
+      ),
+    );
+    return submissions;
+  }
+
+  async function confirmDelete() {
+    const confirmation = document.querySelector<HTMLInputElement>('input[name="confirm-delete"]');
+    if (!confirmation) throw new Error("Missing delete confirmation");
+    await act(async () => confirmation.click());
+  }
+
+  const MERGE_DIRTY = {
+    operation: "merge",
+    code: "dirty-working-tree",
+    message: "Merge is blocked: the working tree has uncommitted changes.",
+  } as const;
+
+  it("shows the server's delete reason among unrelated ones and sends nothing", async () => {
+    const message = "Delete is blocked: this is the default branch.";
+    const submissions = await renderBranchDialog({
+      kind: "delete",
+      branch: branch("main", {
+        blocked: [MERGE_DIRTY, { operation: "delete-branch", code: "default-branch", message }],
+      }),
+      existsUpstream: false,
+    });
+
+    await confirmDelete();
+    const deleteButton = buttonWithText("Delete branch");
+    expect(document.body.textContent).toContain(message);
+    expect(document.body.textContent).not.toContain(MERGE_DIRTY.message);
+    expect(deleteButton.disabled).toBe(true);
+    await act(async () => deleteButton.click());
+    expect(submissions).toEqual([]);
+  });
+
+  it("blocks delete while an operation holds the repository", async () => {
+    const message = "Blocked: a merge is in progress; resolve or abort it first.";
+    await renderBranchDialog({
+      kind: "delete",
+      branch: branch("feature", {
+        // The server emits both spellings for in-progress and lock-held reasons.
+        blocked: [
+          { operation: "branch-delete", code: "merge-in-progress", message },
+          { operation: "delete-branch", code: "merge-in-progress", message },
+        ],
+      }),
+      existsUpstream: false,
+    });
+
+    await confirmDelete();
+    expect(buttonWithText("Delete branch").disabled).toBe(true);
+    expect(document.body.textContent).toContain(message);
+  });
+
+  it("deletes and renames a branch that is blocked only for merge", async () => {
+    const blocked = [MERGE_DIRTY];
+    const deletions = await renderBranchDialog({
+      kind: "delete",
+      branch: branch("feature", { blocked }),
+      existsUpstream: false,
+    });
+    await confirmDelete();
+    await act(async () => buttonWithText("Delete branch").click());
+    expect(deletions).toEqual([{ kind: "delete", name: "feature", deleteRemote: false }]);
+
+    const renames = await renderBranchDialog({
+      kind: "rename",
+      branch: branch("feature", { blocked }),
+    });
+    expect(document.body.textContent).not.toContain(MERGE_DIRTY.message);
+    const input = document.querySelector<HTMLInputElement>('input[aria-label="New branch name"]');
+    await setInputValue(input!, "feature-two");
+    await act(async () => buttonWithText("Rename").click());
+    expect(renames).toEqual([{ kind: "rename", name: "feature", newName: "feature-two" }]);
+  });
+
+  async function renderRemoteDelete(
+    remoteRefs: ReadonlyArray<GitManagerRefEntry>,
+    extra: Partial<React.ComponentProps<typeof GitManagerBranchDialogs>> = {},
+  ) {
+    const submissions: GitManagerBranchDialogSubmission[] = [];
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={{
+            kind: "delete-remote",
+            branch: branch("origin/feature/a"),
+            remote: "origin",
+            remoteBranch: "feature/a",
+          }}
+          errorMessage={null}
+          refs={[]}
+          remoteRefs={remoteRefs}
+          onClose={() => undefined}
+          onSubmit={(submission) => {
+            submissions.push(submission);
+            return Promise.resolve();
+          }}
+          {...extra}
+        />,
+      ),
+    );
+    return submissions;
+  }
+
+  it("confirms a remote branch delete that names the remote and keeps the local branch", async () => {
+    const submissions = await renderRemoteDelete([branch("origin/feature/a")]);
+
+    expect(document.querySelector("h2")?.textContent).toBe("Delete Remote Branch?");
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("feature/a");
+    expect(text).toContain("origin");
+    expect(text).toContain("A local branch with the same name is kept.");
+    expect(text).toContain("The remote may refuse to delete a protected branch.");
+    const deleteButton = buttonWithText("Delete remote branch");
+    expect(deleteButton.disabled).toBe(true);
+    await act(async () => deleteButton.click());
+    expect(submissions).toEqual([]);
+
+    await confirmDelete();
+    expect(deleteButton.disabled).toBe(false);
+    await act(async () => deleteButton.click());
+    expect(submissions).toEqual([{ kind: "delete-remote", remote: "origin", branch: "feature/a" }]);
+  });
+
+  it("sends nothing when the remote branch is gone from a newer snapshot", async () => {
+    const submissions = await renderRemoteDelete([branch("origin/feature/a")]);
+    await confirmDelete();
+    await renderRemoteDelete([branch("origin/other")]);
+
+    await act(async () => buttonWithText("Delete remote branch").click());
+    expect(submissions).toEqual([]);
+    expect(document.body.textContent).toContain("This remote branch no longer exists.");
+  });
+
+  it("blocks a remote branch that became the remote's default while the dialog was open", async () => {
+    const submissions = await renderRemoteDelete([branch("origin/feature/a")]);
+    await confirmDelete();
+    await renderRemoteDelete([branch("origin/feature/a", { isDefault: true })]);
+
+    await act(async () => buttonWithText("Delete remote branch").click());
+    expect(submissions).toEqual([]);
+    expect(document.body.textContent).toContain(
+      "Delete is blocked: this is the remote's default branch.",
+    );
+  });
+
+  it("shows the Git error inside the open dialog", async () => {
+    const error = "remote: error: protected branch hook declined";
+    await renderRemoteDelete([branch("origin/feature/a")], { errorMessage: error });
+
+    expect(document.body.textContent).toContain(error);
+  });
+
+  // Round 2 (Codex 9): the confirmation says the server checks the remote's default first.
+  it("says the server checks the remote's default branch before deleting", async () => {
+    await renderRemoteDelete([branch("origin/feature/a")]);
+
+    expect(document.body.textContent).toContain(
+      "Before deleting, BiBCode asks the remote for its default branch and refuses to delete it.",
+    );
+  });
+
+  // Round 2 (Antigravity 10, UI.md): during a sign-in each dialog shows the prompt alone, not
+  // the raw Git stderr and the disabled reason stacked with it; the submit stays disabled.
+  it.each([
+    ["delete-remote", "Delete remote branch"],
+    ["delete", "Delete branch"],
+    ["create", "Create and check out"],
+    ["rename", "Rename"],
+  ] as const)("shows only the sign-in prompt in the %s dialog", async (kind, action) => {
+    const stderr = "fatal: Cannot prompt because user interactivity has been disabled.";
+    const reason = "Finish or cancel the sign-in first.";
+    const dialog =
+      kind === "delete-remote"
+        ? {
+            kind,
+            branch: branch("origin/feature/a"),
+            remote: "origin",
+            remoteBranch: "feature/a",
+          }
+        : kind === "delete"
+          ? { kind, branch: branch("feature"), existsUpstream: true }
+          : kind === "create"
+            ? { kind, baseBranch: "main", baseCommit: null }
+            : { kind, branch: branch("feature") };
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={dialog}
+          disabledReason={reason}
+          errorMessage={`Sign in to continue.\n${stderr}`}
+          refs={[branch("main", { current: true })]}
+          remoteRefs={[branch("origin/feature/a")]}
+          signInPrompt={<p>Sign in to example.test?</p>}
+          onClose={() => undefined}
+          onSubmit={() => Promise.resolve()}
+        />,
+      ),
+    );
+
+    // The disabled button keeps its reason as a screen-reader description and a hover title.
+    const visible = document.body.cloneNode(true) as HTMLElement;
+    for (const hidden of visible.querySelectorAll(".sr-only")) hidden.remove();
+    const text = visible.textContent ?? "";
+    expect(text).toContain("Sign in to example.test?");
+    expect(text).not.toContain(stderr);
+    expect(text).not.toContain(reason);
+    expect(buttonWithText(action).disabled).toBe(true);
+  });
+
+  // Round 3 (Codex 8): from submit until the request settles, including a pending sign-in, the
+  // submitted options cannot change, so the dialog never shows options the request does not use.
+  it.each([
+    ["delete", "a sign-in is pending"],
+    ["delete-remote", "a sign-in is pending"],
+    ["delete", "the request is in flight"],
+    ["delete-remote", "the request is in flight"],
+  ] as const)("locks the %s options while %s", async (kind, state) => {
+    const inFlight = state === "the request is in flight";
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={inFlight}
+          dialog={
+            kind === "delete"
+              ? { kind, branch: branch("feature"), existsUpstream: true }
+              : {
+                  kind,
+                  branch: branch("origin/feature/a"),
+                  remote: "origin",
+                  remoteBranch: "feature/a",
+                }
+          }
+          errorMessage={null}
+          refs={[]}
+          remoteRefs={[branch("origin/feature/a")]}
+          signInPrompt={inFlight ? null : <p>Sign in to example.test?</p>}
+          onClose={() => undefined}
+          onSubmit={() => Promise.resolve()}
+        />,
+      ),
+    );
+
+    const boxes = [...document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+    expect(boxes.length).toBe(kind === "delete" ? 2 : 1);
+    for (const box of boxes) expect(box.disabled).toBe(true);
+  });
+
+  // Round 3 (Antigravity 5): a name hint stays a hint while a sign-in prompt shows.
+  it("keeps the rename name hint muted while a sign-in prompt shows", async () => {
+    await act(async () =>
+      root?.render(
+        <GitManagerBranchDialogs
+          busy={false}
+          dialog={{ kind: "rename", branch: branch("feature") }}
+          disabledReason="Finish or cancel the sign-in first."
+          errorMessage={null}
+          refs={[]}
+          remoteRefs={[]}
+          signInPrompt={<p>Sign in to example.test?</p>}
+          onClose={() => undefined}
+          onSubmit={() => Promise.resolve()}
+        />,
+      ),
+    );
+    const input = document.querySelector<HTMLInputElement>('input[aria-label="New branch name"]');
+    await setInputValue(input!, "");
+
+    const hint = document.getElementById("git-manager-rename-branch-disabled-reason");
+    expect(hint?.textContent).toBe("Branch name is required.");
+    expect(hint?.className).toContain("text-muted-foreground");
+  });
+
+  it("shows the server's rename reason and not an unrelated one", async () => {
+    const message =
+      "Rename is blocked: the worktree at /opaque/feature has this branch checked out.";
+    await renderBranchDialog({
+      kind: "rename",
+      branch: branch("feature", {
+        blocked: [
+          MERGE_DIRTY,
+          { operation: "rename-branch", code: "worktree-checked-out", message },
+        ],
+      }),
+    });
+
+    const input = document.querySelector<HTMLInputElement>('input[aria-label="New branch name"]');
+    await setInputValue(input!, "feature-two");
+    expect(document.body.textContent).toContain(message);
+    expect(document.body.textContent).not.toContain(MERGE_DIRTY.message);
+    expect(buttonWithText("Rename").disabled).toBe(true);
   });
 });
 

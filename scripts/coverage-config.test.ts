@@ -43,6 +43,7 @@ const EXPECTED_EXCLUDE = [
   "**/.{idea,git,cache,output,temp}/**",
   "apps/web/public/mockServiceWorker.js",
   "apps/web/public/theme-bootstrap.js",
+  "apps/desktop/src-tauri/src/preview/linux_text_field_undo.js",
   "apps/web/src/lib/vendor/qrcodegen.ts",
   "apps/web/src/routeTree.gen.ts",
 ] as const;
@@ -193,6 +194,11 @@ function findBootstrapExclusionReason(path: string): string | null {
   if (path === "apps/web/public/theme-bootstrap.js") {
     // The classic browser script is evaluated in node:vm by scripts/lib/theme-bootstrap.test.ts.
     return "vm-evaluated-browser-bootstrap";
+  }
+  if (path === "apps/desktop/src-tauri/src/preview/linux_text_field_undo.js") {
+    // The injected preview script is evaluated with new Function by
+    // apps/desktop/e2e/support/linux-text-field-undo.test.ts.
+    return "function-evaluated-preview-script";
   }
   return findViteShim(path) ? "vite-shim" : null;
 }

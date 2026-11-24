@@ -64,6 +64,7 @@ function usage(
         session: null,
         weekly: null,
         fableWeekly: null,
+        windowGroups: [],
         planType: null,
         rateLimitResetCredits: null,
         updatedAt: at,
@@ -93,6 +94,31 @@ describe("outOfTokens.logic", () => {
     expect(usageProviderOf("codex" as never)).toBe("codex");
     expect(usageProviderOf("cursor" as never)).toBeNull();
     expect(usageProviderOf(null)).toBeNull();
+  });
+
+  // Several quota groups make "out of usage" ambiguous (display rounding against exact
+  // exhaustion, a dropped group, a custom instance, different reset times): no hint for now.
+  it("gives Antigravity no hint, even when every window of its snapshot is exhausted", () => {
+    expect(usageProviderOf("antigravity" as never)).toBeNull();
+    const exhausted = window(100, "2026-11-10T15:30:00.000Z");
+    const base = usage("claude", {});
+    const hint = resolveOutOfTokensHint({
+      row: row("antigravity"),
+      usage: {
+        ...base,
+        providers: [
+          {
+            ...base.providers[0]!,
+            provider: "antigravity",
+            windowGroups: [
+              { id: "gemini", label: "Gemini models", session: exhausted, weekly: exhausted },
+            ],
+          },
+        ],
+      },
+      ...OPTIONS,
+    });
+    expect(hint).toBeNull();
   });
 
   it('a reset on another day includes the weekday, "Out of usage until Tue 3:30 PM"', () => {

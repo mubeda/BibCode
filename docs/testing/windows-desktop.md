@@ -864,6 +864,15 @@ minimum-size, and relevant Windows DPI states. Verify:
   support keyboard focus/Shift+Tab; and
 - narrow overlays and menus remain contained and reachable.
 
+Keyboard focus: a preview webview takes Win32 keyboard focus when it opens,
+and a WebDriver click or `element.focus()` does not move it;
+`document.hasFocus()` in the main page shows where it is. Open a preview,
+close or hide it without clicking, and type: the keys must reach the app with
+no system "ding", because the host hands focus back to the main webview when a
+focused preview hides or closes. Packaged native-input cells click their target
+natively before typing for the same reason, so they do not depend on which cell
+ran before them.
+
 Record unavailable authenticated provider scenarios instead of substituting a
 different executable or exposing credentials.
 

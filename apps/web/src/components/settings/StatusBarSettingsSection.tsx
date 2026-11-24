@@ -111,6 +111,19 @@ export function StatusBarSettingsSection() {
         }
       />
       <SettingsRow
+        title="Show Antigravity usage"
+        description="Show the Antigravity CLI's quota in the status bar. It covers the default Antigravity provider only; turn the provider on in Settings, Providers."
+        control={
+          <Switch
+            checked={settings.showAntigravityUsage}
+            onCheckedChange={(checked) =>
+              updateSettings({ showAntigravityUsage: Boolean(checked) })
+            }
+            aria-label="Show Antigravity usage"
+          />
+        }
+      />
+      <SettingsRow
         title="Show Resource Manager"
         description="Show Resource Manager usage in the status bar."
         control={

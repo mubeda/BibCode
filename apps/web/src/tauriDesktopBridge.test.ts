@@ -205,6 +205,15 @@ function installTauriHarness(options?: {
         return Promise.resolve({ access_token: "ssh-bearer" });
       case "desktop_bridge_fetch_ssh_session_state":
         return Promise.resolve({ authenticated: true });
+      case "desktop_bridge_get_linux_software_rendering":
+      case "desktop_bridge_set_linux_software_rendering":
+        // What the host returns off Linux.
+        return Promise.reject({
+          code: "tauri_capability_unsupported",
+          method: "getLinuxSoftwareRendering",
+          capability: "Linux software rendering",
+          message: "getLinuxSoftwareRendering is available on Linux only.",
+        });
       case "desktop_bridge_issue_ssh_web_socket_ticket":
         return Promise.resolve({ ticket: "ws-ticket" });
       default:
@@ -1105,6 +1114,22 @@ describe("tauriDesktopBridge", () => {
       method: "ensureSshEnvironment",
       capability: "sshProvisioning",
     });
+  });
+
+  it("normalizes the off-Linux answer of the software rendering commands", async () => {
+    installTauriHarness();
+    const bridge = await installBridge();
+
+    for (const call of [
+      () => bridge.getLinuxSoftwareRendering?.(),
+      () => bridge.setLinuxSoftwareRendering?.(true),
+    ]) {
+      await expect(call()).rejects.toMatchObject({
+        name: "TauriDesktopCapabilityUnsupportedError",
+        code: "tauri_capability_unsupported",
+        capability: "Linux software rendering",
+      });
+    }
   });
 
   it("routes context menus through the Tauri host command", async () => {

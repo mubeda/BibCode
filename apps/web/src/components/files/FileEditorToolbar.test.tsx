@@ -4,7 +4,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { FileEditorToolbar } from "./FileEditorToolbar";
+import { FileEditorToolbar, redoShortcutLabel } from "./FileEditorToolbar";
+import { isMacPlatform } from "../../lib/platform";
 import { TooltipProvider } from "../ui/tooltip";
 
 describe("FileEditorToolbar", () => {
@@ -202,6 +203,18 @@ describe("FileEditorToolbar", () => {
     expect(container.textContent).not.toContain("Saved");
   });
 
+  it("names every redo chord that works on the platform and in the active view", () => {
+    for (const rendered of [false, true]) {
+      expect(redoShortcutLabel(false, rendered)).toContain("Shift+Ctrl+Z");
+      expect(redoShortcutLabel(false, rendered)).toContain("Ctrl+Y");
+      expect(redoShortcutLabel(true, rendered)).toContain("Shift+Cmd+Z");
+      expect(redoShortcutLabel(true, rendered)).not.toContain("Ctrl+Y");
+    }
+    // TipTap binds Mod-y in the rendered view; Pierre's source view binds no Cmd+Y.
+    expect(redoShortcutLabel(true, true)).toContain("Cmd+Y");
+    expect(redoShortcutLabel(true, false)).not.toContain("Cmd+Y");
+  });
+
   it("keeps native disabled buttons inside focusable hover tooltip triggers", async () => {
     act(() => {
       root.render(
@@ -233,7 +246,7 @@ describe("FileEditorToolbar", () => {
       await Promise.resolve();
     });
     expect(document.body.querySelector('[data-slot="tooltip-popup"]')?.textContent).toContain(
-      "Redo (Shift+Ctrl/Cmd+Z)",
+      redoShortcutLabel(isMacPlatform(navigator.platform), false),
     );
 
     await act(async () => {

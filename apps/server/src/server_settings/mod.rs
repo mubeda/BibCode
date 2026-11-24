@@ -18,7 +18,64 @@ pub(crate) fn built_in_provider_defaults() -> Value {
         "cursor": { "enabled": true, "binaryPath": "cursor-agent", "apiEndpoint": "", "customModels": [] },
         "grok": { "enabled": false, "binaryPath": "grok", "customModels": [] },
         "opencode": { "enabled": true, "binaryPath": "opencode", "serverUrl": "", "serverPassword": "", "customModels": [] },
+        "antigravity": { "enabled": false, "binaryPath": "agy", "customModels": [] },
     })
+}
+
+/// Whether provider instance `instance_id` is on, read from a settings document: the instance's
+/// own `enabled`, else its driver's legacy `providers.<driver>.enabled`. For Antigravity (off by
+/// default) that falls back to its built-in default, a missing instance being off, and it is the
+/// one rule for the inventory, usage, chat and terminal launches. Every other driver keeps the
+/// inventory's earlier reading (on when neither says), and its typed decode is left as it was.
+pub(crate) fn provider_instance_enabled(document: &Value, instance_id: &str) -> bool {
+    let instance = document
+        .get("providerInstances")
+        .and_then(|instances| instances.get(instance_id));
+    let driver = instance
+        .and_then(|instance| instance.get("driver"))
+        .and_then(Value::as_str)
+        .unwrap_or(instance_id);
+    instance
+        .and_then(|instance| instance.get("enabled"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            document
+                .get("providers")
+                .and_then(|providers| providers.get(driver))
+                .and_then(|legacy| legacy.get("enabled"))
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| {
+            if driver == "antigravity" {
+                built_in_provider_defaults()[driver]["enabled"].as_bool()
+            } else {
+                Some(true)
+            }
+        })
+        .unwrap_or(instance.is_some())
+}
+
+/// Writes the resolved `enabled` into every Antigravity instance that omits it, before the typed
+/// decode; other drivers' instances decode as before.
+fn resolve_instance_enabled(settings: &mut Value) {
+    let resolved = settings
+        .get("providerInstances")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|instances| instances.iter())
+        .filter(|(_, instance)| {
+            instance.get("enabled").is_none() && instance["driver"] == "antigravity"
+        })
+        .map(|(id, _)| (id.clone(), provider_instance_enabled(settings, id)))
+        .collect::<Vec<_>>();
+    for (id, enabled) in resolved {
+        if let Some(Value::Object(instance)) = settings
+            .get_mut("providerInstances")
+            .and_then(|instances| instances.get_mut(&id))
+        {
+            instance.insert("enabled".to_owned(), Value::Bool(enabled));
+        }
+    }
 }
 
 /// Recursively fills missing keys in `target` from `defaults` without overwriting existing values.
@@ -59,6 +116,7 @@ pub struct ProvidersState {
     pub cursor: ProviderBinarySettingsState,
     pub grok: ProviderBinarySettingsState,
     pub opencode: ProviderBinarySettingsState,
+    pub antigravity: ProviderBinarySettingsState,
 }
 
 impl ProvidersState {
@@ -76,6 +134,7 @@ impl ProvidersState {
             cursor: provider("cursor"),
             grok: provider("grok"),
             opencode: provider("opencode"),
+            antigravity: provider("antigravity"),
         }
     }
 }
@@ -193,6 +252,7 @@ pub struct ProvidersPatch {
     pub cursor: Option<ProviderSettingsPatch>,
     pub grok: Option<ProviderSettingsPatch>,
     pub opencode: Option<ProviderSettingsPatch>,
+    pub antigravity: Option<ProviderSettingsPatch>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -331,6 +391,7 @@ impl ProviderSettingsStore {
                 source,
             })?;
         normalize_agent_activity_settings(&mut settings);
+        resolve_instance_enabled(&mut settings);
         if let Some(providers) = settings.get_mut("providers") {
             merge_missing(providers, &built_in_provider_defaults());
         }
@@ -447,6 +508,15 @@ impl ProviderSettingsStore {
         Ok(settings)
     }
 
+    /// The stored value of instance `instance_id`'s sensitive variable `name`.
+    pub(crate) async fn stored_secret(
+        &self,
+        instance_id: &str,
+        name: &str,
+    ) -> std::io::Result<String> {
+        fs::read_to_string(self.secret_path(instance_id, name)).await
+    }
+
     fn secret_path(&self, instance_id: &str, name: &str) -> PathBuf {
         self.secrets_dir().join(format!(
             "provider-env-{}-{}",
@@ -492,6 +562,11 @@ fn apply_patch(
             &mut current.providers.opencode,
             providers.opencode,
             "opencode",
+        );
+        apply_provider_patch(
+            &mut current.providers.antigravity,
+            providers.antigravity,
+            "agy",
         );
     }
     if let Some(instances) = patch.provider_instances {
@@ -640,7 +715,30 @@ mod tests {
         ("cursor", true, "cursor-agent"),
         ("grok", false, "grok"),
         ("opencode", true, "opencode"),
+        ("antigravity", false, "agy"),
     ];
+
+    #[tokio::test]
+    async fn antigravity_explicit_enable_survives_a_reload() {
+        let temp = tempfile::tempdir().expect("settings root");
+        fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "providers": { "antigravity": { "enabled": true } }
+            }))
+            .expect("enabled settings JSON"),
+        )
+        .await
+        .expect("enabled settings file");
+
+        let settings = ProviderSettingsStore::new(temp.path())
+            .get()
+            .await
+            .expect("enabled settings load");
+        let providers = serde_json::to_value(settings.providers).expect("providers JSON");
+        assert_eq!(providers["antigravity"]["enabled"], true);
+        assert_eq!(providers["antigravity"]["binaryPath"], "agy");
+    }
 
     #[tokio::test]
     async fn partial_builtin_provider_objects_preserve_enabled_defaults_and_custom_paths() {
@@ -729,6 +827,38 @@ mod tests {
         assert!(reloaded.providers.codex.enabled);
         assert_eq!(reloaded.providers.codex.binary_path, "custom-codex");
         assert_eq!(reloaded, updated);
+    }
+
+    #[tokio::test]
+    async fn antigravity_enable_patch_persists_with_the_agy_binary() {
+        let temp = tempfile::tempdir().expect("settings root");
+        let store = ProviderSettingsStore::new(temp.path());
+        assert!(
+            !store
+                .get()
+                .await
+                .expect("defaults")
+                .providers
+                .antigravity
+                .enabled
+        );
+        store
+            .update(ServerSettingsPatch {
+                providers: Some(ProvidersPatch {
+                    antigravity: Some(ProviderSettingsPatch {
+                        enabled: Some(true),
+                        ..ProviderSettingsPatch::default()
+                    }),
+                    ..ProvidersPatch::default()
+                }),
+                ..ServerSettingsPatch::default()
+            })
+            .await
+            .expect("enable Antigravity");
+
+        let reloaded = store.get().await.expect("reload Antigravity settings");
+        assert!(reloaded.providers.antigravity.enabled);
+        assert_eq!(reloaded.providers.antigravity.binary_path, "agy");
     }
 
     #[test]

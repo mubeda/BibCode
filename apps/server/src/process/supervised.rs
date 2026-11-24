@@ -222,7 +222,15 @@ where
         deadline.unwrap_or_else(|| tokio::time::Instant::now() + execution.timeout);
     #[cfg(windows)]
     let child = {
-        let mut spawn = tokio::task::spawn_blocking(move || spawn_wrapped(&mut command));
+        // A spawn still queued on the blocking pool when the run is cancelled never starts.
+        // shortcut: a cancellation that arrives while CreateProcess is already running is not
+        // observed until the spawn returns (the run then stops the child as usual), and a caller
+        // dropped meanwhile leaves the child to its job's kill-on-close; upgrade if a Windows
+        // caller needs cancellation to interrupt process creation.
+        let queued = cancellation.clone();
+        let mut spawn = tokio::task::spawn_blocking(move || {
+            (!queued.is_cancelled()).then(|| spawn_wrapped(&mut command))
+        });
         match tokio::time::timeout_at(overall_deadline, &mut spawn).await {
             Ok(joined) => joined
                 .map_err(|error| {
@@ -230,12 +238,13 @@ where
                         "supervised process spawn task failed: {error}"
                     )))
                 })?
+                .ok_or(SupervisedRunError::Cancelled)?
                 .map_err(SupervisedRunError::Spawn)?,
             Err(_) => {
                 // The blocking spawn cannot be interrupted; reap whatever it
                 // eventually produces so a late child never runs unsupervised.
                 tokio::spawn(async move {
-                    if let Ok(Ok(child)) = spawn.await {
+                    if let Ok(Some(Ok(child))) = spawn.await {
                         terminate_and_wait_owned(
                             child,
                             cleanup_timeout,
@@ -250,10 +259,15 @@ where
             }
         }
     };
+    // Dropping the retry loop on cancellation is safe: it holds a child only when it returns.
     #[cfg(not(windows))]
-    let child = spawn_retrying_busy_executable(&mut command, overall_deadline)
-        .await
-        .map_err(SupervisedRunError::Spawn)?;
+    let child = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(SupervisedRunError::Cancelled),
+        spawned = spawn_retrying_busy_executable(&mut command, overall_deadline) => {
+            spawned.map_err(SupervisedRunError::Spawn)?
+        }
+    };
     let mut guard = SupervisedChildGuard::arm_with(child, stop_policy, reports.clone());
     let pid = guard.child().id();
     observer(pid);
@@ -1300,6 +1314,48 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "retries must stop at the run deadline, not the retry budget"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_a_held_spawn_never_starts_the_child() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (path, writer) = busy_executable_fixture(directory.path());
+        let cancellation = CancellationToken::new();
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let run = tokio::spawn({
+            let request = busy_executable_request(&path, Duration::from_secs(30));
+            let (cancellation, spawned) = (cancellation.clone(), spawned.clone());
+            async move {
+                run_supervised_with_spawn_observer(request, &cancellation, move |_| {
+                    spawned.fetch_add(1, Ordering::SeqCst);
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !run.is_finished(),
+            "the spawn is held while the script is busy"
+        );
+        let started = std::time::Instant::now();
+        cancellation.cancel();
+        let error = run
+            .await
+            .expect("supervised run task")
+            .expect_err("a cancelled run must not succeed");
+        assert!(
+            matches!(error, SupervisedRunError::Cancelled),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "cancellation must end the held spawn, not the retry budget"
+        );
+        // Released after the cancelled call returned: nothing may start it now.
+        drop(writer);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(spawned.load(Ordering::SeqCst), 0, "the child was started");
     }
 
     #[tokio::test]
