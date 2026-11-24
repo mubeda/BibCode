@@ -9533,9 +9533,11 @@ async fn delivery_text(
         .map(DeliveryText::Turn)
 }
 
-/// The last await before a frozen delivery's prompt is sent: the freeze's own guarded UPDATE
-/// again, so it and the engine's Dismiss of a `sending` row exclude each other in the database.
-/// A row that left `sending` was dismissed by the user's Stop and settles unsent.
+/// The last database await before a frozen delivery's prompt is sent: the freeze's own guarded
+/// UPDATE again, so it and the engine's Dismiss of a `sending` row exclude each other. A row
+/// that left `sending` was dismissed by the user's Stop and settles unsent. The driver still
+/// prepares attachments after this returns; a stop during that preparation is refused by
+/// [`UnsentPromptGate`] before anything is written.
 async fn send_fence(
     repositories: &Repositories,
     row: &ProviderTurnDelivery,
@@ -17021,10 +17023,56 @@ fn runtime_mode(value: &str) -> CodexRuntimeMode {
     }
 }
 
+/// A prompt that has not been written yet. `interrupt(None)` — the follow-up of a Dismiss, or
+/// an archive — advances the epoch. A delivery snapshots it before preparing attachments and
+/// refuses the write when the epoch moved, so a Stop during that preparation is not sent.
+#[derive(Debug, Default)]
+struct UnsentPromptGate {
+    epoch: AtomicU64,
+    #[cfg(test)]
+    after_prepare: StdMutex<Option<Arc<PublicationTestGate>>>,
+}
+
+impl UnsentPromptGate {
+    fn note_stop(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// `true` when a stop arrived after `seen`. The test pause sits between preparation and this
+    /// check, which is where a Stop lands while attachments are still being read.
+    async fn confirm(&self, seen: u64) -> bool {
+        #[cfg(test)]
+        {
+            let pause = self
+                .after_prepare
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+        self.epoch.load(Ordering::Acquire) != seen
+    }
+
+    #[cfg(test)]
+    fn arm_pause(&self, gate: Arc<PublicationTestGate>) {
+        *self
+            .after_prepare
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+    }
+}
+
 struct CodexDriver {
     runtime: CodexSessionRuntime,
     child: SharedChild,
     attachments: AttachmentMaterializer,
+    unsent_prompt: UnsentPromptGate,
     /// The instance's label, which delivery details and refusals name the provider by.
     provider_label: String,
     /// The instance's custom models, which the catalog offers beside Codex's model list.
@@ -17180,6 +17228,7 @@ impl CodexDriver {
             custom_models: request.custom_models,
             config_path,
             retired_model: None,
+            unsent_prompt: UnsentPromptGate::default(),
         })
     }
 
@@ -17386,6 +17435,7 @@ impl ProviderDriver for CodexDriver {
                     },
                 };
             }
+            let seen = self.unsent_prompt.snapshot();
             let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
                 Ok(input) => input,
                 Err(error) => {
@@ -17394,6 +17444,9 @@ impl ProviderDriver for CodexDriver {
                     };
                 }
             };
+            if self.unsent_prompt.confirm(seen).await {
+                return ProviderDeliveryOutcome::StoppedUnsent;
+            }
             match self
                 .runtime
                 .send_turn(
@@ -17494,6 +17547,9 @@ impl ProviderDriver for CodexDriver {
         turn_id: Option<String>,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            if turn_id.is_none() {
+                self.unsent_prompt.note_stop();
+            }
             self.runtime
                 .interrupt_turn(turn_id)
                 .await
@@ -17649,6 +17705,7 @@ struct CursorDriver {
     runtime: CursorSessionRuntime,
     child: SharedChild,
     attachments: AttachmentMaterializer,
+    unsent_prompt: UnsentPromptGate,
     /// Stops the child once the runtime abandons it; aborted with the driver.
     abandon_watch: JoinHandle<()>,
 }
@@ -17679,8 +17736,14 @@ impl CursorDriver {
             runtime,
             child,
             attachments,
+            unsent_prompt: UnsentPromptGate::default(),
             abandon_watch,
         }
+    }
+
+    #[cfg(test)]
+    fn arm_unsent_prompt_pause_for_test(&self, gate: Arc<PublicationTestGate>) {
+        self.unsent_prompt.arm_pause(gate);
     }
 
     async fn spawn(
@@ -17792,6 +17855,7 @@ impl ProviderDriver for CursorDriver {
         _: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
         Box::pin(async move {
+            let seen = self.unsent_prompt.snapshot();
             let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
                 Ok(input) => input,
                 Err(error) => {
@@ -17800,6 +17864,9 @@ impl ProviderDriver for CursorDriver {
                     };
                 }
             };
+            if self.unsent_prompt.confirm(seen).await {
+                return ProviderDeliveryOutcome::StoppedUnsent;
+            }
             let receipt = match self
                 .runtime
                 .send_turn_with_receipt(Some(&text), attachments)
@@ -17838,6 +17905,9 @@ impl ProviderDriver for CursorDriver {
         turn_id: Option<String>,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            if turn_id.is_none() {
+                self.unsent_prompt.note_stop();
+            }
             self.runtime
                 .interrupt_turn(turn_id.as_deref())
                 .await
@@ -17954,6 +18024,7 @@ struct AntigravityDriver {
     runtime: AntigravitySessionRuntime,
     child: SharedChild,
     attachments: AttachmentMaterializer,
+    unsent_prompt: UnsentPromptGate,
     binary_path: String,
     started: std::time::Instant,
     /// Stops the child once the runtime abandons it; aborted with the driver.
@@ -18051,6 +18122,7 @@ impl AntigravityDriver {
             runtime,
             child,
             attachments,
+            unsent_prompt: UnsentPromptGate::default(),
             binary_path,
             started,
             abandon_watch,
@@ -18229,6 +18301,7 @@ impl ProviderDriver for AntigravityDriver {
         _: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
         Box::pin(async move {
+            let seen = self.unsent_prompt.snapshot();
             let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
                 Ok(input) => input,
                 Err(error) => {
@@ -18237,6 +18310,9 @@ impl ProviderDriver for AntigravityDriver {
                     };
                 }
             };
+            if self.unsent_prompt.confirm(seen).await {
+                return ProviderDeliveryOutcome::StoppedUnsent;
+            }
             let receipt = match self
                 .runtime
                 .send_turn_with_receipt(Some(&text), attachments)
@@ -18272,6 +18348,9 @@ impl ProviderDriver for AntigravityDriver {
         turn_id: Option<String>,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            if turn_id.is_none() {
+                self.unsent_prompt.note_stop();
+            }
             self.runtime
                 .interrupt_turn(turn_id.as_deref())
                 .await
@@ -18380,6 +18459,7 @@ struct GrokDriver {
     child: SharedChild,
     requested_model: Option<String>,
     attachments: AttachmentMaterializer,
+    unsent_prompt: UnsentPromptGate,
 }
 impl GrokDriver {
     async fn spawn(
@@ -18436,6 +18516,7 @@ impl GrokDriver {
             child: Arc::new(Mutex::new(child)),
             requested_model: request.model,
             attachments,
+            unsent_prompt: UnsentPromptGate::default(),
         })
     }
 }
@@ -18479,12 +18560,56 @@ impl ProviderDriver for GrokDriver {
                 .map_err(provider_error("grok"))
         })
     }
+    fn deliver(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        _: String,
+        _: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let seen = self.unsent_prompt.snapshot();
+            let materialized = match self.attachments.materialize(attachments).await {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: delivery_detail(&attachment_error("grok")(error), None),
+                    };
+                }
+            };
+            let (images, files) = split_native_images_and_file_references(materialized);
+            let text = match append_file_references(text, &files) {
+                Ok(text) => text,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: delivery_detail(&attachment_error("grok")(error), None),
+                    };
+                }
+            };
+            if self.unsent_prompt.confirm(seen).await {
+                return ProviderDeliveryOutcome::StoppedUnsent;
+            }
+            match self
+                .runtime
+                .send_turn(Some(&text), images.into_iter().map(acp_image).collect())
+                .await
+            {
+                Ok(turn_id) => ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn_id),
+                },
+                Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: delivery_detail(&provider_error("grok")(error), None),
+                },
+            }
+        })
+    }
     fn interrupt(
         &self,
         turn_id: Option<String>,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             let Some(turn_id) = turn_id else {
+                self.unsent_prompt.note_stop();
                 return Ok(());
             };
             self.runtime
@@ -18589,6 +18714,7 @@ struct OpenCodeDriver {
     child: Option<SharedChild>,
     resume_session_id: Option<String>,
     attachments: AttachmentMaterializer,
+    unsent_prompt: UnsentPromptGate,
 }
 impl OpenCodeDriver {
     async fn spawn(
@@ -18638,6 +18764,7 @@ impl OpenCodeDriver {
                 child: None,
                 resume_session_id: request.resume_cursor.as_ref().and_then(resume_string),
                 attachments,
+                unsent_prompt: UnsentPromptGate::default(),
             });
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -18704,6 +18831,7 @@ impl OpenCodeDriver {
             child: Some(child),
             resume_session_id: request.resume_cursor.as_ref().and_then(resume_string),
             attachments,
+            unsent_prompt: UnsentPromptGate::default(),
         })
     }
 
@@ -18784,6 +18912,7 @@ impl ProviderDriver for OpenCodeDriver {
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
         Box::pin(async move {
+            let seen = self.unsent_prompt.snapshot();
             let attachments = match self.materialize_turn_attachments(attachments).await {
                 Ok(attachments) => attachments,
                 Err(error) => {
@@ -18792,6 +18921,9 @@ impl ProviderDriver for OpenCodeDriver {
                     };
                 }
             };
+            if self.unsent_prompt.confirm(seen).await {
+                return ProviderDeliveryOutcome::StoppedUnsent;
+            }
             let result = if attachments.is_empty() {
                 match parse_provider_command(&text) {
                     Some((command, arguments)) => {
@@ -18876,9 +19008,12 @@ impl ProviderDriver for OpenCodeDriver {
     }
     fn interrupt(
         &self,
-        _: Option<String>,
+        turn_id: Option<String>,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            if turn_id.is_none() {
+                self.unsent_prompt.note_stop();
+            }
             self.runtime
                 .interrupt_turn()
                 .await
@@ -20417,6 +20552,7 @@ struct ClaudeDriver {
     targeted_activity_control_supported: AtomicBool,
     sequence: Mutex<u64>,
     attachments: AttachmentMaterializer,
+    unsent_prompt: UnsentPromptGate,
     pending_acknowledgement: ClaudeAcknowledgements,
     /// How long a written message may wait for Claude's replay before it is uncertain.
     acknowledgement_timeout: Duration,
@@ -22023,6 +22159,7 @@ impl ClaudeDriver {
             ),
             sequence: Mutex::new(0),
             attachments,
+            unsent_prompt: UnsentPromptGate::default(),
             pending_acknowledgement,
             acknowledgement_timeout: CLAUDE_DELIVERY_ACKNOWLEDGEMENT_TIMEOUT,
             hook_sink: hook_handle,
@@ -22283,6 +22420,7 @@ impl ClaudeDriver {
         delivery_key: String,
         agent_envelope: bool,
     ) -> ProviderDeliveryOutcome {
+        let seen = self.unsent_prompt.snapshot();
         let (steer_cancellation, acknowledgement_cancellation, compacting) = {
             let runtime = self.runtime.lock().await;
             let steer_cancellation = if let Some(expected) = expected_turn_id.as_deref() {
@@ -22309,6 +22447,9 @@ impl ClaudeDriver {
                 };
             }
         };
+        if self.unsent_prompt.confirm(seen).await {
+            return ProviderDeliveryOutcome::StoppedUnsent;
+        }
         let turn_id = expected_turn_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -22641,9 +22782,12 @@ impl ProviderDriver for ClaudeDriver {
     }
     fn interrupt(
         &self,
-        _: Option<String>,
+        turn_id: Option<String>,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            if turn_id.is_none() {
+                self.unsent_prompt.note_stop();
+            }
             // An interrupted turn leaves nobody to answer its requests. Claude withdraws them
             // too, which then finds nothing pending.
             let cancelled = {
@@ -30894,6 +31038,49 @@ done
                 .contains("session/prompt"),
             "pre-write failure must not create a prompt request"
         );
+    }
+
+    /// A Stop that lands after the send fence, while the driver is still preparing the prompt,
+    /// must not write it. The web Stop dismisses the row and then interrupts with no turn id,
+    /// which is this interrupt: preparation has not started a turn yet.
+    #[tokio::test]
+    async fn a_stop_while_a_prompt_is_prepared_is_not_sent() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("cursor-unsent-stop.jsonl");
+        let driver = cursor_delivery_fixture(&temp, &capture_path, None, false, false).await;
+        driver.start().await.expect("Cursor fixture should start");
+        let pause = Arc::new(super::PublicationTestGate::default());
+        driver.arm_unsent_prompt_pause_for_test(pause.clone());
+        let delivery_driver = driver.clone();
+        let delivery = tokio::spawn(async move {
+            delivery_driver
+                .deliver(
+                    "hello".to_owned(),
+                    Vec::new(),
+                    "default".to_owned(),
+                    "stopped-before-write".to_owned(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+            .await
+            .expect("preparation finished and the write is next");
+        driver
+            .interrupt(None)
+            .await
+            .expect("the stop reaches the driver");
+        pause.release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("the delivery ends")
+            .expect("the delivery task joins");
+        assert_eq!(outcome, super::ProviderDeliveryOutcome::StoppedUnsent);
+        let captured = std::fs::read_to_string(&capture_path).unwrap_or_default();
+        assert!(
+            !captured.contains("\"method\":\"session/prompt\""),
+            "the stopped prompt was written: {captured}"
+        );
+        driver.shutdown().await.expect("Cursor fixture shutdown");
     }
 
     #[tokio::test]
