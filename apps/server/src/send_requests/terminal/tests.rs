@@ -835,6 +835,9 @@ async fn cancel_racing_a_pointer_paste_has_exactly_one_winner() {
     let context = person();
     for run in 0..50 {
         let request_id = format!("race-{run}");
+        // Counted before the send: a cancelled run leaves the terminal ready, so the next
+        // request can be pasted before the send returns.
+        let before = fixture.terminals.writes("b", "term-1").len();
         fixture
             .send(input(
                 &request_id,
@@ -844,7 +847,6 @@ async fn cancel_racing_a_pointer_paste_has_exactly_one_winner() {
             ))
             .await
             .unwrap();
-        let before = fixture.terminals.writes("b", "term-1").len();
         let (cancel, ()) = tokio::join!(fixture.service.cancel(&context, &request_id), async {
             fixture.terminals.set_ready("b", "term-1");
         });
