@@ -1356,8 +1356,8 @@ async function measurePreviewPaint(): Promise<void> {
       sized: true,
       closed: "closed",
     });
-    // Asserted where it was found; elsewhere the evidence shows whether the bug exists there.
-    if (platform === "linux") expect(focusedAfter).toBe(true);
+    // Asserted where it was found; on macOS the evidence shows whether the bug exists there.
+    if (platform !== "mac") expect(focusedAfter).toBe(true);
   } finally {
     reports.close();
   }
@@ -1463,14 +1463,15 @@ function editorQuery(view: View): string {
 }
 
 /**
- * Clicks the centre of `query` natively, as a person does before typing. GTK keyboard focus moves
- * only with a real click: a WebDriver click or `element.focus()` leaves it where it was, such as
- * in a preview webview an earlier cell opened, and native keys then reach nothing. Callers still
- * place focus and the caret through the page afterwards, since the click moves the caret.
+ * Clicks the centre of `query` natively, as a person does before typing. GTK and Win32 keyboard
+ * focus move only with a real click: a WebDriver click or `element.focus()` leaves it where it
+ * was, such as in a preview webview an earlier cell opened, and native keys then reach nothing.
+ * Callers still place focus and the caret through the page afterwards, since the click moves the
+ * caret.
  */
 async function giveNativeFocus(query: string): Promise<void> {
-  // shortcut: Linux only, the platform where native focus was found lost; widen if another shows it.
-  if (platform !== "linux") return;
+  // shortcut: Linux and Windows, where native focus was found lost; add macOS if it shows there.
+  if (platform === "mac") return;
   const centre = await centreOf(query);
   // The calibration click is the focusing click; a second one lands it on target if it was off.
   const offset = await measureNativeClickOffset(centre);
