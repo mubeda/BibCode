@@ -51,6 +51,7 @@ import {
   createSeededUpgradeWdioConfig,
   ManagedProcessRegistry,
   parseSeededDesktopUpgradeSmokeArgs,
+  dropWorkspaceFingerprints,
   prepareSeededUpgradeBuild,
   redactAndBoundUpgradeEvidence,
   writeRemoteUploadCapabilityReceipt,
@@ -981,6 +982,8 @@ describe("seeded packaging build budgets", () => {
     const layout = createSeededUpgradeRunLayout(root, "budget-fixture");
     const triple = seededUpgradeRustTarget(platform, arch);
     const bundleAtStart: Record<string, ReadonlyArray<string>> = {};
+    const fingerprintsAtStart: Record<string, ReadonlyArray<string>> = {};
+    const hostFingerprintsAtStart: Record<string, ReadonlyArray<string>> = {};
     // Stands in for `tauri build`: like Tauri, it adds to whatever bundle directory exists
     // and leaves compilation state beside it in the Cargo target it was given.
     const runCommand = vi.fn(async (command: Parameters<typeof runBoundedCommand>[0]) => {
@@ -998,6 +1001,20 @@ describe("seeded packaging build budgets", () => {
           NodeFS.mkdirSync(NodePath.dirname(path), { recursive: true });
           NodeFS.writeFileSync(path, text);
         };
+        const fingerprints = NodePath.join(release, ".fingerprint");
+        fingerprintsAtStart[build] = NodeFS.existsSync(fingerprints)
+          ? NodeFS.readdirSync(fingerprints).toSorted()
+          : [];
+        // Local crates and a registry dependency, as Cargo names their fingerprints.
+        write(NodePath.join(fingerprints, "bibcode-server-0a1b2c", "lib-bibcode_server"), build);
+        write(NodePath.join(fingerprints, "serde-3d4e5f", "lib-serde"), build);
+        write(NodePath.join(fingerprints, "portable-pty-6a7b8c", "lib-portable_pty"), build);
+        const hostFingerprints = NodePath.join(target, "release", ".fingerprint");
+        hostFingerprintsAtStart[build] = NodeFS.existsSync(hostFingerprints)
+          ? NodeFS.readdirSync(hostFingerprints).toSorted()
+          : [];
+        write(NodePath.join(hostFingerprints, "bibcode-desktop-9d0e1f", "build-script"), build);
+        write(NodePath.join(hostFingerprints, "serde-2c3d4e", "build-script"), build);
         write(NodePath.join(release, "deps", `${build}.rlib`), build);
         if (options.omitBundleFor !== build) {
           write(NodePath.join(bundle, packageName(platform)), `${build} package`);
@@ -1029,6 +1046,7 @@ describe("seeded packaging build budgets", () => {
       SeededUpgradeCommandTimeoutError,
       runCommand,
       prepareSeededUpgradeBuild,
+      dropWorkspaceFingerprints,
       seededUpgradeBundleRoot,
       seededUpgradeVitePlusExecutable,
       seededUpgradeRustTarget,
@@ -1057,6 +1075,8 @@ describe("seeded packaging build budgets", () => {
     return {
       ...context,
       bundleAtStart,
+      fingerprintsAtStart,
+      hostFingerprintsAtStart,
       rename,
       sharedBundle: seededUpgradeBundleRoot(layout.cargoTargetRoot, platform, arch),
       staged,
@@ -1263,6 +1283,21 @@ describe("seeded packaging build budgets", () => {
       "protected-baseline.rlib",
     ]);
     expect(NodeFS.existsSync(owned.sharedBundle)).toBe(false);
+  });
+
+  it("rebuilds the workspace crates in every build while registry dependencies stay shared", async () => {
+    const owned = fixture("linux", "x64");
+    await owned.run();
+    expect(owned.fingerprintsAtStart).toEqual({
+      candidate: [],
+      "previous-stable": ["serde-3d4e5f"],
+      "protected-baseline": ["serde-3d4e5f"],
+    });
+    expect(owned.hostFingerprintsAtStart).toEqual({
+      candidate: [],
+      "previous-stable": ["serde-2c3d4e"],
+      "protected-baseline": ["serde-2c3d4e"],
+    });
   });
 
   it("stops before later builds when a build leaves no bundle to stage", async () => {
