@@ -249,9 +249,9 @@ export function resolveProviderTerminalAction(
 // On since the native Windows batch argument tests ran green on real Windows (D44, Task 12.17).
 export const WINDOWS_TERMINAL_REVIEWS_ENABLED = true;
 
-/** Read-only flags replace `DEFINITIONS`' bypass flags; other CLIs' read-only flags are unverified. */
+/** Review flags replace `DEFINITIONS`' defaults; other CLIs' review terminals are unverified. */
 const REVIEW_ARGUMENTS: Partial<Record<ProviderDriverKind, ReadonlyArray<string>>> = {
-  [ProviderDriverKind.make("claudeAgent")]: ["--permission-mode", "plan"],
+  [ProviderDriverKind.make("claudeAgent")]: ["--dangerously-skip-permissions"],
   [ProviderDriverKind.make("codex")]: ["--sandbox", "read-only", "--ask-for-approval", "never"],
 };
 

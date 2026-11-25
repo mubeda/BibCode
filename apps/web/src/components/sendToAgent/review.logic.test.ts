@@ -188,12 +188,16 @@ describe("buildReviewContent", () => {
     });
     expect(codexLine).toBe("Runs in Codex's read-only sandbox. Writes ask for your approval.");
     expect(build({ guardLine: codexLine }).warning).toBe(codexLine);
-    const instructed = codeReviewGuardLine({
-      kind: "chat",
-      driver: ProviderDriverKind.make("gemini"),
-    });
-    expect(instructed).toBe("Told not to edit. BiBCode cannot block edits for this agent.");
-    expect(build({ guardLine: instructed }).warning).toBe(instructed);
+    for (const driver of ["claudeAgent", "cursor", "opencode", "antigravity", "gemini"]) {
+      const autoLine = codeReviewGuardLine({
+        kind: "chat",
+        driver: ProviderDriverKind.make(driver),
+      });
+      expect(autoLine).toBe(
+        "Runs in auto mode without asking for permissions. Told not to edit; BiBCode cannot block edits for this agent.",
+      );
+      expect(build({ guardLine: autoLine }).warning).toBe(autoLine);
+    }
   });
 
   it("an agent target sends action review with the lead-in and the note and no attachments", async () => {

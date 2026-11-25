@@ -6306,23 +6306,57 @@ describe("ChatView handlers (captured from mocked children)", () => {
       }
     });
 
+    it("starts a Claude chat review in full-access and default modes", async () => {
+      seedReviewEnvironment({ reviewer: { kind: "chat", instanceId: claudeInstanceId } });
+      seedServerThread(makeThread());
+      const view = await mountServerReview();
+      try {
+        expect(view.review().unavailableReason).toBeNull();
+        expect(view.review().guardLine).toBe(
+          "Runs in auto mode without asking for permissions. Told not to edit; BiBCode cannot block edits for this agent.",
+        );
+        await act(async () => view.review().onStart(SCOPE));
+        await vi.waitFor(() => expect(commandCallsFor("thread.startTurn")).toHaveLength(1));
+        const creations = commandCallsFor("worktree.createPanel");
+        expect(creations).toHaveLength(1);
+        expect(creations[0]!.input).toMatchObject({
+          environmentId,
+          input: {
+            hostThreadId: threadId,
+            title: "Panel: Code review · Claude",
+            threadDefaults: {
+              modelSelection: expect.objectContaining({ instanceId: claudeInstanceId }),
+              runtimeMode: "full-access",
+              interactionMode: "default",
+            },
+            codeReview: true,
+          },
+        });
+      } finally {
+        await view.unmount();
+      }
+    });
+
     it("opens a Claude Terminal review with the review command", async () => {
       seedReviewEnvironment({ reviewer: { kind: "terminal", instanceId: claudeInstanceId } });
       seedServerThread(makeThread());
       const view = await mountServerReview();
       try {
         expect(view.review().unavailableReason).toBeNull();
-        expect(view.review().guardLine).toBe("Starts in Claude's plan mode.");
+        expect(view.review().guardLine).toBe(
+          "Runs in auto mode without asking for permissions. Told not to edit; BiBCode cannot block edits for this agent.",
+        );
         await act(async () => view.review().onStart(SCOPE));
         await vi.waitFor(() => expect(commandCallsFor("terminal.open")).toHaveLength(1));
         const opened = commandCallsFor("terminal.open")[0]!.input as {
           input: { command: { executable: string; args: string[] } };
         };
         expect(opened.input.command.executable).toBe("claude");
-        expect(opened.input.command.args.slice(0, 2)).toEqual(["--permission-mode", "plan"]);
+        expect(opened.input.command.args.slice(0, 1)).toEqual(["--dangerously-skip-permissions"]);
+        expect(opened.input.command.args).not.toContain("--permission-mode");
+        expect(opened.input.command.args).not.toContain("plan");
         expect(opened.input.command.args.at(-2)).toBe("--");
         expect(opened.input.command.args.at(-1)).toMatch(/^Code review requested from BiBCode\./);
-        expect(opened.input.command.args).not.toContain("--dangerously-skip-permissions");
         expect(commandCallsFor("worktree.createPanel")).toEqual([]);
       } finally {
         await view.unmount();
@@ -6480,7 +6514,8 @@ describe("ChatView handlers (captured from mocked children)", () => {
           const claudeTerminal = reviewerByLabel(view, "Claude Terminal");
           expect(claudeTerminal).toMatchObject({
             selection: { kind: "terminal", instanceId: claudeInstanceId },
-            guardLine: "Starts in Claude's plan mode.",
+            guardLine:
+              "Runs in auto mode without asking for permissions. Told not to edit; BiBCode cannot block edits for this agent.",
             disabledReason: null,
           });
           await act(async () => startWith(view, claudeTerminal.selection));
@@ -6489,7 +6524,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
             input: { command: { executable: string; args: string[] } };
           };
           expect(opened.input.command.executable).toBe("claude");
-          expect(opened.input.command.args.slice(0, 2)).toEqual(["--permission-mode", "plan"]);
+          expect(opened.input.command.args.slice(0, 1)).toEqual(["--dangerously-skip-permissions"]);
           expect(commandCallsFor("worktree.createPanel")).toEqual([]);
           expect(h.commandCalls.filter((call) => /settings/i.test(call.key))).toEqual([]);
           expect(h.settings["codeReviewAgent"]).toEqual(saved);

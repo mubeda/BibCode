@@ -2537,13 +2537,11 @@ review of the checkout the panel shows:
   shown there and in the tooltip, names the mechanism the review starts with,
   never an outcome:
 
-  | Reviewer                   | Guard line                                                         |
-  | -------------------------- | ------------------------------------------------------------------ |
-  | Claude chat or terminal    | "Starts in Claude's plan mode."                                    |
-  | Codex chat                 | "Runs in Codex's read-only sandbox. Writes ask for your approval." |
-  | Codex terminal             | "Runs in Codex's read-only sandbox."                               |
-  | OpenCode chat              | "Edits and commands ask for your approval."                        |
-  | Cursor, Grok or other chat | "Told not to edit. BiBCode cannot block edits for this agent."     |
+  | Reviewer                          | Guard line                                                                                                       |
+  | --------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+  | Non-Codex chat or Claude terminal | "Runs in auto mode without asking for permissions. Told not to edit; BiBCode cannot block edits for this agent." |
+  | Codex chat                        | "Runs in Codex's read-only sandbox. Writes ask for your approval."                                               |
+  | Codex terminal                    | "Runs in Codex's read-only sandbox."                                                                             |
 
   The Codex chat line above is the one for a server that does not advertise
   `readOnlyCodexReviews` (an older server). With the capability, a Codex chat
@@ -2551,31 +2549,31 @@ review of the checkout the panel shows:
   Codex's read-only sandbox, like the Codex terminal review."
 
   These are the settings BiBCode starts the review with, not a guarantee that
-  nothing is edited. A Claude review loads your user Claude settings and the
-  repository's project and local Claude settings, as every Claude chat does, so
-  a hook that approves leaving plan mode, allow rules for edit tools, or a
-  default mode of `bypassPermissions` in any of them can weaken plan mode. A
-  prompt in the repository can also ask the agent to do more than review.
+  nothing is edited. Non-Codex reviews run in auto mode without prompting and
+  rely on the prompt instruction not to edit files. A prompt in the repository
+  or a provider rule can still ask the agent to do more than review.
 
 - **A chat review** opens as a chat panel of the current thread, in a tab named
-  **Code review · \<agent\>**, on the same checkout. It starts with **Supervised**
-  runtime access, and in plan mode for Claude only. The composer's pickers can
-  change both, as in any chat. A Codex chat review does not ask before
+  **Code review · \<agent\>**, on the same checkout. Non-Codex chat reviews start
+  with **Full access** runtime access and **Default** interaction mode, and
+  BiBCode auto-declines or cancels stray permission and question prompts while
+  those modes stay active. Switching a non-Codex review to **Supervised** or
+  **Plan** mode restores normal prompts. A Codex chat review does not ask before
   commands: the server runs it in Codex's read-only sandbox without approvals,
   as the Codex terminal review runs, so in place of the runtime picker the
   composer shows a disabled **Read-only review** lock that says why on hover or
-  focus (an older server keeps the picker). A
+  focus (an older server keeps the picker and starts in **Supervised**). A
   command the sandbox blocks fails, and an approval or question Codex still
   sends is declined at once, so no card opens. Its first message is the review prompt. If that
   message cannot be sent, the panel stays open with the prompt in its composer.
 - **A review's findings offer no Implement.** When a Claude review ends with a
-  plan, its card reads **Review findings**, with copy and download but no
-  Implement, Refine or **Implement in a new thread**, and Enter in an empty
-  composer sends nothing. This holds after a reload and on other devices. To fix
-  something, ask for it in a normal chat.
+  plan (for example if you switch it to Plan mode), its card reads **Review
+  findings**, with copy and download but no Implement, Refine or **Implement in a
+  new thread**, and Enter in an empty composer sends nothing. This holds after a
+  reload and on other devices. To fix something, ask for it in a normal chat.
 - **A terminal review** opens a Claude or Codex AI Terminal in the centre panel
-  with the CLI's read-only flags (`--permission-mode plan` or `--sandbox
-  read-only --ask-for-approval never`) and no bypass flag, and passes the review
+  (`--dangerously-skip-permissions` for Claude, or `--sandbox read-only
+  --ask-for-approval never` for Codex), and passes the review
   prompt as its one argument. Like other AI Terminals, it shows the agent's
   Activity. A double click opens one terminal. A prompt longer than 8,192
   characters, or one with a control character other than tab and line breaks,

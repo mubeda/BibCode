@@ -941,7 +941,7 @@ describe("resolveProviderReviewTerminalAction", () => {
       ...input,
     });
 
-  it("starts Claude in plan mode with the prompt last, after -- (R97)", () => {
+  it("starts Claude with --dangerously-skip-permissions and the prompt last, after -- (R6)", () => {
     const action = review(claude, {
       modelSelection: { instanceId: ProviderInstanceId.make("claudeAgent"), model: "opus" },
     });
@@ -949,13 +949,14 @@ describe("resolveProviderReviewTerminalAction", () => {
     expect(action?.label).toBe("Claude Review");
     expect(action?.command?.executable).toBe("claude");
     expect(action?.command?.args).toEqual([
-      "--permission-mode",
-      "plan",
+      "--dangerously-skip-permissions",
       "--model",
       "opus",
       "--",
       PROMPT,
     ]);
+    expect(action?.command?.args).not.toContain("--permission-mode");
+    expect(action?.command?.args).not.toContain("plan");
     expect(action?.command?.activity).toEqual({
       driverKind: CLAUDE_DRIVER,
       providerInstanceId: ProviderInstanceId.make("claudeAgent"),
@@ -968,17 +969,15 @@ describe("resolveProviderReviewTerminalAction", () => {
     expect(args.slice(-2)).toEqual(["--", PROMPT]);
   });
 
-  it("never carries a bypass flag", () => {
-    for (const target of [claude, codex]) {
-      const args = review(target)?.command?.args ?? [];
-      expect(args.length).toBeGreaterThan(0);
-      for (const flag of [
-        "--dangerously-skip-permissions",
-        "--allow-dangerously-skip-permissions",
-        "--dangerously-bypass-approvals-and-sandbox",
-      ]) {
-        expect(args).not.toContain(flag);
-      }
+  it("never carries a bypass flag for Codex", () => {
+    const args = review(codex)?.command?.args ?? [];
+    expect(args.length).toBeGreaterThan(0);
+    for (const flag of [
+      "--dangerously-skip-permissions",
+      "--allow-dangerously-skip-permissions",
+      "--dangerously-bypass-approvals-and-sandbox",
+    ]) {
+      expect(args).not.toContain(flag);
     }
   });
 
@@ -986,7 +985,7 @@ describe("resolveProviderReviewTerminalAction", () => {
     const foreign = review(claude, {
       modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "sonnet" },
     });
-    expect(foreign?.command?.args.slice(2, 4)).toEqual(["--model", "opus"]);
+    expect(foreign?.command?.args.slice(1, 3)).toEqual(["--model", "opus"]);
     const own = review(codex, {
       modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
     });
@@ -1031,8 +1030,9 @@ describe("resolveProviderReviewTerminalAction", () => {
 
   it("keeps a prompt that starts with a dash after --", () => {
     const args = review(claude, { prompt: "--dangerously-skip-permissions" })?.command?.args ?? [];
-    expect(args.at(-2)).toBe("--");
-    expect(args.indexOf("--dangerously-skip-permissions")).toBe(args.length - 1);
+    const separatorIndex = args.indexOf("--");
+    expect(separatorIndex).toBeGreaterThanOrEqual(0);
+    expect(args.slice(separatorIndex)).toEqual(["--", "--dangerously-skip-permissions"]);
   });
 
   it("is on on Windows, with line breaks flattened (R98)", () => {

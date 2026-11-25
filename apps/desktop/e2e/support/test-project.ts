@@ -36,10 +36,13 @@ const LONG_REPLY_LINES = 1_000;
 /** Matches the line the Claude shim writes. */
 const longReplyLine = (line: number) => `Fixture long reply line ${line} fills the timeline.`;
 /**
- * A Claude prompt that starts with the code review lead-in (#293) is answered, as Claude in plan
- * mode answers, with an `ExitPlanMode` call whose plan holds the findings.
+ * A Claude prompt that starts with the code review lead-in (#293) normally streams ordinary
+ * findings text in auto mode (`--permission-mode bypassPermissions`); when launched without
+ * `bypassPermissions` or when the prompt carries `CODE_REVIEW_EXIT_PLAN_MARKER`, it emits an
+ * `ExitPlanMode` call whose plan holds the findings.
  */
 const CODE_REVIEW_LEAD_IN = "Code review requested from BiBCode.";
+const CODE_REVIEW_EXIT_PLAN_MARKER = "[[review-exit-plan]]";
 const CODE_REVIEW_FINDING = "Low: example finding";
 const CODE_REVIEW_PLAN = `## Review findings\n\n- ${CODE_REVIEW_FINDING}`;
 /** An answer line names its prompt without the marker, so each turn's answer is its own. */
@@ -641,7 +644,7 @@ export function promptTextFromParts(parts) {
     .join("");
 }
 
-export function appendProviderInput(provider, prompt, kind = "start", turnId) {
+export function appendProviderInput(provider, prompt, kind = "start", turnId, extra) {
   const path = process.env.BIBCODE_E2E_PROVIDER_INPUT_LOG;
   if (!path) {
     throw new Error("BIBCODE_E2E_PROVIDER_INPUT_LOG is required.");
@@ -651,6 +654,7 @@ export function appendProviderInput(provider, prompt, kind = "start", turnId) {
     kind,
     prompt,
     ...(turnId === undefined ? {} : { turnId }),
+    ...(extra ?? {}),
     recordedAt: new Date().toISOString()
   }) + "\n", "utf8");
 }
@@ -842,24 +846,43 @@ reader.on("line", (line) => {
   }
   const sessionId = message.session_id ?? "bibcode-ui-claude-session";
   const prompt = promptTextFromParts(message.message?.content);
-  appendProviderInput("claudeAgent", prompt);
+  const permissionModeIndex = process.argv.indexOf("--permission-mode");
+  const permissionMode = permissionModeIndex === -1 ? null : (process.argv[permissionModeIndex + 1] ?? null);
+  appendProviderInput("claudeAgent", prompt, "start", undefined, { args: process.argv.slice(2) });
   send(message);
   if (prompt.startsWith(${JSON.stringify(CODE_REVIEW_LEAD_IN)})) {
-    send({
-      type: "assistant",
-      session_id: sessionId,
-      uuid: "bibcode-ui-claude-review-plan-" + randomUUID(),
-      parent_tool_use_id: null,
-      message: {
-        id: "bibcode-ui-review-" + randomUUID(),
-        content: [{
-          type: "tool_use",
-          id: "bibcode-ui-review-exit-plan-" + randomUUID(),
-          name: "ExitPlanMode",
-          input: { plan: ${JSON.stringify(CODE_REVIEW_PLAN)} }
-        }]
-      }
-    });
+    if (
+      permissionMode !== "bypassPermissions" ||
+      prompt.includes(${JSON.stringify(CODE_REVIEW_EXIT_PLAN_MARKER)})
+    ) {
+      send({
+        type: "assistant",
+        session_id: sessionId,
+        uuid: "bibcode-ui-claude-review-plan-" + randomUUID(),
+        parent_tool_use_id: null,
+        message: {
+          id: "bibcode-ui-review-" + randomUUID(),
+          content: [{
+            type: "tool_use",
+            id: "bibcode-ui-review-exit-plan-" + randomUUID(),
+            name: "ExitPlanMode",
+            input: { plan: ${JSON.stringify(CODE_REVIEW_PLAN)} }
+          }]
+        }
+      });
+    } else {
+      send({
+        type: "stream_event",
+        session_id: sessionId,
+        uuid: "bibcode-ui-claude-review-stream",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: ${JSON.stringify(CODE_REVIEW_PLAN)} }
+        }
+      });
+    }
     send({
       type: "result",
       subtype: "success",
@@ -1664,6 +1687,7 @@ export const desktopUiFixture = {
   slowReasoningTurnMarker: SLOW_REASONING_TURN_MARKER,
   longReplyTurnMarker: LONG_REPLY_TURN_MARKER,
   codeReviewFinding: CODE_REVIEW_FINDING,
+  codeReviewExitPlanMarker: CODE_REVIEW_EXIT_PLAN_MARKER,
   longReplyLastLine: longReplyLine(LONG_REPLY_LINES),
   reasoningThoughtStart: "Fixture thinking step 1 weighs the parser.",
   /** The last line of the answer to a reasoning prompt whose text, markers aside, is `label`. */

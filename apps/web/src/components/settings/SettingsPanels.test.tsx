@@ -1187,13 +1187,15 @@ describe("AgentsSettingsPanel", () => {
       });
     });
 
-    it("shows the instructed guard line for a Cursor reviewer", () => {
+    it("shows the auto-mode guard line for a non-Codex reviewer", () => {
       h.settings = {
         ...DEFAULT_UNIFIED_SETTINGS,
         codeReviewAgent: { kind: "chat", instanceId: ProviderInstanceId.make("cursor") },
       };
       const markup = render(<AgentsSettingsPanel />);
-      expect(markup).toContain("Told not to edit. BiBCode cannot block edits for this agent.");
+      expect(markup).toContain(
+        "Runs in auto mode without asking for permissions. Told not to edit; BiBCode cannot block edits for this agent.",
+      );
     });
 
     it("keeps an unavailable saved reviewer with its reason", () => {
