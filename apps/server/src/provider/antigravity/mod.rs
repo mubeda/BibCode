@@ -2,6 +2,7 @@
 
 pub use crate::provider::cursor::acp;
 
+pub mod capabilities;
 pub mod runtime;
 
 #[cfg_attr(test, allow(unused_imports))]
