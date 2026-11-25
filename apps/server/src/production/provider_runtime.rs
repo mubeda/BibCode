@@ -12077,6 +12077,11 @@ async fn handle_command(
                     persist_entry(&engine.repositories(), entry, "ready").await
                 }
                 Err(ProviderRuntimeError::UnsupportedCapability { .. }) => {
+                    let old_resume_cursor = entry.resume_cursor.clone();
+                    let warn_v1_rules = entry.launch.provider == "opencode"
+                        && entry.driver.api_version() == 1
+                        && entry.launch.runtime_mode == "full-access"
+                        && runtime_mode != "full-access";
                     let mut launch = entry.launch.clone();
                     launch.runtime_mode = runtime_mode;
                     restart_session(
@@ -12089,7 +12094,36 @@ async fn handle_command(
                         operational_log,
                         None,
                     )
-                    .await
+                    .await?;
+                    if warn_v1_rules
+                        && let Some(restarted) = sessions.get(&thread_id)
+                        && restarted.resume_cursor == old_resume_cursor
+                    {
+                        project_provider_event(
+                            engine,
+                            &restarted.launch,
+                            restarted.resume_cursor.clone(),
+                            restarted.runtime_payload.clone(),
+                            ProviderEvent {
+                                native_event_id: None,
+                                event_type: "runtime.warning".to_owned(),
+                                thread_id: thread_id.clone(),
+                                turn_id: None,
+                                item_id: None,
+                                request_id: None,
+                                payload: json!({
+                                    "message": "OpenCode V1 binds permission rules at session creation and cannot tighten upstream V1 rules mid-session without starting a fresh session.",
+                                    "class": "provider_warning",
+                                }),
+                                activity: Vec::new(),
+                                activity_controls: ProviderActivityControls::default(),
+                            },
+                            #[cfg(test)]
+                            None,
+                        )
+                        .await?;
+                    }
+                    Ok(())
                 }
                 // The thread already asks for this mode: a restart must never start the
                 // session in the earlier, possibly more permissive one.
@@ -18635,6 +18669,7 @@ impl OpenCodeDriver {
                 runtime.use_v2_api();
             }
             runtime.configure_runtime_mode(&request.runtime_mode).await;
+            runtime.set_code_review(request.code_review);
             return Ok(Self {
                 runtime,
                 child: None,
@@ -18695,6 +18730,7 @@ impl OpenCodeDriver {
             runtime.use_v2_api();
         }
         runtime.configure_runtime_mode(&request.runtime_mode).await;
+        runtime.set_code_review(request.code_review);
         if let Some(mcp) = request.mcp.as_ref() {
             runtime
                 .add_mcp_server("bibcode", &mcp.endpoint, &mcp.authorization_header)
@@ -42335,6 +42371,467 @@ done
         assert!(!contents.contains("SYNTHETIC-VALUE-MARKER"), "{contents}");
         let record: Value = serde_json::from_str(contents.trim()).expect("provider option record");
         assert_eq!(record["optionId"], "reasoning");
+    }
+
+    #[tokio::test]
+    async fn opencode_code_review_v1_persisted_card_clears_on_recovery_and_mode_switch_warns() {
+        use super::ActivityInput;
+        use axum::{
+            Json, Router,
+            extract::Path,
+            http::StatusCode,
+            response::sse::Event,
+            routing::{get, post},
+        };
+        use tokio::sync::Mutex as AsyncMutex;
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        let sse_tx: Arc<AsyncMutex<Option<mpsc::UnboundedSender<Value>>>> =
+            Arc::new(AsyncMutex::new(None));
+        let replies: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/global/health",
+                get(|| async { Json(json!({ "healthy": true, "version": "1.18.32" })) }),
+            )
+            .route(
+                "/session/{session_id}",
+                get(|Path(id): Path<String>| async move { Json(json!({ "id": id })) }),
+            )
+            .route(
+                "/permission",
+                get({
+                    let replies = replies.clone();
+                    move || {
+                        let replies = replies.clone();
+                        async move {
+                            if replies.lock().await.is_empty() {
+                                Json(json!([{
+                                    "id": "v1_persisted_perm",
+                                    "sessionID": "ses-v1",
+                                    "permission": "bash",
+                                    "patterns": ["git diff"]
+                                }]))
+                            } else {
+                                Json(json!([]))
+                            }
+                        }
+                    }
+                }),
+            )
+            .route("/question", get(|| async { Json(json!([])) }))
+            .route(
+                "/permission/{id}/reply",
+                post({
+                    let replies = replies.clone();
+                    move |Path(id): Path<String>| {
+                        let replies = replies.clone();
+                        async move {
+                            replies.lock().await.push(id);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/event",
+                get({
+                    let sse_tx = sse_tx.clone();
+                    move || {
+                        let sse_tx = sse_tx.clone();
+                        async move {
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            let _ = tx.send(json!({
+                                "type": "server.connected",
+                                "properties": {}
+                            }));
+                            *sse_tx.lock().await = Some(tx);
+                            let stream = futures_util::StreamExt::map(
+                                UnboundedReceiverStream::new(rx),
+                                |event| {
+                                    Ok::<Event, std::convert::Infallible>(
+                                        Event::default().data(event.to_string()),
+                                    )
+                                },
+                            );
+                            axum::response::Sse::new(stream)
+                        }
+                    }
+                }),
+            );
+        let (endpoint, server) = crate::provider::opencode::server_fixtures::serve(app).await;
+        let temp = TempDir::new().expect("temp");
+        let engine = supervisor_engine().await;
+        let mut events = engine.subscribe_events();
+        // Pre-restart persisted SQLite pending card on thread t1.
+        engine
+            .dispatch(OrchestrationCommand::ThreadActivityAppend {
+                command_id: "seed-v1-card".to_owned(),
+                thread_id: "t1".to_owned(),
+                activity: ActivityInput {
+                    id: "act-v1-card".to_owned(),
+                    tone: "approval".to_owned(),
+                    kind: "approval.requested".to_owned(),
+                    summary: "Approval requested".to_owned(),
+                    payload: json!({
+                        "requestId": "v1_persisted_perm",
+                        "requestType": "exec_command_approval",
+                        "detail": "bash: git diff",
+                        "eventType": "request.opened"
+                    }),
+                    turn_id: None,
+                    sequence: None,
+                    created_at: "2026-07-16T00:00:00Z".to_owned(),
+                },
+                created_at: "2026-07-16T00:00:00Z".to_owned(),
+            })
+            .await
+            .expect("seed persisted approval");
+        assert_eq!(
+            engine
+                .repositories()
+                .get_thread("t1".to_owned())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_approval_count,
+            1
+        );
+
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(super::NativeProviderDriverFactory::new(
+                temp.path().join("attachments"),
+            )),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let mut launch = native_launch(&temp, "opencode");
+        launch.thread_id = "t1".to_owned();
+        launch.runtime_mode = "full-access".to_owned();
+        launch.code_review = true;
+        launch.endpoint = Some(endpoint);
+        launch.resume_cursor = Some(json!({ "sessionId": "ses-v1" }));
+        supervisor.launch(launch).await.expect("launch opencode v1");
+
+        // Auto-decline settles v1_persisted_perm, clears SQLite pending card, and releases queue.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let thread = engine
+                    .repositories()
+                    .get_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if thread.pending_approval_count == 0
+                    && !engine.promotion_held_for_ask_recovery("t1")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .expect("persisted V1 card cleared and recovery promotion released");
+
+        // Switching to approval-required restarts V1 session, emits runtime.warning about V1 rule
+        // creation semantics, and disables local auto-decline so callbacks open cards.
+        *sse_tx.lock().await = None;
+        supervisor
+            .handle_orchestration(OrchestrationCommand::ThreadRuntimeModeSet {
+                command_id: "v1-mode-switch".to_owned(),
+                thread_id: "t1".to_owned(),
+                runtime_mode: "approval-required".to_owned(),
+                created_at: "2026-07-16T00:00:01Z".to_owned(),
+            })
+            .await
+            .expect("V1 mode switch restarts cleanly");
+
+        let mut warned = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !warned && tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(recorded)) = timeout(Duration::from_millis(500), events.recv()).await
+                && recorded.event.event_type == "thread.activity-appended"
+                && recorded.event.payload["activity"]["kind"] == "provider.warning"
+                && recorded.event.payload["activity"]["payload"]["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("session creation") && d.contains("fresh session"))
+            {
+                warned = true;
+            }
+        }
+        assert!(warned, "V1 mode tightening must emit runtime.warning");
+
+        let sender = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(tx) = sse_tx.lock().await.clone() {
+                    break tx;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restarted V1 sse");
+        sender
+            .send(json!({
+                "type": "question.asked",
+                "properties": {
+                    "id": "que_after_v1_switch",
+                    "sessionID": "ses-v1",
+                    "questions": [{ "header": "Check", "question": "Open card?" }]
+                }
+            }))
+            .expect("send question");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let thread = engine
+                    .repositories()
+                    .get_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if thread.pending_user_input_count == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .expect("V1 switch to approval-required must open card on subsequent callback");
+
+        supervisor.shutdown().await.expect("shutdown");
+        engine.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn opencode_code_review_v2_resumes_syncs_permissions_and_clears_persisted_card() {
+        use super::ActivityInput;
+        use axum::{
+            Json, Router,
+            extract::Path,
+            http::StatusCode,
+            response::sse::Event,
+            routing::{delete, get, post},
+        };
+        use tokio::sync::Mutex as AsyncMutex;
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        let sse_tx: Arc<AsyncMutex<Option<mpsc::UnboundedSender<Value>>>> =
+            Arc::new(AsyncMutex::new(None));
+        let patched_rules: Arc<AsyncMutex<Vec<Value>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let replied_perms: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/api/info",
+                get(|| async { Json(json!({ "version": "2.0.29" })) }),
+            )
+            .route(
+                "/api/session",
+                get(|| async { Json(json!({ "data": [] })) }),
+            )
+            .route(
+                "/api/session/{session_id}",
+                get(|Path(id): Path<String>| async move { Json(json!({ "data": { "id": id } })) })
+                    .patch({
+                        let patched_rules = patched_rules.clone();
+                        move |Json(body): Json<Value>| {
+                            let patched_rules = patched_rules.clone();
+                            async move {
+                                patched_rules.lock().await.push(body);
+                                Json(json!({ "data": {} }))
+                            }
+                        }
+                    }),
+            )
+            .route(
+                "/api/session/{session_id}/permission",
+                get({
+                    let replied_perms = replied_perms.clone();
+                    move || {
+                        let replied_perms = replied_perms.clone();
+                        async move {
+                            if replied_perms.lock().await.is_empty() {
+                                Json(json!({
+                                    "data": [{ "id": "v2_persisted_perm", "sessionID": "ses-v2", "permission": "shell" }]
+                                }))
+                            } else {
+                                Json(json!({ "data": [] }))
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/session/{session_id}/form",
+                get(|| async { Json(json!({ "data": [] })) }),
+            )
+            .route(
+                "/api/session/{session_id}/permission/{id}/reply",
+                post({
+                    let replied_perms = replied_perms.clone();
+                    move |Path((_, id)): Path<(String, String)>| {
+                        let replied_perms = replied_perms.clone();
+                        async move {
+                            replied_perms.lock().await.push(id);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/session/{session_id}/form/{id}",
+                delete(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/api/event",
+                get({
+                    let sse_tx = sse_tx.clone();
+                    move || {
+                        let sse_tx = sse_tx.clone();
+                        async move {
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            let _ = tx.send(json!({ "type": "server.connected", "data": {} }));
+                            *sse_tx.lock().await = Some(tx);
+                            let stream = futures_util::StreamExt::map(
+                                UnboundedReceiverStream::new(rx),
+                                |event| {
+                                    Ok::<Event, std::convert::Infallible>(
+                                        Event::default().data(event.to_string()),
+                                    )
+                                },
+                            );
+                            axum::response::Sse::new(stream)
+                        }
+                    }
+                }),
+            );
+        let (endpoint, server) = crate::provider::opencode::server_fixtures::serve(app).await;
+        let temp = TempDir::new().expect("temp");
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(OrchestrationCommand::ThreadActivityAppend {
+                command_id: "seed-v2-card".to_owned(),
+                thread_id: "t1".to_owned(),
+                activity: ActivityInput {
+                    id: "act-v2-card".to_owned(),
+                    tone: "approval".to_owned(),
+                    kind: "approval.requested".to_owned(),
+                    summary: "Approval requested".to_owned(),
+                    payload: json!({
+                        "requestId": "v2_persisted_perm",
+                        "requestType": "exec_command_approval",
+                        "detail": "shell",
+                        "eventType": "request.opened"
+                    }),
+                    turn_id: None,
+                    sequence: None,
+                    created_at: "2026-07-16T00:00:00Z".to_owned(),
+                },
+                created_at: "2026-07-16T00:00:00Z".to_owned(),
+            })
+            .await
+            .expect("seed v2 persisted card");
+
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(super::NativeProviderDriverFactory::new(
+                temp.path().join("attachments"),
+            )),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let mut launch = native_launch(&temp, "opencode");
+        launch.thread_id = "t1".to_owned();
+        launch.runtime_mode = "full-access".to_owned();
+        launch.code_review = true;
+        launch.endpoint = Some(endpoint);
+        launch.resume_cursor = Some(json!({ "sessionId": "ses-v2" }));
+        supervisor.launch(launch).await.expect("launch opencode v2");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let thread = engine
+                    .repositories()
+                    .get_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if thread.pending_approval_count == 0
+                    && !engine.promotion_held_for_ask_recovery("t1")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .expect("persisted V2 card cleared and promotion released");
+
+        // Switch to approval-required -> restart calls v2_sync_permissions with approval-required
+        // rules and opens card on subsequent callback.
+        *sse_tx.lock().await = None;
+        supervisor
+            .handle_orchestration(OrchestrationCommand::ThreadRuntimeModeSet {
+                command_id: "v2-mode-switch".to_owned(),
+                thread_id: "t1".to_owned(),
+                runtime_mode: "approval-required".to_owned(),
+                created_at: "2026-07-16T00:00:01Z".to_owned(),
+            })
+            .await
+            .expect("V2 mode switch restarts cleanly");
+
+        let patches = patched_rules.lock().await.clone();
+        assert_eq!(patches.len(), 2, "{patches:#?}");
+        assert!(
+            patches[1]["permissions"]
+                .as_array()
+                .is_some_and(|rules| rules.iter().any(|r| r["effect"] == "ask")),
+            "second resume after ThreadRuntimeModeSet must sync approval-required rules: {patches:#?}"
+        );
+
+        let sender = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(tx) = sse_tx.lock().await.clone() {
+                    break tx;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restarted V2 sse");
+        sender
+            .send(json!({
+                "type": "permission.asked",
+                "data": { "id": "v2_after_switch", "sessionID": "ses-v2", "permission": "shell" }
+            }))
+            .expect("send V2 permission");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let thread = engine
+                    .repositories()
+                    .get_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if thread.pending_approval_count == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .expect("V2 callback after mode switch must open card");
+
+        supervisor.shutdown().await.expect("shutdown");
+        engine.shutdown().await;
+        server.abort();
     }
 }
 

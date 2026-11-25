@@ -190,6 +190,82 @@ const SIDE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long OpenCode may take to answer the event stream's request with its headers.
 const EVENT_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoDeclineKind {
+    V1Permission,
+    V1Question,
+    V2Permission,
+    V2Form,
+}
+
+fn claim_auto_decline(v2: &mut V2State, kind: AutoDeclineKind, request_id: &str) -> bool {
+    if v2.auto_decline_settled.contains(request_id) {
+        return false;
+    }
+    match kind {
+        AutoDeclineKind::V1Permission | AutoDeclineKind::V1Question => {
+            if v2.v1_settled.contains(request_id) {
+                return false;
+            }
+        }
+        AutoDeclineKind::V2Permission | AutoDeclineKind::V2Form => {
+            if v2.settled.contains(request_id) {
+                return false;
+            }
+        }
+    }
+    v2.auto_decline_in_flight.insert(request_id.to_owned())
+}
+
+fn record_auto_decline_settlement(
+    v2: &mut V2State,
+    tx: &tokio::sync::watch::Sender<u64>,
+    kind: AutoDeclineKind,
+    request_id: &str,
+) -> bool {
+    let newly_settled = if v2.auto_decline_settled.len() < MAX_TRACKED_SETTLEMENTS {
+        v2.auto_decline_settled.insert(request_id.to_owned())
+    } else {
+        !v2.auto_decline_settled.contains(request_id)
+    };
+    match kind {
+        AutoDeclineKind::V1Permission | AutoDeclineKind::V1Question => {
+            if v2.v1_settled.len() < MAX_TRACKED_SETTLEMENTS {
+                v2.v1_settled.insert(request_id.to_owned());
+            }
+        }
+        AutoDeclineKind::V2Permission | AutoDeclineKind::V2Form => {
+            if v2.settled.len() < MAX_TRACKED_SETTLEMENTS {
+                v2.settled.insert(request_id.to_owned());
+            }
+        }
+    }
+    tx.send_modify(|seq| *seq = seq.wrapping_add(1));
+    newly_settled
+}
+
+async fn wait_for_auto_decline_settled(
+    rx: &mut tokio::sync::watch::Receiver<u64>,
+    runtime: &OpenCodeSessionRuntime,
+    request_id: &str,
+) {
+    loop {
+        if runtime
+            .inner
+            .v2
+            .lock()
+            .await
+            .auto_decline_settled
+            .contains(request_id)
+        {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn within_rewind_deadline<T>(
     request: impl std::future::Future<Output = Result<T, OpenCodeRuntimeError>>,
 ) -> Result<T, OpenCodeRuntimeError> {
@@ -405,6 +481,8 @@ struct RuntimeInner {
     activity: Mutex<OpenCodeRuntimeActivityState>,
     /// The server speaks the OpenCode 2 `/api/*` wire. Set once, before `start` or `resume`.
     protocol_v2: AtomicBool,
+    code_review: AtomicBool,
+    auto_decline_settled_tx: tokio::sync::watch::Sender<u64>,
     v2: Mutex<V2State>,
     /// Serializes OpenCode 2 rewinds with the settling a prompt does first, so each unsettled
     /// revert is accounted for once.
@@ -453,6 +531,10 @@ struct V2State {
     /// OpenCode 2 asks settled on the event stream, so a recovery read that still listed them
     /// does not route them again.
     settled: HashSet<String>,
+    /// Asks currently being auto-declined/cancelled in code-review auto mode.
+    auto_decline_in_flight: HashSet<String>,
+    /// Asks confirmed settled (2xx, 404, or provider settlement event) in code-review auto mode.
+    auto_decline_settled: HashSet<String>,
     /// A resumed session reconciles its pending asks once the event stream connects.
     reconcile_asks_on_connect: bool,
     /// Root executions started or ended as the event stream reported them, so an off-pump check
@@ -826,6 +908,7 @@ impl OpenCodeSessionRuntime {
                 .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?;
             headers.insert(AUTHORIZATION, header);
         }
+        let (auto_decline_settled_tx, _) = tokio::sync::watch::channel(0_u64);
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .build()
@@ -882,6 +965,8 @@ impl OpenCodeSessionRuntime {
                     capabilities: ActivityCapabilities::none(),
                 }),
                 protocol_v2: AtomicBool::new(false),
+                code_review: AtomicBool::new(false),
+                auto_decline_settled_tx,
                 v2: Mutex::new(V2State::default()),
                 v2_rewind: Mutex::new(()),
             }),
@@ -964,16 +1049,20 @@ impl OpenCodeSessionRuntime {
 
     async fn started(&self, session_id: &str, payload: Value) -> Result<(), OpenCodeRuntimeError> {
         *self.inner.session_id.lock().await = Some(session_id.to_owned());
-        if self.is_v2() {
+        {
             let mut v2 = self.inner.v2.lock().await;
-            v2.translator = Some(V2TurnTranslator::new(session_id));
-            v2.normalizer = V2ActivityNormalizer::default();
-            v2.permissions.clear();
-            v2.forms.clear();
-            v2.answering.clear();
-            v2.settled_while_answering.clear();
-            v2.cancelled_forms.clear();
-            v2.settled.clear();
+            v2.auto_decline_in_flight.clear();
+            v2.auto_decline_settled.clear();
+            if self.is_v2() {
+                v2.translator = Some(V2TurnTranslator::new(session_id));
+                v2.normalizer = V2ActivityNormalizer::default();
+                v2.permissions.clear();
+                v2.forms.clear();
+                v2.answering.clear();
+                v2.settled_while_answering.clear();
+                v2.cancelled_forms.clear();
+                v2.settled.clear();
+            }
         }
         let resumed = payload.get("resumed").is_some();
         let (recovered_asks, listed) = match (resumed, self.is_v2()) {
@@ -1829,6 +1918,15 @@ impl OpenCodeSessionRuntime {
 
     pub async fn configure_runtime_mode(&self, mode: &str) {
         *self.inner.runtime_mode.lock().await = mode.to_owned();
+    }
+
+    pub fn set_code_review(&self, enabled: bool) {
+        self.inner.code_review.store(enabled, Ordering::Release);
+    }
+
+    async fn should_auto_decline_code_review(&self) -> bool {
+        self.inner.code_review.load(Ordering::Acquire)
+            && self.inner.runtime_mode.lock().await.as_str() == "full-access"
     }
 
     pub async fn respond_to_permission(
@@ -2696,6 +2794,23 @@ impl OpenCodeSessionRuntime {
                 let request_id = v1_request_id(&properties)
                     .unwrap_or("question-1")
                     .to_owned();
+                if self.should_auto_decline_code_review().await
+                    && !self
+                        .inner
+                        .pending_questions
+                        .lock()
+                        .await
+                        .contains_key(&request_id)
+                {
+                    self.schedule_code_review_auto_decline(
+                        AutoDeclineKind::V1Question,
+                        request_id,
+                        None,
+                        turn_id,
+                    )
+                    .await;
+                    return;
+                }
                 let questions = v1_questions(&properties);
                 // One the resume already showed keeps its route and is not shown again.
                 if self
@@ -2726,6 +2841,23 @@ impl OpenCodeSessionRuntime {
                 let request_id = v1_request_id(&properties)
                     .unwrap_or("permission-1")
                     .to_owned();
+                if self.should_auto_decline_code_review().await
+                    && !self
+                        .inner
+                        .pending_permissions
+                        .lock()
+                        .await
+                        .contains_key(&request_id)
+                {
+                    self.schedule_code_review_auto_decline(
+                        AutoDeclineKind::V1Permission,
+                        request_id,
+                        None,
+                        turn_id,
+                    )
+                    .await;
+                    return;
+                }
                 let detail = v1_permission_detail(&properties);
                 // One the resume already showed keeps its route and is not shown again.
                 if self
@@ -2765,24 +2897,56 @@ impl OpenCodeSessionRuntime {
                 // while it routes, so a recovery read that still lists the ask never shows it.
                 let resolved = if event_type == "permission.replied" {
                     let mut pending = self.inner.pending_permissions.lock().await;
-                    self.remember_v1_settlement(&request_id).await;
-                    pending.remove(&request_id).map(|turn_id| {
-                        (
-                            "request.resolved",
-                            turn_id,
-                            json!({ "requestType": "exec_command_approval" }),
+                    let auto_settled = self
+                        .record_provider_settlement_for_auto_decline(
+                            AutoDeclineKind::V1Permission,
+                            &request_id,
                         )
-                    })
+                        .await;
+                    pending
+                        .remove(&request_id)
+                        .map(|turn_id| {
+                            (
+                                "request.resolved",
+                                turn_id,
+                                json!({ "requestType": "exec_command_approval" }),
+                            )
+                        })
+                        .or_else(|| {
+                            auto_settled.then(|| {
+                                (
+                                    "request.resolved",
+                                    turn_id.clone(),
+                                    json!({ "requestType": "exec_command_approval" }),
+                                )
+                            })
+                        })
                 } else {
                     let mut pending = self.inner.pending_questions.lock().await;
-                    self.remember_v1_settlement(&request_id).await;
-                    pending.remove(&request_id).map(|question| {
-                        (
-                            "user-input.resolved",
-                            question.turn_id,
-                            json!({ "answers": {} }),
+                    let auto_settled = self
+                        .record_provider_settlement_for_auto_decline(
+                            AutoDeclineKind::V1Question,
+                            &request_id,
                         )
-                    })
+                        .await;
+                    pending
+                        .remove(&request_id)
+                        .map(|question| {
+                            (
+                                "user-input.resolved",
+                                question.turn_id,
+                                json!({ "answers": {} }),
+                            )
+                        })
+                        .or_else(|| {
+                            auto_settled.then(|| {
+                                (
+                                    "user-input.resolved",
+                                    turn_id.clone(),
+                                    json!({ "answers": {} }),
+                                )
+                            })
+                        })
                 };
                 if let Some((event_type, turn_id, payload)) = resolved {
                     self.emit(event_type, turn_id, Some(request_id), payload)
@@ -2928,6 +3092,24 @@ impl OpenCodeSessionRuntime {
                     session_id,
                     detail,
                 } => {
+                    if self.should_auto_decline_code_review().await
+                        && !self
+                            .inner
+                            .v2
+                            .lock()
+                            .await
+                            .permissions
+                            .contains_key(&request_id)
+                    {
+                        self.schedule_code_review_auto_decline(
+                            AutoDeclineKind::V2Permission,
+                            request_id,
+                            Some(session_id),
+                            turn_id,
+                        )
+                        .await;
+                        continue;
+                    }
                     // One the resume already routed and showed is not shown again.
                     {
                         let mut v2 = self.inner.v2.lock().await;
@@ -2947,17 +3129,22 @@ impl OpenCodeSessionRuntime {
                 }
                 V2Output::PermissionSettled { request_id } => {
                     // Answered elsewhere, such as in the OpenCode terminal.
-                    let pending = {
+                    let (pending, auto_settled) = {
                         let mut v2 = self.inner.v2.lock().await;
-                        if v2.settled.len() < MAX_TRACKED_SETTLEMENTS {
-                            v2.settled.insert(request_id.clone());
-                        }
-                        if v2.answering.contains(&request_id) {
+                        let was_in_flight = v2.auto_decline_in_flight.remove(&request_id);
+                        let newly_settled = record_auto_decline_settlement(
+                            &mut v2,
+                            &self.inner.auto_decline_settled_tx,
+                            AutoDeclineKind::V2Permission,
+                            &request_id,
+                        );
+                        let pending = if v2.answering.contains(&request_id) {
                             v2.settled_while_answering.insert(request_id.clone());
                             None
                         } else {
                             v2.permissions.remove(&request_id)
-                        }
+                        };
+                        (pending, was_in_flight && newly_settled)
                     };
                     if let Some((turn_id, _)) = pending {
                         self.emit(
@@ -2965,6 +3152,13 @@ impl OpenCodeSessionRuntime {
                             turn_id,
                             Some(request_id),
                             json!({ "requestType": "exec_command_approval" }),
+                        )
+                        .await;
+                    } else if auto_settled {
+                        self.emit_auto_decline_resolved(
+                            AutoDeclineKind::V2Permission,
+                            request_id,
+                            turn_id,
                         )
                         .await;
                     }
@@ -2975,6 +3169,18 @@ impl OpenCodeSessionRuntime {
                     questions,
                     fields,
                 } => {
+                    if self.should_auto_decline_code_review().await
+                        && !self.inner.v2.lock().await.forms.contains_key(&form_id)
+                    {
+                        self.schedule_code_review_auto_decline(
+                            AutoDeclineKind::V2Form,
+                            form_id,
+                            Some(session_id),
+                            turn_id,
+                        )
+                        .await;
+                        continue;
+                    }
                     // One the resume already routed and showed is not shown again.
                     {
                         let mut v2 = self.inner.v2.lock().await;
@@ -3002,23 +3208,38 @@ impl OpenCodeSessionRuntime {
                     form_id,
                     session_id,
                 } => {
+                    if self.should_auto_decline_code_review().await {
+                        self.schedule_code_review_auto_decline(
+                            AutoDeclineKind::V2Form,
+                            form_id,
+                            Some(session_id),
+                            turn_id,
+                        )
+                        .await;
+                        continue;
+                    }
                     // A form BiBCode cannot show (such as a sign-in link) would block the agent;
                     // cancelling it tells the agent nobody answered.
                     self.spawn_v2_cancel_unanswerable_form(form_id, session_id, turn_id)
                         .await;
                 }
                 V2Output::FormSettled { form_id } => {
-                    let pending = {
+                    let (pending, auto_settled) = {
                         let mut v2 = self.inner.v2.lock().await;
-                        if v2.settled.len() < MAX_TRACKED_SETTLEMENTS {
-                            v2.settled.insert(form_id.clone());
-                        }
-                        if v2.answering.contains(&form_id) {
+                        let was_in_flight = v2.auto_decline_in_flight.remove(&form_id);
+                        let newly_settled = record_auto_decline_settlement(
+                            &mut v2,
+                            &self.inner.auto_decline_settled_tx,
+                            AutoDeclineKind::V2Form,
+                            &form_id,
+                        );
+                        let pending = if v2.answering.contains(&form_id) {
                             v2.settled_while_answering.insert(form_id.clone());
                             None
                         } else {
                             v2.forms.remove(&form_id)
-                        }
+                        };
+                        (pending, was_in_flight && newly_settled)
                     };
                     if let Some(form) = pending {
                         self.emit(
@@ -3028,6 +3249,9 @@ impl OpenCodeSessionRuntime {
                             json!({ "answers": {} }),
                         )
                         .await;
+                    } else if auto_settled {
+                        self.emit_auto_decline_resolved(AutoDeclineKind::V2Form, form_id, turn_id)
+                            .await;
                     }
                 }
                 V2Output::Usage { mut usage, model } => {
@@ -3327,66 +3551,98 @@ impl OpenCodeSessionRuntime {
         &self,
         asks: Vec<(String, &'static str, Value)>,
     ) -> (Vec<(&'static str, String, Value)>, Vec<(String, String)>) {
+        let auto_decline = self.should_auto_decline_code_review().await;
         let mut recovered = Vec::new();
         let mut unanswerable = Vec::new();
-        let mut v2 = self.inner.v2.lock().await;
-        for (session_id, kind, ask) in asks {
-            let Some(id) = ask.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            if v2.settled.contains(id) {
-                continue;
-            }
-            if kind == "permission" {
-                if v2.permissions.contains_key(id) {
+        let mut to_auto_decline = Vec::new();
+        {
+            let mut v2 = self.inner.v2.lock().await;
+            for (session_id, kind, ask) in asks {
+                let Some(id) = ask.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if v2.settled.contains(id) {
                     continue;
                 }
-                v2.permissions
-                    .insert(id.to_owned(), (None, session_id.clone()));
-                recovered.push((
-                    "request.opened",
-                    id.to_owned(),
-                    json!({
-                        "requestType": "exec_command_approval",
-                        "detail": v2::permission_detail(&ask),
-                        "recovered": true,
-                    }),
-                ));
-                continue;
-            }
-            if v2.forms.contains_key(id) || v2.cancelled_forms.contains(id) {
-                continue;
-            }
-            // One BiBCode cannot show is cancelled, as a live one is.
-            let Some((questions, fields)) = v2::form_questions(&ask) else {
-                if !unanswerable.iter().any(|(form_id, _)| form_id == id) {
-                    unanswerable.push((id.to_owned(), session_id.clone()));
+                if auto_decline {
+                    let decl_kind = if kind == "permission" {
+                        if v2.permissions.contains_key(id) {
+                            continue;
+                        }
+                        AutoDeclineKind::V2Permission
+                    } else {
+                        if v2.forms.contains_key(id) || v2.cancelled_forms.contains(id) {
+                            continue;
+                        }
+                        AutoDeclineKind::V2Form
+                    };
+                    if claim_auto_decline(&mut v2, decl_kind, id) {
+                        to_auto_decline.push((decl_kind, id.to_owned(), session_id));
+                    }
+                    continue;
                 }
-                continue;
-            };
-            v2.forms.insert(
-                id.to_owned(),
-                V2PendingForm {
-                    turn_id: None,
-                    session_id: session_id.clone(),
-                    fields,
-                },
-            );
-            recovered.push((
-                "user-input.requested",
-                id.to_owned(),
-                json!({ "questions": questions, "recovered": true }),
-            ));
+                if kind == "permission" {
+                    if v2.permissions.contains_key(id) {
+                        continue;
+                    }
+                    v2.permissions
+                        .insert(id.to_owned(), (None, session_id.clone()));
+                    recovered.push((
+                        "request.opened",
+                        id.to_owned(),
+                        json!({
+                            "requestType": "exec_command_approval",
+                            "detail": v2::permission_detail(&ask),
+                            "recovered": true,
+                        }),
+                    ));
+                    continue;
+                }
+                if v2.forms.contains_key(id) || v2.cancelled_forms.contains(id) {
+                    continue;
+                }
+                // One BiBCode cannot show is cancelled, as a live one is.
+                let Some((questions, fields)) = v2::form_questions(&ask) else {
+                    if !unanswerable.iter().any(|(form_id, _)| form_id == id) {
+                        unanswerable.push((id.to_owned(), session_id.clone()));
+                    }
+                    continue;
+                };
+                v2.forms.insert(
+                    id.to_owned(),
+                    V2PendingForm {
+                        turn_id: None,
+                        session_id: session_id.clone(),
+                        fields,
+                    },
+                );
+                recovered.push((
+                    "user-input.requested",
+                    id.to_owned(),
+                    json!({ "questions": questions, "recovered": true }),
+                ));
+            }
+        }
+        for (kind, id, session_id) in to_auto_decline {
+            self.spawn_claimed_auto_decline(kind, id, Some(session_id), None);
         }
         (recovered, unanswerable)
     }
 
-    /// Remembers an OpenCode 1 ask settled on the event stream, for a recovery read.
-    async fn remember_v1_settlement(&self, request_id: &str) {
+    async fn record_provider_settlement_for_auto_decline(
+        &self,
+        kind: AutoDeclineKind,
+        request_id: &str,
+    ) -> bool {
         let mut v2 = self.inner.v2.lock().await;
-        if v2.v1_settled.len() < MAX_TRACKED_SETTLEMENTS {
-            v2.v1_settled.insert(request_id.to_owned());
-        }
+        let was_in_flight = v2.auto_decline_in_flight.remove(request_id);
+        let newly_settled = record_auto_decline_settlement(
+            &mut v2,
+            &self.inner.auto_decline_settled_tx,
+            kind,
+            request_id,
+        );
+        was_in_flight && newly_settled
     }
 
     /// The permissions and questions an OpenCode 1 session was waiting on when it resumed, read
@@ -3400,6 +3656,7 @@ impl OpenCodeSessionRuntime {
         session_id: &str,
     ) -> (Vec<(&'static str, String, Value)>, Option<Vec<String>>) {
         self.inner.v2.lock().await.v1_settled.clear();
+        let auto_decline = self.should_auto_decline_code_review().await;
         let mut recovered = Vec::new();
         let permissions = match self.request_url("/permission") {
             Ok(url) => self.v2_get_json(url).await,
@@ -3419,50 +3676,74 @@ impl OpenCodeSessionRuntime {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        {
-            let mut pending = self.inner.pending_permissions.lock().await;
-            for request in of_session(&permissions) {
+        if auto_decline {
+            let mut to_auto_decline = Vec::new();
+            {
+                let mut v2 = self.inner.v2.lock().await;
+                for request in of_session(&permissions) {
+                    if let Some(request_id) = v1_request_id(&request)
+                        && claim_auto_decline(&mut v2, AutoDeclineKind::V1Permission, request_id)
+                    {
+                        to_auto_decline
+                            .push((AutoDeclineKind::V1Permission, request_id.to_owned()));
+                    }
+                }
+                for request in of_session(&questions) {
+                    if let Some(request_id) = v1_request_id(&request)
+                        && claim_auto_decline(&mut v2, AutoDeclineKind::V1Question, request_id)
+                    {
+                        to_auto_decline.push((AutoDeclineKind::V1Question, request_id.to_owned()));
+                    }
+                }
+            }
+            for (kind, request_id) in to_auto_decline {
+                self.spawn_claimed_auto_decline(kind, request_id, None, None);
+            }
+        } else {
+            {
+                let mut pending = self.inner.pending_permissions.lock().await;
+                for request in of_session(&permissions) {
+                    let Some(request_id) = v1_request_id(&request) else {
+                        continue;
+                    };
+                    if pending.contains_key(request_id) {
+                        continue;
+                    }
+                    pending.insert(request_id.to_owned(), None);
+                    recovered.push((
+                        "request.opened",
+                        request_id.to_owned(),
+                        json!({
+                            "requestType": "exec_command_approval",
+                            "detail": v1_permission_detail(&request),
+                            "recovered": true,
+                        }),
+                    ));
+                }
+            }
+            let mut pending = self.inner.pending_questions.lock().await;
+            for request in of_session(&questions) {
                 let Some(request_id) = v1_request_id(&request) else {
                     continue;
                 };
                 if pending.contains_key(request_id) {
                     continue;
                 }
-                pending.insert(request_id.to_owned(), None);
-                recovered.push((
-                    "request.opened",
+                let questions = v1_questions(&request);
+                pending.insert(
                     request_id.to_owned(),
-                    json!({
-                        "requestType": "exec_command_approval",
-                        "detail": v1_permission_detail(&request),
-                        "recovered": true,
-                    }),
+                    PendingQuestion {
+                        turn_id: None,
+                        questions: questions.clone(),
+                    },
+                );
+                recovered.push((
+                    "user-input.requested",
+                    request_id.to_owned(),
+                    json!({ "questions": questions, "recovered": true }),
                 ));
             }
         }
-        let mut pending = self.inner.pending_questions.lock().await;
-        for request in of_session(&questions) {
-            let Some(request_id) = v1_request_id(&request) else {
-                continue;
-            };
-            if pending.contains_key(request_id) {
-                continue;
-            }
-            let questions = v1_questions(&request);
-            pending.insert(
-                request_id.to_owned(),
-                PendingQuestion {
-                    turn_id: None,
-                    questions: questions.clone(),
-                },
-            );
-            recovered.push((
-                "user-input.requested",
-                request_id.to_owned(),
-                json!({ "questions": questions, "recovered": true }),
-            ));
-        }
-        drop(pending);
         let listed_ids = |list: &Option<Value>| {
             list.as_ref().and_then(Value::as_array).map(|requests| {
                 requests
@@ -3698,10 +3979,29 @@ impl OpenCodeSessionRuntime {
             let request_id = request_id.to_owned();
             async move { self.inner.v2.lock().await.v1_settled.contains(&request_id) }
         };
+        let auto_decline = self.should_auto_decline_code_review().await;
         for request in of_session("/permission") {
             let Some(request_id) = v1_request_id(&request).map(str::to_owned) else {
                 continue;
             };
+            if auto_decline {
+                let already_pending = self
+                    .inner
+                    .pending_permissions
+                    .lock()
+                    .await
+                    .contains_key(&request_id);
+                if !already_pending && !settled(&request_id).await {
+                    self.schedule_code_review_auto_decline(
+                        AutoDeclineKind::V1Permission,
+                        request_id,
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+                continue;
+            }
             let mut pending = self.inner.pending_permissions.lock().await;
             if pending.contains_key(&request_id) || settled(&request_id).await {
                 continue;
@@ -3723,6 +4023,24 @@ impl OpenCodeSessionRuntime {
             let Some(request_id) = v1_request_id(&request).map(str::to_owned) else {
                 continue;
             };
+            if auto_decline {
+                let already_pending = self
+                    .inner
+                    .pending_questions
+                    .lock()
+                    .await
+                    .contains_key(&request_id);
+                if !already_pending && !settled(&request_id).await {
+                    self.schedule_code_review_auto_decline(
+                        AutoDeclineKind::V1Question,
+                        request_id,
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+                continue;
+            }
             let mut pending = self.inner.pending_questions.lock().await;
             if pending.contains_key(&request_id) || settled(&request_id).await {
                 continue;
@@ -3743,6 +4061,263 @@ impl OpenCodeSessionRuntime {
             )
             .await;
         }
+    }
+
+    async fn emit_auto_decline_resolved(
+        &self,
+        kind: AutoDeclineKind,
+        request_id: String,
+        turn_id: Option<String>,
+    ) {
+        match kind {
+            AutoDeclineKind::V1Permission | AutoDeclineKind::V2Permission => {
+                self.emit(
+                    "request.resolved",
+                    turn_id,
+                    Some(request_id),
+                    json!({
+                        "requestType": "exec_command_approval",
+                        "decision": "decline",
+                    }),
+                )
+                .await;
+            }
+            AutoDeclineKind::V1Question | AutoDeclineKind::V2Form => {
+                self.emit(
+                    "user-input.resolved",
+                    turn_id,
+                    Some(request_id),
+                    json!({ "answers": {} }),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn schedule_code_review_auto_decline(
+        &self,
+        kind: AutoDeclineKind,
+        request_id: String,
+        session_id: Option<String>,
+        turn_id: Option<String>,
+    ) {
+        let claimed = {
+            let mut v2 = self.inner.v2.lock().await;
+            claim_auto_decline(&mut v2, kind, &request_id)
+        };
+        if claimed {
+            self.spawn_claimed_auto_decline(kind, request_id, session_id, turn_id);
+        }
+    }
+
+    fn build_auto_decline_request(
+        &self,
+        kind: AutoDeclineKind,
+        request_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder, OpenCodeRuntimeError> {
+        match kind {
+            AutoDeclineKind::V1Permission => Ok(self
+                .inner
+                .client
+                .post(self.request_url(&format!("/permission/{request_id}/reply"))?)
+                .json(&json!({ "reply": "reject" }))),
+            AutoDeclineKind::V1Question => Ok(self
+                .inner
+                .client
+                .post(self.request_url(&format!("/question/{request_id}/reject"))?)),
+            AutoDeclineKind::V2Permission => {
+                let session_id = session_id.ok_or(OpenCodeRuntimeError::MissingSession)?;
+                Ok(self
+                    .inner
+                    .client
+                    .post(self.v2_url(
+                        &["session", session_id, "permission", request_id, "reply"],
+                        false,
+                    )?)
+                    .json(&json!({ "decision": v2::permission_decision("decline") })))
+            }
+            AutoDeclineKind::V2Form => {
+                let session_id = session_id.ok_or(OpenCodeRuntimeError::MissingSession)?;
+                Ok(self
+                    .inner
+                    .client
+                    .delete(self.v2_url(&["session", session_id, "form", request_id], false)?))
+            }
+        }
+    }
+
+    fn spawn_claimed_auto_decline(
+        &self,
+        kind: AutoDeclineKind,
+        request_id: String,
+        session_id: Option<String>,
+        turn_id: Option<String>,
+    ) {
+        const AUTO_DECLINE_MAX_ATTEMPTS: usize = 3;
+        const AUTO_DECLINE_BACKOFF: [Duration; 2] =
+            [Duration::from_millis(25), Duration::from_millis(75)];
+
+        let runtime = Arc::downgrade(&self.inner);
+        let cancellation = self.inner.reconciliation_cancellation.clone();
+        let owner_cancellation = self.inner.owner_state.cancellation.clone();
+        let mut settled_rx = self.inner.auto_decline_settled_tx.subscribe();
+        tokio::spawn(async move {
+            let Some(inner) = runtime.upgrade() else {
+                return;
+            };
+            let runtime = OpenCodeSessionRuntime::internal(inner);
+
+            for attempt in 1..=AUTO_DECLINE_MAX_ATTEMPTS {
+                if cancellation.is_cancelled() || owner_cancellation.is_cancelled() {
+                    runtime
+                        .inner
+                        .v2
+                        .lock()
+                        .await
+                        .auto_decline_in_flight
+                        .remove(&request_id);
+                    return;
+                }
+                if runtime
+                    .inner
+                    .v2
+                    .lock()
+                    .await
+                    .auto_decline_settled
+                    .contains(&request_id)
+                {
+                    runtime
+                        .inner
+                        .v2
+                        .lock()
+                        .await
+                        .auto_decline_in_flight
+                        .remove(&request_id);
+                    return;
+                }
+                let Ok(request) =
+                    runtime.build_auto_decline_request(kind, &request_id, session_id.as_deref())
+                else {
+                    break;
+                };
+                let outcome = tokio::select! {
+                    () = cancellation.cancelled() => {
+                        runtime.inner.v2.lock().await.auto_decline_in_flight.remove(&request_id);
+                        return;
+                    }
+                    () = owner_cancellation.cancelled() => {
+                        runtime.inner.v2.lock().await.auto_decline_in_flight.remove(&request_id);
+                        return;
+                    }
+                    () = wait_for_auto_decline_settled(&mut settled_rx, &runtime, &request_id) => {
+                        runtime.inner.v2.lock().await.auto_decline_in_flight.remove(&request_id);
+                        return;
+                    }
+                    result = tokio::time::timeout(SIDE_REQUEST_TIMEOUT, request.send()) => result,
+                };
+                match outcome {
+                    Ok(Ok(response))
+                        if response.status().is_success()
+                            || response.status() == reqwest::StatusCode::NOT_FOUND =>
+                    {
+                        let emit = {
+                            let mut v2 = runtime.inner.v2.lock().await;
+                            v2.auto_decline_in_flight.remove(&request_id);
+                            record_auto_decline_settlement(
+                                &mut v2,
+                                &runtime.inner.auto_decline_settled_tx,
+                                kind,
+                                &request_id,
+                            )
+                        };
+                        if emit {
+                            runtime
+                                .emit_auto_decline_resolved(kind, request_id, turn_id)
+                                .await;
+                        }
+                        return;
+                    }
+                    Ok(Ok(response))
+                        if response.status().is_client_error()
+                            && !matches!(
+                                response.status(),
+                                reqwest::StatusCode::REQUEST_TIMEOUT
+                                    | reqwest::StatusCode::TOO_MANY_REQUESTS
+                            ) =>
+                    {
+                        tracing::warn!(
+                            provider = "opencode",
+                            status = %response.status(),
+                            "OpenCode code-review auto-decline was refused"
+                        );
+                        break;
+                    }
+                    Ok(Ok(response)) => {
+                        tracing::warn!(
+                            provider = "opencode",
+                            attempt,
+                            status = %response.status(),
+                            "OpenCode code-review auto-decline attempt failed transiently"
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            provider = "opencode",
+                            attempt,
+                            %error,
+                            "OpenCode code-review auto-decline HTTP request failed"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            provider = "opencode",
+                            attempt,
+                            "OpenCode code-review auto-decline attempt timed out"
+                        );
+                    }
+                }
+                if attempt < AUTO_DECLINE_MAX_ATTEMPTS {
+                    let delay = AUTO_DECLINE_BACKOFF[attempt - 1];
+                    tokio::select! {
+                        () = cancellation.cancelled() => {
+                            runtime.inner.v2.lock().await.auto_decline_in_flight.remove(&request_id);
+                            return;
+                        }
+                        () = owner_cancellation.cancelled() => {
+                            runtime.inner.v2.lock().await.auto_decline_in_flight.remove(&request_id);
+                            return;
+                        }
+                        () = wait_for_auto_decline_settled(&mut settled_rx, &runtime, &request_id) => {
+                            runtime.inner.v2.lock().await.auto_decline_in_flight.remove(&request_id);
+                            return;
+                        }
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                }
+            }
+
+            let already_settled = {
+                let mut v2 = runtime.inner.v2.lock().await;
+                v2.auto_decline_in_flight.remove(&request_id);
+                v2.auto_decline_settled.contains(&request_id)
+            };
+            if already_settled || cancellation.is_cancelled() || owner_cancellation.is_cancelled() {
+                return;
+            }
+            runtime
+                .emit(
+                    "runtime.error",
+                    turn_id,
+                    None,
+                    json!({
+                        "message": "OpenCode code review could not decline a stray prompt after retries, so the turn is being stopped.",
+                        "class": "provider_error",
+                    }),
+                )
+                .await;
+            let _ = tokio::time::timeout(SIDE_REQUEST_TIMEOUT, runtime.interrupt_turn()).await;
+        });
     }
 
     /// Cancels a form BiBCode cannot show, live or recovered on resume, once per form: off the
@@ -8015,5 +8590,691 @@ mod tests {
                 .v1_settled
                 .contains("que_unrouted")
         );
+    }
+}
+
+#[cfg(test)]
+mod code_review_auto_decline_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        extract::Path,
+        http::StatusCode,
+        response::{
+            IntoResponse,
+            sse::{Event, Sse},
+        },
+        routing::{delete, get, post},
+    };
+    use serde_json::{Value, json};
+    use tokio::{
+        net::TcpListener,
+        sync::{Mutex, mpsc},
+        time::{Duration, timeout},
+    };
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    use super::*;
+
+    fn review_runtime(base_url: &str, v2: bool) -> OpenCodeSessionRuntime {
+        let runtime =
+            OpenCodeSessionRuntime::new(base_url, "opencode-review-thread", "/tmp/review", None);
+        if v2 {
+            runtime.use_v2_api();
+        }
+        runtime.set_code_review(true);
+        runtime
+    }
+
+    async fn collect_until(
+        runtime: &OpenCodeSessionRuntime,
+        mut done: impl FnMut(&[OpenCodeRuntimeEvent]) -> bool,
+    ) -> Vec<OpenCodeRuntimeEvent> {
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done(&events) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = timeout(remaining, runtime.next_event())
+                .await
+                .expect("timed out waiting for expected runtime event")
+                .expect("runtime event stream closed");
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn code_review_v1_auto_declines_live_recovered_and_retry_listed_asks() {
+        #[derive(Default)]
+        struct ServerState {
+            permissions_calls: AtomicUsize,
+            empty_initial_then_retry: AtomicBool,
+            permission_replies: Mutex<Vec<(String, Value)>>,
+            question_rejects: Mutex<Vec<String>>,
+            sse_tx: Mutex<Option<mpsc::UnboundedSender<Value>>>,
+        }
+
+        let state = Arc::new(ServerState::default());
+        let app = Router::new()
+            .route(
+                "/session/{session_id}",
+                get(|Path(id): Path<String>| async move { Json(json!({ "id": id })) }),
+            )
+            .route(
+                "/permission",
+                get({
+                    let state = state.clone();
+                    move || {
+                        let state = state.clone();
+                        async move {
+                            let n = state.permissions_calls.fetch_add(1, Ordering::SeqCst);
+                            if !state.empty_initial_then_retry.load(Ordering::SeqCst) {
+                                if n == 0 {
+                                    Json(json!([{
+                                        "id": "per_rec_1",
+                                        "sessionID": "ses-v1",
+                                        "permission": "bash",
+                                        "patterns": ["git status"]
+                                    }]))
+                                    .into_response()
+                                } else {
+                                    Json(json!([])).into_response()
+                                }
+                            } else if n == 0 {
+                                Json(json!([])).into_response()
+                            } else if n == 1 {
+                                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                            } else {
+                                Json(json!([{
+                                    "id": "per_retry_1",
+                                    "sessionID": "ses-v1",
+                                    "permission": "edit",
+                                    "patterns": ["a.rs"]
+                                }]))
+                                .into_response()
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/question",
+                get(|| async {
+                    Json(json!([{
+                        "id": "que_rec_1",
+                        "sessionID": "ses-v1",
+                        "questions": [{ "header": "Q", "question": "Proceed?" }]
+                    }]))
+                }),
+            )
+            .route(
+                "/permission/{id}/reply",
+                post({
+                    let state = state.clone();
+                    move |Path(id): Path<String>, Json(body): Json<Value>| {
+                        let state = state.clone();
+                        async move {
+                            state.permission_replies.lock().await.push((id, body));
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/question/{id}/reject",
+                post({
+                    let state = state.clone();
+                    move |Path(id): Path<String>| {
+                        let state = state.clone();
+                        async move {
+                            state.question_rejects.lock().await.push(id);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/event",
+                get({
+                    let state = state.clone();
+                    move || {
+                        let state = state.clone();
+                        async move {
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            let _ = tx.send(json!({
+                                "type": "server.connected",
+                                "properties": {}
+                            }));
+                            *state.sse_tx.lock().await = Some(tx);
+                            let stream = futures_util::StreamExt::map(
+                                UnboundedReceiverStream::new(rx),
+                                |event| {
+                                    Ok::<Event, std::convert::Infallible>(
+                                        Event::default().data(event.to_string()),
+                                    )
+                                },
+                            );
+                            Sse::new(stream)
+                        }
+                    }
+                }),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        // Part 1: recovered V1 asks + live V1 asks + duplicate delivery dedupe.
+        let runtime = review_runtime(&format!("http://{address}"), false);
+        runtime.configure_runtime_mode("full-access").await;
+        runtime.resume("ses-v1").await.expect("resume");
+
+        let recovered_events = collect_until(&runtime, |events| {
+            events.iter().any(|event| {
+                event.event_type == "request.resolved"
+                    && event.request_id.as_deref() == Some("per_rec_1")
+            }) && events.iter().any(|event| {
+                event.event_type == "user-input.resolved"
+                    && event.request_id.as_deref() == Some("que_rec_1")
+            }) && events
+                .iter()
+                .any(|event| event.event_type == "requests.recovery-read")
+        })
+        .await;
+        assert!(
+            !recovered_events.iter().any(|event| matches!(
+                event.event_type.as_str(),
+                "request.opened" | "user-input.requested"
+            )),
+            "code_review resume must not emit pending cards: {recovered_events:#?}"
+        );
+
+        let sse_tx = state.sse_tx.lock().await.clone().expect("live sse sender");
+        for event in [
+            json!({
+                "type": "permission.asked",
+                "properties": {
+                    "id": "per_live_1",
+                    "sessionID": "ses-v1",
+                    "permission": "bash",
+                    "patterns": ["rm -rf"]
+                }
+            }),
+            json!({
+                "type": "permission.asked",
+                "properties": {
+                    "id": "per_live_1",
+                    "sessionID": "ses-v1",
+                    "permission": "bash",
+                    "patterns": ["rm -rf"]
+                }
+            }),
+            json!({
+                "type": "question.asked",
+                "properties": {
+                    "id": "que_live_1",
+                    "sessionID": "ses-v1",
+                    "questions": [{ "header": "Mode", "question": "Continue?" }]
+                }
+            }),
+        ] {
+            sse_tx.send(event).expect("send live sse");
+        }
+        let live_events = collect_until(&runtime, |events| {
+            events.iter().any(|event| {
+                event.event_type == "request.resolved"
+                    && event.request_id.as_deref() == Some("per_live_1")
+            }) && events.iter().any(|event| {
+                event.event_type == "user-input.resolved"
+                    && event.request_id.as_deref() == Some("que_live_1")
+            })
+        })
+        .await;
+        assert!(
+            !live_events.iter().any(|event| matches!(
+                event.event_type.as_str(),
+                "request.opened" | "user-input.requested"
+            )),
+            "live code_review asks must not emit pending cards: {live_events:#?}"
+        );
+
+        let perm_replies = state.permission_replies.lock().await.clone();
+        assert_eq!(
+            perm_replies,
+            vec![
+                ("per_rec_1".to_owned(), json!({ "reply": "reject" })),
+                ("per_live_1".to_owned(), json!({ "reply": "reject" })),
+            ]
+        );
+        assert_eq!(
+            state.question_rejects.lock().await.as_slice(),
+            ["que_rec_1", "que_live_1"]
+        );
+        runtime.stop().await.expect("stop");
+
+        // Part 2: empty initial /permission read followed by post-subscription error & retry read
+        // preserves `requests.recovery-read` and still auto-declines `per_retry_1`.
+        state.permissions_calls.store(0, Ordering::SeqCst);
+        state.empty_initial_then_retry.store(true, Ordering::SeqCst);
+        state.permission_replies.lock().await.clear();
+
+        let runtime2 = review_runtime(&format!("http://{address}"), false);
+        runtime2.configure_runtime_mode("full-access").await;
+        *runtime2.inner.session_id.lock().await = Some("ses-v1".to_owned());
+        let (recovered, _) = runtime2.v1_restore_pending_asks("ses-v1").await;
+        assert!(recovered.is_empty());
+        runtime2.v1_show_recovered_asks(recovered).await;
+        let retry_events = collect_until(&runtime2, |events| {
+            events.iter().any(|event| {
+                event.event_type == "request.resolved"
+                    && event.request_id.as_deref() == Some("per_retry_1")
+            })
+        })
+        .await;
+        assert!(
+            retry_events
+                .iter()
+                .any(|event| event.event_type == "requests.recovery-read"),
+            "initial recovery read event must be preserved: {retry_events:#?}"
+        );
+        assert!(
+            !retry_events.iter().any(|event| matches!(
+                event.event_type.as_str(),
+                "request.opened" | "user-input.requested"
+            )),
+            "retry-read asks must not emit pending cards: {retry_events:#?}"
+        );
+        assert_eq!(
+            state.permission_replies.lock().await.as_slice(),
+            [("per_retry_1".to_owned(), json!({ "reply": "reject" }))]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn code_review_v2_auto_declines_live_recovered_and_unanswerable_asks() {
+        #[derive(Default)]
+        struct V2ServerState {
+            permission_replies: Mutex<Vec<(String, String, Value)>>,
+            form_deletes: Mutex<Vec<(String, String)>>,
+        }
+
+        let state = Arc::new(V2ServerState::default());
+        let app = Router::new()
+            .route(
+                "/api/session/{session_id}/permission/{id}/reply",
+                post({
+                    let state = state.clone();
+                    move |Path((sid, id)): Path<(String, String)>, Json(body): Json<Value>| {
+                        let state = state.clone();
+                        async move {
+                            state.permission_replies.lock().await.push((sid, id, body));
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/session/{session_id}/form/{id}",
+                delete({
+                    let state = state.clone();
+                    move |Path((sid, id)): Path<(String, String)>| {
+                        let state = state.clone();
+                        async move {
+                            state.form_deletes.lock().await.push((sid, id));
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let runtime = review_runtime(&format!("http://{address}"), true);
+        runtime.configure_runtime_mode("full-access").await;
+        *runtime.inner.session_id.lock().await = Some("ses-v2".to_owned());
+        runtime.inner.v2.lock().await.translator = Some(v2::V2TurnTranslator::new("ses-v2"));
+
+        // Recovered asks (permission + answerable form + unanswerable form) route via auto-decline
+        // and duplicate recovery calls never re-send.
+        let pending = vec![
+            (
+                "ses-v2".to_owned(),
+                "permission",
+                json!({ "id": "v2_perm_rec", "sessionID": "ses-v2", "permission": "shell" }),
+            ),
+            (
+                "ses-v2".to_owned(),
+                "form",
+                json!({
+                    "id": "v2_form_rec",
+                    "sessionID": "ses-v2",
+                    "title": "Pick",
+                    "fields": [{
+                        "key": "choice",
+                        "type": "string",
+                        "options": [{ "value": "a", "label": "A" }]
+                    }]
+                }),
+            ),
+            (
+                "ses-v2".to_owned(),
+                "form",
+                json!({
+                    "id": "v2_form_unans_rec",
+                    "sessionID": "ses-v2",
+                    "title": "Secret",
+                    "fields": [{ "key": "secret", "type": "string" }]
+                }),
+            ),
+        ];
+        let (recovered, unanswerable) = runtime.v2_route_pending_asks(pending.clone()).await;
+        assert!(recovered.is_empty(), "{recovered:#?}");
+        assert!(unanswerable.is_empty(), "{unanswerable:#?}");
+        let (recovered_dup, unanswerable_dup) = runtime.v2_route_pending_asks(pending).await;
+        assert!(recovered_dup.is_empty());
+        assert!(unanswerable_dup.is_empty());
+
+        // Live V2 PermissionAsked, FormAsked, FormUnanswerable.
+        for sse_event in [
+            json!({
+                "type": "permission.asked",
+                "data": { "id": "v2_perm_live", "sessionID": "ses-v2", "permission": "shell" }
+            }),
+            json!({
+                "type": "form.created",
+                "data": {
+                    "form": {
+                        "id": "v2_form_live",
+                        "sessionID": "ses-v2",
+                        "title": "Confirm",
+                        "fields": [{
+                            "key": "choice",
+                            "type": "string",
+                            "options": [{ "value": "y", "label": "Yes" }]
+                        }]
+                    }
+                }
+            }),
+            json!({
+                "type": "form.created",
+                "data": {
+                    "form": {
+                        "id": "v2_form_unans_live",
+                        "sessionID": "ses-v2",
+                        "title": "Free text",
+                        "fields": [{ "key": "token", "type": "string" }]
+                    }
+                }
+            }),
+        ] {
+            runtime.handle_v2_event(sse_event).await;
+        }
+
+        let events = collect_until(&runtime, |events| {
+            let resolved_ids: Vec<_> = events
+                .iter()
+                .filter_map(|event| event.request_id.as_deref())
+                .collect();
+            [
+                "v2_perm_rec",
+                "v2_form_rec",
+                "v2_form_unans_rec",
+                "v2_perm_live",
+                "v2_form_live",
+                "v2_form_unans_live",
+            ]
+            .into_iter()
+            .all(|id| resolved_ids.contains(&id))
+        })
+        .await;
+        assert!(
+            !events.iter().any(|event| matches!(
+                event.event_type.as_str(),
+                "request.opened" | "user-input.requested" | "runtime.error"
+            )),
+            "V2 code_review must auto-settle without cards or errors: {events:#?}"
+        );
+
+        let perms = state.permission_replies.lock().await.clone();
+        assert_eq!(perms.len(), 2, "{perms:?}");
+        assert!(
+            perms.iter().all(|(sid, _, body)| {
+                sid == "ses-v2" && body == &json!({ "decision": "reject" })
+            })
+        );
+        let deletes = state.form_deletes.lock().await.clone();
+        assert_eq!(deletes.len(), 4, "{deletes:?}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn code_review_auto_decline_retries_404_provider_settlement_and_exhaustion() {
+        #[derive(Default)]
+        struct RetryServerState {
+            attempts: Mutex<HashMap<String, usize>>,
+            interrupts: AtomicUsize,
+            aborts: AtomicUsize,
+        }
+
+        let state = Arc::new(RetryServerState::default());
+        let app = Router::new()
+            .route(
+                "/permission/{id}/reply",
+                post({
+                    let state = state.clone();
+                    move |Path(id): Path<String>| {
+                        let state = state.clone();
+                        async move {
+                            let mut attempts = state.attempts.lock().await;
+                            let n = attempts.entry(id.clone()).or_default();
+                            *n += 1;
+                            match id.as_str() {
+                                "v1_retry_ok" if *n < 3 => StatusCode::SERVICE_UNAVAILABLE,
+                                "v1_retry_ok" => StatusCode::OK,
+                                "v1_404" => StatusCode::NOT_FOUND,
+                                _ => StatusCode::INTERNAL_SERVER_ERROR,
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/session/{sid}/abort",
+                post({
+                    let state = state.clone();
+                    move || {
+                        let state = state.clone();
+                        async move {
+                            state.aborts.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/session/{sid}/permission/{id}/reply",
+                post({
+                    let state = state.clone();
+                    move |Path((_, id)): Path<(String, String)>| {
+                        let state = state.clone();
+                        async move {
+                            let mut attempts = state.attempts.lock().await;
+                            let n = attempts.entry(id).or_default();
+                            *n += 1;
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/session/{sid}/interrupt",
+                post({
+                    let state = state.clone();
+                    move || {
+                        let state = state.clone();
+                        async move {
+                            state.interrupts.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        // 1. V1 transient failure retries up to 3 attempts -> 2xx, and 404 settles without retries.
+        let v1 = review_runtime(&format!("http://{address}"), false);
+        v1.configure_runtime_mode("full-access").await;
+        *v1.inner.session_id.lock().await = Some("ses-v1".to_owned());
+        v1.handle_sse_event(
+            "ses-v1",
+            json!({
+                "type": "permission.asked",
+                "properties": { "id": "v1_retry_ok", "sessionID": "ses-v1", "permission": "bash" }
+            }),
+        )
+        .await;
+        v1.handle_sse_event(
+            "ses-v1",
+            json!({
+                "type": "permission.asked",
+                "properties": { "id": "v1_404", "sessionID": "ses-v1", "permission": "bash" }
+            }),
+        )
+        .await;
+        let ok_events = collect_until(&v1, |events| {
+            events
+                .iter()
+                .any(|e| e.request_id.as_deref() == Some("v1_retry_ok"))
+                && events
+                    .iter()
+                    .any(|e| e.request_id.as_deref() == Some("v1_404"))
+        })
+        .await;
+        assert!(
+            !ok_events.iter().any(|e| e.event_type == "runtime.error"),
+            "{ok_events:#?}"
+        );
+        {
+            let attempts = state.attempts.lock().await;
+            assert_eq!(attempts.get("v1_retry_ok"), Some(&3));
+            assert_eq!(attempts.get("v1_404"), Some(&1));
+        }
+
+        // 2. V1 exhaustion emits runtime.error(provider_error) + calls /abort.
+        v1.handle_sse_event(
+            "ses-v1",
+            json!({
+                "type": "permission.asked",
+                "properties": { "id": "v1_exhaust", "sessionID": "ses-v1", "permission": "bash" }
+            }),
+        )
+        .await;
+        let v1_err_events = collect_until(&v1, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "runtime.error" && e.payload["class"] == "provider_error")
+        })
+        .await;
+        assert!(!v1_err_events.is_empty());
+        timeout(Duration::from_secs(2), async {
+            while state.aborts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("v1 abort invoked");
+        assert_eq!(state.attempts.lock().await.get("v1_exhaust"), Some(&3));
+
+        // 3. V2 provider settlement stops retries early after attempt 1; exhaustion emits
+        //    runtime.error(provider_error) + calls /api/session/{sid}/interrupt.
+        let v2 = review_runtime(&format!("http://{address}"), true);
+        v2.configure_runtime_mode("full-access").await;
+        *v2.inner.session_id.lock().await = Some("ses-v2".to_owned());
+        v2.inner.v2.lock().await.translator = Some(v2::V2TurnTranslator::new("ses-v2"));
+        v2.handle_v2_event(json!({
+            "type": "permission.asked",
+            "data": { "id": "v2_settled_early", "sessionID": "ses-v2", "permission": "shell" }
+        }))
+        .await;
+        timeout(Duration::from_secs(2), async {
+            while state
+                .attempts
+                .lock()
+                .await
+                .get("v2_settled_early")
+                .copied()
+                .unwrap_or(0)
+                == 0
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("attempt 1 started");
+        v2.handle_v2_event(json!({
+            "type": "permission.replied",
+            "data": { "requestID": "v2_settled_early" }
+        }))
+        .await;
+        let settled_events = collect_until(&v2, |events| {
+            events.iter().any(|e| {
+                e.event_type == "request.resolved"
+                    && e.request_id.as_deref() == Some("v2_settled_early")
+            })
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            state.attempts.lock().await.get("v2_settled_early"),
+            Some(&1),
+            "provider settlement must cancel remaining retries"
+        );
+        assert!(
+            !settled_events
+                .iter()
+                .any(|e| e.event_type == "runtime.error"),
+            "{settled_events:#?}"
+        );
+
+        v2.handle_v2_event(json!({
+            "type": "permission.asked",
+            "data": { "id": "v2_exhaust", "sessionID": "ses-v2", "permission": "shell" }
+        }))
+        .await;
+        let v2_err_events = collect_until(&v2, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "runtime.error" && e.payload["class"] == "provider_error")
+        })
+        .await;
+        assert!(!v2_err_events.is_empty());
+        timeout(Duration::from_secs(2), async {
+            while state.interrupts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("v2 interrupt invoked");
+        assert_eq!(state.attempts.lock().await.get("v2_exhaust"), Some(&3));
+        server.abort();
     }
 }
