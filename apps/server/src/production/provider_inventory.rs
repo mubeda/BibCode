@@ -685,6 +685,12 @@ pub(crate) fn unsupported_instances(settings: &Value) -> Vec<ProviderProbeResult
         .collect()
 }
 
+pub(crate) fn instance_is_enabled_and_available(settings: &Value, instance_id: &str) -> bool {
+    definitions(settings).into_iter().any(|definition| {
+        definition.instance_id == instance_id && definition.enabled && definition.available
+    })
+}
+
 /// `reuse_catalog` skips Antigravity's session probe:
 /// the last one stays through the merge.
 async fn probe_one_snapshot(

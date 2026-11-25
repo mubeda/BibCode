@@ -106,6 +106,8 @@ pub struct ProviderBinarySettingsState {
     pub server_url: String,
     #[serde(default)]
     pub server_password: String,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -927,6 +929,32 @@ mod tests {
         );
         assert_eq!(
             document["providers"]["antigravity"]["unknownExtraKey"],
+            "preserved"
+        );
+
+        let updated = store
+            .update(ServerSettingsPatch {
+                enable_terminal_agent_activity: Some(true),
+                ..Default::default()
+            })
+            .await
+            .expect("update unrelated field");
+        assert!(updated.providers.antigravity.enabled);
+        assert_eq!(updated.providers.antigravity.binary_path, "custom-agy");
+        let after_update_doc = store
+            .get_document()
+            .await
+            .expect("reload document after unrelated update");
+        assert_eq!(
+            after_update_doc["providers"]["antigravity"]["binaryPath"],
+            "custom-agy"
+        );
+        assert_eq!(
+            after_update_doc["providers"]["antigravity"]["customModels"],
+            serde_json::json!(["gemini-pro"])
+        );
+        assert_eq!(
+            after_update_doc["providers"]["antigravity"]["unknownExtraKey"],
             "preserved"
         );
 

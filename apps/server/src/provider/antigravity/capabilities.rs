@@ -479,8 +479,8 @@ async fn read_skill_metadata(
 
 fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
     let trimmed_bom = contents.trim_start_matches('\u{feff}');
-    let mut lines = trimmed_bom.lines();
-    let Some(first_line) = lines.next() else {
+    let lines: Vec<&str> = trimmed_bom.lines().collect();
+    let Some(first_line) = lines.first() else {
         return (None, None);
     };
     if first_line.trim() != "---" {
@@ -490,12 +490,15 @@ fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
     let mut name = None;
     let mut description = None;
     let mut closed = false;
-    for line in lines {
+    let mut index = 1;
+    while index < lines.len() {
+        let line = lines[index];
         let trimmed = line.trim();
         if trimmed == "---" || trimmed == "..." {
             closed = true;
             break;
         }
+        index += 1;
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
@@ -503,10 +506,16 @@ fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
             continue;
         };
         let key = raw_key.trim();
+        let cleaned_value = strip_yaml_inline_comment(raw_value).trim();
+        let parsed = if is_yaml_block_scalar_indicator(cleaned_value) {
+            parse_yaml_block_scalar(&lines, &mut index, cleaned_value)
+        } else {
+            unquote_yaml_scalar(cleaned_value)
+        };
         if key == "name" && name.is_none() {
-            name = unquote_yaml_scalar(raw_value);
+            name = parsed;
         } else if key == "description" && description.is_none() {
-            description = unquote_yaml_scalar(raw_value);
+            description = parsed;
         }
     }
 
@@ -515,6 +524,118 @@ fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
     } else {
         (None, None)
     }
+}
+
+fn is_yaml_block_scalar_indicator(value: &str) -> bool {
+    matches!(value, ">" | ">-" | ">+" | "|" | "|-" | "|+")
+}
+
+fn parse_yaml_block_scalar(lines: &[&str], index: &mut usize, indicator: &str) -> Option<String> {
+    let mut raw_block = Vec::new();
+    while *index < lines.len() {
+        let line = lines[*index];
+        let trimmed = line.trim();
+        if trimmed == "---" || trimmed == "..." {
+            break;
+        }
+        if !trimmed.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
+            break;
+        }
+        raw_block.push(line);
+        *index += 1;
+    }
+
+    let block_indent = raw_block
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.bytes()
+                .take_while(|b| *b == b' ' || *b == b'\t')
+                .count()
+        })
+        .unwrap_or(0);
+
+    let stripped_lines: Vec<&str> = raw_block
+        .into_iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                ""
+            } else {
+                let prefix = line
+                    .bytes()
+                    .take(block_indent)
+                    .take_while(|b| *b == b' ' || *b == b'\t')
+                    .count();
+                &line[prefix..]
+            }
+        })
+        .collect();
+
+    let combined = if indicator.starts_with('|') {
+        stripped_lines.join("\n")
+    } else {
+        let mut folded = String::new();
+        let mut pending_paragraph_break = false;
+        let mut has_line_in_paragraph = false;
+        for line in stripped_lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                if !folded.is_empty() {
+                    pending_paragraph_break = true;
+                }
+                has_line_in_paragraph = false;
+                continue;
+            }
+            if pending_paragraph_break {
+                folded.push('\n');
+                pending_paragraph_break = false;
+            } else if has_line_in_paragraph {
+                folded.push(' ');
+            }
+            folded.push_str(trimmed);
+            has_line_in_paragraph = true;
+        }
+        folded
+    };
+
+    trimmed_non_empty(Some(combined.as_str())).map(str::to_owned)
+}
+
+fn strip_yaml_inline_comment(raw: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut prev_whitespace = true;
+
+    for (idx, ch) in raw.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+            prev_whitespace = ch == ' ' || ch == '\t';
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+            prev_whitespace = ch == ' ' || ch == '\t';
+            continue;
+        }
+        if ch == '"' {
+            in_double = true;
+        } else if ch == '\'' {
+            in_single = true;
+        } else if ch == '#' && prev_whitespace {
+            return &raw[..idx];
+        }
+        prev_whitespace = ch == ' ' || ch == '\t';
+    }
+    raw
 }
 
 fn unquote_yaml_scalar(raw: &str) -> Option<String> {
@@ -828,5 +949,61 @@ mod tests {
             }])
         );
         assert_eq!(parse_available_commands_update(&json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn parses_inline_yaml_comments_and_folded_or_literal_block_scalars() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create .git");
+        let home = temp.path().join("empty-home");
+
+        write_skill(
+            &repo.join(".agents/skills/review-dir"),
+            "---\nname: review # display name\ndescription: \"Keep # inside quotes\" # trailing comment\n---\n# Body\n",
+        );
+        write_skill(
+            &repo.join(".agents/skills/folded-skill"),
+            "---\nname: folded-skill\ndescription: >\n  Line one\n  line two\n\n  Paragraph two\n---\n",
+        );
+        write_skill(
+            &repo.join(".agents/skills/literal-skill"),
+            "---\nname: literal-skill\ndescription: |-\n  First line\n  Second line\n---\n",
+        );
+
+        let local = discover_local_skills_with_environment(&repo, &isolated_home_env(&home)).await;
+        assert!(local.issues.is_empty(), "issues: {:?}", local.issues);
+
+        let by_name = |name: &str| local.skills.iter().find(|s| s.name == name);
+        let review = by_name("review").expect("inline comment name parsed as review");
+        assert_eq!(review.description.as_deref(), Some("Keep # inside quotes"));
+        assert_eq!(review.scope, "project");
+
+        let merged = merge_acp_available_commands(
+            Some(&[AcpAvailableCommand {
+                name: "review".to_owned(),
+                description: None,
+                input_hint: None,
+            }]),
+            &local.skills,
+        );
+        assert!(merged.slash_commands.is_empty());
+        assert_eq!(merged.skills.len(), 1);
+        assert_eq!(merged.skills[0]["name"], "review");
+        assert_eq!(merged.skills[0]["scope"], "project");
+        assert_eq!(merged.skills[0]["invocation"], "slash");
+        assert_eq!(merged.skills[0]["description"], "Keep # inside quotes");
+
+        let folded = by_name("folded-skill").expect("folded-skill present");
+        assert_eq!(
+            folded.description.as_deref(),
+            Some("Line one line two\nParagraph two")
+        );
+
+        let literal = by_name("literal-skill").expect("literal-skill present");
+        assert_eq!(
+            literal.description.as_deref(),
+            Some("First line\nSecond line")
+        );
     }
 }

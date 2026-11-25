@@ -240,6 +240,12 @@ where
                                 state.matched_commands = Some(commands);
                                 notify.notify_waiters();
                             }
+                        } else if let Some((_, existing_commands)) = state
+                            .pending
+                            .iter_mut()
+                            .find(|(existing_sid, _)| *existing_sid == sid)
+                        {
+                            *existing_commands = commands;
                         } else {
                             if state.pending.len() >= MAX_ANTIGRAVITY_PRE_SESSION_UPDATES {
                                 state.pending.pop_front();
@@ -277,6 +283,32 @@ where
     }
 }
 
+async fn discover_antigravity_local_within<F>(
+    limit: Duration,
+    cancellation: &CancellationToken,
+    discover: F,
+) -> Result<crate::provider::antigravity::capabilities::LocalSkillScanResult, String>
+where
+    F: Future<Output = crate::provider::antigravity::capabilities::LocalSkillScanResult>,
+{
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            Err("Skill discovery was cancelled. Retry to reload the catalog.".to_owned())
+        }
+        result = timeout(limit, discover) => match result {
+            Ok(scan) => Ok(scan),
+            Err(_) => Ok(crate::provider::antigravity::capabilities::LocalSkillScanResult {
+                skills: Vec::new(),
+                issues: vec![
+                    "Local Antigravity skill scan timed out. Retry to reload the catalog."
+                        .to_owned(),
+                ],
+            }),
+        },
+    }
+}
+
 async fn antigravity_capabilities_with_timeout(
     executable: &Path,
     cwd: &Path,
@@ -290,11 +322,15 @@ async fn antigravity_capabilities_with_timeout(
         return Err("Skill discovery was cancelled. Retry to reload the catalog.".to_owned());
     }
 
-    let local = crate::provider::antigravity::capabilities::discover_local_skills_with_environment(
-        cwd,
-        environment,
+    let local = discover_antigravity_local_within(
+        probe_timeout,
+        cancellation,
+        crate::provider::antigravity::capabilities::discover_local_skills_with_environment(
+            cwd,
+            environment,
+        ),
     )
-    .await;
+    .await?;
     if cancellation.is_cancelled() {
         return Err("Skill discovery was cancelled. Retry to reload the catalog.".to_owned());
     }
@@ -379,134 +415,134 @@ async fn antigravity_capabilities_with_timeout(
         spawn_antigravity_acp_transport(stdout, stdin, stderr, collector.clone(), notify.clone());
     let connection = &transport.connection;
 
-    let handshake = async {
-        let initialize = connection
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": false, "writeTextFile": false },
-                        "terminal": false,
-                    },
-                    "clientInfo": { "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") },
-                }),
-            )
-            .await?;
-        if initialize.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
-            return Ok(AntigravityProbeOutcome::Completed {
-                commands: None,
-                overflow_truncated: false,
-                issue: Some(
-                    "Antigravity CLI reported an unsupported protocol; showing locally discovered skills.",
-                ),
-            });
-        }
-        let session = connection
-            .request(
-                "session/new",
-                json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
-            )
-            .await?;
-        let Some(session_id) = session
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
-            return Ok(AntigravityProbeOutcome::Completed {
-                commands: None,
-                overflow_truncated: false,
-                issue: Some(
-                    "Antigravity CLI did not return a session ID; showing locally discovered skills.",
-                ),
-            });
-        };
+    enum HandshakeCapture {
+        Cancelled,
+        TimedOut,
+        Ready {
+            session_id: String,
+            advertises_close: bool,
+            commands: Option<Vec<crate::provider::antigravity::capabilities::AcpAvailableCommand>>,
+            overflow_truncated: bool,
+        },
+        Early(AntigravityProbeOutcome),
+    }
 
-        // Drain any notifications queued before `session/new` returned, then promote matches.
-        let _ = connection.barrier().await;
-        let (already_matched, already_closed) = {
-            let mut state = collector
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.session_id = Some(session_id.clone());
-            let mut latest = None;
-            while let Some((sid, commands)) = state.pending.pop_front() {
-                if sid.as_deref() == Some(session_id.as_str()) {
-                    latest = Some(commands);
+    let captured = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => HandshakeCapture::Cancelled,
+        result = timeout(probe_timeout, async {
+            let initialize = connection
+                .request(
+                    "initialize",
+                    json!({
+                        "protocolVersion": 1,
+                        "clientCapabilities": {
+                            "fs": { "readTextFile": false, "writeTextFile": false },
+                            "terminal": false,
+                        },
+                        "clientInfo": { "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") },
+                    }),
+                )
+                .await?;
+            if initialize.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+                return Ok(HandshakeCapture::Early(AntigravityProbeOutcome::Completed {
+                    commands: None,
+                    overflow_truncated: false,
+                    issue: Some(
+                        "Antigravity CLI reported an unsupported protocol; showing locally discovered skills.",
+                    ),
+                }));
+            }
+            let session = connection
+                .request(
+                    "session/new",
+                    json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
+                )
+                .await?;
+            let Some(session_id) = session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                return Ok(HandshakeCapture::Early(AntigravityProbeOutcome::Completed {
+                    commands: None,
+                    overflow_truncated: false,
+                    issue: Some(
+                        "Antigravity CLI did not return a session ID; showing locally discovered skills.",
+                    ),
+                }));
+            };
+
+            let _ = connection.barrier().await;
+            let (already_matched, already_closed) = {
+                let mut state = collector
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.session_id = Some(session_id.clone());
+                let mut latest = None;
+                while let Some((sid, commands)) = state.pending.pop_front() {
+                    if sid.as_deref() == Some(session_id.as_str()) {
+                        latest = Some(commands);
+                    }
                 }
-            }
-            if latest.is_some() {
-                state.matched_commands = latest;
-            }
-            (state.matched_commands.is_some(), state.closed)
-        };
+                if latest.is_some() {
+                    state.matched_commands = latest;
+                }
+                (state.matched_commands.is_some(), state.closed)
+            };
 
-        if !already_matched && !already_closed {
-            let settle_deadline = tokio::time::Instant::now() + ANTIGRAVITY_COMMANDS_SETTLE_TIMEOUT;
-            loop {
-                let notified = notify.notified();
-                {
-                    let state = collector
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if state.matched_commands.is_some() || state.closed {
+            if !already_matched && !already_closed {
+                let settle_deadline =
+                    tokio::time::Instant::now() + ANTIGRAVITY_COMMANDS_SETTLE_TIMEOUT;
+                loop {
+                    let notified = notify.notified();
+                    {
+                        let state = collector
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if state.matched_commands.is_some() || state.closed {
+                            break;
+                        }
+                    }
+                    if tokio::time::timeout_at(settle_deadline, notified)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
-                if tokio::time::timeout_at(settle_deadline, notified)
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
             }
-        }
 
-        if antigravity_advertises_close(&initialize) {
-            let _ = timeout(
-                ANTIGRAVITY_CLOSE_TIMEOUT,
-                connection.request("session/close", json!({ "sessionId": session_id })),
-            )
-            .await;
-            let _ = connection.barrier().await;
-        }
-
-        let state = collector
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok::<AntigravityProbeOutcome, cursor::acp::AcpProtocolError>(
-            AntigravityProbeOutcome::Completed {
+            let state = collector
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok::<HandshakeCapture, cursor::acp::AcpProtocolError>(HandshakeCapture::Ready {
+                session_id,
+                advertises_close: antigravity_advertises_close(&initialize),
                 commands: state.matched_commands.clone(),
                 overflow_truncated: state.overflow_truncated,
-                issue: None,
-            },
-        )
-    };
-
-    let outcome = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => AntigravityProbeOutcome::Cancelled,
-        result = timeout(probe_timeout, handshake) => match result {
-            Ok(Ok(outcome)) => outcome,
+            })
+        }) => match result {
+            Ok(Ok(capture)) => capture,
             Ok(Err(cursor::acp::AcpProtocolError::RemoteRequest {
                 code: -32000,
                 message,
                 ..
             })) if message.trim().eq_ignore_ascii_case("authentication required") => {
-                AntigravityProbeOutcome::Completed {
+                HandshakeCapture::Early(AntigravityProbeOutcome::Completed {
                     commands: None,
                     overflow_truncated: false,
                     issue: Some(ANTIGRAVITY_SIGN_IN_MESSAGE),
-                }
+                })
             }
             Ok(Err(cursor::acp::AcpProtocolError::RemoteRequest { .. })) => {
-                AntigravityProbeOutcome::Completed {
+                HandshakeCapture::Early(AntigravityProbeOutcome::Completed {
                     commands: None,
                     overflow_truncated: false,
                     issue: Some(
                         "Could not query Antigravity commands; showing locally discovered skills.",
                     ),
-                }
+                })
             }
             Ok(Err(_)) => {
                 if exits::watching()
@@ -525,15 +561,68 @@ async fn antigravity_capabilities_with_timeout(
                         false,
                     );
                 }
-                AntigravityProbeOutcome::Completed {
+                HandshakeCapture::Early(AntigravityProbeOutcome::Completed {
                     commands: None,
                     overflow_truncated: false,
                     issue: Some(
                         "Could not query Antigravity commands; showing locally discovered skills.",
                     ),
+                })
+            }
+            Err(_) => HandshakeCapture::TimedOut,
+        }
+    };
+
+    let outcome = match captured {
+        HandshakeCapture::Cancelled => AntigravityProbeOutcome::Cancelled,
+        HandshakeCapture::TimedOut => AntigravityProbeOutcome::TimedOut,
+        HandshakeCapture::Early(outcome) => outcome,
+        HandshakeCapture::Ready {
+            session_id,
+            advertises_close,
+            mut commands,
+            mut overflow_truncated,
+        } => {
+            let mut close_cancelled = false;
+            if advertises_close {
+                let close_fut = async {
+                    let _ = connection
+                        .request("session/close", json!({ "sessionId": session_id.as_str() }))
+                        .await;
+                    let _ = connection.barrier().await;
+                };
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        close_cancelled = true;
+                    }
+                    _ = timeout(ANTIGRAVITY_CLOSE_TIMEOUT, close_fut) => {
+                        let state = collector
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if commands.is_none() && state.matched_commands.is_some() {
+                            commands = state.matched_commands.clone();
+                        }
+                        overflow_truncated |= state.overflow_truncated;
+                    }
                 }
             }
-            Err(_) => AntigravityProbeOutcome::TimedOut,
+            if close_cancelled {
+                AntigravityProbeOutcome::Cancelled
+            } else {
+                let issue = if commands.is_none() {
+                    Some(
+                        "Antigravity did not report its command list in time; showing locally discovered skills. Retry to reload.",
+                    )
+                } else {
+                    None
+                };
+                AntigravityProbeOutcome::Completed {
+                    commands,
+                    overflow_truncated,
+                    issue,
+                }
+            }
         }
     };
 
@@ -603,31 +692,56 @@ fn scrub_antigravity_capabilities(
     if secret_values.is_empty() {
         return;
     }
-    for command in &mut capabilities.slash_commands {
-        scrub_value_secrets(command, secret_values);
-    }
-    for skill in &mut capabilities.skills {
-        scrub_value_secrets(skill, secret_values);
-    }
+    capabilities.slash_commands.retain_mut(|command| {
+        let Some(object) = command.as_object_mut() else {
+            return false;
+        };
+        if object
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| contains_any_secret(name, secret_values))
+        {
+            return false;
+        }
+        scrub_string_field(object, "description", secret_values);
+        if let Some(input) = object.get_mut("input").and_then(Value::as_object_mut) {
+            scrub_string_field(input, "hint", secret_values);
+        }
+        true
+    });
+    capabilities.skills.retain_mut(|skill| {
+        let Some(object) = skill.as_object_mut() else {
+            return false;
+        };
+        if object
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| contains_any_secret(name, secret_values))
+        {
+            return false;
+        }
+        scrub_string_field(object, "description", secret_values);
+        scrub_string_field(object, "path", secret_values);
+        true
+    });
     for issue in &mut capabilities.issues {
         *issue = scrub_secrets_in_text(issue, secret_values);
     }
 }
 
-fn scrub_value_secrets(value: &mut Value, secret_values: &[String]) {
-    match value {
-        Value::String(text) => *text = scrub_secrets_in_text(text, secret_values),
-        Value::Array(items) => {
-            for item in items {
-                scrub_value_secrets(item, secret_values);
-            }
-        }
-        Value::Object(map) => {
-            for entry in map.values_mut() {
-                scrub_value_secrets(entry, secret_values);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+fn contains_any_secret(text: &str, secret_values: &[String]) -> bool {
+    secret_values
+        .iter()
+        .any(|secret| !secret.is_empty() && text.contains(secret.as_str()))
+}
+
+fn scrub_string_field(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    secret_values: &[String],
+) {
+    if let Some(Value::String(text)) = object.get_mut(field) {
+        *text = scrub_secrets_in_text(text, secret_values);
     }
 }
 
@@ -1777,7 +1891,7 @@ done"#,
             &[SECRET.to_owned()],
             Some(&registry),
             &CancellationToken::new(),
-            Duration::from_millis(300),
+            Duration::from_millis(900),
         )
         .await
         .expect("timeout falls back to local skills");
@@ -1965,5 +2079,306 @@ done"#,
             "attribution registration must clear on cancel: {:?}",
             cancel_registry.registered_sources()
         );
+    }
+
+    #[tokio::test]
+    async fn antigravity_skill_catalog_cancels_and_bounds_local_skill_scan() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = timeout(
+            Duration::from_millis(200),
+            super::discover_antigravity_local_within(
+                Duration::from_secs(15),
+                &cancel,
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("cancelled local scan must return without stalling")
+        .expect_err("cancelled local scan must return Err");
+        assert!(err.to_ascii_lowercase().contains("cancel"));
+
+        let timed_out = timeout(
+            Duration::from_millis(250),
+            super::discover_antigravity_local_within(
+                Duration::from_millis(50),
+                &CancellationToken::new(),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("timed out local scan must return within bound")
+        .expect("timed out local scan degrades cleanly with issue");
+        assert!(timed_out.skills.is_empty());
+        assert!(!timed_out.issues.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_skill_catalog_adds_issue_when_cli_omits_available_commands_update() {
+        let sandbox = TestSandbox::new("antigravity-skills-missing-update");
+        let home = sandbox.path("home");
+        let cwd = sandbox.path("workspace");
+        std::fs::create_dir_all(cwd.join(".git")).expect("create .git");
+        write_antigravity_skill(
+            &cwd.join(".agents/skills/local-skill"),
+            "local-skill",
+            "Desc",
+        );
+
+        let bin = antigravity_script(
+            &sandbox,
+            "agy-no-update",
+            &format!(
+                r#"while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,{init}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"s-no-update"}}}}\n' "$id" ;;
+    *'"method":"session/close"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done"#,
+                init = super::super::tests::antigravity_initialize(1, "1.5.13", true),
+            ),
+        );
+
+        let catalog = discover_capabilities(
+            &antigravity_cap_settings(&bin, &home, true, vec![]),
+            "antigravity",
+            &cwd,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("omitted update still falls back cleanly");
+        assert_eq!(catalog["skills"][0]["name"], "local-skill");
+        let issues = catalog["issues"].as_array().unwrap();
+        assert!(
+            issues.iter().any(|issue| issue
+                .as_str()
+                .is_some_and(|s| s.contains("did not report its command list"))),
+            "expected incomplete-catalog issue, got {issues:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_skill_catalog_retains_target_catalog_when_one_foreign_session_floods_updates()
+     {
+        let sandbox = TestSandbox::new("antigravity-skills-single-foreign-flood");
+        let home = sandbox.path("home");
+        let cwd = sandbox.path("workspace");
+        std::fs::create_dir_all(cwd.join(".git")).expect("create .git");
+        write_antigravity_skill(
+            &cwd.join(".agents/skills/target-skill"),
+            "target-skill",
+            "Desc",
+        );
+
+        let target_update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "target-session",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        { "name": "target-skill" },
+                        { "name": "target-cmd" }
+                    ]
+                }
+            }
+        });
+        let bin = antigravity_script(
+            &sandbox,
+            "agy-single-foreign-flood",
+            &format!(
+                r#"while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{target_update}'
+      j=0
+      while [ "$j" -lt 40 ]; do
+        printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"foreign-single","update":{{"sessionUpdate":"available_commands_update","availableCommands":[{{"name":"foreign-cmd-%d"}}]}}}}}}\n' "$j"
+        j=$((j + 1))
+      done
+      printf '{{"jsonrpc":"2.0","id":%s,{init}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"target-session"}}}}\n' "$id"
+      ;;
+    *'"method":"session/close"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done"#,
+                target_update = target_update,
+                init = super::super::tests::antigravity_initialize(1, "1.5.13", true),
+            ),
+        );
+
+        let catalog = discover_capabilities(
+            &antigravity_cap_settings(&bin, &home, true, vec![]),
+            "antigravity",
+            &cwd,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("single foreign flood does not evict target session");
+        assert_eq!(catalog["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(catalog["skills"][0]["name"], "target-skill");
+        assert_eq!(catalog["slashCommands"].as_array().unwrap().len(), 1);
+        assert_eq!(catalog["slashCommands"][0]["name"], "target-cmd");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_skill_catalog_keeps_captured_catalog_if_session_close_stalls() {
+        let sandbox = TestSandbox::new("antigravity-skills-close-stall");
+        let home = sandbox.path("home");
+        let cwd = sandbox.path("workspace");
+        std::fs::create_dir_all(cwd.join(".git")).expect("create .git");
+        write_antigravity_skill(&cwd.join(".agents/skills/fast-skill"), "fast-skill", "Desc");
+
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "fast-session",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        { "name": "fast-skill" },
+                        { "name": "fast-cmd" }
+                    ]
+                }
+            }
+        });
+        let bin = antigravity_script(
+            &sandbox,
+            "agy-close-stall",
+            &format!(
+                r#"while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,{init}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{update}'
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"fast-session"}}}}\n' "$id"
+      ;;
+    *'"method":"session/close"'*) sleep 30 ;;
+  esac
+done"#,
+                init = super::super::tests::antigravity_initialize(1, "1.5.13", true),
+                update = update,
+            ),
+        );
+        let env = vec![
+            (OsString::from("HOME"), home.as_os_str().to_os_string()),
+            (
+                OsString::from("USERPROFILE"),
+                home.as_os_str().to_os_string(),
+            ),
+        ];
+        let capabilities = antigravity_capabilities_with_timeout(
+            &bin,
+            &cwd,
+            &env,
+            &[],
+            None,
+            &CancellationToken::new(),
+            Duration::from_millis(900),
+        )
+        .await
+        .expect("captured catalog survives stalled session/close");
+        assert!(capabilities.issues.is_empty(), "{:?}", capabilities.issues);
+        assert_eq!(capabilities.skills.len(), 1);
+        assert_eq!(capabilities.skills[0]["name"], "fast-skill");
+        assert_eq!(capabilities.slash_commands.len(), 1);
+        assert_eq!(capabilities.slash_commands[0]["name"], "fast-cmd");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_skill_catalog_preserves_enum_fields_and_omits_secret_named_entries() {
+        const SECRET_NAME: &str = "secret-cmd-name";
+        let sandbox = TestSandbox::new("antigravity-skills-enum-scrub");
+        let home = sandbox.path("home");
+        let cwd = sandbox.path("workspace");
+        std::fs::create_dir_all(cwd.join(".git")).expect("create .git");
+        write_antigravity_skill(
+            &cwd.join(".agents/skills/local-skill"),
+            "local-skill",
+            "Desc",
+        );
+        write_antigravity_skill(
+            &cwd.join(format!(".agents/skills/{SECRET_NAME}")),
+            SECRET_NAME,
+            "Secret skill",
+        );
+
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "enum-session",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        { "name": "local-skill", "description": "Match local skill" },
+                        { "name": SECRET_NAME, "description": "Must be omitted" },
+                        { "name": "safe-cmd", "description": format!("Uses {SECRET_NAME} safely"), "input": { "hint": SECRET_NAME } }
+                    ]
+                }
+            }
+        });
+        let bin = antigravity_script(
+            &sandbox,
+            "agy-enum-scrub",
+            &format!(
+                r#"while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,{init}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{update}'
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"enum-session"}}}}\n' "$id"
+      ;;
+    *'"method":"session/close"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done"#,
+                init = super::super::tests::antigravity_initialize(1, "1.5.13", true),
+                update = update,
+            ),
+        );
+        let settings = antigravity_cap_settings(
+            &bin,
+            &home,
+            true,
+            vec![
+                json!({"name": "ENUM_LITERAL_SLASH", "value": "slash", "sensitive": true}),
+                json!({"name": "ENUM_LITERAL_PROJECT", "value": "project", "sensitive": true}),
+                json!({"name": "SECRET_CMD_TOKEN", "value": SECRET_NAME, "sensitive": true}),
+            ],
+        );
+        let catalog = discover_capabilities(
+            &settings,
+            "antigravity",
+            &cwd,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("enum scrub probe succeeds");
+
+        assert_eq!(catalog["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(catalog["skills"][0]["name"], "local-skill");
+        assert_eq!(catalog["skills"][0]["invocation"], "slash");
+        assert_eq!(catalog["skills"][0]["scope"], "project");
+
+        let commands = catalog["slashCommands"].as_array().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["name"], "safe-cmd");
+        assert!(!catalog.to_string().contains(SECRET_NAME));
     }
 }
