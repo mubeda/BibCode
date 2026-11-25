@@ -710,11 +710,11 @@ jobs:
           test "$(gh release view "$RELEASE_TAG" --json targetCommitish --jq .targetCommitish)" = "$RELEASE_REF"
 
       - name: Prepare stable release assets
-        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true'
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable'
         shell: bash
         run: |
           set -euo pipefail
-          find release-assets -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > expected-assets.txt
+          find release-assets -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort > expected-assets.txt
 
       - name: Publish stable release
         if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true' && needs.preflight.outputs.previous_tag != ''
@@ -781,7 +781,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify stable draft release assets
-        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested != 'true'
+        if: needs.preflight.outputs.validate_only != 'true' && needs.preflight.outputs.release_channel == 'stable'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

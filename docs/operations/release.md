@@ -555,9 +555,10 @@ only that disposable worktree after a successful integration.
 6. After a human has inspected the draft, rerun the workflow manually with the
    same version, select the stable channel, and set `publish` to `true`. The
    approval run requires the existing draft, rebuilds the same tagged commit,
-   repeats validation, and only then publishes it. It does not upload or
-   replace the inspected draft assets. Only numeric non-prerelease stable
-   releases are marked latest.
+   repeats validation, verifies that the remote draft's `isDraft` state and
+   uploaded assets match `expected-assets.txt`, and only then publishes it. It
+   does not upload or replace the inspected draft assets. Only numeric
+   non-prerelease stable releases are marked latest.
 7. Confirm publication through the REST latest endpoint as described below,
    inspect finalization, and synchronize `develop` using the maintainer branch
    flow. Install and smoke-test each ordinary installer on its target operating
@@ -688,35 +689,61 @@ curated notes after every new or regenerated draft.
 
 ### Draft inspection
 
-Use a fresh inspection directory and the previous stable tag. Compare asset
-names with only the version replaced; a changed asset set needs an explanation
-from the current workflow, rather than a fixed historical asset count. A
-desktop-only release with [symbol archives](#symbol-assets) publishes the six
-desktop installers, six `bibcode-desktop-symbols-*.zip` archives, and (for
-numeric stable releases) the stable updater files (`latest.json`, six `.sig`
-files, and two macOS `.app.tar.gz` archives), with zero standalone server
-archives, packages, checksums, or `bibcode-server-symbols-*.zip` files.
+Use a fresh inspection directory and compare the draft's uploaded assets
+against the expected desktop-only asset set derived from the current release
+contract: six desktop installers, six `bibcode-desktop-symbols-*.zip` archives,
+and (for numeric stable releases) the stable updater files (`latest.json`, six
+`.sig` files, and two macOS `.app.tar.gz` archives), with zero standalone
+server archives, packages, checksums, or `bibcode-server-symbols-*.zip` files.
+Deriving `expected.txt` directly from the current contract works both for a
+repository's first release and for the first desktop-only release after a prior
+release that published standalone server assets, without aborting `set -eu` on
+retired server files:
 
 ```sh
 set -eu
-previous_tag='<previous-stable-tag>'
 inspection_dir=$(mktemp -d)
-gh release view "$previous_tag" --json assets > "$inspection_dir/previous.json"
 gh release view "$tag" --json isDraft,targetCommitish,assets > "$inspection_dir/draft.json"
-jq -r --arg old "${previous_tag#v}" --arg new "$version" \
-  '.assets[].name | split($old) | join($new)' "$inspection_dir/previous.json" \
-  | LC_ALL=C sort > "$inspection_dir/expected-from-previous.txt"
 jq -r '.assets[].name' "$inspection_dir/draft.json" \
   | LC_ALL=C sort > "$inspection_dir/uploaded.txt"
-diff -u "$inspection_dir/expected-from-previous.txt" "$inspection_dir/uploaded.txt"
+{
+  printf '%s\n' \
+    "BiBCode_${version}_aarch64.dmg" \
+    "BiBCode_${version}_x64.dmg" \
+    "BiBCode_${version}_aarch64.AppImage" \
+    "BiBCode_${version}_amd64.AppImage" \
+    "BiBCode_${version}_arm64-setup.exe" \
+    "BiBCode_${version}_x64-setup.exe" \
+    "bibcode-desktop-symbols-${version}-darwin-aarch64.zip" \
+    "bibcode-desktop-symbols-${version}-darwin-x86_64.zip" \
+    "bibcode-desktop-symbols-${version}-linux-aarch64.zip" \
+    "bibcode-desktop-symbols-${version}-linux-x86_64.zip" \
+    "bibcode-desktop-symbols-${version}-windows-aarch64.zip" \
+    "bibcode-desktop-symbols-${version}-windows-x86_64.zip"
+  case "$version" in
+    *-*) ;;
+    *)
+      printf '%s\n' \
+        "latest.json" \
+        "bibcode-update-darwin-aarch64.app.tar.gz" \
+        "bibcode-update-darwin-aarch64.app.tar.gz.sig" \
+        "bibcode-update-darwin-x86_64.app.tar.gz" \
+        "bibcode-update-darwin-x86_64.app.tar.gz.sig" \
+        "BiBCode_${version}_aarch64.AppImage.sig" \
+        "BiBCode_${version}_amd64.AppImage.sig" \
+        "BiBCode_${version}_arm64-setup.exe.sig" \
+        "BiBCode_${version}_x64-setup.exe.sig"
+      ;;
+  esac
+} | LC_ALL=C sort > "$inspection_dir/expected.txt"
+diff -u "$inspection_dir/expected.txt" "$inspection_dir/uploaded.txt"
 jq -e '.isDraft and (.assets | length > 0 and all(.[]; .size > 0))' "$inspection_dir/draft.json"
 test "$(jq -r .targetCommitish "$inspection_dir/draft.json")" = "$(git rev-parse "$tag^{commit}")"
 gh release download "$tag" --dir "$inspection_dir/assets"
 ```
 
-For the first release, use the current workflow's asset validation without a
-previous-release comparison. Inspect the downloaded stable manifest and verify
-its payloads, using the release overlay from the candidate commit:
+Inspect the downloaded stable manifest and verify its payloads using the release
+overlay from the candidate commit:
 
 ```sh
 repository=$(gh repo view --json nameWithOwner --jq .nameWithOwner)

@@ -224,7 +224,20 @@ describe("release asset assembly", () => {
         version: "0.4.3",
         updater: false,
       }),
-    ).rejects.toThrow(/Windows x64 NSIS/);
+    ).rejects.toThrow(/Windows x64 NSIS \(BiBCode_0\.4\.3_x64-setup\.exe\)/);
+
+    const missingAliasInstallerRoot = temporaryRoot();
+    writeDesktopFixture(missingAliasInstallerRoot, "0.4.3", false);
+    NodeFS.rmSync(NodePath.join(missingAliasInstallerRoot, "BiBCode_0.4.3_aarch64.dmg"));
+    await expect(
+      assembleReleaseAssets({
+        assetsDir: missingAliasInstallerRoot,
+        version: "0.4.3",
+        updater: false,
+      }),
+    ).rejects.toThrow(
+      /macOS ARM64 DMG \(BiBCode_0\.4\.3_aarch64\.dmg or BiBCode_0\.4\.3_arm64\.dmg\)/,
+    );
 
     const missingSymbolRoot = temporaryRoot();
     writeDesktopFixture(missingSymbolRoot, "0.4.3", false);

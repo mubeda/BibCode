@@ -1049,7 +1049,7 @@ mod tests {
         });
         let addr = addr_rx.recv().unwrap();
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let local_server_url =
             server_release_url.replace(&release_prefix, &format!("http://{addr}/"));
         let local_desktop_url =

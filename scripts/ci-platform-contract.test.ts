@@ -1089,10 +1089,18 @@ describe("cross-platform release contract", () => {
       "needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'",
     );
     expect(requireDraft?.run).toMatch(/gh release view[^]*isDraft/);
-    for (const draftStep of [prepareDraft, createDraft, createFirstDraft, verifyDraft]) {
+    for (const draftStep of [createDraft, createFirstDraft]) {
       expect(draftStep?.if).toContain("needs.preflight.outputs.validate_only != 'true'");
       expect(draftStep?.if).toContain("needs.preflight.outputs.publish_requested != 'true'");
     }
+    for (const verifyStep of [prepareDraft, verifyDraft]) {
+      expect(verifyStep?.if).toContain("needs.preflight.outputs.validate_only != 'true'");
+      expect(verifyStep?.if).toContain("needs.preflight.outputs.release_channel == 'stable'");
+      expect(verifyStep?.if).not.toContain("publish_requested != 'true'");
+    }
+    const steps = release.steps ?? [];
+    expect(steps.indexOf(prepareDraft!)).toBeLessThan(steps.indexOf(verifyDraft!));
+    expect(steps.indexOf(verifyDraft!)).toBeLessThan(steps.indexOf(publish!));
     expect(publish?.if).toContain("needs.preflight.outputs.validate_only != 'true'");
     expect(publish?.if).toContain(
       "needs.preflight.outputs.release_channel == 'stable' && needs.preflight.outputs.publish_requested == 'true'",

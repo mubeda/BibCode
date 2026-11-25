@@ -45,10 +45,19 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function requireOne(entries: ReadonlyArray<string>, pattern: RegExp, label: string): string {
+function requireOne(
+  entries: ReadonlyArray<string>,
+  pattern: RegExp,
+  label: string,
+  expectedNames: ReadonlyArray<string>,
+): string {
   const matches = entries.filter((entry) => pattern.test(entry));
   if (matches.length !== 1) {
-    throw new ReleaseAssetAssemblyError(`Expected exactly one ${label}, found ${matches.length}.`);
+    const expected = expectedNames.join(" or ");
+    const found = matches.length === 0 ? "" : ` (${matches.join(", ")})`;
+    throw new ReleaseAssetAssemblyError(
+      `Expected exactly one ${label} (${expected}), found ${matches.length}${found}.`,
+    );
   }
   return matches[0]!;
 }
@@ -65,31 +74,41 @@ function expectedDesktopAssets(
     entries,
     new RegExp(`^BiBCode_${escaped}_(?:aarch64|arm64)\\.dmg$`),
     "macOS ARM64 DMG",
+    [`BiBCode_${version}_aarch64.dmg`, `BiBCode_${version}_arm64.dmg`],
   );
   const macX64 = requireOne(
     entries,
     new RegExp(`^BiBCode_${escaped}_(?:x64|x86_64)\\.dmg$`),
     "macOS x64 DMG",
+    [`BiBCode_${version}_x64.dmg`, `BiBCode_${version}_x86_64.dmg`],
   );
   const linuxArm64 = requireOne(
     entries,
     new RegExp(`^BiBCode_${escaped}_(?:aarch64|arm64)\\.AppImage$`),
     "Linux ARM64 AppImage",
+    [`BiBCode_${version}_aarch64.AppImage`, `BiBCode_${version}_arm64.AppImage`],
   );
   const linuxX64 = requireOne(
     entries,
     new RegExp(`^BiBCode_${escaped}_(?:amd64|x64|x86_64)\\.AppImage$`),
     "Linux x64 AppImage",
+    [
+      `BiBCode_${version}_amd64.AppImage`,
+      `BiBCode_${version}_x64.AppImage`,
+      `BiBCode_${version}_x86_64.AppImage`,
+    ],
   );
   const winArm64 = requireOne(
     entries,
     new RegExp(`^BiBCode_${escaped}_arm64-setup\\.exe$`),
     "Windows ARM64 NSIS",
+    [`BiBCode_${version}_arm64-setup.exe`],
   );
   const winX64 = requireOne(
     entries,
     new RegExp(`^BiBCode_${escaped}_x64-setup\\.exe$`),
     "Windows x64 NSIS",
+    [`BiBCode_${version}_x64-setup.exe`],
   );
   return {
     installers: new Set([macArm64, macX64, linuxArm64, linuxX64, winArm64, winX64]),
