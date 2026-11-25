@@ -2340,6 +2340,152 @@ describe("ChatComposer menu selection", () => {
     expect(draftOf(threadRef)?.prompt).toBe("/docs ");
   });
 
+  describe("Antigravity slash skills and commands", () => {
+    const antigravityId = ProviderInstanceId.make("antigravity");
+
+    function antigravityStatus(overrides: Partial<ServerProvider> = {}): ServerProvider {
+      return {
+        ...codexProvider,
+        instanceId: antigravityId,
+        driver: ProviderDriverKind.make("antigravity"),
+        slashCommands: [{ name: "plan", description: "Plan mode" }],
+        skills: [
+          {
+            name: "review-branch",
+            description: "Review local branch",
+            path: "/ws/.agents/skills/review-branch/SKILL.md",
+            scope: "project",
+            enabled: true,
+            invocation: "slash",
+          },
+        ],
+        agents: [],
+        ...overrides,
+      };
+    }
+
+    function renderAntigravity(statusOverrides: Partial<ServerProvider> = {}) {
+      const provider = antigravityStatus(statusOverrides);
+      return renderComposer({
+        providerBindingInstanceId: antigravityId,
+        providerStatuses: [codexProvider, provider],
+        activeProjectDefaultModelSelection: {
+          instanceId: antigravityId,
+          model: "gpt-5.4",
+        },
+      });
+    }
+
+    it("shows loading state while Antigravity capabilities are pending under slash", () => {
+      h.capabilityPending = true;
+      h.capabilityOverride = null;
+      seedPrompt("/");
+      renderAntigravity();
+
+      const menu = findCapture("ComposerCommandMenu");
+      expect(menu["isLoading"]).toBe(true);
+      expect(menu["loadingText"]).toBe("Loading provider skills...");
+    });
+
+    it("surfaces partial-catalog issues while keeping local Antigravity slash skills", () => {
+      const issue = "Could not query Antigravity commands; showing locally discovered skills.";
+      h.capabilityOverride = {
+        slashCommands: [],
+        skills: antigravityStatus().skills,
+        agents: [],
+        issues: [issue],
+      };
+      seedPrompt("/");
+      renderAntigravity();
+
+      const menu = findCapture("ComposerCommandMenu");
+      const items = menu["items"] as Array<Record<string, unknown>>;
+      expect(menu["issueText"]).toBe(issue);
+      expect(items.map((item) => item["label"])).toEqual(["/review-branch"]);
+    });
+
+    it("surfaces providerCapabilities errors such as older-server refusal in the Antigravity slash menu", () => {
+      const error = "Skill discovery is not supported for this provider.";
+      h.capabilityError = error;
+      h.capabilityOverride = null;
+      seedPrompt("/");
+      renderAntigravity();
+
+      const menu = findCapture("ComposerCommandMenu");
+      expect(menu["issueText"]).toBe(error);
+      expect(menu["onRetry"]).toBe(h.retryCapabilities);
+    });
+
+    it("lists Antigravity Skills and Commands groups under slash and inserts /<name> without changing Codex dollar behavior", () => {
+      seedPrompt("/");
+      renderAntigravity();
+
+      const menu = findCapture("ComposerCommandMenu");
+      const items = menu["items"] as Array<Record<string, unknown>>;
+      expect(items).toEqual([
+        expect.objectContaining({
+          id: "provider-command:antigravity:plan",
+          type: "provider-command",
+          group: "commands",
+          label: "/plan",
+          replacement: "/plan ",
+        }),
+        expect.objectContaining({
+          id: "provider-skill:antigravity:slash:review-branch",
+          type: "provider-skill",
+          group: "skills",
+          label: "/review-branch",
+          replacement: "/review-branch ",
+        }),
+      ]);
+
+      // Antigravity uses `/` for skills, never `$`.
+      h.captures.length = 0;
+      seedPrompt("$rev");
+      renderAntigravity();
+      expect(filterCaptures("ComposerCommandMenu")).toHaveLength(0);
+
+      // Selecting an Antigravity skill inserts `/<name> `.
+      h.captures.length = 0;
+      seedPrompt("review /rev");
+      renderAntigravity();
+      setEditorSnapshot("review /rev", 11);
+      const onSelect = findCapture("ComposerCommandMenu")["onSelect"] as (
+        item: Record<string, unknown>,
+      ) => void;
+      const slashItems = findCapture("ComposerCommandMenu")["items"] as Array<
+        Record<string, unknown>
+      >;
+      onSelect(
+        slashItems.find((item) => item["id"] === "provider-skill:antigravity:slash:review-branch")!,
+      );
+      expect(draftOf(threadRef)?.prompt).toBe("review /review-branch ");
+
+      // Antigravity keeps the `/` menu reachable even with an empty catalog.
+      h.captures.length = 0;
+      h.capabilityOverride = { slashCommands: [], skills: [], agents: [], issues: [] };
+      seedPrompt("/");
+      renderAntigravity();
+      expect(findCapture("ComposerCommandMenu")).toMatchObject({
+        items: [],
+        emptyStateText: "No matching provider command or skill.",
+      });
+      h.capabilityOverride = undefined;
+
+      // Codex keeps `$` skill invocation unchanged.
+      h.captures.length = 0;
+      seedPrompt("$ref");
+      renderComposer();
+      const codexItems = findCapture("ComposerCommandMenu")["items"] as Array<
+        Record<string, unknown>
+      >;
+      expect(codexItems[0]).toMatchObject({
+        id: "provider-skill:codex:dollar:refactor",
+        replacement: "$refactor ",
+      });
+    });
+  });
+
   it("inserts an explicit provider-agent instruction", () => {
     const { onSelect, items } = renderCommandMenu("@code");
 

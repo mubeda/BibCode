@@ -8,9 +8,8 @@ reconstructing driver state in the client.
 Built-in provider settings defaults come from one server table. Both the control
 plane and the runtime settings reader fill missing fields from it, so a partial
 `providers.<driver>` object means the same thing everywhere. Codex, Claude,
-Cursor, and OpenCode are enabled by default; Antigravity (Preview) and Grok are
-disabled. Explicitly saved
-values, including `enabled: false`, are preserved.
+Cursor, OpenCode, and Antigravity are enabled by default; Grok is disabled.
+Explicitly saved values, including `enabled: false`, are preserved.
 
 `supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
 a property of an individual usage event. Codex and Claude always advertise this
@@ -94,7 +93,13 @@ walked), and one set of canonical paths covers every root, so a symlinked root
 is walked once and its skills keep the scope of the first root that reached
 them. One budget of 10 folder levels below a root and 10,000 directory entries
 covers the whole scan; when it runs out the skills found so far are kept with
-one "Skill list is incomplete" issue.
+one "Skill list is incomplete" issue. Antigravity scans `.agents/skills`,
+`.agent/skills`, `_agents/skills`, and `_agent/skills` up to the Git root plus
+`~/.gemini/config/skills` with the same depth, entry, cycle, and skip bounds,
+and runs `agy acp` (`initialize` then `session/new`, draining incoming ACP
+notifications concurrently with bounded retention and without sending a prompt)
+to merge `available_commands_update` authoritatively over those local skills,
+falling back to local skills on sign-out, timeout, or older CLIs.
 
 `packages/client-runtime` owns the capability query family. Cache identity
 includes environment, provider instance, directory, and a configuration revision.
@@ -114,7 +119,7 @@ catalogs retain native errors in `issues`; unreadable Cursor roots are reported,
 while absent optional roots are normal. A Cursor scan that outlives its 15 second
 limit returns the skills found so far with an incomplete issue instead of failing. Failed discovery raises
 `ServerProviderCapabilitiesError`; the composer offers Retry and preserves the
-draft. Native `$` (Codex) and `/` (Claude, Cursor, OpenCode) menus remain reachable
+draft. Native `$` (Codex) and `/` (Claude, Cursor, Antigravity, OpenCode) menus remain reachable
 with an empty catalog so newly installed skills can be discovered.
 
 ## Execution path
@@ -214,14 +219,14 @@ No identity or label is inferred from a description.
 Each driver translates between the common orchestration model and its native
 protocol:
 
-| Provider    | Native integration                                              | Steer                 | Checkpoint revert       | Activity support                                                                           |
-| ----------- | --------------------------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
-| Codex       | Codex App Server JSON-RPC                                       | `turn/steer`          | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
-| Claude      | Claude stream-JSON CLI and authenticated hooks                  | Stream-JSON user line | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
-| Cursor      | Agent Client Protocol                                           | Unsupported           | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
-| Antigravity | `agy acp`, Agent Client Protocol (Preview, disabled by default) | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
-| Grok        | Agent Client Protocol                                           | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
-| OpenCode    | OpenCode server/events API                                      | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Provider    | Native integration                             | Steer                 | Checkpoint revert       | Activity support                                                                           |
+| ----------- | ---------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
+| Codex       | Codex App Server JSON-RPC                      | `turn/steer`          | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Claude      | Claude stream-JSON CLI and authenticated hooks | Stream-JSON user line | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
+| Cursor      | Agent Client Protocol                          | Unsupported           | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
+| Antigravity | `agy acp`, Agent Client Protocol               | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
+| Grok        | Agent Client Protocol                          | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
+| OpenCode    | OpenCode server/events API                     | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
 
 Codex, Cursor, and Grok keep the provider's JSON-RPC request ID for their wire
 response. BiBCode gives each approval or question an opaque request ID scoped

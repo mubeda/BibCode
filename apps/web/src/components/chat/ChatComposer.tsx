@@ -918,7 +918,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     selectedProviderEntry?.driverKind === "codex"
       ? "dollar"
       : selectedProviderEntry &&
-          ["claudeAgent", "cursor", "opencode"].includes(selectedProviderEntry.driverKind)
+          ["claudeAgent", "cursor", "opencode", "antigravity"].includes(
+            selectedProviderEntry.driverKind,
+          )
         ? "slash"
         : undefined;
   const composerCapabilities = useMemo(
