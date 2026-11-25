@@ -307,18 +307,17 @@ describe("cross-platform CI contract", () => {
     expect(requireJob(ci, "native_desktop").env).toBeUndefined();
 
     const release = readWorkflow(RELEASE_WORKFLOW_PATH).workflow;
-    for (const name of ["build_desktop", "build_server"]) {
-      const job = requireJob(release, name);
-      const cache = job.steps?.find((step) => step.name === "Cache Rust build output");
-      expect(cache?.with?.["shared-key"], name).toBe("native-desktop");
-      expect(cache?.with?.["save-if"], name).toBe(false);
-      expect(String(cache?.with?.workspaces), name).toBe(". -> target\n");
-      // Job-level CARGO_* or RUST* env would change the cache key.
-      expect(
-        Object.keys(job.env ?? {}).filter((key) => /^(CARGO|RUST)/.test(key)),
-        name,
-      ).toEqual([]);
-    }
+    expect(release.jobs?.build_server).toBeUndefined();
+    const job = requireJob(release, "build_desktop");
+    const cache = job.steps?.find((step) => step.name === "Cache Rust build output");
+    expect(cache?.with?.["shared-key"], "build_desktop").toBe("native-desktop");
+    expect(cache?.with?.["save-if"], "build_desktop").toBe(false);
+    expect(String(cache?.with?.workspaces), "build_desktop").toBe(". -> target\n");
+    // Job-level CARGO_* or RUST* env would change the cache key.
+    expect(
+      Object.keys(job.env ?? {}).filter((key) => /^(CARGO|RUST)/.test(key)),
+      "build_desktop",
+    ).toEqual([]);
   });
 
   it("allows native CI to finish host tests, optimized recovery probes, and bundles", () => {
@@ -928,12 +927,15 @@ describe("cross-platform release contract", () => {
     expect(releaseAssets?.run).toMatch(/is_update_candidate/);
   });
 
-  it("builds independent six-target desktop and server release matrices", () => {
+  it("builds a six-target desktop release matrix without a standalone server matrix", () => {
     const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
     const desktop = requireJob(workflow, "build_desktop");
-    const server = requireJob(workflow, "build_server");
+    const relayConfig = requireJob(workflow, "relay_public_config");
     const release = requireJob(workflow, "release");
 
+    expect(workflow.jobs?.build_server).toBeUndefined();
+    expect(relayConfig.needs).toBe("preflight");
+    expect(desktop.needs).toEqual(["preflight", "relay_public_config"]);
     // Both macOS builds need more than 90 minutes when their Rust cache is cold.
     expect(desktop["timeout-minutes"]).toBe("${{ matrix.jobTimeoutMinutes }}");
     expect(desktop.strategy?.matrix?.include).toEqual([
@@ -986,60 +988,56 @@ describe("cross-platform release contract", () => {
         jobTimeoutMinutes: 90,
       },
     ]);
-    expect(server.strategy?.matrix?.include).toEqual([
-      {
-        label: "macOS arm64",
-        runner: "macos-26",
-        platform: "mac",
-        arch: "arm64",
-        serverOs: "darwin",
-        serverArch: "aarch64",
-      },
-      {
-        label: "macOS x64",
-        runner: "macos-15-intel",
-        platform: "mac",
-        arch: "x64",
-        serverOs: "darwin",
-        serverArch: "x86_64",
-      },
-      {
-        label: "Linux arm64",
-        runner: "ubuntu-22.04-arm",
-        platform: "linux",
-        arch: "arm64",
-        serverOs: "linux",
-        serverArch: "aarch64",
-      },
-      {
-        label: "Linux x64",
-        runner: "ubuntu-22.04",
-        platform: "linux",
-        arch: "x64",
-        serverOs: "linux",
-        serverArch: "x86_64",
-      },
-      {
-        label: "Windows arm64",
-        runner: "windows-11-vs2026-arm",
-        platform: "win",
-        arch: "arm64",
-        serverOs: "windows",
-        serverArch: "aarch64",
-      },
-      {
-        label: "Windows x64",
-        runner: "windows-2025",
-        platform: "win",
-        arch: "x64",
-        serverOs: "windows",
-        serverArch: "x86_64",
-      },
-    ]);
-    expect(allStepCommands(server)).toContain("scripts/build-server-artifact.ts");
-    expect(allStepCommands(server)).toContain('chown -R "$HOST_UID:$HOST_GID" /workspace/target');
-    expect(allStepCommands(server)).toContain("scripts/smoke-server-distribution.ts");
-    expect(release.needs).toEqual(["preflight", "build_desktop", "build_server"]);
+    expect(release.needs).toEqual(["preflight", "build_desktop"]);
+    expect(release.if).toBeDefined();
+    expect(release.if).not.toContain("needs.build_server");
+
+    const evaluateReleaseIf = (context: {
+      failure: boolean;
+      cancelled: boolean;
+      preflightResult: string;
+      buildDesktopResult: string;
+      validateOnly: string;
+    }): boolean => {
+      const inner = release.if!.replace(/^\$\{\{\s*|\s*\}\}$/g, "");
+      const expr = inner
+        .replaceAll("failure()", JSON.stringify(context.failure))
+        .replaceAll("cancelled()", JSON.stringify(context.cancelled))
+        .replaceAll("needs.preflight.result", JSON.stringify(context.preflightResult))
+        .replaceAll("needs.build_desktop.result", JSON.stringify(context.buildDesktopResult))
+        .replaceAll("needs.preflight.outputs.validate_only", JSON.stringify(context.validateOnly));
+      if (!/^[a-zA-Z0-9_'"\s!&|=()]+$/.test(expr)) {
+        throw new Error(`Unexpected tokens in release.if expression: ${expr}`);
+      }
+      return Boolean(new Function(`return (${expr});`)());
+    };
+
+    for (const validateOnly of ["true", "false"]) {
+      expect(
+        evaluateReleaseIf({
+          failure: false,
+          cancelled: false,
+          preflightResult: "success",
+          buildDesktopResult: "success",
+          validateOnly,
+        }),
+      ).toBe(true);
+      expect(
+        evaluateReleaseIf({
+          failure: false,
+          cancelled: false,
+          preflightResult: "success",
+          buildDesktopResult: "failure",
+          validateOnly,
+        }),
+      ).toBe(false);
+    }
+
+    const releaseCommands = allStepCommands(release);
+    expect(releaseCommands).not.toContain("server-*");
+    expect(releaseCommands).not.toContain("release-downloads/server");
+    expect(releaseCommands).not.toContain("minisign");
+    expect(releaseCommands).not.toContain("BIBCODE_SERVER_SIGNING_");
   });
 
   it("cryptographically verifies every updater payload before creating a stable draft", () => {
@@ -1499,38 +1497,22 @@ describe("release symbols and crash smoke contract", () => {
     );
   });
 
-  it("builds the server with symbols, then dumps and strips it on the host before packaging", () => {
-    const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
-    const server = requireJob(workflow, "build_server");
-    const linux = stepNamed(server, "Build Linux server on the compatibility baseline");
-    const native = stepNamed(server, "Build macOS or Windows server");
-    const dump = stepNamed(server, "Dump and strip server symbols");
+  it("omits standalone server symbol builds from release.yml while keeping CI server tests and desktop upgrades active", () => {
+    const { raw: releaseRaw, workflow: release } = readWorkflow(RELEASE_WORKFLOW_PATH);
+    const { workflow: ci } = readWorkflow(CI_WORKFLOW_PATH);
+    const { workflow: upgrade } = readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH);
 
-    for (const setting of symbolProfile) expect(linux.run).toContain(`--env ${setting}`);
-    expect(linux.run).toContain('--env "RUSTFLAGS=-C link-arg=-Wl,--build-id=sha1"');
-    expect(native.env).toEqual({
-      CARGO_PROFILE_RELEASE_STRIP: "none",
-      CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only",
-      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "packed",
-    });
-    expect(stepIndex(server, "Dump and strip server symbols")).toBeGreaterThan(
-      stepIndex(server, "Build macOS or Windows server"),
-    );
-    expect(stepIndex(server, "Dump and strip server symbols")).toBeLessThan(
-      stepIndex(server, "Build standalone server artifacts"),
-    );
-    expect(dump.run).toContain(
-      '--zip "server-release/bibcode-server-symbols-${{ needs.preflight.outputs.version }}-${{ matrix.serverOs }}-${{ matrix.serverArch }}.zip"',
-    );
-    expect(dump.run).toContain('strip --strip-all -o "$stripped" "$release_dir/bibcode"');
-    // Plain strip: rustc's level for macOS executables (`-x` is for dynamic libraries).
-    expect(dump.run).toContain('mac) strip -o "$stripped" "$release_dir/bibcode"');
-    expect(dump.run).not.toContain("strip -x");
-    expect(dump.run).toContain('mv "$stripped" "$release_dir/bibcode"');
-    expect(dump.run).toContain('codesign --verify --verbose=2 "$release_dir/bibcode"');
-    expect(stepNamed(server, "Upload server artifacts").with?.path).toContain(
-      "server-release/*.zip",
-    );
+    expect(release.jobs?.build_server).toBeUndefined();
+    expect(releaseRaw).not.toContain("bibcode-server-symbols-");
+    expect(releaseRaw).not.toContain("scripts/build-server-artifact.ts");
+    expect(releaseRaw).not.toContain("scripts/smoke-server-distribution.ts");
+    expect(releaseRaw).not.toContain("scripts/test-linux-server-package.ts");
+
+    expect(requireJob(ci, "server_tests_windows")).toBeDefined();
+    expect(requireJob(ci, "server_tests_macos")).toBeDefined();
+    expect(requireJob(ci, "crash-smoke")).toBeDefined();
+    expect(requireJob(upgrade, "seeded_upgrade_smoke")).toBeDefined();
+    expect(requireJob(upgrade, "windows_wsl_upgrade_smoke")).toBeDefined();
   });
 
   it("gives the release job time to move the symbol archives", () => {

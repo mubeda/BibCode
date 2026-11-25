@@ -94,7 +94,11 @@ it("publishes stable updater metadata atomically from a verified draft", () => {
     /if:[^\n]*needs\.preflight\.outputs\.release_channel == 'stable' && needs\.preflight\.outputs\.publish_requested == 'true'[\s\S]*gh release edit/,
   );
   assert.match(releaseWorkflow, /assemble-release-assets\.ts/);
-  assert.match(releaseWorkflow, /pattern:\s*server-\*/);
+  assert.match(releaseWorkflow, /pattern:\s*desktop-\*/);
+  assert.notMatch(releaseWorkflow, /pattern:\s*server-\*/);
+  assert.notMatch(releaseWorkflow, /release-downloads\/server/);
+  assert.notMatch(releaseWorkflow, /minisign/);
+  assert.notMatch(releaseWorkflow, /BIBCODE_SERVER_SIGNING/);
   assert.match(releaseWorkflow, /files:\s*\|\s*\n\s+release-assets\/\*/);
 });
 
@@ -155,10 +159,14 @@ it("uses current release tooling for manual repairs while preserving the tagged 
     releaseWorkflow,
     /name: Build \$\{\{ matrix\.label \}\}[\s\S]*ref: \$\{\{ needs\.preflight\.outputs\.ref \}\}/,
   );
+  assert.equal(/^\s{2}build_server:/m.test(releaseWorkflow), false);
+  assert.match(releaseWorkflow, /needs:\s*\[\s*preflight,\s*build_desktop\s*\]/);
+  assert.match(releaseWorkflow, /relay_public_config:/);
   assert.match(
     releaseWorkflow,
-    /name: Build server \$\{\{ matrix\.label \}\}[\s\S]*ref: \$\{\{ needs\.preflight\.outputs\.ref \}\}/,
+    /build_desktop:[\s\S]*?needs:\s*\[\s*preflight,\s*relay_public_config\s*\]/,
   );
+  assert.notMatch(releaseWorkflow, /needs\.build_server/);
   assert.match(
     releaseDocumentation,
     /manual repair run[\s\S]*current release tooling[\s\S]*tagged commit/i,
