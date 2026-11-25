@@ -1213,6 +1213,7 @@ impl NativeServerControl {
             &settings,
             instance_id,
             Path::new(cwd),
+            self.process_attribution.get(),
             cancellation,
         )
         .await
@@ -2334,34 +2335,63 @@ impl NativeServerControl {
     ) -> Result<Value, Value> {
         let generation = self.settings_generation.load(Ordering::Acquire);
         if let Some(key) = CapabilityCache::key(&payload) {
-            let mut cache = self
-                .capability_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some((value, stale)) = cache.cached(&key, generation) {
-                if stale && cache.refreshing.insert(key.clone()) {
-                    drop(cache);
-                    let owner = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = owner
-                            .discover_provider_capabilities(payload, CancellationToken::new())
-                            .await
-                        {
-                            // The reason can carry provider error text that names skills.
-                            let tag = error.get("_tag").and_then(Value::as_str);
-                            tracing::warn!(
-                                instance_id = %key.0,
-                                tag = tag.unwrap_or_default(),
-                                "background provider capability refresh failed"
-                            );
-                        }
-                        owner
+            let cached = {
+                let cache = self
+                    .capability_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                cache.cached(&key, generation)
+            };
+            if let Some((value, stale)) = cached {
+                let settings_check = {
+                    let _guard = self.settings_update_lock.lock().await;
+                    crate::server_settings::ProviderSettingsStore::new(&self.state_directory)
+                        .get()
+                        .await
+                };
+                if let Err(error) = settings_check {
+                    let mut cache = self
+                        .capability_cache
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    cache.entries.remove(&key);
+                    cache.refreshing.remove(&key);
+                    return Err(json!({
+                        "_tag": "ServerProviderCapabilitiesError",
+                        "reason": error.to_string(),
+                    }));
+                }
+                if stale {
+                    let should_refresh = {
+                        let mut cache = self
                             .capability_cache
                             .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .refreshing
-                            .remove(&key);
-                    });
+                            .unwrap_or_else(|error| error.into_inner());
+                        cache.refreshing.insert(key.clone())
+                    };
+                    if should_refresh {
+                        let owner = self.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = owner
+                                .discover_provider_capabilities(payload, CancellationToken::new())
+                                .await
+                            {
+                                // The reason can carry provider error text that names skills.
+                                let tag = error.get("_tag").and_then(Value::as_str);
+                                tracing::warn!(
+                                    instance_id = %key.0,
+                                    tag = tag.unwrap_or_default(),
+                                    "background provider capability refresh failed"
+                                );
+                            }
+                            owner
+                                .capability_cache
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .refreshing
+                                .remove(&key);
+                        });
+                    }
                 }
                 return Ok(value);
             }
@@ -4567,6 +4597,166 @@ done
             text()
         );
         child.complete();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_capabilities_rpc_refuses_missing_secret_cold_and_on_warmed_cache_and_evicts()
+     {
+        const SECRET_VALUE: &str = "fixture-secret-antigravity-rpc";
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-capabilities-rpc");
+        let control = scheduler_control(&temp).await;
+        let home = sandbox.path("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let ws1 = sandbox.path("ws1");
+        let ws2 = sandbox.path("ws2");
+        let skill_dir = ws1.join(".agents/skills/review-branch");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review-branch\ndescription: Review branch\n---\n",
+        )
+        .expect("write SKILL.md");
+        std::fs::create_dir_all(&ws2).expect("create ws2");
+
+        let requests = sandbox.path("antigravity-cap-rpc.requests");
+        let init_update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "session-1",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        { "name": "review-branch", "description": "ACP review skill" },
+                        { "name": "plan", "description": "Plan mode", "input": { "hint": "goal" } }
+                    ]
+                }
+            }
+        });
+        let binary_cap = sandbox.executable_script(
+            "antigravity-cli-cap-rpc-commands",
+            &format!(
+                r#"case "$1" in
+  --version) printf '%s\n' '1.5.13'; exit 0 ;;
+esac
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> '{requests}'
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,{init}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{update}'
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"session-1"}}}}\n' "$id"
+      ;;
+    *'"method":"session/close"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done"#,
+                requests = requests.display(),
+                init = provider_inventory::tests::antigravity_initialize(1, "1.5.13", true),
+                update = init_update,
+            ),
+            "",
+        );
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "antigravity": {
+                            "driver": "antigravity",
+                            "enabled": true,
+                            "config": { "binaryPath": binary_cap },
+                            "environment": [
+                                { "name": "HOME", "value": home },
+                                { "name": "USERPROFILE", "value": home },
+                                { "name": "ANTIGRAVITY_API_KEY", "value": SECRET_VALUE, "sensitive": true }
+                            ]
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("settings update succeeds");
+        wait_for_full_refresh_idle(&control).await;
+
+        let sessions_before = antigravity_sessions(&requests);
+        let payload1 = json!({ "instanceId": "antigravity", "cwd": ws1 });
+        let warm = control
+            .call(
+                "server.getProviderCapabilities",
+                payload1.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("initial Antigravity capabilities succeed");
+        assert_eq!(warm["issues"], json!([]), "warm issues: {warm}");
+        assert!(
+            warm["skills"]
+                .as_array()
+                .is_some_and(|skills| skills.iter().any(|s| s["name"] == "review-branch")),
+            "expected review-branch skill: {warm}"
+        );
+        assert!(
+            warm["slashCommands"]
+                .as_array()
+                .is_some_and(|cmds| cmds.iter().any(|c| c["name"] == "plan")),
+            "expected plan slash command: {warm}"
+        );
+        assert!(!warm.to_string().contains(SECRET_VALUE));
+        let sessions_after_warm = antigravity_sessions(&requests);
+        assert_eq!(sessions_after_warm, sessions_before + 1);
+
+        let key1 = CapabilityCache::key(&payload1).expect("cache key");
+        assert!(
+            control
+                .capability_cache
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&key1),
+            "warmed capability entry should be cached"
+        );
+
+        // Remove the persisted secret without bumping settings_generation.
+        std::fs::remove_file(secret_path(
+            &control.state_directory,
+            "antigravity",
+            "ANTIGRAVITY_API_KEY",
+        ))
+        .expect("remove persisted secret");
+
+        let warmed_err = control
+            .call(
+                "server.getProviderCapabilities",
+                payload1,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("warmed cache must refuse missing secret");
+        assert_eq!(warmed_err["_tag"], "ServerProviderCapabilitiesError");
+        assert!(
+            !control
+                .capability_cache
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&key1),
+            "warmed cache entry must be evicted when secret read fails"
+        );
+        assert_eq!(antigravity_sessions(&requests), sessions_after_warm);
+
+        let cold_err = control
+            .call(
+                "server.getProviderCapabilities",
+                json!({ "instanceId": "antigravity", "cwd": ws2 }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("cold cache must refuse missing secret");
+        assert_eq!(cold_err["_tag"], "ServerProviderCapabilitiesError");
+        assert_eq!(antigravity_sessions(&requests), sessions_after_warm);
     }
 
     async fn mutable_provider_registry(
