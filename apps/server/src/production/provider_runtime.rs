@@ -18068,6 +18068,7 @@ impl AntigravityDriver {
                 cancel_grace,
                 control_timeout: ANTIGRAVITY_CONTROL_TIMEOUT,
                 initial_options: request.options,
+                code_review: request.code_review,
             },
             connection,
             incoming,

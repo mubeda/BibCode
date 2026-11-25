@@ -67,11 +67,14 @@ shows "Antigravity is taking longer than usual to start. One of its MCP servers
 may not be responding; run `agy mcp list` in a terminal to see which one." and
 BiBCode keeps waiting; see [Starting a provider](README.md#starting-a-provider).
 
-BiBCode never answers a permission request for you, in any mode. A request the
-CLI sends is always shown to you. When you change the mode while the agent is
-working, the change applies once the CLI confirms it; use **Stop** to end the
-turn at once. If the CLI does not confirm a mode, the next message is refused
-until it does.
+BiBCode never answers a permission request with an approval for you, in any mode.
+Normally, a request the CLI sends is always shown to you; in a code review panel
+running in auto mode (`full-access` and `default`), BiBCode cancels stray
+permission requests at once without opening a card (switching the panel to
+Supervised or Plan restores normal cards). When you change the mode while the
+agent is working, the change applies once the CLI confirms it; use **Stop** to
+end the turn at once. If the CLI does not confirm a mode, the next message is
+refused until it does.
 
 ## Terminal
 
