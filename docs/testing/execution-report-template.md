@@ -179,19 +179,6 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | ---- | -------- | ------------- | -------------------- | --------------------------- |
 |      |          |               |                      |                             |
 
-## Standalone server distribution evidence
-
-- Exact staged or installed executable:
-- Packaged web discovery result:
-- Environment descriptor result:
-- Pairing/token-exchange result:
-- Shutdown/exit result:
-- Checksum result:
-- Optional Minisign result or explicitly unsigned state:
-- Package install/remove result, when applicable:
-- Isolated data sentinel preserved after removal:
-- Container image and native architecture, when applicable:
-
 ## Packaged UI and visual evidence
 
 | Scenario | Screenshot absolute path | State | Pixel-review finding |
@@ -243,7 +230,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 
 - Settings/card confirmation, fresh counts, Cancel, and Retry reconfirmation:
 - Progress/queued/restart/version checking, closing the view, and row Dismiss:
-- Manual archive/package/OS/architecture/SSH steps and Copy:
+- Manual server update steps (generic/SSH) and Copy:
 - Browser explicit Reload and composer input retained:
 - Host request notice and Manage devices (native | tests-only | unavailable):
 - Fake-host UI/session evidence and light/dark screenshots:

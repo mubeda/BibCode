@@ -280,10 +280,10 @@ recently used entries above that. Which workflow saves which entry:
   `refs/heads/main`, including when a later step fails (`cache-on-failure`).
   Pull requests read that default-branch cache and save nothing.
 - Native desktop sets `shared-key: native-desktop`, so one entry per runner
-  OS and architecture. Release's `build_desktop` and `build_server` use the
+  OS and architecture. Release's `build_desktop` uses the
   same key, the same `. -> target` workspace, and no job-level `CARGO_*` or
-  `RUST*` environment, so they restore the entry CI's `main` run saved and
-  never save (`save-if: false`). A tag run used to save its own entries under
+  `RUST*` environment, so it restores the entry CI's `main` run saved and
+  never saves (`save-if: false`). A tag run used to save its own entries under
   `refs/tags/<tag>`, which no later run could restore and which pushed the
   `main` entries out.
 - Seeded Packaged Desktop Upgrade has no Rust cache step: its harness builds in
@@ -356,11 +356,11 @@ it is billed per GiB above 10. List the entries with
   Windows lanes wait for the exact candidate's installed PE version before
   stopping and relaunching the host, retaining bounded handoff observations.
   Its WSL-specific lane remains Windows x64.
-- `.github/workflows/release.yml` runs the stable/nightly release pipeline. See
-  the [Release Checklist](./release.md). Its separate server matrix builds six
-  archives, four Linux packages, and native distribution evidence before release
-  assembly can create a draft. Both matrices also publish Breakpad
-  [symbol archives](./release.md#symbol-assets).
+- `.github/workflows/release.yml` runs the stable/nightly desktop release
+  pipeline. See the [Release Checklist](./release.md). Its six-target desktop
+  matrix builds installers, stable updater metadata, and desktop Breakpad
+  [symbol archives](./release.md#symbol-assets). Standalone server builds,
+  packages, and smoke tests do not run in Release CI.
 - `.github/workflows/deploy-relay.yml` deploys the BiBCode Connect relay from
   `main` only when the required Cloudflare repository configuration exists.
 - `.github/workflows/transfer-report.yml` runs on pull requests that touch the server or its

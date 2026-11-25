@@ -19,40 +19,33 @@ import {
 
 describe("manualUpdateSteps", () => {
   const base = { serverVersion: "0.7.2", sshLaunched: false } as const;
-  it("names the archive and checksum command for the host OS and architecture", () => {
-    const linux = manualUpdateSteps({
-      ...base,
-      installKind: "archive",
-      os: "linux",
-      arch: "arm64",
-    });
-    expect(linux).toContain("bibcode-server-vVERSION-linux-aarch64.tar.gz");
-    expect(linux).toContain("bibcode-server-SHA256SUMS");
-    expect(linux).toContain("sha256sum --check -");
-    expect(
-      manualUpdateSteps({ ...base, installKind: "archive", os: "darwin", arch: "x64" }),
-    ).toContain("shasum -a 256 -c");
-    const windows = manualUpdateSteps({
-      ...base,
-      installKind: "archive",
-      os: "windows",
-      arch: "x64",
-    });
-    expect(windows).toContain("bibcode-server-vVERSION-windows-x86_64.zip");
-    expect(windows).toContain("Get-FileHash");
-    expect(windows).not.toContain("grep");
+  const expectedGeneric = [
+    "# Update this BiBCode server on its host:",
+    "# 1. Stop the running server (Ctrl+C or its service manager).",
+    "# 2. Install the new bibcode distribution for this host.",
+    "# 3. Restart it or its service:",
+    "bibcode serve",
+    "",
+    "# Currently running: v0.7.2",
+  ].join("\n");
+
+  it("uses generic operator instructions for archive and system-package installs without release server download links", () => {
+    for (const candidate of [
+      { ...base, installKind: "archive", os: "linux", arch: "arm64" },
+      { ...base, installKind: "archive", os: "darwin", arch: "x64" },
+      { ...base, installKind: "archive", os: "windows", arch: "x64" },
+      { ...base, installKind: "system-package", os: "linux", arch: "x64" },
+      { ...base, installKind: "flatpak", os: "unknown", arch: "other" },
+    ] as const) {
+      const steps = manualUpdateSteps(candidate);
+      expect(steps).toBe(expectedGeneric);
+      expect(steps).not.toContain("bibcode-server-vVERSION");
+      expect(steps).not.toContain(".deb");
+      expect(steps).not.toContain(".rpm");
+      expect(steps).not.toContain("bibcode-server-SHA256SUMS");
+    }
   });
-  it("gives platform package options and preserves running version context", () => {
-    const steps = manualUpdateSteps({
-      ...base,
-      installKind: "system-package",
-      os: "linux",
-      arch: "x64",
-    });
-    expect(steps).toContain("sudo apt install ./bibcode-server_VERSION_amd64.deb");
-    expect(steps).toContain("sudo dnf install ./bibcode-server-VERSION-1.x86_64.rpm");
-    expect(steps).toContain("Currently running: v0.7.2");
-  });
+
   it("instructs an SSH operator to verify this server and reconnect without stopping every recorded pid", () => {
     const steps = manualUpdateSteps({
       ...base,
@@ -65,16 +58,6 @@ describe("manualUpdateSteps", () => {
     expect(steps).toContain("Reconnect");
     expect(steps).toContain("Verify");
     expect(steps).not.toContain("kill");
-  });
-  it("uses generic operator guidance when platform or install kind is unknown", () => {
-    const steps = manualUpdateSteps({
-      ...base,
-      installKind: "flatpak",
-      os: "unknown",
-      arch: "other",
-    });
-    expect(steps).toContain("bibcode serve");
-    expect(steps).not.toContain("linux-");
   });
 });
 

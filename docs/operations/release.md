@@ -1,7 +1,8 @@
 # Release Checklist
 
-This document describes the Tauri 2 desktop and native standalone-server release
-workflow. The repository does not package or publish Electron artifacts.
+This document describes the Tauri 2 desktop release workflow. The repository
+does not package or publish Electron artifacts, and GitHub Releases publish
+desktop assets only.
 
 ## Release Workflow
 
@@ -12,11 +13,11 @@ workflow. The repository does not package or publish Electron artifacts.
 
 For validation-only release-candidate verification from a feature branch, dispatch the workflow
 with `validate_only=true`, `publish=false`, and a unique prerelease version such
-as `0.4.2-validation.123`. This path runs the complete native desktop and server
-matrices, assembles and checksums the public asset set, and uploads it as the
+as `0.4.2-validation.123`. This path runs the complete native desktop matrix,
+assembles and validates the public desktop asset set, and uploads it as the
 `validated-release-assets` Actions artifact. It does not create or modify a Git
 tag or GitHub Release. It runs `vp check` and `vp run typecheck` before the
-native matrices and relies on the pull-request CI workflow for the full test
+native matrix and relies on the pull-request CI workflow for the full test
 graph. `validate_only` and `publish` are mutually exclusive.
 
 Publication-capable preflight runs `vp check`, `vp run typecheck`, and
@@ -53,8 +54,8 @@ matrix then creates native Tauri installers on the matching operating system:
 | Windows  | `windows-11-vs2026-arm` | arm64        | NSIS executable |
 | Windows  | `windows-2025`          | x64          | NSIS executable |
 
-The native Intel release producers use supported macOS 15 for both desktop and
-server packaging. CI's Native desktop macOS x64 row uses the same
+The native Intel release producer uses supported macOS 15 for desktop
+packaging. CI's Native desktop macOS x64 row uses the same
 `macos-15-intel` runner, so CI builds and tests the Intel app Release ships.
 Release restores CI's `native-desktop` Rust cache, whose key names only the OS
 family and architecture, so a CI row on `macos-26-intel` would save objects
@@ -80,17 +81,10 @@ Each matrix job installs the frontend build toolchain, Rust, and the pinned
 and in-process server and embeds the built React assets. No Node runtime or
 TypeScript server is packaged.
 
-A separate native matrix builds `bibcode` plus the matching static web client for the
-same six targets. macOS and Linux receive `.tar.gz` archives; Windows receives `.zip`.
-Linux also receives direct-download `.deb` and `.rpm` packages for both architectures.
-The Linux server binary is compiled on an Ubuntu 20.04 compatibility baseline, then its
-packages are installed and exercised on Ubuntu 22.04, Ubuntu 24.04, Debian 12, Rocky
-Linux 9, and Fedora 44.
-
 Numeric stable versions are updater candidates and are marked latest only after
 manual publication approval. Stable prerelease versions and manual nightly
-releases are GitHub prereleases, are never marked latest, and publish desktop
-installers plus standalone server distributions without updater metadata.
+releases are GitHub prereleases, are never marked latest, and publish only the
+six desktop installers and six desktop symbol archives without updater metadata.
 
 ## Supported Platforms
 
@@ -99,46 +93,30 @@ installers plus standalone server distributions without updater metadata.
 - Linux x64 and ARM64 AppImages built on matching Ubuntu 22.04 runners and exercised on Ubuntu 22.04,
   Ubuntu 24.04, and Debian 12.
 
-`scripts/run-msvc.mjs` selects the requested native MSVC architecture. Linux desktop
-release artifacts use Ubuntu 22.04; standalone server builds use the older compatibility
-baseline described above. The AppImage carries an allowlist of the build host's GStreamer
-core, base and good plugins (LGPL), so its build hosts install the base, good and ALSA plugin
-packages; see [AppImage build and inspection](../testing/linux-desktop.md#appimage-build-and-inspection)
+`scripts/run-msvc.mjs` selects the requested native MSVC architecture. Linux
+desktop release artifacts use Ubuntu 22.04. The AppImage carries an allowlist of
+the build host's GStreamer core, base and good plugins (LGPL), so its build hosts
+install the base, good and ALSA plugin packages; see
+[AppImage build and inspection](../testing/linux-desktop.md#appimage-build-and-inspection)
 and [`apps/desktop/THIRD_PARTY_NOTICES.md`](../../apps/desktop/THIRD_PARTY_NOTICES.md).
-
-## Standalone Server Assets
-
-Each release contains `bibcode-server-v<version>-<os>-<architecture>.tar.gz` for macOS
-and Linux or `.zip` for Windows. Public OS/architecture keys are
-`darwin-{aarch64,x86_64}`, `linux-{aarch64,x86_64}`, and
-`windows-{aarch64,x86_64}`. Linux also publishes:
-
-- `bibcode-server_<version>_arm64.deb`
-- `bibcode-server_<version>_amd64.deb`
-- `bibcode-server-<version>-1.aarch64.rpm`
-- `bibcode-server-<version>-1.x86_64.rpm`
-
-The packages are direct GitHub Release downloads, not hosted APT or RPM repositories.
-Before staging, each server job dumps the binary's symbols and strips it; see
-[Symbol assets](#symbol-assets).
-Every release includes `bibcode-server-SHA256SUMS`; optional server `.minisig` files
-appear only when both dedicated server-signing secrets are configured.
-Windows server archives are written through `scripts/create-portable-zip.ps1`, which assigns
-forward-slash entry names explicitly. The artifact builder rejects a mislabeled non-ZIP payload,
-backslash entry names, duplicate entries, traversal, or paths outside the versioned root.
+Standalone server archives and Linux `.deb`/`.rpm` packages are no longer built
+or published by Release CI; build them locally from source with `dist:server:*`
+when needed (see [Standalone Server Installation](../user/server-installation.md)).
 
 ## Symbol Assets
 
-Each release also contains twelve Breakpad symbol archives, one for each
-release binary: `bibcode-desktop-symbols-<version>-<os>-<architecture>.zip` and
-`bibcode-server-symbols-<version>-<os>-<architecture>.zip`, with the public
-OS/architecture keys of the server archives. Each archive holds one `.sym` file
+Each release contains six Breakpad symbol archives, one for each desktop target:
+`bibcode-desktop-symbols-<version>-<os>-<architecture>.zip`, using public
+OS/architecture keys `darwin-{aarch64,x86_64}`, `linux-{aarch64,x86_64}`, and
+`windows-{aarch64,x86_64}`. Each archive holds one `.sym` file
 in symbol-store layout, `<module>/<debug id>/<module>.sym`. On Windows the module
 is named after its PDB: `<name>.pdb/<debug id>/<name>.sym`. `minidump-stackwalk`
 and the profiler's symbolication read that layout from the extracted archive.
-`scripts/assemble-release-assets.ts` requires all twelve and still rejects any
-other unlisted file. The archives are not covered by `bibcode-server-SHA256SUMS`
-or the optional server signatures.
+`scripts/assemble-release-assets.ts` requires all six desktop symbol archives
+(plus the six desktop installers, and stable updater metadata when `--updater` is
+passed) and rejects any unlisted file, including standalone server archives,
+`.deb`/`.rpm` packages, `bibcode-server-SHA256SUMS`, `.minisig` signatures, and
+`bibcode-server-symbols-*.zip`.
 
 The archive names are a client contract. `bibcode profiler symbolicate
 --download`, and the profiler MCP tool `profiler_symbolicate` with
@@ -146,9 +124,10 @@ The archive names are a client contract. `bibcode profiler symbolicate
 `https://github.com/mubeda/BibCode/releases/download/v<version>/<archive>` for
 the version, OS, and architecture recorded in the crash sidecar or panic event,
 and unpack it into `<state dir>/profiler-symbols/`. The repository is the
-updater's, which a test pins. A release that lacks the archive answers "the
-release publishes no symbols", so renaming an archive or dropping it from a
-release breaks symbolication of that release's crashes.
+updater's, which a test pins. A desktop-only release lacks standalone server
+symbol archives and returns `"the release publishes no symbols"`, so renaming a
+desktop archive or dropping it from a release breaks symbolication of that
+release's desktop crashes.
 
 The shipped binaries stay stripped. `[profile.release]` keeps `strip = "symbols"`,
 and the release jobs override the profile through the environment of their own
@@ -176,15 +155,12 @@ Cargo re-links its unstripped `deps/` artifact over the stripped binary even
 when nothing needs rebuilding. The wrapper therefore fails the job unless the
 binary is still the stripped file after bundling, and unless the copy in each
 bundle that has a readable one (the macOS app, the AppImage's file system) has
-its build ID and symbol table; Windows installers pack the binary itself. The
-server jobs build `bibcode` with the same profile (the Linux build inside its
-Ubuntu 20.04 container), then dump and strip it on the runner before staging.
-Both strip as rustc does for executables, with `strip --strip-all` on Linux and
-plain `strip` on macOS, into a copy that replaces the binary, so Cargo's
-hard-linked `deps/` artifact keeps its symbols for the next build. Apple silicon
-runs only signed code, so the server job runs `codesign --verify` on the
-stripped arm64 binary. Windows ships its binaries as linked and keeps the names
-in the PDB, which is not published. Both matrices install `dump_syms` 2.3.9 with
+its build ID and symbol table; Windows installers pack the binary itself.
+Linux and macOS strip as rustc does for executables, with `strip --strip-all`
+on Linux and plain `strip` on macOS, into a copy that replaces the binary, so
+Cargo's hard-linked `deps/` artifact keeps its symbols for the next build.
+Windows ships its binaries as linked and keeps the names in the PDB, which is
+not published. The desktop matrix installs `dump_syms` 2.3.9 with
 `cargo install --locked`; Rust Cache keeps `~/.cargo/bin`, so a restored runner
 skips that compile. `scripts/dump-symbols.ts` fails the job when a `.sym` lacks
 functions with source lines or `STACK` records (unwind data). The CI
@@ -255,11 +231,6 @@ Developer account and new signing secrets in the release workflow. Tauri updater
 not replace Apple Developer ID signing, macOS notarization, or Windows
 Authenticode.
 
-Every server artifact is covered by `bibcode-server-SHA256SUMS`. If both
-`BIBCODE_SERVER_SIGNING_PRIVATE_KEY` and `BIBCODE_SERVER_SIGNING_PUBLIC_KEY` are
-configured, release assembly also creates and verifies `.minisig` files. Server signing
-is optional and uses a key separate from the mandatory Tauri updater key.
-
 Keep a password-protected backup of the updater private key in an approved
 offline recovery location, with access restricted to release maintainers. Keep
 its passphrase in a separate approved secret store.
@@ -300,7 +271,7 @@ manifest signature to match its adjacent `.sig` asset.
 
 Stable-channel and nightly prereleases never receive the updater signing overlay,
 updater signatures, descriptors, or `latest.json`, and never feed the app updater. They
-still publish the validated standalone server matrix and checksums.
+publish only the six desktop installers and six desktop symbol archives.
 
 ### Update installation safety
 
@@ -555,9 +526,9 @@ only that disposable worktree after a successful integration.
    artifacts have built, fix and verify the controller on `main`, then start a
    manual repair run for the same version with `publish=false`. The manual
    repair run uses current release tooling only for assembly and verification;
-   every desktop and server artifact remains built from the immutable tagged
+   every desktop artifact remains built from the immutable tagged
    commit resolved by preflight.
-2. Confirm the six native desktop and six native server build jobs complete and
+2. Confirm the six native desktop build jobs complete and
    that the stable desktop jobs received
    the two signing secrets above. Do not inspect or print their values.
 3. Confirm the workflow's descriptor-validation and updater-signature steps
@@ -571,9 +542,10 @@ only that disposable worktree after a successful integration.
    - each target has a nonempty signature and a tag-specific HTTPS payload URL;
    - the release contains a nonempty `.sig` asset for each target;
    - the release contains `latest.json`, two macOS DMGs, two Linux AppImages,
-     and two Windows NSIS installers, plus the standalone server archives,
-     Linux `.deb`/`.rpm` packages, updater payload archives required by the
-     manifest, and the twelve [symbol archives](#symbol-assets); and
+     and two Windows NSIS installers, plus the updater payload archives required
+     by the manifest and the six desktop [symbol archives](#symbol-assets) (21
+     assets total for a stable updater release, or 12 for a prerelease/nightly);
+     and
    - no private key or passphrase is present in any asset, manifest, or log.
 
 5. Confirm the workflow's comparison of sorted asset names with its generated
@@ -718,9 +690,12 @@ curated notes after every new or regenerated draft.
 
 Use a fresh inspection directory and the previous stable tag. Compare asset
 names with only the version replaced; a changed asset set needs an explanation
-from the current workflow, rather than a fixed historical asset count. The first
-release with [symbol archives](#symbol-assets) adds twelve
-`bibcode-{desktop,server}-symbols-*.zip` names to the previous set:
+from the current workflow, rather than a fixed historical asset count. A
+desktop-only release with [symbol archives](#symbol-assets) publishes the six
+desktop installers, six `bibcode-desktop-symbols-*.zip` archives, and (for
+numeric stable releases) the stable updater files (`latest.json`, six `.sig`
+files, and two macOS `.app.tar.gz` archives), with zero standalone server
+archives, packages, checksums, or `bibcode-server-symbols-*.zip` files.
 
 ```sh
 set -eu
@@ -777,13 +752,10 @@ budgets are timeouts, not expected completion durations:
 
 - preflight: 60 minutes;
 - each desktop build: 90 minutes, except macOS arm64 and Intel, which get 150
-  because a cold Rust cache can take them past 90. Desktop and server builds
-  restore CI's `native-desktop` Rust cache from `main` (same key and symbol
-  profile) and never save one, so a release from a commit `main` has built
-  starts warm;
-- each server build: 120 minutes;
-- the release job: 25 minutes. It moves about 440 MB of symbol archives (28 to
-  45 MB each).
+  because a cold Rust cache can take them past 90. Desktop builds restore CI's
+  `native-desktop` Rust cache from `main` (same key and symbol profile) and
+  never save one, so a release from a commit `main` has built starts warm;
+- the release job: 25 minutes. It moves about 250 MB of desktop symbol archives.
 
 Use Actions job timings to plan the tag and approval runs separately.
 

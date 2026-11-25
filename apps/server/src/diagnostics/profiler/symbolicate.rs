@@ -428,7 +428,19 @@ pub fn fetch_release_symbols(
     cache: &Path,
 ) -> Result<PathBuf, SymbolicateError> {
     let (stem, url) = release_asset(family, version, platform, arch)?;
-    let store = cache.join(&stem);
+    fetch_release_symbols_with(&stem, cache, |archive| {
+        block_on(download(&url, archive, MAX_DOWNLOAD_BYTES))
+            .map_err(SymbolicateError::Runtime)
+            .and_then(|downloaded| downloaded)
+    })
+}
+
+fn fetch_release_symbols_with(
+    stem: &str,
+    cache: &Path,
+    fetch: impl FnOnce(&Path) -> Result<(), SymbolicateError>,
+) -> Result<PathBuf, SymbolicateError> {
+    let store = cache.join(stem);
     if store.is_dir() {
         return Ok(store);
     }
@@ -438,9 +450,7 @@ pub fn fetch_release_symbols(
     let unique = uuid::Uuid::new_v4();
     let archive = cache.join(format!(".{stem}-{unique}.zip"));
     let unpacked = cache.join(format!(".{stem}-{unique}"));
-    let fetched = block_on(download(&url, &archive, MAX_DOWNLOAD_BYTES))
-        .map_err(SymbolicateError::Runtime)
-        .and_then(|downloaded| downloaded)
+    let fetched = fetch(&archive)
         .and_then(|()| unpack(&archive, &unpacked, MAX_UNPACKED_BYTES))
         .and_then(|()| fs::rename(&unpacked, &store).map_err(at(&store)));
     let _ = fs::remove_file(&archive);
@@ -455,16 +465,25 @@ pub fn fetch_release_symbols(
 }
 
 async fn download(url: &str, to: &Path, max_bytes: u64) -> Result<(), SymbolicateError> {
-    let failed = |error: reqwest::Error| SymbolicateError::Download(error.to_string());
-    let too_large =
-        || SymbolicateError::Download(format!("{url} is larger than {} MiB", max_bytes >> 20));
     let client = reqwest::Client::builder()
         .https_only(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .user_agent(concat!("bibcode/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(failed)?;
+        .map_err(|error| SymbolicateError::Download(error.to_string()))?;
+    download_with_client(&client, url, to, max_bytes).await
+}
+
+async fn download_with_client(
+    client: &reqwest::Client,
+    url: &str,
+    to: &Path,
+    max_bytes: u64,
+) -> Result<(), SymbolicateError> {
+    let failed = |error: reqwest::Error| SymbolicateError::Download(error.to_string());
+    let too_large =
+        || SymbolicateError::Download(format!("{url} is larger than {} MiB", max_bytes >> 20));
     let response = client.get(url).send().await.map_err(failed)?;
     // A release from before symbols were published, or a build that was never released.
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -961,5 +980,136 @@ mod tests {
         let error = symbolicate_dump(&dump, &[]).unwrap_err();
 
         assert!(matches!(error, SymbolicateError::Minidump(_)), "{error}");
+    }
+
+    #[test]
+    fn desktop_only_release_symbols_download_cleanly_while_missing_server_symbols_return_404_error()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let desktop_sym = SYM.replace(
+            "linux x86_64 ABC123 bibcode",
+            "linux x86_64 ABC123 bibcode-desktop",
+        );
+        let desktop_zip = zip_of(&[
+            ("bibcode-desktop/ABC123/", ""),
+            ("bibcode-desktop/ABC123/bibcode-desktop.sym", &desktop_sym),
+        ]);
+        let (server_stem, server_release_url) =
+            release_asset(SymbolFamily::Server, "0.1.0", "linux", "x86_64").unwrap();
+        let (desktop_stem, desktop_release_url) =
+            release_asset(SymbolFamily::Desktop, "0.1.0", "linux", "x86_64").unwrap();
+        let release_prefix = format!("https://github.com/{RELEASE_REPOSITORY}/releases/download/");
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        accepted = listener.accept() => {
+                            let Ok((mut stream, _)) = accepted else { break; };
+                            let mut request = vec![0_u8; 4096];
+                            let read = stream.read(&mut request).await.unwrap();
+                            let first_line = String::from_utf8_lossy(&request[..read])
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .to_owned();
+                            if first_line.starts_with(
+                                "GET /v0.1.0/bibcode-desktop-symbols-0.1.0-linux-x86_64.zip ",
+                            ) {
+                                let header = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    desktop_zip.len()
+                                );
+                                stream.write_all(header.as_bytes()).await.unwrap();
+                                stream.write_all(&desktop_zip).await.unwrap();
+                            } else {
+                                let body = b"Not Found";
+                                let header = format!(
+                                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                stream.write_all(header.as_bytes()).await.unwrap();
+                                stream.write_all(body).await.unwrap();
+                            }
+                            let _ = stream.shutdown().await;
+                        }
+                    }
+                }
+            });
+        });
+        let addr = addr_rx.recv().unwrap();
+
+        let client = reqwest::Client::new();
+        let local_server_url =
+            server_release_url.replace(&release_prefix, &format!("http://{addr}/"));
+        let local_desktop_url =
+            desktop_release_url.replace(&release_prefix, &format!("http://{addr}/"));
+        let cache = tempfile::tempdir().unwrap();
+
+        // Production download remains strictly HTTPS-only.
+        let https_error = block_on(download(
+            &local_desktop_url,
+            &cache.path().join("blocked.zip"),
+            MAX_DOWNLOAD_BYTES,
+        ))
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(https_error, SymbolicateError::Download(_)),
+            "{https_error}"
+        );
+
+        let server_error = fetch_release_symbols_with(&server_stem, cache.path(), |archive| {
+            block_on(download_with_client(
+                &client,
+                &local_server_url,
+                archive,
+                MAX_DOWNLOAD_BYTES,
+            ))
+            .map_err(SymbolicateError::Runtime)
+            .and_then(|downloaded| downloaded)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&server_error, SymbolicateError::Download(msg) if msg.contains("the release publishes no symbols")),
+            "{server_error}"
+        );
+        assert!(!cache.path().join(&server_stem).exists());
+        assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+
+        let store = fetch_release_symbols_with(&desktop_stem, cache.path(), |archive| {
+            block_on(download_with_client(
+                &client,
+                &local_desktop_url,
+                archive,
+                MAX_DOWNLOAD_BYTES,
+            ))
+            .map_err(SymbolicateError::Runtime)
+            .and_then(|downloaded| downloaded)
+        })
+        .unwrap();
+        assert_eq!(store, cache.path().join(&desktop_stem));
+        assert!(
+            store
+                .join("bibcode-desktop/ABC123/bibcode-desktop.sym")
+                .is_file()
+        );
+
+        let event = json!({ "frames": [frame("bibcode-desktop", Some("ABC123"), 0x1010)] });
+        let named = symbolicate_panic(&event, &[store]);
+        assert_eq!(named["frames"][0]["function"], "my_fn");
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
     }
 }

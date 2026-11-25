@@ -170,9 +170,10 @@ there and re-pair if its port changed. A restart on the old version is reported
 explicitly. The host displays who requested the update; **Manage devices** opens
 its sharing controls.
 
-Headless and externally managed hosts use **Show update steps** and **Copy**.
-Steps match their archive/package, OS, architecture, or SSH launch. Run them on
-that host; verify an SSH pid still belongs to that server before stopping it.
+Headless and externally managed hosts use **Show update steps** and **Copy**,
+showing generic manual-update instructions (or SSH reconnect steps when started
+over SSH). Run them on that host; verify an SSH pid still belongs to that
+server before stopping it.
 The browser page offers **Reload** when its own server was updated by another
 client. It preserves your unsent text until you choose Reload.
 
@@ -184,10 +185,11 @@ startup URL in a browser by default; `serve` does not. Only headless web-mode
 no usable hostname is reported. `start` (including `start --no-browser`), bare
 `bibcode`, and the desktop app's own backend keep the name "Local".
 
-Download the signed-release checksum set and the native archive or Linux package for
-your host by following [Standalone server installation](./server-installation.md).
-Published server distributions contain the matching built web client and discover it
-automatically.
+GitHub Releases publish desktop installers only. Build a standalone server
+binary or local distribution by following
+[Standalone server installation](./server-installation.md); locally built
+distributions (`vp run dist:server:*`) contain the matching built web client and
+discover it automatically.
 
 For example, bind to a trusted Tailnet address and serve built web assets:
 
@@ -322,7 +324,8 @@ loopback, and create a local port forward. The remote host must provide:
 - each provider CLI and its credentials.
 
 The launcher does not install Node.js, npm, npx, package-manager shims, or a
-BiBCode binary on the remote host. Install a matching standalone server release first.
+BiBCode binary on the remote host. Build and install a matching `bibcode` binary
+first (see [Standalone server installation](./server-installation.md)).
 
 Adding the environment pairs this desktop with the remote server over SSH. The
 desktop then appears as a device with standard access on the host's **Share**
