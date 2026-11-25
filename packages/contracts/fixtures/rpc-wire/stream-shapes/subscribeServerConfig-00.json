@@ -115,7 +115,7 @@
               "customModels": []
             },
             "antigravity": {
-              "enabled": false,
+              "enabled": true,
               "binaryPath": "agy",
               "customModels": []
             }

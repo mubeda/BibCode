@@ -102,7 +102,7 @@ describe("applyProviderInstanceSettings", () => {
       provider({ provider: ProviderDriverKind.make("antigravity"), instanceId: "antigravity" }),
       provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex-work" }),
     ]);
-    const [antigravity, codex] = applyProviderInstanceSettings(entries, {
+    const [antigravityDefault, codexDefault] = applyProviderInstanceSettings(entries, {
       providerInstances: {
         [ProviderInstanceId.make("antigravity")]: {
           driver: ProviderDriverKind.make("antigravity"),
@@ -112,8 +112,29 @@ describe("applyProviderInstanceSettings", () => {
       providers: { codex: { enabled: false } } as never,
     });
 
-    expect(antigravity?.enabled).toBe(false);
-    expect(codex?.enabled).toBe(true);
+    expect(antigravityDefault?.enabled).toBe(true);
+    expect(codexDefault?.enabled).toBe(true);
+
+    const [antigravityLegacyDisabled] = applyProviderInstanceSettings(entries, {
+      providerInstances: {
+        [ProviderInstanceId.make("antigravity")]: {
+          driver: ProviderDriverKind.make("antigravity"),
+        },
+      },
+      providers: { antigravity: { enabled: false } } as never,
+    });
+    expect(antigravityLegacyDisabled?.enabled).toBe(false);
+
+    const [antigravityInstanceDisabled] = applyProviderInstanceSettings(entries, {
+      providerInstances: {
+        [ProviderInstanceId.make("antigravity")]: {
+          driver: ProviderDriverKind.make("antigravity"),
+          enabled: false,
+        },
+      },
+      providers: { antigravity: { enabled: true } } as never,
+    });
+    expect(antigravityInstanceDisabled?.enabled).toBe(false);
   });
 
   it("uses settings when a streamed snapshot still reports a disabled default as enabled", () => {

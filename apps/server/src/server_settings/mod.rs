@@ -18,12 +18,12 @@ pub(crate) fn built_in_provider_defaults() -> Value {
         "cursor": { "enabled": true, "binaryPath": "cursor-agent", "apiEndpoint": "", "customModels": [] },
         "grok": { "enabled": false, "binaryPath": "grok", "customModels": [] },
         "opencode": { "enabled": true, "binaryPath": "opencode", "serverUrl": "", "serverPassword": "", "customModels": [] },
-        "antigravity": { "enabled": false, "binaryPath": "agy", "customModels": [] },
+        "antigravity": { "enabled": true, "binaryPath": "agy", "customModels": [] },
     })
 }
 
 /// Whether provider instance `instance_id` is on, read from a settings document: the instance's
-/// own `enabled`, else its driver's legacy `providers.<driver>.enabled`. For Antigravity (off by
+/// own `enabled`, else its driver's legacy `providers.<driver>.enabled`. For Antigravity (on by
 /// default) that falls back to its built-in default, a missing instance being off, and it is the
 /// one rule for the inventory, usage, chat and terminal launches. Every other driver keeps the
 /// inventory's earlier reading (on when neither says), and its typed decode is left as it was.
@@ -715,7 +715,7 @@ mod tests {
         ("cursor", true, "cursor-agent"),
         ("grok", false, "grok"),
         ("opencode", true, "opencode"),
-        ("antigravity", false, "agy"),
+        ("antigravity", true, "agy"),
     ];
 
     #[tokio::test]
@@ -830,11 +830,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn antigravity_enable_patch_persists_with_the_agy_binary() {
+    async fn antigravity_disable_and_enable_patches_persist_with_the_agy_binary() {
         let temp = tempfile::tempdir().expect("settings root");
         let store = ProviderSettingsStore::new(temp.path());
         assert!(
-            !store
+            store
                 .get()
                 .await
                 .expect("defaults")
@@ -842,6 +842,27 @@ mod tests {
                 .antigravity
                 .enabled
         );
+        store
+            .update(ServerSettingsPatch {
+                providers: Some(ProvidersPatch {
+                    antigravity: Some(ProviderSettingsPatch {
+                        enabled: Some(false),
+                        ..ProviderSettingsPatch::default()
+                    }),
+                    ..ProvidersPatch::default()
+                }),
+                ..ServerSettingsPatch::default()
+            })
+            .await
+            .expect("disable Antigravity");
+
+        let disabled = store
+            .get()
+            .await
+            .expect("reload disabled Antigravity settings");
+        assert!(!disabled.providers.antigravity.enabled);
+        assert_eq!(disabled.providers.antigravity.binary_path, "agy");
+
         store
             .update(ServerSettingsPatch {
                 providers: Some(ProvidersPatch {
@@ -859,6 +880,77 @@ mod tests {
         let reloaded = store.get().await.expect("reload Antigravity settings");
         assert!(reloaded.providers.antigravity.enabled);
         assert_eq!(reloaded.providers.antigravity.binary_path, "agy");
+    }
+
+    #[tokio::test]
+    async fn antigravity_instance_and_partial_legacy_settings_default_enabled_and_preserve_explicit_false()
+     {
+        let temp = tempfile::tempdir().expect("settings root");
+        let store = ProviderSettingsStore::new(temp.path());
+
+        fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "providers": {
+                    "antigravity": {
+                        "binaryPath": "custom-agy",
+                        "customModels": ["gemini-pro"],
+                        "unknownExtraKey": "preserved"
+                    }
+                },
+                "providerInstances": {
+                    "antigravity": {
+                        "driver": "antigravity",
+                        "config": { "binaryPath": "custom-agy" }
+                    }
+                }
+            }))
+            .expect("partial Antigravity JSON"),
+        )
+        .await
+        .expect("write partial Antigravity settings");
+
+        let partial = store
+            .get()
+            .await
+            .expect("load partial Antigravity settings");
+        assert!(partial.providers.antigravity.enabled);
+        assert_eq!(partial.providers.antigravity.binary_path, "custom-agy");
+        assert!(partial.provider_instances["antigravity"].enabled);
+        let document = store
+            .get_document()
+            .await
+            .expect("load partial Antigravity document");
+        assert_eq!(
+            document["providers"]["antigravity"]["customModels"],
+            serde_json::json!(["gemini-pro"])
+        );
+        assert_eq!(
+            document["providers"]["antigravity"]["unknownExtraKey"],
+            "preserved"
+        );
+
+        fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "providers": { "antigravity": { "enabled": false } },
+                "providerInstances": {
+                    "antigravity": { "driver": "antigravity" },
+                    "antigravity_explicit": { "driver": "antigravity", "enabled": false }
+                }
+            }))
+            .expect("disabled Antigravity JSON"),
+        )
+        .await
+        .expect("write disabled Antigravity settings");
+
+        let disabled = store
+            .get()
+            .await
+            .expect("load disabled Antigravity settings");
+        assert!(!disabled.providers.antigravity.enabled);
+        assert!(!disabled.provider_instances["antigravity"].enabled);
+        assert!(!disabled.provider_instances["antigravity_explicit"].enabled);
     }
 
     #[test]

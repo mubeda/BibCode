@@ -414,7 +414,7 @@ fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
             instance_id: driver.to_owned(),
             driver: driver.to_owned(),
             display_name: None,
-            // Raw settings carry no defaults; Antigravity must stay off until enabled.
+            // Raw settings carry no defaults; built-in drivers default on until turned off.
             enabled: provider_is_enabled(
                 driver,
                 crate::server_settings::provider_instance_enabled(settings, driver),
@@ -4085,10 +4085,10 @@ done
         assert_eq!(explicit_cursor.binary_path, "cursor-agent");
     }
 
-    /// An instance saved without `enabled` is off for the inventory, a chat launch and a
-    /// terminal launch alike when the legacy entry is off or absent (Antigravity's default).
+    /// An instance saved without `enabled` follows its legacy entry, then Antigravity's built-in
+    /// default (`enabled: true`) for inventory, chat launch, and terminal launch alike.
     #[tokio::test]
-    async fn an_antigravity_instance_without_enabled_is_off_for_every_launch() {
+    async fn an_antigravity_instance_without_enabled_follows_legacy_then_default() {
         let sandbox = crate::test_support::TestSandbox::new("antigravity-enabled-rule");
         let binary = sandbox.executable_script("agy", "exit 0", "");
         let instance = json!({
@@ -4097,38 +4097,59 @@ done
         });
         let root = sandbox.path("settings");
         std::fs::create_dir_all(&root).expect("settings root");
-        for document in [
-            json!({
-                "providers": { "antigravity": { "enabled": false } },
-                "providerInstances": { "antigravity": instance.clone() }
-            }),
-            json!({ "providerInstances": { "antigravity": instance.clone() } }),
-        ] {
-            std::fs::write(root.join("settings.json"), document.to_string()).expect("settings");
-            let inventory = definitions(&document);
-            let listed = inventory
-                .iter()
-                .find(|definition| definition.instance_id == "antigravity")
-                .expect("the instance");
-            assert!(!listed.enabled, "inventory: {document}");
-            let chat = super::super::provider_runtime::resolve_provider_route_settings(
-                &root,
-                "antigravity",
-                None,
-            )
-            .await;
-            assert!(chat.is_err(), "chat launch: {document}");
-            let typed = crate::server_settings::ProviderSettingsStore::new(&root)
-                .get()
-                .await
-                .expect("typed settings");
-            let terminal =
-                crate::provider_terminal::ProviderTerminalInventory::from_settings(&typed);
-            assert!(
-                !terminal.get("antigravity").expect("terminal entry").enabled,
-                "terminal launch: {document}"
-            );
-        }
+
+        let legacy_disabled = json!({
+            "providers": { "antigravity": { "enabled": false } },
+            "providerInstances": { "antigravity": instance.clone() }
+        });
+        std::fs::write(root.join("settings.json"), legacy_disabled.to_string()).expect("settings");
+        let inventory = definitions(&legacy_disabled);
+        let listed = inventory
+            .iter()
+            .find(|definition| definition.instance_id == "antigravity")
+            .expect("the instance");
+        assert!(!listed.enabled, "inventory: {legacy_disabled}");
+        let chat = super::super::provider_runtime::resolve_provider_route_settings(
+            &root,
+            "antigravity",
+            None,
+        )
+        .await;
+        assert!(chat.is_err(), "chat launch: {legacy_disabled}");
+        let typed = crate::server_settings::ProviderSettingsStore::new(&root)
+            .get()
+            .await
+            .expect("typed settings");
+        let terminal = crate::provider_terminal::ProviderTerminalInventory::from_settings(&typed);
+        assert!(
+            !terminal.get("antigravity").expect("terminal entry").enabled,
+            "terminal launch: {legacy_disabled}"
+        );
+
+        let omitted_enabled = json!({ "providerInstances": { "antigravity": instance } });
+        std::fs::write(root.join("settings.json"), omitted_enabled.to_string()).expect("settings");
+        let inventory = definitions(&omitted_enabled);
+        let listed = inventory
+            .iter()
+            .find(|definition| definition.instance_id == "antigravity")
+            .expect("the instance");
+        assert!(listed.enabled, "inventory: {omitted_enabled}");
+        let chat = super::super::provider_runtime::resolve_provider_route_settings(
+            &root,
+            "antigravity",
+            None,
+        )
+        .await;
+        assert!(chat.is_ok(), "chat launch: {omitted_enabled}");
+        let typed = crate::server_settings::ProviderSettingsStore::new(&root)
+            .get()
+            .await
+            .expect("typed settings");
+        let terminal = crate::provider_terminal::ProviderTerminalInventory::from_settings(&typed);
+        assert!(
+            terminal.get("antigravity").expect("terminal entry").enabled,
+            "terminal launch: {omitted_enabled}"
+        );
     }
 
     /// Other drivers read a missing instance `enabled` exactly as before: the inventory falls
@@ -4170,16 +4191,25 @@ done
     }
 
     #[test]
-    fn fresh_antigravity_inventory_is_disabled_and_runs_agy_not_its_slug() {
+    fn fresh_antigravity_inventory_is_enabled_and_runs_agy_not_its_slug() {
         let fresh = definitions(&json!({}));
         let antigravity = fresh
             .iter()
             .find(|definition| definition.instance_id == "antigravity")
             .expect("built-in Antigravity definition");
-        assert!(!antigravity.enabled);
+        assert!(antigravity.enabled);
         assert!(antigravity.available);
         assert_eq!(antigravity.binary_path, "agy");
         assert_eq!(default_provider_binary("antigravity"), "agy");
+
+        let explicit_disabled = definitions(&json!({
+            "providers": { "antigravity": { "enabled": false } }
+        }));
+        let explicit_disabled = explicit_disabled
+            .iter()
+            .find(|definition| definition.instance_id == "antigravity")
+            .expect("disabled Antigravity definition");
+        assert!(!explicit_disabled.enabled);
 
         let custom = definitions(&json!({
             "providerInstances": {

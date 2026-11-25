@@ -139,10 +139,10 @@ export function applyProviderInstanceSettings(
   return entries.map((entry) => {
     const explicitInstance = settings.providerInstances?.[entry.instanceId];
     const enabled = explicitInstance
-      ? // Antigravity is off by default: the server falls back to its legacy entry, then off.
+      ? // Antigravity falls back to its legacy entry, then on; other drivers without enabled default on.
         (explicitInstance.enabled ??
         (entry.driverKind === "antigravity"
-          ? (legacyProviders[entry.driverKind]?.enabled ?? false)
+          ? (legacyProviders[entry.driverKind]?.enabled ?? true)
           : true))
       : entry.isDefault
         ? (legacyProviders[entry.driverKind]?.enabled ?? entry.enabled)

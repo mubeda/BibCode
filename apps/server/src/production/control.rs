@@ -6249,12 +6249,45 @@ done
     }
 
     #[test]
-    fn native_settings_default_antigravity_to_disabled_with_the_agy_binary() {
+    fn native_settings_default_antigravity_to_enabled_with_the_agy_binary() {
         let mut settings = json!({});
         apply_settings_defaults(&mut settings);
 
-        assert_eq!(settings["providers"]["antigravity"]["enabled"], false);
+        assert_eq!(settings["providers"]["antigravity"]["enabled"], true);
         assert_eq!(settings["providers"]["antigravity"]["binaryPath"], "agy");
+
+        let mut persisted_disabled = json!({
+            "providers": { "antigravity": { "enabled": false } }
+        });
+        apply_settings_defaults(&mut persisted_disabled);
+        assert_eq!(
+            persisted_disabled["providers"]["antigravity"]["enabled"],
+            false
+        );
+
+        let mut partial_legacy = json!({
+            "providers": {
+                "antigravity": {
+                    "binaryPath": "custom-agy",
+                    "customModels": ["gemini-pro"],
+                    "extraUnknownKey": 42
+                }
+            }
+        });
+        apply_settings_defaults(&mut partial_legacy);
+        assert_eq!(partial_legacy["providers"]["antigravity"]["enabled"], true);
+        assert_eq!(
+            partial_legacy["providers"]["antigravity"]["binaryPath"],
+            "custom-agy"
+        );
+        assert_eq!(
+            partial_legacy["providers"]["antigravity"]["customModels"],
+            json!(["gemini-pro"])
+        );
+        assert_eq!(
+            partial_legacy["providers"]["antigravity"]["extraUnknownKey"],
+            42
+        );
     }
 
     #[test]
