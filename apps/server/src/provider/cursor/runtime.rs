@@ -87,6 +87,7 @@ pub struct CursorSessionOptions {
     pub model: String,
     pub resume_session_id: Option<String>,
     pub mcp_servers: Vec<Value>,
+    pub code_review: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -231,6 +232,7 @@ struct RuntimeInner {
     mode_state: Mutex<Option<Value>>,
     runtime_mode: Mutex<String>,
     interaction_mode: Mutex<String>,
+    code_review: bool,
     active_turn_id: Mutex<Option<String>>,
     /// Turns announced with `turn.started` whose `turn.completed` is not emitted yet, each with
     /// whether the user stopped it. Every path that ends a turn claims it here first, so a turn
@@ -298,6 +300,7 @@ impl CursorSessionRuntime {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let runtime_mode = options.runtime_mode.clone();
         let interaction_mode = options.interaction_mode.clone();
+        let code_review = options.code_review;
         let inner = Arc::new(RuntimeInner {
             options,
             connection: Mutex::new(connection.clone()),
@@ -310,6 +313,7 @@ impl CursorSessionRuntime {
             mode_state: Mutex::new(None),
             runtime_mode: Mutex::new(runtime_mode),
             interaction_mode: Mutex::new(interaction_mode),
+            code_review,
             active_turn_id: Mutex::new(None),
             unsettled_turns: std::sync::Mutex::new(HashMap::new()),
             events_tx,
@@ -1556,6 +1560,17 @@ impl CursorSessionRuntime {
         }
     }
 
+    async fn should_auto_decline_code_review(&self) -> bool {
+        if !self.inner.code_review {
+            return false;
+        }
+        let is_full_access = self.inner.runtime_mode.lock().await.as_str() == "full-access";
+        if !is_full_access {
+            return false;
+        }
+        self.inner.interaction_mode.lock().await.as_str() != "plan"
+    }
+
     async fn handle_request(
         &self,
         connection: AcpJsonRpcConnection,
@@ -1567,6 +1582,12 @@ impl CursorSessionRuntime {
     ) -> Result<(), CursorRuntimeError> {
         match method.as_str() {
             "cursor/ask_question" => {
+                if self.should_auto_decline_code_review().await {
+                    connection
+                        .respond(wire_id, json!({ "outcome": "cancelled" }))
+                        .await?;
+                    return Ok(());
+                }
                 let request_id = request_scope.user_input_id(&correlation_id);
                 let turn_id = self.inner.active_turn_id.lock().await.clone();
                 let questions = params
@@ -1667,6 +1688,12 @@ impl CursorSessionRuntime {
                         .await?;
                     return Ok(());
                 }
+                if self.should_auto_decline_code_review().await {
+                    connection
+                        .respond(wire_id, json!({ "outcome": { "outcome": "cancelled" } }))
+                        .await?;
+                    return Ok(());
+                }
                 self.inner.pending_requests.lock().await.insert(
                     request_id.clone(),
                     PendingRequest {
@@ -1697,6 +1724,12 @@ impl CursorSessionRuntime {
                 Ok(())
             }
             "_x.ai/ask_user_question" | "x.ai/ask_user_question" => {
+                if self.should_auto_decline_code_review().await {
+                    connection
+                        .respond(wire_id, json!({ "outcome": "cancelled" }))
+                        .await?;
+                    return Ok(());
+                }
                 let request_id = request_scope.user_input_id(&correlation_id);
                 let turn_id = self.inner.active_turn_id.lock().await.clone();
                 let questions = params
@@ -1883,6 +1916,7 @@ mod tests {
                 model: model.to_owned(),
                 resume_session_id: None,
                 mcp_servers: Vec::new(),
+                code_review: false,
             },
             connection,
             incoming,
@@ -3479,5 +3513,275 @@ mod tests {
             "Unknown error while loading session"
         ));
         assert!(!session_load_is_permanently_gone("model not found"));
+    }
+
+    fn review_runtime(
+        code_review: bool,
+        runtime_mode: &str,
+        interaction_mode: &str,
+    ) -> (
+        CursorSessionRuntime,
+        Lines<BufReader<DuplexStream>>,
+        DuplexStream,
+    ) {
+        let (stdout, stdout_peer) = duplex(8192);
+        let (stdin_peer, stdin) = duplex(8192);
+        let (stderr, _stderr_peer) = duplex(4096);
+        let (connection, incoming) =
+            AcpJsonRpcConnection::spawn(stdout, stdin, stderr, AcpConnectionConfig::default());
+        let runtime = CursorSessionRuntime::new(
+            CursorSessionOptions {
+                thread_id: "cursor-review-thread".to_owned(),
+                cwd: "/workspace".to_owned(),
+                runtime_mode: runtime_mode.to_owned(),
+                interaction_mode: interaction_mode.to_owned(),
+                model: "default".to_owned(),
+                resume_session_id: None,
+                mcp_servers: Vec::new(),
+                code_review,
+            },
+            connection,
+            incoming,
+        );
+        (runtime, BufReader::new(stdin_peer).lines(), stdout_peer)
+    }
+
+    async fn send_incoming_request(
+        runtime: &CursorSessionRuntime,
+        wire_id: u64,
+        method: &str,
+        params: Value,
+    ) {
+        let connection = runtime.inner.connection.lock().await.clone();
+        runtime
+            .handle_request(
+                connection,
+                RequestScope::new(),
+                format!("corr-{wire_id}"),
+                json!(wire_id),
+                method.to_owned(),
+                params,
+            )
+            .await
+            .expect("handle_request");
+    }
+
+    async fn read_peer_response(requests: &mut Lines<BufReader<DuplexStream>>) -> Value {
+        let line = timeout(Duration::from_secs(2), requests.next_line())
+            .await
+            .expect("peer response timeout")
+            .expect("peer response line")
+            .expect("non-empty line");
+        serde_json::from_str(&line).expect("json response")
+    }
+
+    async fn assert_no_pending_event(runtime: &CursorSessionRuntime) {
+        let mut events = runtime.inner.events_rx.lock().await;
+        assert!(
+            timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "expected no emitted event"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_review_auto_mode_cancels_stray_permissions_and_all_question_methods() {
+        let (runtime, mut requests, _stdout_peer) = review_runtime(true, "full-access", "default");
+
+        // Allow option still auto-approves as in full-access.
+        send_incoming_request(
+            &runtime,
+            1,
+            "session/request_permission",
+            json!({
+                "toolCall": { "title": "Read file" },
+                "options": [
+                    { "optionId": "allow-once", "kind": "allow_once" },
+                    { "optionId": "reject-once", "kind": "reject_once" }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            read_peer_response(&mut requests).await,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "outcome": { "outcome": "selected", "optionId": "allow-once" } }
+            })
+        );
+        assert_no_pending_event(&runtime).await;
+
+        // Empty and reject-only permission asks cancel immediately without opening a card.
+        for (wire_id, options) in [
+            (2, json!([])),
+            (
+                3,
+                json!([{ "optionId": "reject-once", "kind": "reject_once" }]),
+            ),
+        ] {
+            send_incoming_request(
+                &runtime,
+                wire_id,
+                "session/request_permission",
+                json!({ "toolCall": { "title": "Blocked" }, "options": options }),
+            )
+            .await;
+            assert_eq!(
+                read_peer_response(&mut requests).await,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": wire_id,
+                    "result": { "outcome": { "outcome": "cancelled" } }
+                })
+            );
+            assert_no_pending_event(&runtime).await;
+        }
+
+        // All three interactive question methods cancel immediately without opening a card.
+        for (wire_id, method) in [
+            (4, "cursor/ask_question"),
+            (5, "_x.ai/ask_user_question"),
+            (6, "x.ai/ask_user_question"),
+        ] {
+            send_incoming_request(
+                &runtime,
+                wire_id,
+                method,
+                json!({ "questions": [{ "id": "q1", "prompt": "Proceed?" }] }),
+            )
+            .await;
+            assert_eq!(
+                read_peer_response(&mut requests).await,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": wire_id,
+                    "result": { "outcome": "cancelled" }
+                })
+            );
+            assert_no_pending_event(&runtime).await;
+        }
+        assert!(runtime.inner.pending_requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn code_review_non_auto_modes_and_ordinary_chats_open_normal_pending_cards() {
+        // Non-review chat in full-access + default still opens cards for questions and
+        // un-approvable permissions.
+        let (ordinary, mut ordinary_requests, _stdout_peer) =
+            review_runtime(false, "full-access", "default");
+        send_incoming_request(
+            &ordinary,
+            10,
+            "session/request_permission",
+            json!({ "toolCall": { "title": "No allow" }, "options": [] }),
+        )
+        .await;
+        assert!(
+            timeout(Duration::from_millis(50), ordinary_requests.next_line())
+                .await
+                .is_err(),
+            "non-review must not auto-reply on empty options"
+        );
+        assert_eq!(
+            ordinary
+                .inner
+                .events_rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .expect("event")
+                .event_type,
+            "request.opened"
+        );
+        send_incoming_request(
+            &ordinary,
+            11,
+            "cursor/ask_question",
+            json!({ "questions": [{ "id": "q1", "prompt": "Proceed?" }] }),
+        )
+        .await;
+        assert_eq!(
+            ordinary
+                .inner
+                .events_rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .expect("event")
+                .event_type,
+            "user-input.requested"
+        );
+
+        // Code review switched to Supervised or Plan restores normal cards.
+        let (review, mut review_requests, _stdout_peer) =
+            review_runtime(true, "full-access", "default");
+        review
+            .set_runtime_mode("approval-required")
+            .await
+            .expect("switch to supervised");
+        send_incoming_request(
+            &review,
+            12,
+            "x.ai/ask_user_question",
+            json!({ "questions": [{ "question": "Proceed?" }] }),
+        )
+        .await;
+        assert!(
+            timeout(Duration::from_millis(50), review_requests.next_line())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            review
+                .inner
+                .events_rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .expect("event")
+                .event_type,
+            "user-input.requested"
+        );
+
+        review
+            .set_runtime_mode("full-access")
+            .await
+            .expect("switch to full-access");
+        review
+            .set_interaction_mode("plan")
+            .await
+            .expect("switch to plan");
+        send_incoming_request(
+            &review,
+            13,
+            "session/request_permission",
+            json!({
+                "toolCall": { "title": "Reject only" },
+                "options": [{ "optionId": "reject-once", "kind": "reject_once" }]
+            }),
+        )
+        .await;
+        assert!(
+            timeout(Duration::from_millis(50), review_requests.next_line())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            review
+                .inner
+                .events_rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .expect("event")
+                .event_type,
+            "request.opened"
+        );
     }
 }

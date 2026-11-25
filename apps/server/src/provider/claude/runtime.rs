@@ -1681,6 +1681,7 @@ pub struct ClaudeProviderRuntime {
     /// it started by itself with no replay (Claude Code 2.1.326). Each text by the turn and item
     /// it was stored under, oldest first; its `result` ends them all.
     texts_outside_turn: Vec<(Option<String>, Option<String>)>,
+    auto_decline_code_review: bool,
 }
 
 /// A copy whose first `system/init` names a session ID BiBCode did not assign: Claude would
@@ -1738,6 +1739,7 @@ impl ClaudeProviderRuntime {
             pending_turn_started: None,
             turn_produced_output: false,
             texts_outside_turn: Vec::new(),
+            auto_decline_code_review: false,
         }
     }
 
@@ -1808,6 +1810,10 @@ impl ClaudeProviderRuntime {
             self.activity_not_before_unix_nanos = current_unix_nanos();
             self.correlated_activity_enabled = false;
         }
+    }
+
+    pub(crate) fn set_auto_decline_code_review(&mut self, enabled: bool) {
+        self.auto_decline_code_review = enabled;
     }
 
     pub(crate) fn set_targeted_activity_control_supported(&mut self, supported: bool) {
@@ -2626,6 +2632,12 @@ impl ClaudeProviderRuntime {
                         request_id,
                         &json!({ "behavior": "deny", "message": EXIT_PLAN_MODE_DENIAL }),
                     )),
+                    _ if self.auto_decline_code_review => {
+                        output.control_responses.push(control_response(
+                            request_id,
+                            &json!({ "behavior": "deny", "message": CODE_REVIEW_DENIAL }),
+                        ))
+                    }
                     "AskUserQuestion" => {
                         output.events = self.open_user_input_request(
                             UserInputRequestInput {
@@ -3780,6 +3792,11 @@ fn claude_hook_native_event_id(value: &Value) -> Option<String> {
 /// What Claude is told when it asks to leave plan mode. Without a host, Claude Code has no
 /// `ExitPlanMode` tool at all and the turn ends with the plan as text. This keeps that outcome.
 const EXIT_PLAN_MODE_DENIAL: &str = "The plan is shown to the user in BiBCode, who reviews it there. Do not carry out the plan. End your turn now and wait for the user's decision.";
+
+/// What Claude is told when a stray approval or interactive question fires in an auto-mode
+/// code review panel.
+const CODE_REVIEW_DENIAL: &str =
+    "Code review runs unattended without prompts or edits. Continue without asking or editing.";
 
 /// The `control_response` frame that answers Claude's request `request_id`.
 #[must_use]
@@ -7534,6 +7551,153 @@ mod tool_result_tests {
         let events = tool_result_events(screenshot);
         let preview = json!(format!("before\nafter{TOOL_RESULT_TRUNCATED_NOTE}"));
         assert_eq!(stored_contents(&events), [&preview, &preview]);
+    }
+}
+
+#[cfg(test)]
+mod code_review_auto_decline_tests {
+    use super::*;
+
+    fn can_use_tool_request(request_id: &str, tool_name: &str, tool_use_id: &str) -> Value {
+        json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": tool_name,
+                "tool_use_id": tool_use_id,
+                "input": match tool_name {
+                    "AskUserQuestion" => json!({
+                        "questions": [{
+                            "question": "Continue?",
+                            "header": "Q",
+                            "options": [{ "label": "Yes", "description": "Proceed" }]
+                        }]
+                    }),
+                    "ExitPlanMode" => json!({ "plan": "## Review findings\n\n- ok" }),
+                    _ => json!({ "command": "git status" }),
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn auto_decline_code_review_denies_stray_tool_and_question_without_pending_cards() {
+        let mut runtime =
+            ClaudeProviderRuntime::new("thread-review".to_owned(), "session".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-review".to_owned(),
+            input: "Review".to_owned(),
+        });
+        runtime.set_auto_decline_code_review(true);
+
+        let question_out = runtime.handle_raw_value(
+            &can_use_tool_request("req-question", "AskUserQuestion", "tool-q"),
+            1_000,
+        );
+        assert!(question_out.events.is_empty());
+        assert_eq!(question_out.control_responses.len(), 1);
+        assert_eq!(
+            question_out.control_responses[0]["response"]["request_id"],
+            "req-question"
+        );
+        assert_eq!(
+            question_out.control_responses[0]["response"]["response"]["behavior"],
+            "deny"
+        );
+        assert!(
+            runtime
+                .resolve_user_input_request("req-question", json!({}))
+                .is_none(),
+            "AskUserQuestion must not enter pending_user_inputs while auto-declining code reviews"
+        );
+
+        let tool_out =
+            runtime.handle_raw_value(&can_use_tool_request("req-bash", "Bash", "tool-b"), 1_001);
+        assert!(tool_out.events.is_empty());
+        assert_eq!(tool_out.control_responses.len(), 1);
+        assert_eq!(
+            tool_out.control_responses[0]["response"]["request_id"],
+            "req-bash"
+        );
+        assert_eq!(
+            tool_out.control_responses[0]["response"]["response"]["behavior"],
+            "deny"
+        );
+        assert_ne!(
+            tool_out.control_responses[0]["response"]["response"]["message"],
+            EXIT_PLAN_MODE_DENIAL
+        );
+        assert!(
+            runtime
+                .resolve_permission_request("req-bash", Decision::Accept)
+                .is_none(),
+            "Bash must not enter pending_approvals while auto-declining code reviews"
+        );
+
+        let plan_out = runtime.handle_raw_value(
+            &can_use_tool_request("req-plan", "ExitPlanMode", "tool-p"),
+            1_002,
+        );
+        assert!(plan_out.events.is_empty());
+        assert_eq!(
+            plan_out.control_responses,
+            vec![control_response(
+                "req-plan",
+                &json!({ "behavior": "deny", "message": EXIT_PLAN_MODE_DENIAL })
+            )]
+        );
+    }
+
+    #[test]
+    fn non_review_or_disabled_auto_decline_opens_normal_pending_cards() {
+        let mut runtime =
+            ClaudeProviderRuntime::new("thread-chat".to_owned(), "session".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "Help".to_owned(),
+        });
+
+        let question_out = runtime.handle_raw_value(
+            &can_use_tool_request("req-q1", "AskUserQuestion", "tool-q1"),
+            1_000,
+        );
+        assert!(question_out.control_responses.is_empty());
+        assert_eq!(
+            question_out
+                .events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["user-input.requested"]
+        );
+
+        let tool_out =
+            runtime.handle_raw_value(&can_use_tool_request("req-b1", "Bash", "tool-b1"), 1_001);
+        assert!(tool_out.control_responses.is_empty());
+        assert_eq!(
+            tool_out
+                .events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["request.opened"]
+        );
+
+        // Switching out of auto mode (e.g. to Supervised or Plan) disables auto-decline.
+        runtime.set_auto_decline_code_review(true);
+        runtime.set_auto_decline_code_review(false);
+        let after_disable =
+            runtime.handle_raw_value(&can_use_tool_request("req-b2", "Bash", "tool-b2"), 1_002);
+        assert!(after_disable.control_responses.is_empty());
+        assert_eq!(
+            after_disable
+                .events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["request.opened"]
+        );
     }
 }
 

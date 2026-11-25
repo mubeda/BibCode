@@ -291,7 +291,11 @@ waiting is refused and nothing is written to Claude. Session rules end with
 the Claude process: a new session asks again.
 
 Full access runs Claude with `bypassPermissions`, which asks for nothing except
-tools that need you, such as `AskUserQuestion`.
+tools that need you, such as `AskUserQuestion`. In a code review panel in auto
+mode (`full-access` and `default`), BiBCode auto-denies stray tool approvals
+and `AskUserQuestion` immediately without opening a card (while `ExitPlanMode`
+still denies and ends the turn as above); switching the panel to Supervised or
+Plan restores normal cards.
 
 ## Steering a running turn
 

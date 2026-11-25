@@ -223,8 +223,9 @@ pub struct ProviderLaunchRequest {
     /// The host of a side chat (#265), whose messages the side chat's first delivered turn
     /// carries. `None` for any other thread.
     pub side_chat_host_thread_id: Option<String>,
-    /// The thread is a code review panel (#376), from the thread row. Read by Codex only, which
-    /// then never asks and stays in its read-only sandbox, whatever `runtime_mode` says.
+    /// The thread is a code review panel (#376), from the thread row. Codex stays in its
+    /// read-only never-prompting sandbox whatever `runtime_mode` says; non-Codex drivers start in
+    /// `full-access` and auto-decline or cancel stray prompts while in auto mode.
     pub code_review: bool,
 }
 
@@ -17717,6 +17718,7 @@ impl CursorDriver {
                 model: request.model.unwrap_or_default(),
                 resume_session_id: request.resume_cursor.as_ref().and_then(resume_string),
                 mcp_servers: acp_mcp_servers(request.mcp.as_ref()),
+                code_review: request.code_review,
             },
             connection,
             incoming,
@@ -20411,6 +20413,7 @@ struct ClaudeDriver {
     runtime_mode: Mutex<ClaudeRuntimeMode>,
     configured_runtime_mode: Mutex<String>,
     interaction_mode: Mutex<String>,
+    code_review: bool,
     options: Vec<Value>,
     supports_fast_mode: bool,
     targeted_activity_provisionally_supported: bool,
@@ -21975,6 +21978,9 @@ impl ClaudeDriver {
         provider_runtime.set_targeted_activity_control_supported(
             targeted_activity_provisionally_supported && activity_enabled,
         );
+        provider_runtime.set_auto_decline_code_review(
+            request.code_review && mode == ClaudeRuntimeMode::FullAccess,
+        );
         if matches!(launch, ClaudeLaunch::Fork { .. }) {
             provider_runtime.expect_session_id(session_id.clone());
         }
@@ -22015,6 +22021,7 @@ impl ClaudeDriver {
             runtime_mode: Mutex::new(mode),
             configured_runtime_mode: Mutex::new(request.runtime_mode),
             interaction_mode: Mutex::new(request.interaction_mode),
+            code_review: request.code_review,
             options: request.options,
             supports_fast_mode,
             targeted_activity_provisionally_supported,
@@ -22224,6 +22231,9 @@ impl ClaudeDriver {
         let interaction_mode = self.interaction_mode.lock().await.clone();
         let mode = claude_mode(&runtime_mode, &interaction_mode);
         *self.runtime_mode.lock().await = mode;
+        self.runtime.lock().await.set_auto_decline_code_review(
+            self.code_review && mode == ClaudeRuntimeMode::FullAccess,
+        );
         let request = ClaudeControlRequest::set_permission_mode(
             self.next_sequence().await,
             mode.permission_mode(),
@@ -31286,6 +31296,7 @@ done
                 model: "test-model".to_owned(),
                 resume_session_id: None,
                 mcp_servers: Vec::new(),
+                code_review: false,
             },
             connection,
             incoming,
