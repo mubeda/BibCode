@@ -85,14 +85,17 @@ describe("getProviderSummary", () => {
       getProviderSummary(
         provider({ auth: { status: "authenticated", type: "oauth", label: "User account" } }),
       ),
-    ).toEqual({ headline: "Authenticated · User account", detail: null });
+    ).toEqual({ headline: "Authenticated", detail: null });
     expect(
       getProviderSummary(provider({ auth: { status: "authenticated", type: "api-key" } })),
-    ).toEqual({ headline: "Authenticated · api-key", detail: null });
+    ).toEqual({ headline: "Authenticated", detail: null });
     expect(getProviderSummary(provider({ auth: { status: "authenticated" } }))).toEqual({
       headline: "Authenticated",
       detail: null,
     });
+    expect(
+      getProviderSummary(provider({ auth: { status: "authenticated" }, message: "Account ready" })),
+    ).toEqual({ headline: "Authenticated", detail: "Account ready" });
     expect(
       getProviderSummary(
         provider({ auth: { status: "unauthenticated" }, message: "Sign in required" }),

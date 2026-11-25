@@ -79,8 +79,6 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     value: ProviderDriverKind.make("antigravity"),
     label: "Antigravity",
     icon: AntigravityIcon,
-    // The chat over `agy acp` is the preview; the terminal runs the user's own CLI (spec R13).
-    badgeLabel: "Chat preview",
     settingsSchema: AntigravitySettings,
   },
 ];

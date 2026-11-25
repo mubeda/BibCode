@@ -52,9 +52,8 @@ export function getProviderSummary(provider: ServerProvider | undefined) {
     };
   }
   if (provider.auth.status === "authenticated") {
-    const authLabel = provider.auth.label ?? provider.auth.type;
     return {
-      headline: authLabel ? `Authenticated · ${authLabel}` : "Authenticated",
+      headline: "Authenticated",
       detail: provider.message ?? null,
     };
   }

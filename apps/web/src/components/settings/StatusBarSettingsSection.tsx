@@ -112,7 +112,7 @@ export function StatusBarSettingsSection() {
       />
       <SettingsRow
         title="Show Antigravity usage"
-        description="Show the Antigravity CLI's quota in the status bar. It covers the default Antigravity provider only; turn the provider on in Settings, Providers."
+        description="Show the Antigravity CLI's quota in the status bar. Covers the default Antigravity provider only."
         control={
           <Switch
             checked={settings.showAntigravityUsage}

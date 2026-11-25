@@ -1672,7 +1672,7 @@ describe("ProviderSettingsPanel", () => {
     expect(personalCard).not.toHaveProperty("onSessionDefaultsChange");
   });
 
-  it("offers a disabled Antigravity card with a chat preview badge and session defaults (R11)", () => {
+  it("offers an enabled Antigravity card without a preview badge and keeps session defaults (R11)", () => {
     const antigravityDriver = ProviderDriverKind.make("antigravity");
     const customId = ProviderInstanceId.make("antigravity_work");
     const settings = baseProviderSettings();
@@ -1697,16 +1697,18 @@ describe("ProviderSettingsPanel", () => {
     const customCard = h.instanceCards.find((card) => String(card.instanceId) === customId)!;
     expect(defaultCard.instance).toMatchObject({
       driver: antigravityDriver,
-      enabled: false,
-      config: { enabled: false, binaryPath: "agy" },
+      enabled: true,
+      config: { enabled: true, binaryPath: "agy" },
     });
     for (const card of [defaultCard, customCard]) {
       expect(card.driverOption).toMatchObject({
         value: antigravityDriver,
         label: "Antigravity",
         icon: AntigravityIcon,
-        badgeLabel: "Chat preview",
       });
+      expect(
+        (card.driverOption as { badgeLabel?: string } | undefined)?.badgeLabel,
+      ).toBeUndefined();
     }
     expect(typeof defaultCard.onSessionDefaultsChange).toBe("function");
     expect(customCard).not.toHaveProperty("onSessionDefaultsChange");
@@ -1717,7 +1719,7 @@ describe("ProviderSettingsPanel", () => {
     });
   });
 
-  it("writes enabled explicitly when the default Antigravity card is switched on", () => {
+  it("writes enabled explicitly when the default Antigravity card is switched off", () => {
     const antigravityId = ProviderInstanceId.make("antigravity");
     h.settings = baseProviderSettings();
 
@@ -1725,7 +1727,7 @@ describe("ProviderSettingsPanel", () => {
     const card = h.instanceCards.find((entry) => String(entry.instanceId) === "antigravity")!;
     (card.onUpdate as (next: ProviderInstanceConfig) => void)({
       ...(card.instance as ProviderInstanceConfig),
-      enabled: true,
+      enabled: false,
     });
 
     const patch = h.updateSettings.mock.calls.at(-1)![0] as {
@@ -1733,7 +1735,7 @@ describe("ProviderSettingsPanel", () => {
     };
     expect(patch.providerInstances[antigravityId]).toMatchObject({
       driver: "antigravity",
-      enabled: true,
+      enabled: false,
       config: { binaryPath: "agy" },
     });
   });
