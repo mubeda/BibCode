@@ -184,7 +184,7 @@ function reviewTab(provider: string) {
   return browser.$(`//button[@role="tab"][.//span[normalize-space()="Code review · ${provider}"]]`);
 }
 
-type ReviewInputLogEntry = ProviderInputLogEntry & { readonly args?: ReadonlyArray<string> };
+type ReviewInputLogEntry = ProviderInputLogEntry & { readonly permissionMode?: string | null };
 
 async function waitForReviewStart(
   provider: "codex" | "claudeAgent",
@@ -360,11 +360,9 @@ describe("packaged Source Control review", () => {
 
     // A one-off Claude chat review from the review menu; the saved reviewer stays chat Codex.
     const baseline = readProviderInputLog(preparedProviderInputLogPath).length;
-    const { prompt, args } = await startOneOffClaudeReview(baseline);
+    const { prompt, permissionMode } = await startOneOffClaudeReview(baseline);
     expect(prompt).toContain(UNCOMMITTED_SCOPE);
-    const permissionModeIndex = args?.indexOf("--permission-mode") ?? -1;
-    expect(permissionModeIndex).toBeGreaterThanOrEqual(0);
-    expect(args?.[permissionModeIndex + 1]).toBe("bypassPermissions");
+    expect(permissionMode).toBe("bypassPermissions");
 
     await waitForComposerDisplayed();
     await expect(composerForm().$('button[aria-label="Full access"]')).toExist();
@@ -400,12 +398,10 @@ describe("packaged Source Control review", () => {
     const baseline = readProviderInputLog(preparedProviderInputLogPath).length;
     await setProjectReviewPrompt(`Review {scope}. ${desktopUiFixture.codeReviewExitPlanMarker}`);
     try {
-      const { prompt, args } = await startOneOffClaudeReview(baseline);
+      const { prompt, permissionMode } = await startOneOffClaudeReview(baseline);
       expect(prompt).toContain(UNCOMMITTED_SCOPE);
       expect(prompt).toContain(desktopUiFixture.codeReviewExitPlanMarker);
-      const permissionModeIndex = args?.indexOf("--permission-mode") ?? -1;
-      expect(permissionModeIndex).toBeGreaterThanOrEqual(0);
-      expect(args?.[permissionModeIndex + 1]).toBe("bypassPermissions");
+      expect(permissionMode).toBe("bypassPermissions");
     } finally {
       await setProjectReviewPrompt(null);
     }

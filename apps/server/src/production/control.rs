@@ -2350,15 +2350,16 @@ impl NativeServerControl {
                     let settings_json = serde_json::to_value(settings).map_err(|error| {
                         json!({"_tag":"ServerProviderCapabilitiesError","reason":error.to_string()})
                     })?;
-                    let still_enabled = provider_inventory::instance_is_enabled_and_available(
+                    let cache_valid = provider_inventory::instance_capability_cache_valid(
                         &settings_json,
                         &key.0,
+                        (!key.1.is_empty()).then_some(Path::new(&key.1)),
                     );
                     let mut cache = self
                         .capability_cache
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    if !still_enabled {
+                    if !cache_valid {
                         cache.entries.remove(&key);
                         cache.refreshing.remove(&key);
                         None
@@ -2403,6 +2404,12 @@ impl NativeServerControl {
                                 tag = tag.unwrap_or_default(),
                                 "background provider capability refresh failed"
                             );
+                            owner
+                                .capability_cache
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .entries
+                                .remove(&key);
                         }
                         owner
                             .capability_cache
@@ -4954,6 +4961,157 @@ done"#,
                 .entries
                 .contains_key(&incomplete_key),
             "incomplete fallback must not be cached"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_capabilities_rpc_evicts_warmed_cache_when_binary_or_workspace_disappears()
+    {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = crate::test_support::TestSandbox::new("antigravity-capabilities-rpc-evict");
+        let control = scheduler_control(&temp).await;
+        let home = sandbox.path("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let ws = sandbox.path("ws");
+        let skill_dir = ws.join(".agents/skills/review-branch");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review-branch\ndescription: Review\n---\n",
+        )
+        .expect("write SKILL.md");
+
+        let update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "session-1",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{ "name": "review-branch" }]
+                }
+            }
+        });
+        let bin = sandbox.executable_script(
+            "antigravity-cli-evict",
+            &format!(
+                r#"case "$1" in
+  --version) printf '%s\n' '1.5.13'; exit 0 ;;
+esac
+while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,{init}}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{update}'
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"session-1"}}}}\n' "$id"
+      ;;
+    *'"method":"session/close"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done"#,
+                init = provider_inventory::tests::antigravity_initialize(1, "1.5.13", true),
+                update = update,
+            ),
+            "",
+        );
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "antigravity": {
+                            "driver": "antigravity",
+                            "enabled": true,
+                            "config": { "binaryPath": bin },
+                            "environment": [
+                                { "name": "HOME", "value": home },
+                                { "name": "USERPROFILE", "value": home }
+                            ]
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("configure antigravity");
+
+        let payload = json!({ "instanceId": "antigravity", "cwd": ws });
+        let key = CapabilityCache::key(&payload).unwrap();
+        let warm = control
+            .call(
+                "server.getProviderCapabilities",
+                payload.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("warm cache");
+        assert!(warm["skills"].as_array().is_some_and(|s| !s.is_empty()));
+        assert!(
+            control
+                .capability_cache
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&key)
+        );
+
+        // 1. Removing the workspace directory invalidates and evicts the warmed entry.
+        let ws_backup = sandbox.path("ws-backup");
+        std::fs::rename(&ws, &ws_backup).expect("move workspace away");
+        let missing_ws_err = control
+            .call(
+                "server.getProviderCapabilities",
+                payload.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("removed workspace must not serve warmed cache");
+        assert_eq!(missing_ws_err["_tag"], "ServerProviderCapabilitiesError");
+        assert!(
+            !control
+                .capability_cache
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&key)
+        );
+
+        // Restore workspace, warm again, then remove the binary.
+        std::fs::rename(&ws_backup, &ws).expect("restore workspace");
+        control
+            .call(
+                "server.getProviderCapabilities",
+                payload.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("re-warm cache");
+        assert!(
+            control
+                .capability_cache
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&key)
+        );
+
+        std::fs::remove_file(&bin).expect("remove antigravity binary");
+        let missing_bin_err = control
+            .call(
+                "server.getProviderCapabilities",
+                payload,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("removed binary must not serve warmed cache");
+        assert_eq!(missing_bin_err["_tag"], "ServerProviderCapabilitiesError");
+        assert!(
+            !control
+                .capability_cache
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&key)
         );
     }
 

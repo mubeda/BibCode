@@ -624,7 +624,7 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: desktop-*
-          merge-multiple: true
+          merge-multiple: false
           path: release-downloads/desktop
 
       - name: Merge isolated release artifacts
@@ -639,7 +639,7 @@ jobs:
               exit 1
             fi
             cp "$file" "$target"
-          done < <(find release-downloads/desktop -maxdepth 1 -type f -print0)
+          done < <(find release-downloads/desktop -mindepth 2 -type f -print0)
 
       - id: release_timestamp
         name: Capture release timestamp

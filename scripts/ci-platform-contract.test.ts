@@ -1528,4 +1528,33 @@ describe("release symbols and crash smoke contract", () => {
 
     expect(requireJob(workflow, "release")["timeout-minutes"]).toBeGreaterThanOrEqual(25);
   });
+
+  it("downloads desktop artifacts into isolated directories and rejects duplicate basenames", () => {
+    const { workflow } = readWorkflow(RELEASE_WORKFLOW_PATH);
+    const releaseJob = requireJob(workflow, "release");
+    const download = stepNamed(releaseJob, "Download all desktop artifacts");
+    const merge = stepNamed(releaseJob, "Merge isolated release artifacts");
+
+    expect(download.with?.["merge-multiple"]).toBe(false);
+    expect(merge.run).toContain("find release-downloads/desktop -mindepth 2 -type f -print0");
+
+    // Exercise the real shell merge snippet against two per-artifact directories with a collision.
+    const tmpDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "bibcode-merge-dup-"));
+    try {
+      const first = NodePath.join(tmpDir, "release-downloads/desktop/desktop-a");
+      const second = NodePath.join(tmpDir, "release-downloads/desktop/desktop-b");
+      NodeFS.mkdirSync(first, { recursive: true });
+      NodeFS.mkdirSync(second, { recursive: true });
+      NodeFS.writeFileSync(NodePath.join(first, "BiBCode_1.0.0_x64.dmg"), "a");
+      NodeFS.writeFileSync(NodePath.join(second, "BiBCode_1.0.0_x64.dmg"), "b");
+      const result = NodeChildProcess.spawnSync("bash", ["-c", merge.run ?? ""], {
+        cwd: tmpDir,
+        encoding: "utf8",
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("Duplicate release asset basename: BiBCode_1.0.0_x64.dmg");
+    } finally {
+      NodeFS.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

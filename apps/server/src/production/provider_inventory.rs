@@ -685,10 +685,37 @@ pub(crate) fn unsupported_instances(settings: &Value) -> Vec<ProviderProbeResult
         .collect()
 }
 
-pub(crate) fn instance_is_enabled_and_available(settings: &Value, instance_id: &str) -> bool {
-    definitions(settings).into_iter().any(|definition| {
-        definition.instance_id == instance_id && definition.enabled && definition.available
-    })
+pub(crate) fn instance_capability_cache_valid(
+    settings: &Value,
+    instance_id: &str,
+    cwd: Option<&Path>,
+) -> bool {
+    if let Some(dir) = cwd
+        && !dir.is_dir()
+    {
+        return false;
+    }
+    let Some(definition) = definitions(settings).into_iter().find(|definition| {
+        definition.instance_id == instance_id
+            && definition.enabled
+            && definition.available
+            && !definition.missing_secret
+    }) else {
+        return false;
+    };
+    if definition.driver == "antigravity"
+        && resolve_provider_executable_with_environment(
+            &definition.binary_path,
+            definition
+                .environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        )
+        .is_none()
+    {
+        return false;
+    }
+    true
 }
 
 /// `reuse_catalog` skips Antigravity's session probe:

@@ -848,7 +848,7 @@ reader.on("line", (line) => {
   const prompt = promptTextFromParts(message.message?.content);
   const permissionModeIndex = process.argv.indexOf("--permission-mode");
   const permissionMode = permissionModeIndex === -1 ? null : (process.argv[permissionModeIndex + 1] ?? null);
-  appendProviderInput("claudeAgent", prompt, "start", undefined, { args: process.argv.slice(2) });
+  appendProviderInput("claudeAgent", prompt, "start", undefined, { permissionMode });
   send(message);
   if (prompt.startsWith(${JSON.stringify(CODE_REVIEW_LEAD_IN)})) {
     if (

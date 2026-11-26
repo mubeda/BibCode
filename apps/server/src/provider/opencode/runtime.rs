@@ -219,6 +219,10 @@ impl BoundedIdSet {
         self.ids.clear();
         self.order.clear();
     }
+
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.ids.iter()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -494,6 +498,9 @@ struct RuntimeInner {
     /// Cancelled and replaced whenever a turn starts or ends so a stale auto-decline retry worker
     /// never interrupts a subsequent turn.
     auto_decline_turn_cancellation: StdMutex<CancellationToken>,
+    /// Serializes new user turn admission against an exhausted auto-decline worker's final
+    /// ownership check and session-wide interrupt.
+    auto_decline_interrupt_gate: Mutex<()>,
     v2: Mutex<V2State>,
     /// Serializes OpenCode 2 rewinds with the settling a prompt does first, so each unsettled
     /// revert is accounted for once.
@@ -544,7 +551,7 @@ struct V2State {
     settled: BoundedIdSet,
     /// Verified descendant sessions of the OpenCode 1 root session (tracked regardless of whether
     /// Chat Activity is enabled) so V1 code-review auto-decline handles subagent asks.
-    v1_verified_children: HashSet<String>,
+    v1_verified_children: BoundedIdSet,
     /// Asks currently being auto-declined/cancelled in code-review auto mode, keyed to a
     /// per-request cancellation token signalled on provider settlement.
     auto_decline_in_flight: HashMap<String, CancellationToken>,
@@ -981,6 +988,7 @@ impl OpenCodeSessionRuntime {
                 protocol_v2: AtomicBool::new(false),
                 code_review: AtomicBool::new(false),
                 auto_decline_turn_cancellation: StdMutex::new(CancellationToken::new()),
+                auto_decline_interrupt_gate: Mutex::new(()),
                 v2: Mutex::new(V2State::default()),
                 v2_rewind: Mutex::new(()),
             }),
@@ -1932,19 +1940,27 @@ impl OpenCodeSessionRuntime {
     }
 
     async fn begin_turn(&self) -> String {
-        self.begin_turn_with(json!({})).await
+        let _gate = self.inner.auto_decline_interrupt_gate.lock().await;
+        self.begin_turn_with(json!({}), true).await
     }
 
-    /// A turn OpenCode started on its own. It is marked so the supervisor projects it running:
-    /// BiBCode's own turns are announced before they are sent, and a send can still fail.
+    /// A turn OpenCode started on its own (or a resumed running execution adopted on connect).
+    /// Preserves already-running recovery auto-decline workers so adopting the same execution
+    /// does not cancel them.
     async fn begin_provider_started_turn(&self) -> String {
-        self.begin_turn_with(json!({ "providerStarted": true }))
+        self.begin_turn_with(json!({ "providerStarted": true }), false)
             .await
     }
 
-    async fn begin_turn_with(&self, payload: Value) -> String {
+    async fn begin_turn_with(
+        &self,
+        payload: Value,
+        cancel_in_flight_auto_declines: bool,
+    ) -> String {
         let turn_id = format!("turn-{}", Uuid::new_v4());
-        self.reset_auto_decline_turn_cancellation();
+        if cancel_in_flight_auto_declines {
+            self.reset_auto_decline_turn_cancellation();
+        }
         *self.inner.active_user_message_id.lock().await = None;
         self.inner.assistant_message_ids.lock().await.clear();
         self.inner.assistant_text.lock().await.clear();
@@ -2544,11 +2560,16 @@ impl OpenCodeSessionRuntime {
             PayloadSessionIdentity::Missing | PayloadSessionIdentity::Conflicting => None,
         };
         if matches!(event_type, "session.created" | "session.updated")
+            && let PayloadSessionIdentity::Agreed(agreed_session_id) = payload_identity
             && let Some(child_id) = properties
                 .pointer("/info/id")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|candidate| valid_key(candidate) && *candidate != session_id)
+                .filter(|candidate| {
+                    valid_key(candidate)
+                        && *candidate != session_id
+                        && *candidate == agreed_session_id
+                })
             && let Some(parent_id) = properties
                 .pointer("/info/parentID")
                 .and_then(Value::as_str)
@@ -2566,7 +2587,7 @@ impl OpenCodeSessionRuntime {
             let parent_verified = parent_id == session_id
                 || parent_verified_in_activity
                 || v2.v1_verified_children.contains(parent_id);
-            if parent_verified && v2.v1_verified_children.len() < RECONCILIATION_CHILD_LIMIT {
+            if parent_verified {
                 v2.v1_verified_children.insert(child_id.to_owned());
             }
         }
@@ -3779,57 +3800,177 @@ impl OpenCodeSessionRuntime {
         was_in_flight && newly_settled
     }
 
-    /// Collects the OpenCode 1 root session plus any verified descendant sessions (from cached
-    /// SSE/activity state and best-effort `GET /session/{id}/children`) for code-review
-    /// auto-decline on resume. Foreign sessions are never included.
-    async fn v1_review_session_ids(&self, root_session_id: &str) -> HashSet<String> {
+    /// Best-effort OpenCode 1 JSON read that distinguishes 404 (`Ok(None)`) from transient
+    /// transport/5xx errors (`Err(())`), bounded to a per-call timeout.
+    async fn v1_get_json_checked(
+        &self,
+        url: String,
+        timeout: Duration,
+    ) -> Result<Option<Value>, ()> {
+        let read = async {
+            let response = self.inner.client.get(url).send().await.map_err(|_| ())?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if !response.status().is_success() {
+                return Err(());
+            }
+            response.json::<Value>().await.map(Some).map_err(|_| ())
+        };
+        tokio::time::timeout(timeout, read).await.map_err(|_| ())?
+    }
+
+    /// Resolves whether any unknown candidate `sessionID`s present in pending OpenCode 1 asks
+    /// belong to verified descendants of `root_session_id`. Performs zero HTTP requests when all
+    /// pending asks already belong to the root or cached verified children. Returns the allowed
+    /// session IDs plus whether ownership resolution was complete (false on transient errors or
+    /// deadline expiry so recovery retries).
+    async fn v1_resolve_review_ownership(
+        &self,
+        root_session_id: &str,
+        candidates: &HashSet<String>,
+    ) -> (HashSet<String>, bool) {
+        const V1_OWNERSHIP_DEADLINE: Duration = Duration::from_secs(3);
+
         let mut allowed = HashSet::new();
         allowed.insert(root_session_id.to_owned());
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back((root_session_id.to_owned(), 0usize));
         {
             let v2 = self.inner.v2.lock().await;
-            for child in &v2.v1_verified_children {
-                if allowed.insert(child.clone()) {
-                    queue.push_back((child.clone(), 1));
+            for child in v2.v1_verified_children.iter() {
+                allowed.insert(child.clone());
+            }
+        }
+        let mut unknown: Vec<String> = candidates
+            .iter()
+            .filter(|sid| valid_key(sid) && !allowed.contains(*sid))
+            .cloned()
+            .collect();
+        if unknown.is_empty() {
+            return (allowed, true);
+        }
+        unknown.sort();
+
+        let deadline = tokio::time::Instant::now() + V1_OWNERSHIP_DEADLINE;
+        let mut needs_children_bfs = false;
+        let mut transient_failure = false;
+
+        // 1. Fast upward walk via `GET /session/{id}` (`parentID` chain): O(depth) calls per
+        //    candidate instead of walking unrelated sibling subtrees.
+        for candidate in &unknown {
+            let mut current = candidate.clone();
+            let mut chain: Vec<String> = Vec::new();
+            let mut visited = HashSet::new();
+            for _ in 0..8 {
+                if allowed.contains(&current) {
+                    let mut v2 = self.inner.v2.lock().await;
+                    for id in chain {
+                        v2.v1_verified_children.insert(id.clone());
+                        allowed.insert(id);
+                    }
+                    break;
+                }
+                if !visited.insert(current.clone()) {
+                    break;
+                }
+                let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+                else {
+                    return (allowed, false);
+                };
+                let Ok(url) = self.session_request_url(&current, &[]) else {
+                    break;
+                };
+                match self.v1_get_json_checked(url, remaining).await {
+                    Ok(Some(session)) => {
+                        let parent = session
+                            .get("parentID")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|id| valid_key(id));
+                        match parent {
+                            Some(parent_id) => {
+                                chain.push(current);
+                                current = parent_id.to_owned();
+                            }
+                            None => {
+                                // Either a foreign root session or a server that omits `parentID`
+                                // on `/session/{id}` (fall back to `/children` check).
+                                if session.get("parentID").is_none() {
+                                    needs_children_bfs = true;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        needs_children_bfs = true;
+                        break;
+                    }
+                    Err(()) => {
+                        transient_failure = true;
+                        needs_children_bfs = true;
+                        break;
+                    }
                 }
             }
         }
-        while let Some((parent_id, depth)) = queue.pop_front() {
-            if depth >= 4 || allowed.len() > RECONCILIATION_CHILD_LIMIT {
-                break;
-            }
-            let Ok(url) = self.session_request_url(&parent_id, &["children"]) else {
-                continue;
-            };
-            let Some(Value::Array(children)) = self.v2_get_json(url).await else {
-                continue;
-            };
-            let mut v2 = self.inner.v2.lock().await;
-            for child in children {
-                let Some(child_id) = child
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|id| valid_key(id) && *id != root_session_id)
+
+        // 2. Fallback to bounded `/session/{parent}/children` BFS only when upward lookup left
+        //    unknown candidates unresolved, still within the single overall deadline.
+        if needs_children_bfs && unknown.iter().any(|id| !allowed.contains(id)) {
+            let mut bfs_transient = false;
+            let mut queue = std::collections::VecDeque::new();
+            let mut visited_parents = HashSet::new();
+            queue.push_back((root_session_id.to_owned(), 0usize));
+            visited_parents.insert(root_session_id.to_owned());
+            while let Some((parent_id, depth)) = queue.pop_front() {
+                if depth >= 4 || allowed.len() > MAX_TRACKED_SETTLEMENTS {
+                    break;
+                }
+                if !unknown.iter().any(|id| !allowed.contains(id)) {
+                    break;
+                }
+                let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
                 else {
+                    return (allowed, false);
+                };
+                let Ok(url) = self.session_request_url(&parent_id, &["children"]) else {
                     continue;
                 };
-                let child_parent = child.get("parentID").and_then(Value::as_str).map(str::trim);
-                if child_parent != Some(parent_id.as_str()) {
-                    continue;
-                }
-                if v2.v1_verified_children.len() < RECONCILIATION_CHILD_LIMIT {
+                let children = match self.v1_get_json_checked(url, remaining).await {
+                    Ok(Some(Value::Array(children))) => children,
+                    Ok(_) => continue,
+                    Err(()) => {
+                        bfs_transient = true;
+                        continue;
+                    }
+                };
+                let mut v2 = self.inner.v2.lock().await;
+                for child in children {
+                    let Some(child_id) = child
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|id| valid_key(id) && *id != root_session_id)
+                    else {
+                        continue;
+                    };
+                    let child_parent = child.get("parentID").and_then(Value::as_str).map(str::trim);
+                    if child_parent != Some(parent_id.as_str()) {
+                        continue;
+                    }
                     v2.v1_verified_children.insert(child_id.to_owned());
-                }
-                if allowed.len() <= RECONCILIATION_CHILD_LIMIT
-                    && allowed.insert(child_id.to_owned())
-                {
-                    queue.push_back((child_id.to_owned(), depth + 1));
+                    if allowed.insert(child_id.to_owned())
+                        && visited_parents.insert(child_id.to_owned())
+                    {
+                        queue.push_back((child_id.to_owned(), depth + 1));
+                    }
                 }
             }
+            transient_failure = bfs_transient;
         }
-        allowed
+
+        let complete = !transient_failure || unknown.iter().all(|id| allowed.contains(id));
+        (allowed, complete)
     }
 
     /// The permissions and questions an OpenCode 1 session was waiting on when it resumed, read
@@ -3844,11 +3985,6 @@ impl OpenCodeSessionRuntime {
     ) -> (Vec<(&'static str, String, Value)>, Option<Vec<String>>) {
         self.inner.v2.lock().await.v1_settled.clear();
         let auto_decline = self.should_auto_decline_code_review().await;
-        let allowed_sessions = if auto_decline {
-            self.v1_review_session_ids(session_id).await
-        } else {
-            HashSet::from([session_id.to_owned()])
-        };
         let mut recovered = Vec::new();
         let permissions = match self.request_url("/permission") {
             Ok(url) => self.v2_get_json(url).await,
@@ -3857,6 +3993,21 @@ impl OpenCodeSessionRuntime {
         let questions = match self.request_url("/question") {
             Ok(url) => self.v2_get_json(url).await,
             Err(_) => None,
+        };
+        let allowed_sessions = if auto_decline {
+            let candidates = permissions
+                .iter()
+                .chain(questions.iter())
+                .filter_map(Value::as_array)
+                .flatten()
+                .filter_map(|request| request.get("sessionID").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect::<HashSet<_>>();
+            self.v1_resolve_review_ownership(session_id, &candidates)
+                .await
+                .0
+        } else {
+            HashSet::from([session_id.to_owned()])
         };
         let of_session = |list: &Option<Value>| {
             list.iter()
@@ -4038,16 +4189,16 @@ impl OpenCodeSessionRuntime {
                 }
             }
         }
-        self.v1_route_listed(&session_id, &fresh).await;
+        let mut ownership_complete = self.v1_route_listed(&session_id, &fresh).await;
         self.emit_v1_listed(&fresh).await;
         // The first read since the subscription finished, completed or not: the asks it found
         // are shown, so queued messages may go (#187).
         self.emit_recovery_read().await;
-        // A list that could not be read is read again with a backoff, each failure logged, so
-        // the asks it holds still appear.
+        // A list (or child-ownership check) that could not be read is read again with a backoff,
+        // each failure logged, so the asks it holds still appear or auto-decline.
         let mut delay = RESUME_READ_RETRY_FIRST;
         let mut attempt = 1;
-        while fresh.values().any(Option::is_none) {
+        while fresh.values().any(Option::is_none) || !ownership_complete {
             if attempt == RESUME_READ_ATTEMPTS {
                 tracing::warn!(
                     provider = "opencode",
@@ -4064,7 +4215,7 @@ impl OpenCodeSessionRuntime {
             delay = delay.saturating_mul(2).min(RESUME_READ_RETRY_LONGEST);
             attempt += 1;
             fresh = self.v1_read_pending_lists().await;
-            self.v1_route_listed(&session_id, &fresh).await;
+            ownership_complete = self.v1_route_listed(&session_id, &fresh).await;
             self.emit_v1_listed(&fresh).await;
         }
         self.inner.v2.lock().await.v1_settled.clear();
@@ -4173,20 +4324,29 @@ impl OpenCodeSessionRuntime {
         lists
     }
 
-    /// Routes and shows this session's listed asks not routed or settled yet.
+    /// Routes and shows this session's listed asks not routed or settled yet. Returns whether
+    /// child-session ownership for any listed review asks was resolved conclusively.
     async fn v1_route_listed(
         &self,
         session_id: &str,
         fresh: &HashMap<&'static str, Option<Vec<Value>>>,
-    ) {
+    ) -> bool {
         // An ask created between the resume's read and the subscription is in the fresh lists
         // only (OpenCode does not replay it); one the event stream already delivered has its
         // route and is skipped.
         let auto_decline = self.should_auto_decline_code_review().await;
-        let allowed_sessions = if auto_decline {
-            self.v1_review_session_ids(session_id).await
+        let (allowed_sessions, ownership_complete) = if auto_decline {
+            let candidates = fresh
+                .values()
+                .flatten()
+                .flatten()
+                .filter_map(|request| request.get("sessionID").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect::<HashSet<_>>();
+            self.v1_resolve_review_ownership(session_id, &candidates)
+                .await
         } else {
-            HashSet::from([session_id.to_owned()])
+            (HashSet::from([session_id.to_owned()]), true)
         };
         let of_session = |path: &str| {
             fresh
@@ -4288,6 +4448,7 @@ impl OpenCodeSessionRuntime {
             )
             .await;
         }
+        ownership_complete
     }
 
     async fn emit_auto_decline_resolved(
@@ -4530,15 +4691,19 @@ impl OpenCodeSessionRuntime {
                 }
             }
 
-            {
-                let mut v2 = runtime.inner.v2.lock().await;
-                v2.auto_decline_in_flight.remove(&request_id);
-            }
+            let _interrupt_gate = runtime.inner.auto_decline_interrupt_gate.lock().await;
             if settled_token.is_cancelled()
                 || cancellation.is_cancelled()
                 || owner_cancellation.is_cancelled()
                 || is_turn_superseded(&runtime, turn_id.as_deref(), &turn_cancellation).await
             {
+                runtime
+                    .inner
+                    .v2
+                    .lock()
+                    .await
+                    .auto_decline_in_flight
+                    .remove(&request_id);
                 return;
             }
             runtime
@@ -4552,7 +4717,20 @@ impl OpenCodeSessionRuntime {
                     }),
                 )
                 .await;
-            let _ = tokio::time::timeout(SIDE_REQUEST_TIMEOUT, runtime.interrupt_turn()).await;
+            runtime
+                .inner
+                .v2
+                .lock()
+                .await
+                .auto_decline_in_flight
+                .remove(&request_id);
+            if !settled_token.is_cancelled() && !turn_cancellation.is_cancelled() {
+                tokio::select! {
+                    () = settled_token.cancelled() => {}
+                    () = turn_cancellation.cancelled() => {}
+                    _ = tokio::time::timeout(SIDE_REQUEST_TIMEOUT, runtime.interrupt_turn()) => {}
+                }
+            }
         });
     }
 
@@ -9825,6 +10003,249 @@ mod code_review_auto_decline_tests {
             !events.iter().any(|e| e.event_type == "runtime.error"),
             "{events:#?}"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn code_review_v1_adopting_running_execution_preserves_recovered_auto_decline() {
+        let reject_entered = Arc::new(tokio::sync::Notify::new());
+        let release_reject = Arc::new(tokio::sync::Notify::new());
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/permission", get(|| async { Json(json!([])) }))
+            .route(
+                "/question",
+                get(|| async {
+                    Json(json!([{
+                        "id": "que_busy_adopt",
+                        "sessionID": "ses-busy",
+                        "questions": [{ "question": "Proceed?" }]
+                    }]))
+                }),
+            )
+            .route(
+                "/session/status",
+                get(|| async { Json(json!({ "ses-busy": { "type": "busy" } })) }),
+            )
+            .route(
+                "/question/{id}/reject",
+                post({
+                    let reject_entered = reject_entered.clone();
+                    let release_reject = release_reject.clone();
+                    let rejected = rejected.clone();
+                    move || {
+                        let reject_entered = reject_entered.clone();
+                        let release_reject = release_reject.clone();
+                        let rejected = rejected.clone();
+                        async move {
+                            reject_entered.notify_one();
+                            release_reject.notified().await;
+                            rejected.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let v1 = review_runtime(&format!("http://{address}"), false);
+        v1.configure_runtime_mode("full-access").await;
+        *v1.inner.session_id.lock().await = Some("ses-busy".to_owned());
+
+        let (recovered, _) = v1.v1_restore_pending_asks("ses-busy").await;
+        assert!(recovered.is_empty());
+        timeout(Duration::from_secs(2), reject_entered.notified())
+            .await
+            .expect("recovered reject started");
+
+        // Adopting the busy running execution must NOT cancel the recovered auto-decline worker.
+        v1.v1_adopt_running_execution("ses-busy").await;
+        assert!(v1.inner.active_turn_id.lock().await.is_some());
+
+        release_reject.notify_waiters();
+        let events = collect_until(&v1, |events| {
+            events.iter().any(|e| {
+                e.event_type == "user-input.resolved"
+                    && e.request_id.as_deref() == Some("que_busy_adopt")
+            })
+        })
+        .await;
+        assert_eq!(rejected.load(Ordering::SeqCst), 1);
+        assert!(
+            !events.iter().any(|e| e.event_type == "runtime.error"),
+            "{events:#?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn code_review_v1_conflicting_event_cache_rollover_lazy_lookup_and_transient_retry() {
+        let children_calls = Arc::new(AtomicUsize::new(0));
+        let rejects: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let return_pending = Arc::new(AtomicBool::new(false));
+        let fail_first_children = Arc::new(AtomicBool::new(true));
+        let app = Router::new()
+            .route("/permission", get(|| async { Json(json!([])) }))
+            .route(
+                "/question",
+                get({
+                    let return_pending = return_pending.clone();
+                    move || {
+                        let return_pending = return_pending.clone();
+                        async move {
+                            if return_pending.load(Ordering::SeqCst) {
+                                Json(json!([{
+                                    "id": "que_retry_child",
+                                    "sessionID": "ses-late-child",
+                                    "questions": [{ "question": "Retry child?" }]
+                                }]))
+                            } else {
+                                Json(json!([]))
+                            }
+                        }
+                    }
+                }),
+            )
+            .route("/session/{id}", get(|| async { StatusCode::NOT_FOUND }))
+            .route(
+                "/session/ses-lazy-root/children",
+                get({
+                    let children_calls = children_calls.clone();
+                    let fail_first_children = fail_first_children.clone();
+                    move || {
+                        let children_calls = children_calls.clone();
+                        let fail_first_children = fail_first_children.clone();
+                        async move {
+                            children_calls.fetch_add(1, Ordering::SeqCst);
+                            if fail_first_children.swap(false, Ordering::SeqCst) {
+                                axum::response::IntoResponse::into_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                )
+                            } else {
+                                axum::response::IntoResponse::into_response(Json(json!([
+                                    { "id": "ses-late-child", "parentID": "ses-lazy-root" }
+                                ])))
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/session/ses-late-child/children",
+                get(|| async { Json(json!([])) }),
+            )
+            .route(
+                "/question/{id}/reject",
+                post({
+                    let rejects = rejects.clone();
+                    move |Path(id): Path<String>| {
+                        let rejects = rejects.clone();
+                        async move {
+                            rejects.lock().await.push(id);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let v1 = review_runtime(&format!("http://{address}"), false);
+        v1.configure_runtime_mode("full-access").await;
+        *v1.inner.session_id.lock().await = Some("ses-lazy-root".to_owned());
+
+        // 1. When pending lists are empty, resume makes ZERO /children calls.
+        let _ = v1.v1_restore_pending_asks("ses-lazy-root").await;
+        assert_eq!(
+            children_calls.load(Ordering::SeqCst),
+            0,
+            "empty pending lists must not walk /children"
+        );
+
+        // 2. Conflicting session.created must NOT register the foreign child.
+        v1.handle_sse_event(
+            "ses-lazy-root",
+            json!({
+                "type": "session.created",
+                "properties": {
+                    "sessionID": "ses-foreign-mismatch",
+                    "info": { "id": "ses-spoofed-conflict", "parentID": "ses-lazy-root" }
+                }
+            }),
+        )
+        .await;
+        v1.handle_sse_event(
+            "ses-lazy-root",
+            json!({
+                "type": "question.asked",
+                "properties": {
+                    "id": "que_conflict_foreign",
+                    "sessionID": "ses-spoofed-conflict",
+                    "questions": [{ "question": "Spoofed?" }]
+                }
+            }),
+        )
+        .await;
+
+        // 3. Children created past 50 entries are still tracked and auto-declined.
+        for i in 0..60 {
+            v1.handle_sse_event(
+                "ses-lazy-root",
+                json!({
+                    "type": "session.created",
+                    "properties": { "info": { "id": format!("ses-child-{i}"), "parentID": "ses-lazy-root" } }
+                }),
+            )
+            .await;
+        }
+        v1.handle_sse_event(
+            "ses-lazy-root",
+            json!({
+                "type": "question.asked",
+                "properties": {
+                    "id": "que_child_59",
+                    "sessionID": "ses-child-59",
+                    "questions": [{ "question": "Late child?" }]
+                }
+            }),
+        )
+        .await;
+
+        // 4. Transient 500 on /children while /permission & /question succeed triggers retry and
+        //    eventually declines the child ask.
+        return_pending.store(true, Ordering::SeqCst);
+        v1.v1_show_recovered_asks(Vec::new()).await;
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let list = rejects.lock().await;
+                if list.iter().any(|id| id == "que_child_59")
+                    && list.iter().any(|id| id == "que_retry_child")
+                {
+                    break;
+                }
+                drop(list);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late child and retried ownership child asks both auto-declined");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let mut rejected = rejects.lock().await.clone();
+        rejected.sort();
+        assert_eq!(
+            rejected,
+            vec!["que_child_59".to_owned(), "que_retry_child".to_owned()],
+            "conflicting foreign session must never be auto-declined"
+        );
+        assert!(children_calls.load(Ordering::SeqCst) >= 2);
         server.abort();
     }
 }

@@ -1355,9 +1355,11 @@ exercise a seeded update. The required matrix is macOS ARM64/x64, Linux ARM64/x6
 Windows ARM64/x64. A cross-compiled or emulated executable is compatibility evidence, not
 a native pass.
 
-GitHub Releases publish desktop installers and desktop symbols only; standalone
-server archives and Linux `.deb`/`.rpm` packages are no longer released on
-GitHub. When validating a locally built standalone `bibcode` server, inspect the
+GitHub Releases publish desktop installers, desktop symbols, and (for numeric
+stable releases) updater assets (`latest.json`, six `.sig` files, and two macOS
+`.app.tar.gz` archives) only; standalone server archives and Linux `.deb`/`.rpm`
+packages are no longer released on GitHub. When validating a locally built
+standalone `bibcode` server, inspect the
 native executable, run `bibcode --version`, start the staged distribution without
 `--static-dir`, fetch `/`, read the environment descriptor, issue and exchange
 pairing material, then terminate and prove cleanup. If validating local Linux

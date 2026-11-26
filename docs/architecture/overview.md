@@ -2573,7 +2573,7 @@ bounded memory, and works while the server is stopped.
   crash records still work.
 - An idle crash monitor costs about 0.2% of a core, from `minidumper`'s fixed
   10 ms poll loop.
-- Each release carries about 440 MB of symbol archives, 28 to 45 MB each.
+- Each release carries about 220 MB of desktop symbol archives (six platform archives, 28 to 45 MB each).
 - On Windows and Linux a preview tab's web content counts as `webview`, so a
   previewed app that leaks or keeps a core busy can raise a `webview` finding.
   Telling the two apart needs the preview host's process ids or command lines.

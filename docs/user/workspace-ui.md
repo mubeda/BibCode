@@ -4,9 +4,9 @@ BiBCode is split into left, center, and right work areas. The left panel
 navigates agents and project/worktree threads, the center panel runs chats and
 terminals, and the right panel hosts project tools.
 
-The bottom status bar shows Claude and Codex usage for the environment selected
-in the left rail, and Antigravity usage when you turn that item on in the status
-bar settings (off by default; see [Antigravity](../providers/antigravity.md)). Selecting a remote server changes both the displayed account
+The bottom status bar shows Claude, Codex, and Antigravity usage for the
+environment selected in the left rail (all three are on by default; toggle any
+of them in status bar settings, see [Antigravity](../providers/antigravity.md)). Selecting a remote server changes both the displayed account
 usage and the target of refresh or usage-reset actions. A server that has not
 returned usage does not borrow the local server's values.
 
@@ -2561,8 +2561,10 @@ review of the checkout the panel shows:
   with an allow option are auto-approved while reject-only/empty permissions and
   interactive questions are auto-cancelled). Switching a non-Codex review to
   **Supervised** (or **Plan** on providers that support Plan mode; OpenCode does
-  not have a Plan interaction mode) restores normal prompts. A Codex chat review
-  does not ask before
+  BiBCode's review auto-decline and restores normal prompts. On OpenCode V1,
+  upstream allow-all rules stay bound to the existing session until you start a
+  fresh session, so BiBCode warns when resuming that session under Supervised. A
+  Codex chat review does not ask before
   commands: the server runs it in Codex's read-only sandbox without approvals,
   as the Codex terminal review runs, so in place of the runtime picker the
   composer shows a disabled **Read-only review** lock that says why on hover or
