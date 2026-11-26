@@ -2557,8 +2557,12 @@ review of the checkout the panel shows:
   **Code review · \<agent\>**, on the same checkout. Non-Codex chat reviews start
   with **Full access** runtime access and **Default** interaction mode, and
   BiBCode auto-declines or cancels stray permission and question prompts while
-  those modes stay active. Switching a non-Codex review to **Supervised** or
-  **Plan** mode restores normal prompts. A Codex chat review does not ask before
+  those modes stay active (in full-access Cursor reviews, permission requests
+  with an allow option are auto-approved while reject-only/empty permissions and
+  interactive questions are auto-cancelled). Switching a non-Codex review to
+  **Supervised** (or **Plan** on providers that support Plan mode; OpenCode does
+  not have a Plan interaction mode) restores normal prompts. A Codex chat review
+  does not ask before
   commands: the server runs it in Codex's read-only sandbox without approvals,
   as the Codex terminal review runs, so in place of the runtime picker the
   composer shows a disabled **Read-only review** lock that says why on hover or

@@ -20947,7 +20947,6 @@ done
 capture='@CAPTURE@'
 prompt_id=''
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$capture"
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*|*'"method":"authenticate"'*)
@@ -20956,7 +20955,11 @@ while IFS= read -r line; do
     *'"method":"session/new"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"cursor-rev","modes":{"currentModeId":"ask","availableModes":[{"id":"agent","name":"Agent"},{"id":"ask","name":"Ask"},{"id":"plan","name":"Plan"}]}}}\n' "$id"
       ;;
-    *'"method":"session/set_mode"'*|*'"method":"session/set_model"'*|*'"method":"session/set_config_option"'*)
+    *'"method":"session/set_mode"'*)
+      printf '%s\n' "$line" >> "$capture"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"session/set_model"'*|*'"method":"session/set_config_option"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       ;;
     *'"method":"session/prompt"'*)
@@ -20964,12 +20967,15 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":8001,"method":"session/request_permission","params":{"toolCall":{"title":"`reject-only`"},"options":[{"optionId":"reject","kind":"reject_once"}]}}\n'
       ;;
     *'"id":8001'*)
+      printf '%s\n' "$line" >> "$capture"
       printf '{"jsonrpc":"2.0","id":8002,"method":"cursor/ask_question","params":{"questions":[{"id":"q1","prompt":"Proceed?"}]}}\n'
       ;;
     *'"id":8002'*)
+      printf '%s\n' "$line" >> "$capture"
       printf '{"jsonrpc":"2.0","id":8003,"method":"x.ai/ask_user_question","params":{"questions":[{"question":"Proceed?"}]}}\n'
       ;;
     *'"id":8003'*)
+      printf '%s\n' "$line" >> "$capture"
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"cursor-rev","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Cursor review findings."}}}}\n'
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt_id"
       ;;

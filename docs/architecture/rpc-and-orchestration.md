@@ -2372,8 +2372,10 @@ true, and the projector stores it in `projection_threads.code_review`
 `false`. Thread shells and details carry `codeReview: true` only for a review
 panel, and the client offers no Implement, Refine or "Implement in a new thread"
 on such a thread. The client opens a review with `createPanel`
-(`approval-required`; `plan` for Claude, `default` for every other driver; the
-review model when it belongs to the reviewer's instance) and then sends the
+(`full-access` and `default` for non-Codex drivers; `approval-required` and
+`default` for Codex, where the server enforces `CodexRuntimeMode::CodeReview`
+read-only sandbox and `approvalPolicy: "never"`; the review model when it
+belongs to the reviewer's instance) and then sends the
 resolved review prompt with `thread.turn.start`. The project's review prompt is
 `codeReviewPrompt` on the project (default `""`), set through
 `project.meta.update` and stored in `projection_projects.code_review_prompt`
@@ -2382,7 +2384,8 @@ resolved review prompt with `thread.turn.start`. The project's review prompt is
 without the key leaves it alone. The user's review agent, model and prompt are
 server settings (`codeReviewAgent`, `codeReviewModelSelection`,
 `codeReviewPrompt`). A terminal review uses no new path: it is an AI Terminal
-opened through the terminal open RPC with the CLI's read-only flags, `--` and
+opened through the terminal open RPC with `--dangerously-skip-permissions` for
+Claude or `--sandbox read-only --ask-for-approval never` for Codex, `--` and
 the prompt as the last argument.
 
 Closing a chat panel follows one rule (`apps/web/src/centerPanelClose.ts`): a

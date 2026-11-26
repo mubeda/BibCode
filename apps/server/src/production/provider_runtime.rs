@@ -7077,6 +7077,7 @@ mod workspace_loss_tests {
             &mut sessions,
             f.launch.clone(),
             false,
+            false,
             None,
             None,
             false,
@@ -8432,6 +8433,7 @@ async fn run_supervisor(
                     &mut sessions,
                     *request,
                     context_handoff,
+                    false,
                     frozen_delivery.as_deref(),
                     message_id.as_deref(),
                     abort_on_lost_resume,
@@ -11397,6 +11399,7 @@ async fn launch_session(
     sessions: &mut HashMap<String, SessionEntry>,
     mut request: ProviderLaunchRequest,
     context_handoff: bool,
+    prior_opencode_v1_full_access_created: bool,
     frozen_delivery: Option<&ProviderTurnDelivery>,
     message_id: Option<&str>,
     abort_on_lost_resume: bool,
@@ -11467,13 +11470,20 @@ async fn launch_session(
             ),
     ))));
     // A session suspended, shut down or crashed while it owed a context handoff still owes it.
+    let prior_runtime = engine
+        .repositories()
+        .get_provider_session_runtime(request.thread_id.clone())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
     let context_handoff = context_handoff
-        || engine
-            .repositories()
-            .get_provider_session_runtime(request.thread_id.clone())
-            .await
-            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+        || prior_runtime
+            .as_ref()
             .is_some_and(|runtime| saved_context_handoff(runtime.runtime_payload.as_ref()));
+    let prior_v1_full_access_created = prior_opencode_v1_full_access_created
+        || prior_runtime.as_ref().is_some_and(|runtime| {
+            saved_opencode_v1_full_access_created(runtime.runtime_payload.as_ref())
+                || (runtime.provider_name == "opencode" && runtime.runtime_mode == "full-access")
+        });
     let driver = factory.create(request.clone()).await?;
     let retired_model = driver.retired_model();
     // The session runs Codex's default, so the thread's "auto" below is no model change to
@@ -11524,6 +11534,20 @@ async fn launch_session(
         .is_some_and(|requested| {
             started.resume_cursor.as_ref().and_then(resume_string) != Some(requested)
         });
+    let resumed_same_session = request.resume_cursor.is_some() && !resume_lost;
+    let opencode_v1_full_access_created = request.provider == "opencode"
+        && driver.api_version() == 1
+        && if resumed_same_session {
+            prior_v1_full_access_created
+                || (prior_runtime.is_none() && request.runtime_mode == "full-access")
+        } else {
+            request.runtime_mode == "full-access"
+        };
+    let mut started = started;
+    started.runtime_payload = runtime_payload_with_v1_full_access_created(
+        started.runtime_payload,
+        opencode_v1_full_access_created,
+    );
     if resume_lost && abort_on_lost_resume {
         let _ = driver.shutdown().await;
         // Keep the requested cursor: the explicit retry releases its delivery from it.
@@ -11700,6 +11724,42 @@ async fn launch_session(
     {
         Ok(result) => result?,
         Err(stopped) => return Err(stopped_launch(stopped).await),
+    }
+    if resumed_same_session
+        && opencode_v1_full_access_created
+        && request.runtime_mode != "full-access"
+    {
+        match unless_launch_stopped(
+            &request,
+            stop,
+            project_provider_event(
+                engine,
+                &request,
+                started.resume_cursor.clone(),
+                started.runtime_payload.clone(),
+                ProviderEvent {
+                    native_event_id: None,
+                    event_type: "runtime.warning".to_owned(),
+                    thread_id: request.thread_id.clone(),
+                    turn_id: None,
+                    item_id: None,
+                    request_id: None,
+                    payload: json!({
+                        "message": "OpenCode V1 binds permission rules at session creation and cannot tighten upstream V1 rules mid-session without starting a fresh session.",
+                        "class": "provider_warning",
+                    }),
+                    activity: Vec::new(),
+                    activity_controls: ProviderActivityControls::default(),
+                },
+                #[cfg(test)]
+                None,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(stopped) => return Err(stopped_launch(stopped).await),
+        }
     }
     if resume_lost
         && let Err(stopped) = unless_launch_stopped(
@@ -12077,11 +12137,6 @@ async fn handle_command(
                     persist_entry(&engine.repositories(), entry, "ready").await
                 }
                 Err(ProviderRuntimeError::UnsupportedCapability { .. }) => {
-                    let old_resume_cursor = entry.resume_cursor.clone();
-                    let warn_v1_rules = entry.launch.provider == "opencode"
-                        && entry.driver.api_version() == 1
-                        && entry.launch.runtime_mode == "full-access"
-                        && runtime_mode != "full-access";
                     let mut launch = entry.launch.clone();
                     launch.runtime_mode = runtime_mode;
                     restart_session(
@@ -12094,36 +12149,7 @@ async fn handle_command(
                         operational_log,
                         None,
                     )
-                    .await?;
-                    if warn_v1_rules
-                        && let Some(restarted) = sessions.get(&thread_id)
-                        && restarted.resume_cursor == old_resume_cursor
-                    {
-                        project_provider_event(
-                            engine,
-                            &restarted.launch,
-                            restarted.resume_cursor.clone(),
-                            restarted.runtime_payload.clone(),
-                            ProviderEvent {
-                                native_event_id: None,
-                                event_type: "runtime.warning".to_owned(),
-                                thread_id: thread_id.clone(),
-                                turn_id: None,
-                                item_id: None,
-                                request_id: None,
-                                payload: json!({
-                                    "message": "OpenCode V1 binds permission rules at session creation and cannot tighten upstream V1 rules mid-session without starting a fresh session.",
-                                    "class": "provider_warning",
-                                }),
-                                activity: Vec::new(),
-                                activity_controls: ProviderActivityControls::default(),
-                            },
-                            #[cfg(test)]
-                            None,
-                        )
-                        .await?;
-                    }
-                    Ok(())
+                    .await
                 }
                 // The thread already asks for this mode: a restart must never start the
                 // session in the earlier, possibly more permissive one.
@@ -13259,9 +13285,15 @@ async fn restart_session(
     let mut activity_dispatch_sender = None;
     let mut activity_dispatch_capacity = None;
     let mut context_handoff = false;
+    let mut prior_opencode_v1_full_access_created = false;
     if let Some(entry) = sessions.get_mut(thread_id) {
         launch.resume_cursor = entry.resume_cursor.clone();
         context_handoff = entry.pending_context_handoff.load(Ordering::Acquire);
+        prior_opencode_v1_full_access_created =
+            saved_opencode_v1_full_access_created(entry.runtime_payload.as_ref())
+                || (entry.launch.provider == "opencode"
+                    && entry.driver.api_version() == 1
+                    && entry.launch.runtime_mode == "full-access");
         inherited_activity_lifecycle = Some(entry.activity_lifecycle.clone());
         terminal_sender = Some(entry.terminal_sender.clone());
         idle_timeout = Some(entry.idle_timeout);
@@ -13318,6 +13350,7 @@ async fn restart_session(
         sessions,
         launch,
         context_handoff,
+        prior_opencode_v1_full_access_created,
         None,
         message_id,
         false,
@@ -15448,6 +15481,35 @@ fn runtime_payload_with_resume_refused(payload: Option<Value>) -> Option<Value> 
         object.insert(RESUME_REFUSED_PAYLOAD_FIELD.to_owned(), Value::Bool(true));
     }
     Some(payload)
+}
+
+/// Marks an OpenCode V1 session created in `full-access` (allow-all rules baked at session
+/// creation), so resuming that same V1 session under a tighter runtime mode warns the user even
+/// after suspension or restart.
+const OPENCODE_V1_FULL_ACCESS_CREATED_FIELD: &str = "opencodeV1FullAccessCreated";
+
+fn runtime_payload_with_v1_full_access_created(
+    payload: Option<Value>,
+    created: bool,
+) -> Option<Value> {
+    if !created {
+        return payload;
+    }
+    let mut payload = payload.unwrap_or_else(|| json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            OPENCODE_V1_FULL_ACCESS_CREATED_FIELD.to_owned(),
+            Value::Bool(true),
+        );
+    }
+    Some(payload)
+}
+
+fn saved_opencode_v1_full_access_created(payload: Option<&Value>) -> bool {
+    payload
+        .and_then(|payload| payload.get(OPENCODE_V1_FULL_ACCESS_CREATED_FIELD))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 fn saved_context_handoff(payload: Option<&Value>) -> bool {
@@ -42829,6 +42891,341 @@ done
         })
         .await
         .expect("V2 callback after mode switch must open card");
+
+        supervisor.shutdown().await.expect("shutdown");
+        engine.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn opencode_code_review_v1_suspended_mode_switch_warns_on_resume() {
+        use axum::{
+            Json, Router,
+            extract::Path,
+            response::sse::Event,
+            routing::{get, post},
+        };
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        let app = Router::new()
+            .route(
+                "/global/health",
+                get(|| async { Json(json!({ "healthy": true, "version": "1.18.32" })) }),
+            )
+            .route(
+                "/session",
+                post(|| async { Json(json!({ "id": "ses-v1-susp" })) }),
+            )
+            .route(
+                "/session/{session_id}",
+                get(|Path(id): Path<String>| async move { Json(json!({ "id": id })) }),
+            )
+            .route("/permission", get(|| async { Json(json!([])) }))
+            .route("/question", get(|| async { Json(json!([])) }))
+            .route(
+                "/event",
+                get(|| async {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let _ = tx.send(json!({ "type": "server.connected", "properties": {} }));
+                    let stream =
+                        futures_util::StreamExt::map(UnboundedReceiverStream::new(rx), |event| {
+                            Ok::<Event, std::convert::Infallible>(
+                                Event::default().data(event.to_string()),
+                            )
+                        });
+                    axum::response::Sse::new(stream)
+                }),
+            );
+        let (endpoint, server) = crate::provider::opencode::server_fixtures::serve(app).await;
+        let temp = TempDir::new().expect("temp");
+        let engine = supervisor_engine().await;
+        let mut events = engine.subscribe_events();
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(super::NativeProviderDriverFactory::new(
+                temp.path().join("attachments"),
+            )),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        // 1. Start a fresh OpenCode V1 review in full-access, then suspend it (server shutdown /
+        //    idle suspension persists `status = "suspended"` with `resume_cursor` and creation flag).
+        let mut launch = native_launch(&temp, "opencode");
+        launch.thread_id = "t1".to_owned();
+        launch.runtime_mode = "full-access".to_owned();
+        launch.code_review = true;
+        launch.endpoint = Some(endpoint.clone());
+        supervisor
+            .launch(launch.clone())
+            .await
+            .expect("launch v1 full-access");
+        supervisor.shutdown().await.expect("suspend v1 session");
+
+        let suspended_row = engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .expect("read suspended runtime")
+            .expect("suspended runtime row exists");
+        assert_eq!(suspended_row.status, "suspended");
+        assert_eq!(
+            suspended_row.resume_cursor,
+            Some(json!({ "sessionId": "ses-v1-susp" }))
+        );
+
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(super::NativeProviderDriverFactory::new(
+                temp.path().join("attachments"),
+            )),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+
+        // 2. While suspended, ThreadRuntimeModeSet sees SessionNotFound and succeeds quietly.
+        let mode_switch = OrchestrationCommand::ThreadRuntimeModeSet {
+            command_id: "mode-while-suspended".to_owned(),
+            thread_id: "t1".to_owned(),
+            runtime_mode: "approval-required".to_owned(),
+            created_at: "2026-07-16T00:00:02Z".to_owned(),
+        };
+        engine
+            .dispatch(mode_switch.clone())
+            .await
+            .expect("dispatch mode set");
+        super::route_orchestration_command(
+            &supervisor,
+            &engine,
+            &temp.path().to_path_buf(),
+            mode_switch,
+        )
+        .await
+        .expect("mode set while suspended succeeds");
+
+        // 3. Resuming the same V1 session under approval-required must emit runtime.warning.
+        let mut resumed_launch = launch;
+        resumed_launch.runtime_mode = "approval-required".to_owned();
+        resumed_launch.resume_cursor = suspended_row.resume_cursor;
+        supervisor
+            .launch(resumed_launch)
+            .await
+            .expect("resume v1 in approval-required");
+
+        let mut warned = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !warned && tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(recorded)) = timeout(Duration::from_millis(500), events.recv()).await
+                && recorded.event.event_type == "thread.activity-appended"
+                && recorded.event.payload["activity"]["kind"] == "provider.warning"
+                && recorded.event.payload["activity"]["payload"]["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("session creation") && d.contains("fresh session"))
+            {
+                warned = true;
+            }
+        }
+        assert!(
+            warned,
+            "resuming a suspended full-access OpenCode V1 session under approval-required must emit runtime.warning"
+        );
+
+        supervisor.shutdown().await.expect("shutdown");
+        engine.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn opencode_code_review_v1_settlement_during_recovery_clears_persisted_card() {
+        use super::ActivityInput;
+        use axum::{
+            Json, Router, extract::Path, http::StatusCode, response::IntoResponse,
+            response::sse::Event, routing::get,
+        };
+        use tokio::sync::{Mutex as AsyncMutex, Notify};
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        let perm_calls = Arc::new(AtomicUsize::new(0));
+        let question_calls = Arc::new(AtomicUsize::new(0));
+        let question_entered = Arc::new(Notify::new());
+        let release_question = Arc::new(Notify::new());
+        let sse_tx: Arc<AsyncMutex<Option<mpsc::UnboundedSender<Value>>>> =
+            Arc::new(AsyncMutex::new(None));
+        let app = Router::new()
+            .route(
+                "/global/health",
+                get(|| async { Json(json!({ "healthy": true, "version": "1.18.32" })) }),
+            )
+            .route(
+                "/session/{session_id}",
+                get(|Path(id): Path<String>| async move { Json(json!({ "id": id })) }),
+            )
+            .route(
+                "/session/{session_id}/children",
+                get(|| async { Json(json!([])) }),
+            )
+            .route(
+                "/permission",
+                get({
+                    let perm_calls = perm_calls.clone();
+                    move || {
+                        let perm_calls = perm_calls.clone();
+                        async move {
+                            // First read (initial pre-subscription resume) fails so the ask is
+                            // only discovered on the post-subscription recovery read.
+                            if perm_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                            } else {
+                                Json(json!([{
+                                    "id": "v1_race_perm",
+                                    "sessionID": "ses-v1-race",
+                                    "permission": "bash",
+                                    "patterns": ["git status"]
+                                }]))
+                                .into_response()
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/question",
+                get({
+                    let question_calls = question_calls.clone();
+                    let question_entered = question_entered.clone();
+                    let release_question = release_question.clone();
+                    move || {
+                        let question_calls = question_calls.clone();
+                        let question_entered = question_entered.clone();
+                        let release_question = release_question.clone();
+                        async move {
+                            // Second call is inside post-subscription `v1_read_pending_lists`,
+                            // after `/permission` returned `v1_race_perm`. Hold it open while
+                            // `permission.replied` arrives over SSE.
+                            if question_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                                question_entered.notify_one();
+                                release_question.notified().await;
+                            }
+                            Json(json!([]))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/event",
+                get({
+                    let sse_tx = sse_tx.clone();
+                    move || {
+                        let sse_tx = sse_tx.clone();
+                        async move {
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            let _ = tx.send(json!({
+                                "type": "server.connected",
+                                "properties": {}
+                            }));
+                            *sse_tx.lock().await = Some(tx);
+                            let stream = futures_util::StreamExt::map(
+                                UnboundedReceiverStream::new(rx),
+                                |event| {
+                                    Ok::<Event, std::convert::Infallible>(
+                                        Event::default().data(event.to_string()),
+                                    )
+                                },
+                            );
+                            axum::response::Sse::new(stream)
+                        }
+                    }
+                }),
+            );
+        let (endpoint, server) = crate::provider::opencode::server_fixtures::serve(app).await;
+        let temp = TempDir::new().expect("temp");
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(OrchestrationCommand::ThreadActivityAppend {
+                command_id: "seed-v1-race-card".to_owned(),
+                thread_id: "t1".to_owned(),
+                activity: ActivityInput {
+                    id: "act-v1-race-card".to_owned(),
+                    tone: "approval".to_owned(),
+                    kind: "approval.requested".to_owned(),
+                    summary: "Approval requested".to_owned(),
+                    payload: json!({
+                        "requestId": "v1_race_perm",
+                        "requestType": "exec_command_approval",
+                        "detail": "bash: git status",
+                        "eventType": "request.opened"
+                    }),
+                    turn_id: None,
+                    sequence: None,
+                    created_at: "2026-07-16T00:00:00Z".to_owned(),
+                },
+                created_at: "2026-07-16T00:00:00Z".to_owned(),
+            })
+            .await
+            .expect("seed persisted approval");
+
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(super::NativeProviderDriverFactory::new(
+                temp.path().join("attachments"),
+            )),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let mut launch = native_launch(&temp, "opencode");
+        launch.thread_id = "t1".to_owned();
+        launch.runtime_mode = "full-access".to_owned();
+        launch.code_review = true;
+        launch.endpoint = Some(endpoint);
+        launch.resume_cursor = Some(json!({ "sessionId": "ses-v1-race" }));
+        supervisor.launch(launch).await.expect("launch v1 race");
+
+        timeout(Duration::from_secs(5), question_entered.notified())
+            .await
+            .expect("post-subscription /question read started");
+        let tx = sse_tx
+            .lock()
+            .await
+            .clone()
+            .expect("sse connected before /question read");
+        tx.send(json!({
+            "type": "permission.replied",
+            "properties": {
+                "requestID": "v1_race_perm",
+                "sessionID": "ses-v1-race",
+                "reply": "reject"
+            }
+        }))
+        .expect("send settlement while /question is open");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release_question.notify_waiters();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let thread = engine
+                    .repositories()
+                    .get_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if thread.pending_approval_count == 0
+                    && !engine.promotion_held_for_ask_recovery("t1")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .expect("settled ask during recovery must clear persisted SQLite card and release queue");
 
         supervisor.shutdown().await.expect("shutdown");
         engine.shutdown().await;

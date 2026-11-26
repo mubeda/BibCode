@@ -264,15 +264,13 @@ async function expectNoImplementActions(): Promise<void> {
 }
 
 async function expectReviewFindings(): Promise<void> {
-  // The plan card's text first, so a missing flag fails at the Implement check below.
-  await expect(browser.$(visibleSurfaceSelector)).toHaveText(
-    expect.stringContaining(desktopUiFixture.codeReviewFinding),
-    { wait: 30_000 },
-  );
+  // The proposed-plan card itself must render the findings with no Implement/Refine actions.
+  const planCard = browser.$(visibleSurfaceSelector).$('[data-item-type="proposed-plan"]');
+  await expect(planCard).toHaveText(expect.stringContaining(desktopUiFixture.codeReviewFinding), {
+    wait: 30_000,
+  });
   await expectNoImplementActions();
-  await expect(browser.$(visibleSurfaceSelector)).toHaveText(
-    expect.stringContaining("Review findings"),
-  );
+  await expect(planCard).toHaveText(expect.stringContaining("Review findings"));
 }
 
 // Each test sets itself up: the harness resets the connection catalog and reloads the document
@@ -377,9 +375,9 @@ describe("packaged Source Control review", () => {
       expect.stringContaining(desktopUiFixture.codeReviewFinding),
       { wait: 30_000 },
     );
-    await expect(browser.$(visibleSurfaceSelector)).toHaveText(
-      expect.stringContaining("Review findings"),
-    );
+    await expect(
+      browser.$(visibleSurfaceSelector).$('[data-item-type="proposed-plan"]'),
+    ).not.toExist();
     await expect(
       browser.$(visibleSurfaceSelector).$('//button[normalize-space()="Implement"]'),
     ).not.toExist();
