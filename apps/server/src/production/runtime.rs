@@ -3741,7 +3741,8 @@ mod tests {
                 "claudeAgent":{"enabled":false},
                 "cursor":{"enabled":false},
                 "grok":{"enabled":false},
-                "opencode":{"enabled":false}
+                "opencode":{"enabled":false},
+                "antigravity":{"enabled":false}
             }}),
         );
         let database = Database::open_in_memory().await.expect("database");
