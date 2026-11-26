@@ -1438,6 +1438,7 @@ exec "$BIBCODE_TEST_EXECUTABLE" --exact production::provider_inventory::capabili
         );
     }
 
+    #[cfg(unix)]
     fn antigravity_cap_settings(
         binary: &Path,
         home: &Path,
