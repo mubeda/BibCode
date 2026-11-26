@@ -10,8 +10,9 @@ Intel x64. A native run proves only the host architecture unless another native
 Mac executes the other artifact. Record macOS build, hardware architecture,
 and whether translation is involved.
 
-Standalone server releases provide native ARM64 and x64 `.tar.gz` archives containing
-`bibcode` and the matching web client. Validate the archive matching the native host.
+GitHub Releases publish macOS desktop `.dmg` installers only; standalone
+`bibcode` server builds are compiled and validated locally when needed rather
+than distributed as GitHub Release assets.
 
 ## Host and toolchain inventory
 
@@ -55,7 +56,7 @@ Select focused tests from affected source and verify at least:
 - Local desktop presentation omits WSL controls while saved remote environments
   remain selectable in the environment rail without bypassing desktop-owned
   connection controls;
-- Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent;
+- Claude, Codex, Cursor, OpenCode, and Antigravity remain visible while Grok is absent;
 - the installed Claude Code is within the hooked range and passes Anthropic's
   signature check within its budget, and a newer build is proven before the
   ceiling is raised
@@ -198,7 +199,7 @@ check is a failed native build; a check against a different installed bundle
 does not qualify the release DMG.
 
 The release producer hosts are macOS 26 ARM64 and supported macOS 15 Intel for
-both desktop and standalone server artifacts. Native desktop CI's Intel row
+desktop release artifacts. Native desktop CI's Intel row
 uses the same macOS 15 Intel runner, so it builds what Release ships. Packaged
 UI and upgrade validation retain macOS 26 Intel. The producer hosts run the same
 mounted-application signature and Finder pixel criteria, with all platform
@@ -495,8 +496,9 @@ as not verified, with the lock evidence (`ioreg -n Root -d1` shows
   packaged app is running lands on Add Server with the code prefilled. The
   custom scheme is bundle-time-only on macOS and is not an unbundled dev-mode
   check;
-- provider settings and action menus show Claude, Codex, Cursor, and OpenCode
-  without Early Access labels and omit Grok/Grok Terminal;
+- provider settings and action menus show Claude, Codex, Cursor, OpenCode, and
+  Antigravity without preview or Early Access labels (with plain "Authenticated"
+  status rows omitting email and method details) and omit Grok/Grok Terminal;
 - external worktree grouping, full paths, actions, physical identity, and
   restart are correct;
 - sidebar menus: right-click a worktree card, the primary card and a project
@@ -614,8 +616,9 @@ ones:
 - **Shutdown.** With the profiler on and a provider session and a terminal
   open, quit with **⌘Q**. After the next start no new `crash.webview` or
   `subprocess.crash` finding exists.
-- **Stripped arm64 signature.** On Apple silicon, build the standalone server
-  as the release job does and verify the stripped copy's ad-hoc signature:
+- **Stripped arm64 signature.** On Apple silicon, when building a local
+  stripped standalone server binary, verify the stripped copy's ad-hoc
+  signature:
 
   ```sh
   CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
@@ -625,8 +628,7 @@ ones:
   codesign --verify --verbose=2 target/release/bibcode.stripped
   ```
 
-  The release server job runs the same `codesign --verify`, so a failure here
-  predicts a failed release; record it.
+  Record any failure when testing local stripped arm64 server builds.
 
 ## Android device previews
 

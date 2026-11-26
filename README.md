@@ -23,7 +23,7 @@
 
 ## What it is
 
-BiBCode is a desktop app, a browser UI, and a headless server for coding agents. It runs Codex, Claude Code, Cursor (Early Access), Antigravity (Preview), and OpenCode side by side, each in its own Git worktree, with the terminals, Git client, pull requests, and CI pipelines for the same project one click away. It runs on macOS, Windows, and Linux, on Apple Silicon, Intel, and ARM64, and it can run on another machine and connect back to your desktop.
+BiBCode is a desktop app, a browser UI, and a headless server for coding agents. It runs Codex, Claude Code, Cursor (Early Access), Antigravity, and OpenCode side by side, each in its own Git worktree, with the terminals, Git client, pull requests, and CI pipelines for the same project one click away. It runs on macOS, Windows, and Linux, on Apple Silicon, Intel, and ARM64, and it can run on another machine and connect back to your desktop.
 
 All screenshots below use demo data.
 
@@ -117,7 +117,7 @@ Get the latest build from the [latest release page](https://github.com/mubeda/Bi
 - Windows: `.exe` installer (x64 or ARM64)
 - Linux: `.AppImage` (x64 or ARM64)
 
-The same release has standalone `bibcode` server archives for each platform, plus `.deb` and `.rpm` packages for Linux. See [Standalone server installation](docs/user/server-installation.md) for checksums, installation, and manual updates.
+GitHub Releases publish desktop installers only. To run a headless `bibcode` server, build it locally from source; see [Standalone server installation](docs/user/server-installation.md) for local build, installation, and manual update steps.
 
 > [!NOTE]
 > macOS releases are ad-hoc signed without an Apple Developer identity or
@@ -139,7 +139,7 @@ The same release has standalone `bibcode` server archives for each platform, plu
 > - Codex: install [Codex CLI](https://developers.openai.com/codex/cli) and run `codex login`
 > - Claude: install [Claude Code](https://claude.com/product/claude-code) and run `claude auth login`
 > - Cursor: install [Cursor CLI](https://cursor.com/cli) and run `cursor-agent login`
-> - Antigravity (Preview, off by default): install the Antigravity CLI and run `agy` to sign in
+> - Antigravity: install the Antigravity CLI and run `agy` to sign in
 > - OpenCode: install [OpenCode](https://opencode.ai) and run `opencode auth login`
 
 Then open BiBCode, add a project, and start a chat. [Getting started](docs/getting-started/quick-start.md) walks through the first launch, and [Workspace UI](docs/user/workspace-ui.md) covers every panel.
