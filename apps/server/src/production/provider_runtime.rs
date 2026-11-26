@@ -42409,7 +42409,7 @@ done
         let providers = ProvidersState::default();
         let resolved = super::provider_binary_settings(&providers, "antigravity", None);
         assert_eq!(resolved.binary_path, "agy");
-        assert!(!resolved.enabled, "disabled by default, unlike Codex");
+        assert!(resolved.enabled, "enabled by default like Codex");
         let detail = crate::provider::cursor::acp::AcpProtocolError::LineTooLong {
             stream: "stdout",
             maximum: 128 * 1024,
