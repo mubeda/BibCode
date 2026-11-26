@@ -120,15 +120,25 @@ describe("resolveCodeReviewPrompt", () => {
   });
 });
 
+const AUTO_MODE_GUARD_LINE =
+  "Runs in auto mode without asking for permissions. Told not to edit; BiBCode cannot block edits for this agent.";
+
 describe("resolveCodeReviewChatModes", () => {
-  it("uses plan only for Claude and approval everywhere", () => {
-    expect(resolveCodeReviewChatModes(ProviderDriverKind.make("claudeAgent"))).toEqual({
+  it("uses full-access + default for non-Codex drivers and approval-required + default for Codex", () => {
+    expect(resolveCodeReviewChatModes(ProviderDriverKind.make("codex"))).toEqual({
       runtimeMode: "approval-required",
-      interactionMode: "plan",
+      interactionMode: "default",
     });
-    for (const driver of ["codex", "cursor", "grok", "opencode"]) {
+    for (const driver of [
+      "claudeAgent",
+      "cursor",
+      "grok",
+      "opencode",
+      "antigravity",
+      "custom-reviewer",
+    ]) {
       expect(resolveCodeReviewChatModes(ProviderDriverKind.make(driver))).toEqual({
-        runtimeMode: "approval-required",
+        runtimeMode: "full-access",
         interactionMode: "default",
       });
     }
@@ -139,23 +149,20 @@ describe("codeReviewGuardLine", () => {
   const line = (kind: "chat" | "terminal", driver: string) =>
     codeReviewGuardLine({ kind, driver: ProviderDriverKind.make(driver) });
 
-  it("returns the design note's line for each of the seven reviewers", () => {
-    expect(line("chat", "claudeAgent")).toBe("Starts in Claude's plan mode.");
+  it("returns the auto-mode guard line for non-Codex reviewers and read-only lines for Codex", () => {
+    expect(line("chat", "claudeAgent")).toBe(AUTO_MODE_GUARD_LINE);
     expect(line("chat", "codex")).toBe(
       "Runs in Codex's read-only sandbox. Writes ask for your approval.",
     );
-    expect(line("chat", "opencode")).toBe("Edits and commands ask for your approval.");
-    expect(line("chat", "cursor")).toBe(
-      "Told not to edit. BiBCode cannot block edits for this agent.",
-    );
-    expect(line("chat", "grok")).toBe(
-      "Told not to edit. BiBCode cannot block edits for this agent.",
-    );
-    expect(line("terminal", "claudeAgent")).toBe("Starts in Claude's plan mode.");
+    expect(line("chat", "opencode")).toBe(AUTO_MODE_GUARD_LINE);
+    expect(line("chat", "cursor")).toBe(AUTO_MODE_GUARD_LINE);
+    expect(line("chat", "grok")).toBe(AUTO_MODE_GUARD_LINE);
+    expect(line("chat", "antigravity")).toBe(AUTO_MODE_GUARD_LINE);
+    expect(line("terminal", "claudeAgent")).toBe(AUTO_MODE_GUARD_LINE);
     expect(line("terminal", "codex")).toBe("Runs in Codex's read-only sandbox.");
   });
 
-  it("offers the Antigravity chat as a reviewer with the instructed guard, and no terminal review", () => {
+  it("offers the Antigravity chat as a reviewer with the auto-mode guard, and no terminal review", () => {
     const antigravity = {
       instanceId: ProviderInstanceId.make("antigravity"),
       driver: ProviderDriverKind.make("antigravity"),
@@ -181,7 +188,7 @@ describe("codeReviewGuardLine", () => {
     ).toEqual([
       {
         value: "chat:antigravity",
-        guardLine: "Told not to edit. BiBCode cannot block edits for this agent.",
+        guardLine: AUTO_MODE_GUARD_LINE,
       },
     ]);
   });
@@ -204,12 +211,20 @@ describe("codeReviewGuardLine", () => {
         driver: ProviderDriverKind.make("claudeAgent"),
         readOnlyCodexReviews: true,
       }),
-    ).toBe("Starts in Claude's plan mode.");
+    ).toBe(AUTO_MODE_GUARD_LINE);
   });
 
   it("never promises that a review cannot edit", () => {
     for (const kind of ["chat", "terminal"] as const) {
-      for (const driver of ["claudeAgent", "codex", "opencode", "cursor", "grok", "other"]) {
+      for (const driver of [
+        "claudeAgent",
+        "codex",
+        "opencode",
+        "cursor",
+        "grok",
+        "antigravity",
+        "other",
+      ]) {
         const text = line(kind, driver);
         expect(text).not.toMatch(/blocks|cannot edit/i);
         expect(text).not.toContain("—");
@@ -217,10 +232,8 @@ describe("codeReviewGuardLine", () => {
     }
   });
 
-  it("treats an unknown driver as instructed only", () => {
-    expect(line("chat", "other")).toBe(
-      "Told not to edit. BiBCode cannot block edits for this agent.",
-    );
+  it("treats an unknown driver as auto-mode instructed only", () => {
+    expect(line("chat", "other")).toBe(AUTO_MODE_GUARD_LINE);
   });
 });
 

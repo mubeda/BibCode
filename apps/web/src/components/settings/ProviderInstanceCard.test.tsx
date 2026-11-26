@@ -341,26 +341,31 @@ describe("header + status", () => {
     expect(ui.find("Badge").children).toBe("Early Access");
   });
 
-  it("marks the Antigravity chat as a preview and keeps its session defaults", () => {
+  it("omits any preview badge on Antigravity while keeping Early Access on Grok metadata and session defaults", () => {
     const antigravity = getDriverOption(ProviderDriverKind.make("antigravity"))!;
-    render(
+    const grok = getDriverOption(ProviderDriverKind.make("grok"))!;
+    expect(antigravity.badgeLabel).toBeUndefined();
+    expect(grok.badgeLabel).toBe("Early Access");
+
+    const markup = render(
       baseProps({
         instanceId: ProviderInstanceId.make("antigravity"),
-        instance: { driver: antigravity.value, enabled: false } as ProviderInstanceConfig,
+        instance: { driver: antigravity.value, enabled: true } as ProviderInstanceConfig,
         driverOption: antigravity,
         onSessionDefaultsChange: vi.fn(),
       }),
     );
 
-    expect(ui.find("Badge").children).toBe("Chat preview");
+    expect(ui.filter("Badge")).toHaveLength(0);
+    expect(markup).not.toContain("Chat preview");
     expect(ui.find("ProviderSessionDefaultsControls")).toMatchObject({
       driver: antigravity.value,
-      disabled: true,
+      disabled: false,
     });
-    expect(ui.byLabel("Switch", "Enable Antigravity").checked).toBe(false);
+    expect(ui.byLabel("Switch", "Enable Antigravity").checked).toBe(true);
   });
 
-  it("notes Google's written position once Antigravity is enabled or set up, never blocking it", () => {
+  it("notes Google's written position with an Account terms link once Antigravity is enabled or set up, never blocking it", () => {
     const antigravity = getDriverOption(ProviderDriverKind.make("antigravity"))!;
     const note = "Antigravity FAQ says tools that wrap the Antigravity CLI";
     const card = (enabled: boolean, installed: boolean | undefined) =>
@@ -376,7 +381,10 @@ describe("header + status", () => {
         }),
       );
 
-    expect(card(true, undefined)).toContain(note);
+    const enabledMarkup = card(true, undefined);
+    expect(enabledMarkup).toContain(note);
+    expect(enabledMarkup).toContain("Account terms");
+    expect(enabledMarkup).not.toContain("Why it is Preview");
     expect(ui.byLabel("Switch", "Enable Antigravity").disabled).toBeUndefined();
     expect(card(false, true)).toContain(note);
     expect(card(false, false)).not.toContain(note);
@@ -425,31 +433,51 @@ describe("header + status", () => {
     expect(ui.find("ProviderInstanceIcon").statusDotClassName).toBe("bg-destructive");
   });
 
-  it("renders the authenticated-as row with a redacted email and detail", () => {
-    const markup = render(
-      baseProps({
-        liveProvider: liveProvider({
-          auth: { status: "authenticated", email: "dev@example.com", label: "Pro" },
+  it.each(["codex", "claudeAgent", "cursor", "opencode", "antigravity"] as const)(
+    "renders plain Authenticated without email or auth method for %s",
+    (driver) => {
+      const driverKind = ProviderDriverKind.make(driver);
+      const markup = render(
+        baseProps({
+          instanceId: ProviderInstanceId.make(driver),
+          instance: instanceConfig({ driver: driverKind }),
+          driverOption: getDriverOption(driverKind) ?? driverOption({ value: driverKind }),
+          liveProvider: liveProvider({
+            driver: driverKind,
+            auth: {
+              status: "authenticated",
+              email: "test-user@example.test",
+              label: "Pro",
+              type: "oauth",
+            },
+            message: "Ready to run",
+          }),
         }),
-      }),
-    );
-    expect(markup).toContain("Authenticated as");
-    expect(markup).toContain("dev@example.com");
-    expect(markup).toContain("Pro");
-  });
+      );
+      expect(markup).toContain("Authenticated");
+      expect(markup).toContain("Ready to run");
+      expect(markup).not.toContain("Authenticated as");
+      expect(markup).not.toContain("test-user@example.test");
+      expect(markup).not.toContain("Pro");
+      expect(markup).not.toContain("oauth");
+      expect(ui.filter("RedactedSensitiveText")).toHaveLength(0);
+    },
+  );
 
-  it("renders the summary row with the account email when not authenticated", () => {
+  it("renders the summary row without the account email when not authenticated", () => {
     const markup = render(
       baseProps({
         liveProvider: liveProvider({
-          auth: { status: "unauthenticated", email: "pending@example.com" },
+          auth: { status: "unauthenticated", email: "pending@example.test" },
           message: "Sign in required",
         }),
       }),
     );
     expect(markup).toContain("Not authenticated");
-    expect(markup).toContain("pending@example.com");
     expect(markup).toContain("Sign in required");
+    expect(markup).not.toContain("pending@example.test");
+    expect(markup).not.toContain("Email");
+    expect(ui.filter("RedactedSensitiveText")).toHaveLength(0);
   });
 
   it("renders a checking summary when there is no live provider", () => {

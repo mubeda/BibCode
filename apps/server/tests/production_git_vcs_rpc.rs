@@ -482,7 +482,8 @@ async fn automatic_git_fetch_setting_changes_apply_without_restart() {
                 "claudeAgent": { "enabled": false },
                 "cursor": { "enabled": false },
                 "grok": { "enabled": false },
-                "opencode": { "enabled": false }
+                "opencode": { "enabled": false },
+                "antigravity": { "enabled": false }
             }
         }),
     );

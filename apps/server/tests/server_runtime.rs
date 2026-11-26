@@ -136,7 +136,8 @@ fn write_disabled_provider_settings(temp: &TempDir) -> PathBuf {
                 "claudeAgent": { "enabled": false },
                 "cursor": { "enabled": false },
                 "grok": { "enabled": false },
-                "opencode": { "enabled": false }
+                "opencode": { "enabled": false },
+                "antigravity": { "enabled": false }
             }
         }))
         .expect("encode provider settings"),

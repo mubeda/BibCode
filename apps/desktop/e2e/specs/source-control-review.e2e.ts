@@ -4,7 +4,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import { refreshDesktopUiDocument } from "../support/document-navigation.ts";
-import { readProviderInputLog } from "../support/provider-input-log.ts";
+import { readProviderInputLog, type ProviderInputLogEntry } from "../support/provider-input-log.ts";
 import { desktopUiFixture } from "../support/test-project.ts";
 import {
   ensureMainSidebarOpen,
@@ -184,23 +184,61 @@ function reviewTab(provider: string) {
   return browser.$(`//button[@role="tab"][.//span[normalize-space()="Code review · ${provider}"]]`);
 }
 
-async function waitForReviewStart(provider: "codex" | "claudeAgent", baseline: number) {
-  let prompt: string | undefined;
+type ReviewInputLogEntry = ProviderInputLogEntry & { readonly permissionMode?: string | null };
+
+async function waitForReviewStart(
+  provider: "codex" | "claudeAgent",
+  baseline: number,
+): Promise<ReviewInputLogEntry> {
+  let match: ReviewInputLogEntry | undefined;
   await browser.waitUntil(
     () => {
-      prompt = readProviderInputLog(preparedProviderInputLogPath)
+      match = readProviderInputLog(preparedProviderInputLogPath)
         .slice(baseline)
         .find(
           (entry) =>
             entry.provider === provider &&
             entry.kind === "start" &&
             entry.prompt.startsWith(REVIEW_LEAD_IN),
-        )?.prompt;
-      return prompt !== undefined;
+        ) as ReviewInputLogEntry | undefined;
+      return match !== undefined;
     },
     { timeoutMsg: `The review's first message did not reach ${provider}.` },
   );
-  return prompt!;
+  return match!;
+}
+
+async function startOneOffClaudeReview(baseline: number): Promise<ReviewInputLogEntry> {
+  await browser.$('button[aria-label="Review options"]').click();
+  const claude = browser.$(
+    '//*[@role="menuitem"][.//span[normalize-space()="Claude"]][not(@aria-disabled="true")]',
+  );
+  await claude.waitForExist();
+  await browser.execute((item: HTMLElement) => item.click(), await claude);
+  await reviewTab("Claude").waitForDisplayed({
+    timeoutMsg: "The Claude review tab did not open.",
+  });
+  return waitForReviewStart("claudeAgent", baseline);
+}
+
+async function setProjectReviewPrompt(promptText: string | null): Promise<void> {
+  await browser.$('button[aria-label="Review options"]').click();
+  const item = browser.$(
+    '//*[@role="menuitem" and normalize-space()="Review prompt for this project…"]',
+  );
+  await item.waitForExist();
+  await browser.execute((entry: HTMLElement) => entry.click(), await item);
+  const dialog = browser.$('[role="dialog"]');
+  await dialog.waitForDisplayed();
+  if (promptText === null) {
+    await dialog.$('//button[normalize-space()="Reset"]').click();
+  } else {
+    const field = dialog.$("textarea");
+    await field.waitForDisplayed();
+    await field.setValue(promptText);
+  }
+  await dialog.$('//button[normalize-space()="Save"]').click();
+  await dialog.waitForExist({ reverse: true });
 }
 
 /** No Implement, Refine or "Implement in a new thread", and an empty Enter sends nothing. */
@@ -226,15 +264,13 @@ async function expectNoImplementActions(): Promise<void> {
 }
 
 async function expectReviewFindings(): Promise<void> {
-  // The plan card's text first, so a missing flag fails at the Implement check below.
-  await expect(browser.$(visibleSurfaceSelector)).toHaveText(
-    expect.stringContaining(desktopUiFixture.codeReviewFinding),
-    { wait: 30_000 },
-  );
+  // The proposed-plan card itself must render the findings with no Implement/Refine actions.
+  const planCard = browser.$(visibleSurfaceSelector).$('[data-item-type="proposed-plan"]');
+  await expect(planCard).toHaveText(expect.stringContaining(desktopUiFixture.codeReviewFinding), {
+    wait: 30_000,
+  });
   await expectNoImplementActions();
-  await expect(browser.$(visibleSurfaceSelector)).toHaveText(
-    expect.stringContaining("Review findings"),
-  );
+  await expect(planCard).toHaveText(expect.stringContaining("Review findings"));
 }
 
 // Each test sets itself up: the harness resets the connection catalog and reloads the document
@@ -280,7 +316,7 @@ describe("packaged Source Control review", () => {
     await browser.$('button[aria-label="Review changes"]').click();
     const tab = reviewTab("Codex");
     await tab.waitForDisplayed({ timeoutMsg: "The Codex review tab did not open." });
-    const prompt = await waitForReviewStart("codex", baseline);
+    const { prompt } = await waitForReviewStart("codex", baseline);
     expect(prompt).toContain(UNCOMMITTED_SCOPE);
 
     // Codex runs the review in its own read-only sandbox, so the composer shows a disabled lock
@@ -314,7 +350,7 @@ describe("packaged Source Control review", () => {
     );
   });
 
-  it("shows a Claude review's plan as Review findings with no Implement, also after a reload", async () => {
+  it("runs a Claude review in auto mode with bypassPermissions and ordinary findings", async () => {
     await setDesktopUiWindowSize(1_280, 900);
     await ensureFixtureProjectImported();
     await openPrimaryThread();
@@ -324,21 +360,53 @@ describe("packaged Source Control review", () => {
 
     // A one-off Claude chat review from the review menu; the saved reviewer stays chat Codex.
     const baseline = readProviderInputLog(preparedProviderInputLogPath).length;
-    await browser.$('button[aria-label="Review options"]').click();
-    const claude = browser.$(
-      '//*[@role="menuitem"][.//span[normalize-space()="Claude"]][not(@aria-disabled="true")]',
-    );
-    await claude.waitForExist();
-    await browser.execute((item: HTMLElement) => item.click(), await claude);
-    await reviewTab("Claude").waitForDisplayed({
-      timeoutMsg: "The Claude review tab did not open.",
-    });
-    const prompt = await waitForReviewStart("claudeAgent", baseline);
+    const { prompt, permissionMode } = await startOneOffClaudeReview(baseline);
     expect(prompt).toContain(UNCOMMITTED_SCOPE);
-    await waitForComposerDisplayed();
-    // Claude reviews start in plan mode.
-    await expect(composerForm().$('button[aria-label="Disable plan mode"]')).toExist();
+    expect(permissionMode).toBe("bypassPermissions");
 
+    await waitForComposerDisplayed();
+    await expect(composerForm().$('button[aria-label="Full access"]')).toExist();
+    await expect(composerForm().$('button[aria-label="Enable plan mode"]')).toExist();
+    await expect(composerForm().$('button[aria-label="Disable plan mode"]')).not.toExist();
+
+    await expect(browser.$(visibleSurfaceSelector)).toHaveText(
+      expect.stringContaining(desktopUiFixture.codeReviewFinding),
+      { wait: 30_000 },
+    );
+    await expect(
+      browser.$(visibleSurfaceSelector).$('[data-item-type="proposed-plan"]'),
+    ).not.toExist();
+    await expect(
+      browser.$(visibleSurfaceSelector).$('//button[normalize-space()="Implement"]'),
+    ).not.toExist();
+    await expect(
+      browser.$(visibleSurfaceSelector).$('//button[normalize-space()="Refine"]'),
+    ).not.toExist();
+    await browser.saveScreenshot(
+      NodePath.join(preparedArtifactDirectory, "review-claude-auto-findings.png"),
+    );
+  });
+
+  it("shows a Claude review's plan as Review findings with no Implement, also after a reload", async () => {
+    await setDesktopUiWindowSize(1_280, 900);
+    await ensureFixtureProjectImported();
+    await openPrimaryThread();
+    await sendFirstMessage();
+    modifyTrackedFile();
+    await openSourceControl();
+
+    const baseline = readProviderInputLog(preparedProviderInputLogPath).length;
+    await setProjectReviewPrompt(`Review {scope}. ${desktopUiFixture.codeReviewExitPlanMarker}`);
+    try {
+      const { prompt, permissionMode } = await startOneOffClaudeReview(baseline);
+      expect(prompt).toContain(UNCOMMITTED_SCOPE);
+      expect(prompt).toContain(desktopUiFixture.codeReviewExitPlanMarker);
+      expect(permissionMode).toBe("bypassPermissions");
+    } finally {
+      await setProjectReviewPrompt(null);
+    }
+
+    await waitForComposerDisplayed();
     await expectReviewFindings();
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "review-claude-findings.png"),

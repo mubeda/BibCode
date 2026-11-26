@@ -91,10 +91,13 @@ it repeats.
      `P symbolicate <sid>:<seq> --json` for a panic, with the `sid` and `seq`
      of the `panic` event.
    - Symbols come from `--symbols <dir>` (repeatable; a Breakpad store laid out
-     as `<module>/<debug id>/<module>.sym`), or from `--download`. That fetches
-     the release asset `bibcode-desktop-symbols-<version>-<os>-<arch>.zip` or
-     `bibcode-server-symbols-<version>-<os>-<arch>.zip`. A panic event's
-     `version`, `os` and `arch`, when present, pick the asset.
+     as `<module>/<debug id>/<module>.sym`), or from `--download`. GitHub
+     Releases publish desktop symbol archives only (`bibcode-desktop-symbols-<version>-<os>-<arch>.zip`);
+     requesting `--download` for a standalone server crash on a desktop-only
+     release returns `"the release publishes no symbols"` (pass `--symbols <dir>`
+     for locally built server binaries; older releases that published server
+     symbols used `bibcode-server-symbols-<version>-<os>-<arch>.zip`). A panic
+     event's `version`, `os` and `arch`, when present, pick the asset.
    - Ask the user before `--download`, and say what it costs: a desktop `.sym`
      is about 250 MB and can take around 1 GB of memory to parse. Ask especially
      on a remote host, where the download and the memory are the host's.

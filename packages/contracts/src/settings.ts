@@ -220,7 +220,7 @@ export const ClientSettingsSchema = Schema.Struct({
   ),
   // Its own flag, not a `StatusBarItem`: an older client resets the whole item list when it
   // meets a literal it does not know, and would write that reset back.
-  showAntigravityUsage: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  showAntigravityUsage: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   statusBarUsageMode: StatusBarUsageMode.pipe(
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_STATUS_BAR_USAGE_MODE)),
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_STATUS_BAR_USAGE_MODE)),
@@ -487,7 +487,7 @@ export type GrokSettings = typeof GrokSettings.Type;
 export const AntigravitySettings = makeProviderSettingsSchema(
   {
     enabled: Schema.Boolean.pipe(
-      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.withDecodingDefault(Effect.succeed(true)),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
     binaryPath: makeBinaryPathSetting("agy").pipe(

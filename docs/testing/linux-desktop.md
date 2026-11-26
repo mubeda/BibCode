@@ -11,9 +11,9 @@ runners. Record the distribution release, architecture, and desktop session for
 each native validation; a passing Git subprocess check alone does not qualify
 the complete desktop, installer, or updater on that system.
 
-Standalone server releases add ARM64/x64 `.tar.gz`, `.deb`, and `.rpm` artifacts. Native
-package evidence covers Ubuntu 22.04, Ubuntu 24.04, Debian 12, Rocky Linux 9, and Fedora
-44 as prescribed by the shared runbook.
+GitHub Releases publish Linux desktop AppImages only; standalone `bibcode`
+server binaries and `.deb`/`.rpm` packages are built and validated locally when
+needed rather than distributed as GitHub Release assets.
 
 ## Distribution, desktop, and toolchain inventory
 
@@ -73,7 +73,7 @@ Select focused tests from affected source and verify at least:
 - Local desktop presentation omits WSL controls while saved remote environments
   remain selectable in the environment rail without bypassing desktop-owned
   connection controls;
-- Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent; and
+- Claude, Codex, Cursor, OpenCode, and Antigravity remain visible while Grok is absent; and
 - a Claude AI Terminal behind a mise shim is hooked through the real install,
   on a block-sharing filesystem and on ext4, within its budget
   ([Claude Terminal pin, attestation and shim](cross-platform-validation.md#claude-terminal-pin-attestation-and-shim));
@@ -898,8 +898,9 @@ verify:
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with
   the code prefilled;
-- provider settings and action menus show Claude, Codex, Cursor, and OpenCode
-  without Early Access labels and omit Grok/Grok Terminal;
+- provider settings and action menus show Claude, Codex, Cursor, OpenCode, and
+  Antigravity without preview or Early Access labels (with plain "Authenticated"
+  status rows omitting email and method details) and omit Grok/Grok Terminal;
 - text rendering: body text in the sidebar and transcript shows no uneven
   whole-pixel letter gaps, including when the session hinting is `full` (the
   host pins `hintslight`); in a screenshot crop enlarged to 300%, text in the

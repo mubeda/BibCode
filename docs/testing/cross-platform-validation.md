@@ -716,20 +716,27 @@ Profiler on, as every packaged run should be, and read its findings afterwards.
 It modifies the fixture's `README.md`, clicks **Review changes** in Source
 Control and checks that a **Code review · Codex** tab opens, that Codex's first
 provider input starts with the review lead-in and names the uncommitted scope,
-and that the panel's runtime picker reads **Supervised** (the stored mode; the
-server still runs a Codex review read-only without approvals, which
-`production_provider_runtime.rs` proves against the fake Codex, not this
-spec). It then picks
-**Claude** under **Review once with** in the review menu: the Claude fixture
-answers a prompt that starts with "Code review requested from BiBCode." with an
-`ExitPlanMode` plan, and the spec checks that the card reads **Review findings**
-with no Implement, Refine or **Implement in a new thread**, and that Enter in
-the empty composer sends nothing, before and after a reload. It saves
-`review-codex-panel.png`, `review-claude-findings.png` and
-`review-claude-findings-after-reload.png`. To prove the flag decides the Claude
-case, build once with `codeReview: false` in the review handler's panel request
-in `apps/web/src/components/ChatView.tsx` and run the spec alone: it must fail at
-the Implement check. Restore the line before the full suite.
+and that the composer shows the disabled **Read-only review** lock (with its
+hover tooltip explaining why the mode picker does not apply; `production_provider_runtime.rs`
+also proves against the fake Codex that the server runs a Codex review read-only
+without approvals). It then covers two **Claude** cases via **Review once with**:
+
+1. Ordinary auto-mode review: Claude launches with `--permission-mode bypassPermissions`,
+   the composer shows **Full access** with Plan mode off, and ordinary findings
+   render without a `[data-item-type="proposed-plan"]` card or Implement/Refine
+   actions (`review-claude-auto-findings.png`).
+2. Proposed-plan review: when the project's review prompt contains the fixture's
+   `ExitPlanMode` marker, Claude answers with an `ExitPlanMode` plan, and the
+   spec checks that the `[data-item-type="proposed-plan"]` card reads **Review
+   findings** with no Implement, Refine or **Implement in a new thread**, and
+   that Enter in the empty composer sends nothing, before and after a reload
+   (`review-claude-findings.png` and `review-claude-findings-after-reload.png`).
+
+It also saves `review-button-narrow.png` and `review-codex-panel.png`. To prove
+the flag decides the proposed-plan Claude case, build once with `codeReview: false`
+in the review handler's panel request in `apps/web/src/components/ChatView.tsx`
+and run the spec alone: it must fail at the Implement check. Restore the line
+before the full suite.
 
 The default suite also includes `send-to-agent.e2e.ts` (isolate it with
 `BIBCODE_E2E_SPEC=./specs/send-to-agent.e2e.ts`). It runs with **Agent
@@ -1348,21 +1355,20 @@ exercise a seeded update. The required matrix is macOS ARM64/x64, Linux ARM64/x6
 Windows ARM64/x64. A cross-compiled or emulated executable is compatibility evidence, not
 a native pass.
 
-For every standalone server target, inspect the native executable, run `bibcode
---version`, start the staged distribution without `--static-dir`, fetch `/`, read the
-environment descriptor, issue and exchange pairing material, then terminate and prove
-cleanup. Linux additionally installs and removes both package formats in native
-containers:
-
-| Format | Required systems                      |
-| ------ | ------------------------------------- |
-| `.deb` | Ubuntu 22.04, Ubuntu 24.04, Debian 12 |
-| `.rpm` | Rocky Linux 9, Fedora 44              |
-
-Package removal must delete `/usr/bin/bibcode` and package-owned documentation/web
-assets while preserving a test sentinel in the isolated BiBCode data root. Record the
-archive/package name, reported architecture, version, startup result, pairing result,
-shutdown result, and evidence artifact location in the execution report.
+GitHub Releases publish desktop installers, desktop symbols, and (for numeric
+stable releases) updater assets (`latest.json`, six `.sig` files, and two macOS
+`.app.tar.gz` archives) only; standalone server archives and Linux `.deb`/`.rpm`
+packages are no longer released on GitHub. When validating a locally built
+standalone `bibcode` server, inspect the
+native executable, run `bibcode --version`, start the staged distribution without
+`--static-dir`, fetch `/`, read the environment descriptor, issue and exchange
+pairing material, then terminate and prove cleanup. If validating local Linux
+packaging scripts (`.deb` on Ubuntu 22.04/24.04 or Debian 12; `.rpm` on Rocky
+Linux 9 or Fedora 44), verify that package removal deletes `/usr/bin/bibcode`
+and package-owned documentation/web assets while preserving a test sentinel in
+the isolated BiBCode data root. Record the artifact name, reported architecture,
+version, startup result, pairing result, shutdown result, and evidence artifact
+location in the execution report.
 
 ### Grant-driven remote sharing
 

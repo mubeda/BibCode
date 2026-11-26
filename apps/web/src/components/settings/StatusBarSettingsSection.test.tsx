@@ -58,10 +58,10 @@ vi.mock("../ui/switch", () => ({
 
 import { StatusBarSettingsSection } from "./StatusBarSettingsSection";
 
-function render(settings: UnifiedSettings = DEFAULT_UNIFIED_SETTINGS): void {
+function render(settings: UnifiedSettings = DEFAULT_UNIFIED_SETTINGS): string {
   h.controls.length = 0;
   h.settings = settings;
-  renderToStaticMarkup(<StatusBarSettingsSection />);
+  return renderToStaticMarkup(<StatusBarSettingsSection />);
 }
 
 function control(kind: Control["kind"], label: string): Control {
@@ -102,13 +102,15 @@ describe("StatusBarSettingsSection", () => {
     expect(h.updateSettings).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps the Antigravity opt-in out of the status bar item list", () => {
-    render();
+  it("defaults Antigravity usage on and keeps it out of the status bar item list", () => {
+    const markup = render();
     const antigravity = control("switch", "Show Antigravity usage");
-    expect(antigravity.props.checked).toBe(false);
-    invoke(antigravity, "onCheckedChange", true);
+    expect(antigravity.props.checked).toBe(true);
+    expect(markup).not.toContain("turn the provider on in Settings, Providers");
+    expect(markup).toContain("Covers the default Antigravity provider only.");
+    invoke(antigravity, "onCheckedChange", false);
     // Its own flag: an older client resets the whole item list when it meets an unknown literal.
-    expect(h.updateSettings).toHaveBeenCalledWith({ showAntigravityUsage: true });
+    expect(h.updateSettings).toHaveBeenCalledWith({ showAntigravityUsage: false });
     expect(DEFAULT_UNIFIED_SETTINGS.statusBarItems).not.toContain("antigravity");
   });
 

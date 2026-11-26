@@ -65,6 +65,7 @@ pub struct AntigravitySessionOptions {
     pub control_timeout: Duration,
     /// The thread's options (the thinking level), written during the start.
     pub initial_options: Vec<Value>,
+    pub code_review: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +212,7 @@ struct Gate {
     cancelled_turn: Option<String>,
     runtime_mode: String,
     interaction_mode: String,
+    code_review: bool,
     /// The CLI's mode may differ from the one the thread needs: the next prompt writes it first.
     /// True until the first acknowledgement, so a failed start leaves no confirmed mode.
     mode_unconfirmed: bool,
@@ -268,6 +270,7 @@ impl AntigravitySessionRuntime {
             cancelled_turn: None,
             runtime_mode: options.runtime_mode.clone(),
             interaction_mode: options.interaction_mode.clone(),
+            code_review: options.code_review,
             mode_unconfirmed: true,
             mode_generation: 0,
             pending: HashMap::new(),
@@ -1272,6 +1275,13 @@ impl AntigravitySessionRuntime {
                 .await?;
             return Ok(());
         };
+        if gate.code_review && mode_for(&gate.runtime_mode, &gate.interaction_mode) == "auto" {
+            drop(gate);
+            connection
+                .respond(wire_id, json!({ "outcome": { "outcome": "cancelled" } }))
+                .await?;
+            return Ok(());
+        }
         let options = params
             .get("options")
             .and_then(Value::as_array)

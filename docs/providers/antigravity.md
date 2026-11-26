@@ -1,8 +1,8 @@
 # Antigravity
 
-Antigravity is a **Preview** provider and is disabled by default. Turn it on in
-**Settings → Providers** when you want it. Until then BiBCode does not probe the CLI
-and shows no Antigravity entry in the chat or terminal menus.
+Antigravity is enabled by default in **Settings → Providers** (explicitly saving it
+disabled keeps it off). When `agy` is installed and enabled, BiBCode shows
+Antigravity in the chat and terminal menus.
 
 BiBCode offers two ways to use it:
 
@@ -34,8 +34,9 @@ restore access." followed by Google's own notice.
 
 ## Settings
 
-Enable the Antigravity card in **Settings → Providers** and, if `agy` is not on the
-server's `PATH`, set **Binary path**. The default is `agy`.
+Antigravity is enabled by default in **Settings → Providers**; toggle it off
+there if you do not want to use it, and if `agy` is not on the server's `PATH`,
+set **Binary path**. The default is `agy`.
 
 The IDE has shipped a launcher that is also named `agy`. If an old launcher comes
 first on `PATH`, BiBCode runs the wrong program, and the version probe cannot
@@ -66,11 +67,14 @@ shows "Antigravity is taking longer than usual to start. One of its MCP servers
 may not be responding; run `agy mcp list` in a terminal to see which one." and
 BiBCode keeps waiting; see [Starting a provider](README.md#starting-a-provider).
 
-BiBCode never answers a permission request for you, in any mode. A request the
-CLI sends is always shown to you. When you change the mode while the agent is
-working, the change applies once the CLI confirms it; use **Stop** to end the
-turn at once. If the CLI does not confirm a mode, the next message is refused
-until it does.
+BiBCode never answers a permission request with an approval for you, in any mode.
+Normally, a request the CLI sends is always shown to you; in a code review panel
+running in auto mode (`full-access` and `default`), BiBCode cancels stray
+permission requests at once without opening a card (switching the panel to
+Supervised or Plan restores normal cards). When you change the mode while the
+agent is working, the change applies once the CLI confirms it; use **Stop** to
+end the turn at once. If the CLI does not confirm a mode, the next message is
+refused until it does.
 
 ## Terminal
 
@@ -84,12 +88,24 @@ an Antigravity Terminal once before the first chat.
 
 ## Usage in the status bar
 
-Turn on **Antigravity usage** in the status bar settings to see the five-hour
-and weekly limits the CLI reports, for each model group, with their reset times.
-BiBCode reads them with `agy -p "/usage"`, which sends no prompt, at most every
-five minutes; the refresh button reads at once. It needs CLI version 1.1.11 or
+**Show Antigravity usage** is on by default in **Settings → Status bar** to show
+the five-hour and weekly limits the CLI reports, for each model group, with
+their reset times (unset buckets omit a placeholder epoch reset time). BiBCode
+reads them with `agy -p "/usage"`, which sends no prompt, at most every five
+minutes; the refresh button reads at once. It needs CLI version 1.1.11 or
 later and an account sign-in: with an API key there is no account quota to show.
 BiBCode reads only the built-in Antigravity instance.
+
+## Skills and slash commands
+
+Typing `/` in an Antigravity chat opens native slash commands and skills.
+BiBCode queries `agy acp` (without sending a prompt) and merges
+`available_commands_update` with bounded local skill discovery across
+`.agents/skills`, `.agent/skills`, `_agents/skills`, and `_agent/skills` up to
+the containing Git root plus `~/.gemini/config/skills`. Matching skills appear
+under **Skills** and extra ACP commands appear under **Commands**; when the CLI
+is signed out, older, or times out, BiBCode falls back to locally discovered
+skills and shows a notice in the menu.
 
 ## How often BiBCode contacts the CLI
 
@@ -108,7 +124,7 @@ hand, and otherwise at most every five minutes.
 - A very large single file write can exceed the transport's line limit and end
   the session.
 
-## Why it is Preview
+## Account terms
 
 Google's position on using the CLI from another application is not settled, and
 Google was not asked about it for BiBCode. The
@@ -122,4 +138,4 @@ Google supports officially. Read the FAQ and the
 [ACP page](https://antigravity.google/docs/cli/acp), check which plan covers your
 use, and decide for yourself before relying on it. Settings → Providers repeats
 the FAQ's statement on the Antigravity card while Antigravity is enabled or
-installed; it never stops you from enabling it.
+installed; it never stops you from keeping it enabled or turning it off.

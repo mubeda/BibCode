@@ -56,7 +56,7 @@ pub(crate) fn missing_hosting_executable_dir(sandbox: &Path) -> PathBuf {
 }
 
 /// Settings that explicitly preserve the built-in enabled defaults (Codex,
-/// Claude, Cursor, and OpenCode enabled; Grok and Antigravity disabled) in both settings readers,
+/// Claude, Cursor, OpenCode, and Antigravity enabled; Grok disabled) in both settings readers,
 /// while pinning each legacy `binaryPath` to [`missing_provider_executable`] and
 /// disabling the update check that would otherwise call registry.npmjs.org /
 /// downloads.claude.ai.
@@ -76,7 +76,7 @@ pub(crate) fn hermetic_provider_settings(sandbox: &Path) -> Value {
         ("cursor", true),
         ("grok", false),
         ("opencode", true),
-        ("antigravity", false),
+        ("antigravity", true),
     ] {
         providers.insert(
             driver.to_owned(),

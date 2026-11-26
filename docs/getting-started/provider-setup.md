@@ -2,13 +2,13 @@
 
 BiBCode supports five coding-agent providers:
 
-| Provider                                   | Command        | Sign in                         |
-| ------------------------------------------ | -------------- | ------------------------------- |
-| [Codex](../providers/codex.md)             | `codex`        | `codex login`                   |
-| [Claude](../providers/claude.md)           | `claude`       | `claude auth login`             |
-| [Cursor](../providers/cursor.md)           | `cursor-agent` | `cursor-agent login`            |
-| [Antigravity](../providers/antigravity.md) | `agy`          | `agy` (Preview, off by default) |
-| [OpenCode](../providers/opencode.md)       | `opencode`     | `opencode auth login`           |
+| Provider                                   | Command        | Sign in               |
+| ------------------------------------------ | -------------- | --------------------- |
+| [Codex](../providers/codex.md)             | `codex`        | `codex login`         |
+| [Claude](../providers/claude.md)           | `claude`       | `claude auth login`   |
+| [Cursor](../providers/cursor.md)           | `cursor-agent` | `cursor-agent login`  |
+| [Antigravity](../providers/antigravity.md) | `agy`          | `agy`                 |
+| [OpenCode](../providers/opencode.md)       | `opencode`     | `opencode auth login` |
 
 Install and authenticate at least one provider before starting a chat. The
 provider executable and its credentials must be available on the machine that

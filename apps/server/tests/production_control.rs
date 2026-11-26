@@ -335,7 +335,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
 
 fn isolated_claude_settings(sandbox: &Path, instance: Value) -> Value {
     let mut settings = hermetic_providers::hermetic_provider_settings(sandbox);
-    for driver in ["codex", "cursor", "grok", "opencode"] {
+    for driver in ["codex", "cursor", "grok", "opencode", "antigravity"] {
         settings["providers"][driver]["enabled"] = Value::Bool(false);
     }
     settings["providerInstances"] = json!({"claudeAgent": instance});
@@ -1140,7 +1140,8 @@ async fn refresh_providers_returns_version_advisories_without_registry_access() 
             "claudeAgent": { "enabled": false },
             "cursor": { "enabled": false },
             "grok": { "enabled": false },
-            "opencode": { "enabled": false }
+            "opencode": { "enabled": false },
+            "antigravity": { "enabled": false }
         },
         "providerInstances": {
             "codex": {

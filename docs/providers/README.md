@@ -2,13 +2,13 @@
 
 BiBCode currently supports these coding-agent providers:
 
-| Provider                        | Default state      | Native integration        | Activity                                              |
-| ------------------------------- | ------------------ | ------------------------- | ----------------------------------------------------- |
-| [Codex](./codex.md)             | Enabled            | Codex App Server JSON-RPC | Structured chat and conditional terminal observation. |
-| [Claude](./claude.md)           | Enabled            | Stream-JSON CLI and hooks | Capability-gated chat and terminal observation.       |
-| [OpenCode](./opencode.md)       | Enabled            | HTTP and server events    | Structured chat and conditional terminal observation. |
-| [Cursor](./cursor.md)           | Enabled            | Agent Client Protocol     | Chat; no structured activity in protocol v2.          |
-| [Antigravity](./antigravity.md) | Disabled (Preview) | Agent Client Protocol     | Chat and terminal; no structured activity.            |
+| Provider                        | Default state | Native integration        | Activity                                              |
+| ------------------------------- | ------------- | ------------------------- | ----------------------------------------------------- |
+| [Codex](./codex.md)             | Enabled       | Codex App Server JSON-RPC | Structured chat and conditional terminal observation. |
+| [Claude](./claude.md)           | Enabled       | Stream-JSON CLI and hooks | Capability-gated chat and terminal observation.       |
+| [OpenCode](./opencode.md)       | Enabled       | HTTP and server events    | Structured chat and conditional terminal observation. |
+| [Cursor](./cursor.md)           | Enabled       | Agent Client Protocol     | Chat; no structured activity in protocol v2.          |
+| [Antigravity](./antigravity.md) | Enabled       | Agent Client Protocol     | Chat and terminal; no structured activity.            |
 
 The legacy Grok driver is intentionally not exposed as a supported provider:
 it is omitted from Settings and from chat/terminal action menus even if an old

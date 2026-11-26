@@ -116,6 +116,7 @@ fn options(runtime_mode: &str) -> AntigravitySessionOptions {
         cancel_grace: Duration::from_secs(5),
         control_timeout: Duration::from_secs(3),
         initial_options: Vec::new(),
+        code_review: false,
     }
 }
 
@@ -1988,4 +1989,195 @@ async fn a_disabled_account_is_its_own_error() {
             if google_message == ACCOUNT_DISABLED),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+async fn code_review_auto_mode_cancels_stray_permissions_without_approving_or_opening_card() {
+    let mut opts = options("full-access");
+    opts.code_review = true;
+    let (runtime, mut peer) = started_with(opts, "auto").await;
+    let prompt = begin_turn(&runtime, &mut peer).await;
+
+    // Even when allow_once is present, code review in auto mode cancels instead of approving
+    // or opening a pending card.
+    peer.permission(allow_or_deny()).await;
+    let reply = peer.next().await;
+    assert_eq!(
+        reply,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": { "outcome": { "outcome": "cancelled" } },
+        }),
+        "BiBCode must cancel stray Antigravity permission asks and never silently approve them"
+    );
+
+    // Empty and reject-only options also cancel immediately.
+    peer.permission_as(json!("2"), SESSION, "execute", json!([]))
+        .await;
+    assert_eq!(
+        peer.next().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "result": { "outcome": { "outcome": "cancelled" } },
+        })
+    );
+    peer.permission_as(
+        json!("3"),
+        SESSION,
+        "execute",
+        json!([{ "optionId": "deny", "name": "Deny", "kind": "reject_once" }]),
+    )
+    .await;
+    assert_eq!(
+        peer.next().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "3",
+            "result": { "outcome": { "outcome": "cancelled" } },
+        })
+    );
+
+    assert!(runtime.inner.gate.lock().await.pending.is_empty());
+    peer.reply(&prompt.1, json!({ "stopReason": "end_turn" }))
+        .await;
+    let events = events_until(&runtime, "turn.completed").await;
+    assert_eq!(
+        types(&events),
+        ["turn.started", "turn.completed"],
+        "no request.opened event may fire during auto-mode Antigravity code review: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn code_review_non_auto_and_ordinary_chats_keep_showing_permission_cards() {
+    // Ordinary non-review chat in full-access + default keeps showing cards and never auto-cancels.
+    let (ordinary, mut ordinary_peer) = started("full-access", "auto").await;
+    let ordinary_prompt = begin_turn(&ordinary, &mut ordinary_peer).await;
+    ordinary_peer.permission(allow_or_deny()).await;
+    assert!(ordinary_peer.silent().await);
+    let opened = events_until(&ordinary, "request.opened").await;
+    assert_eq!(types(&opened), ["turn.started", "request.opened"]);
+    let perm_id = {
+        ordinary
+            .inner
+            .gate
+            .lock()
+            .await
+            .pending
+            .keys()
+            .next()
+            .cloned()
+            .expect("pending permission")
+    };
+    ordinary
+        .respond_to_request(&perm_id, "accept")
+        .await
+        .expect("accept");
+    let ordinary_reply = ordinary_peer.next().await;
+    assert_eq!(
+        ordinary_reply,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": { "outcome": { "outcome": "selected", "optionId": "allow" } },
+        })
+    );
+    ordinary_peer
+        .reply(&ordinary_prompt.1, json!({ "stopReason": "end_turn" }))
+        .await;
+    let _ = events_until(&ordinary, "turn.completed").await;
+
+    // Code review switched to Supervised or Plan restores normal cards.
+    let mut review_opts = options("full-access");
+    review_opts.code_review = true;
+    let (review, mut review_peer) = started_with(review_opts, "auto").await;
+
+    let set_supervised = {
+        let review = review.clone();
+        tokio::spawn(async move { review.set_runtime_mode("approval-required").await })
+    };
+    answer_mode(&mut review_peer, "default").await;
+    set_supervised.await.expect("join").expect("supervised");
+
+    let supervised_prompt = begin_turn(&review, &mut review_peer).await;
+    review_peer.permission(allow_or_deny()).await;
+    assert!(review_peer.silent().await);
+    let supervised_events = events_until(&review, "request.opened").await;
+    assert_eq!(
+        types(&supervised_events),
+        ["turn.started", "request.opened"]
+    );
+    let sup_perm_id = {
+        review
+            .inner
+            .gate
+            .lock()
+            .await
+            .pending
+            .keys()
+            .next()
+            .cloned()
+            .expect("supervised pending permission")
+    };
+    review
+        .respond_to_request(&sup_perm_id, "decline")
+        .await
+        .expect("decline");
+    assert_eq!(
+        review_peer.next().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": { "outcome": { "outcome": "selected", "optionId": "deny" } },
+        })
+    );
+    review_peer
+        .reply(&supervised_prompt.1, json!({ "stopReason": "end_turn" }))
+        .await;
+    let _ = events_until(&review, "turn.completed").await;
+
+    let set_plan = {
+        let review = review.clone();
+        tokio::spawn(async move { review.set_interaction_mode("plan").await })
+    };
+    answer_mode(&mut review_peer, "plan").await;
+    set_plan.await.expect("join").expect("plan");
+
+    let plan_prompt = begin_turn(&review, &mut review_peer).await;
+    review_peer
+        .permission_as(json!("2"), SESSION, "execute", allow_or_deny())
+        .await;
+    assert!(review_peer.silent().await);
+    let plan_events = events_until(&review, "request.opened").await;
+    assert_eq!(types(&plan_events), ["turn.started", "request.opened"]);
+    let plan_perm_id = {
+        review
+            .inner
+            .gate
+            .lock()
+            .await
+            .pending
+            .keys()
+            .next()
+            .cloned()
+            .expect("plan pending permission")
+    };
+    review
+        .respond_to_request(&plan_perm_id, "decline")
+        .await
+        .expect("decline");
+    assert_eq!(
+        review_peer.next().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "result": { "outcome": { "outcome": "selected", "optionId": "deny" } },
+        })
+    );
+    review_peer
+        .reply(&plan_prompt.1, json!({ "stopReason": "end_turn" }))
+        .await;
+    let _ = events_until(&review, "turn.completed").await;
 }

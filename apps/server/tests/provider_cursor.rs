@@ -174,6 +174,7 @@ async fn cursor_runtime_matches_approval_and_cancel_traces() {
                 "url": "http://127.0.0.1:3773/mcp",
                 "headers": [{ "name": "Authorization", "value": "Bearer secret" }],
             })],
+            code_review: false,
         },
         connection.clone(),
         incoming,
@@ -406,6 +407,7 @@ async fn cursor_runtime_applies_the_selected_model_after_session_creation() {
             model: "gpt-5.4".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -462,6 +464,7 @@ async fn cursor_runtime_starts_a_new_session_when_the_saved_one_cannot_be_loaded
             model: "default".to_owned(),
             resume_session_id: Some("cursor-gone".to_owned()),
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -494,6 +497,7 @@ async fn cursor_runtime_keeps_the_saved_session_when_load_fails_transiently() {
             model: "default".to_owned(),
             resume_session_id: Some("cursor-kept".to_owned()),
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -528,6 +532,7 @@ async fn cursor_fast_mode_uses_acp_config_update() {
             model: "default".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -593,6 +598,7 @@ async fn cursor_empty_options_compensate_if_a_baseline_reset_fails() {
             model: "default".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -683,6 +689,7 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
             model: "default".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -801,6 +808,7 @@ fn cursor_model_runtime(model: &str) -> (CursorSessionRuntime, ScriptedPeer) {
             model: model.to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1075,6 +1083,7 @@ async fn cursor_default_model_restoration_uses_the_advertised_provider_value() {
             model: "default".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1167,6 +1176,7 @@ async fn cursor_default_model_restoration_rejects_a_fabricated_default() {
             model: "default".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1217,6 +1227,7 @@ async fn cursor_option_failure_compensates_acknowledged_updates() {
             model: "default".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1307,6 +1318,7 @@ async fn cursor_malformed_config_acknowledgement_is_compensated() {
             model: "default".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1352,6 +1364,7 @@ async fn cursor_failed_compensation_latches_configuration_uncertain() {
             model: "default".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1430,6 +1443,7 @@ async fn cursor_runtime_leaves_the_default_model_to_cursor() {
             model: "default".to_owned(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1462,6 +1476,7 @@ async fn cursor_full_access_auto_approves_permissions() {
             model: String::new(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1510,6 +1525,7 @@ async fn cursor_extension_requests_emit_plan_todos_and_questions() {
             model: String::new(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1611,6 +1627,7 @@ async fn cursor_runtime_covers_resume_permission_and_notification_edges() {
             model: "gpt-edge".to_owned(),
             resume_session_id: Some("cursor-resumed".to_owned()),
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1939,6 +1956,7 @@ async fn cursor_runtime_rejects_new_sessions_without_an_identifier() {
             model: String::new(),
             resume_session_id: None,
             mcp_servers: Vec::new(),
+            code_review: false,
         },
         connection,
         incoming,
@@ -1955,6 +1973,291 @@ async fn cursor_runtime_rejects_new_sessions_without_an_identifier() {
             .to_string()
             .contains("has not started")
     );
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_code_review_auto_mode_cancels_stray_asks_and_respects_mode_switches() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-code-review-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: String::new(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+            code_review: true,
+        },
+        connection,
+        incoming,
+    );
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new").respond(json!({
+        "sessionId": "cursor-code-review-session",
+        "modes": {
+            "currentModeId": "agent",
+            "availableModes": [
+                { "id": "agent", "name": "Agent" },
+                { "id": "ask", "name": "Ask" },
+                { "id": "plan", "name": "Plan" }
+            ]
+        }
+    }));
+    peer.expect_request("session/set_mode")
+        .expect_params(json!({ "sessionId": "cursor-code-review-session", "modeId": "agent" }))
+        .respond(json!({}));
+    // Turn 1: allow option auto-approves.
+    peer.expect_request("session/prompt")
+        .emit_request(cursor_permission_request(5001))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 5001,
+            "result": { "outcome": { "outcome": "selected", "optionId": "always" } }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    // Turn 2: empty permission options auto-cancel.
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 5002,
+            "method": "session/request_permission",
+            "params": { "toolCall": { "title": "`empty`" }, "options": [] }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 5002,
+            "result": { "outcome": { "outcome": "cancelled" } }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    // Turn 3: reject-only permission options auto-cancel.
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 5003,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": { "title": "`reject-only`" },
+                "options": [{ "optionId": "reject", "kind": "reject_once" }]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 5003,
+            "result": { "outcome": { "outcome": "cancelled" } }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    // Turns 4-6: all three interactive question methods auto-cancel.
+    for (wire_id, method) in [
+        (5004, "cursor/ask_question"),
+        (5005, "_x.ai/ask_user_question"),
+        (5006, "x.ai/ask_user_question"),
+    ] {
+        peer.expect_request("session/prompt")
+            .emit_request(json!({
+                "jsonrpc": "2.0",
+                "id": wire_id,
+                "method": method,
+                "params": { "questions": [{ "id": "q1", "prompt": "Proceed?" }] }
+            }))
+            .expect_response(json!({
+                "jsonrpc": "2.0",
+                "id": wire_id,
+                "result": { "outcome": "cancelled" }
+            }))
+            .respond(json!({ "stopReason": "end_turn" }));
+    }
+    // Switch to Supervised (`approval-required`) -> question opens normal card.
+    peer.expect_request("session/set_mode")
+        .expect_params(json!({ "sessionId": "cursor-code-review-session", "modeId": "ask" }))
+        .respond(json!({}));
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 5007,
+            "method": "cursor/ask_question",
+            "params": {
+                "questions": [{
+                    "id": "scope",
+                    "prompt": "Which scope?",
+                    "options": [{ "id": "workspace", "label": "Workspace" }]
+                }]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 5007,
+            "result": { "answers": { "scope": "Workspace" } }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    // Switch back to Full access, then Plan -> reject-only permission opens normal card.
+    peer.expect_request("session/set_mode")
+        .expect_params(json!({ "sessionId": "cursor-code-review-session", "modeId": "agent" }))
+        .respond(json!({}));
+    peer.expect_request("session/set_mode")
+        .expect_params(json!({ "sessionId": "cursor-code-review-session", "modeId": "plan" }))
+        .respond(json!({}));
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 5008,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": { "title": "`plan-check`" },
+                "options": [{ "optionId": "reject", "kind": "reject_once" }]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 5008,
+            "result": { "outcome": { "outcome": "selected", "optionId": "reject" } }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+
+    let peer_task = tokio::spawn(peer.run());
+    runtime.start().await.expect("start");
+
+    for turn in 1..=6 {
+        let turn_id = runtime
+            .send_turn(Some(&format!("turn-{turn}")), Vec::new())
+            .await
+            .expect("send review turn");
+        let events = collect_cursor_turn(&runtime, &turn_id).await;
+        assert!(
+            !events.iter().any(|event| matches!(
+                event.event_type.as_str(),
+                "request.opened" | "user-input.requested"
+            )),
+            "turn {turn} must not emit pending UI cards during auto-mode code review: {events:?}"
+        );
+    }
+
+    runtime
+        .set_runtime_mode("approval-required")
+        .await
+        .expect("switch to supervised");
+    let supervised_turn = runtime
+        .send_turn(Some("supervised"), Vec::new())
+        .await
+        .expect("send supervised");
+    let question =
+        next_cursor_event_matching(&runtime, |event| event.event_type == "user-input.requested")
+            .await;
+    let request_id = question.request_id.expect("question request id");
+    runtime
+        .respond_to_user_input(&request_id, json!({ "scope": "Workspace" }))
+        .await
+        .expect("answer question");
+    collect_cursor_turn(&runtime, &supervised_turn).await;
+
+    runtime
+        .set_runtime_mode("full-access")
+        .await
+        .expect("switch to full-access");
+    runtime
+        .set_interaction_mode("plan")
+        .await
+        .expect("switch to plan");
+    let plan_turn = runtime
+        .send_turn(Some("plan"), Vec::new())
+        .await
+        .expect("send plan");
+    let permission =
+        next_cursor_event_matching(&runtime, |event| event.event_type == "request.opened").await;
+    let perm_id = permission.request_id.expect("permission request id");
+    runtime
+        .respond_to_request(&perm_id, "decline")
+        .await
+        .expect("decline permission");
+    collect_cursor_turn(&runtime, &plan_turn).await;
+
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_non_review_full_access_opens_cards_for_questions_and_reject_only_permissions() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-non-review-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: String::new(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+            code_review: false,
+        },
+        connection,
+        incoming,
+    );
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "cursor-non-review-session" }));
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 5101,
+            "method": "_x.ai/ask_user_question",
+            "params": { "questions": [{ "question": "Proceed?" }] }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 5101,
+            "result": {
+                "outcome": "accepted",
+                "answers": { "Proceed?": ["Yes"] }
+            }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 5102,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": { "title": "`reject-only`" },
+                "options": [{ "optionId": "reject", "kind": "reject_once" }]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 5102,
+            "result": { "outcome": { "outcome": "selected", "optionId": "reject" } }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+
+    let peer_task = tokio::spawn(peer.run());
+    runtime.start().await.expect("start");
+    let turn_id = runtime
+        .send_turn(Some("ordinary"), Vec::new())
+        .await
+        .expect("send");
+    let question =
+        next_cursor_event_matching(&runtime, |event| event.event_type == "user-input.requested")
+            .await;
+    let request_id = question.request_id.expect("question id");
+    runtime
+        .respond_to_user_input(&request_id, json!({ "Proceed?": "Yes" }))
+        .await
+        .expect("answer");
+    collect_cursor_turn(&runtime, &turn_id).await;
+
+    let second_turn = runtime
+        .send_turn(Some("reject-only"), Vec::new())
+        .await
+        .expect("send reject-only");
+    let permission =
+        next_cursor_event_matching(&runtime, |event| event.event_type == "request.opened").await;
+    let perm_id = permission.request_id.expect("permission id");
+    runtime
+        .respond_to_request(&perm_id, "decline")
+        .await
+        .expect("decline");
+    collect_cursor_turn(&runtime, &second_turn).await;
     peer_task.await.expect("peer");
 }
 

@@ -47,16 +47,17 @@ export function resolveCodeReviewPrompt(input: {
 }
 
 export function resolveCodeReviewChatModes(driver: ProviderDriverKind): {
-  readonly runtimeMode: "approval-required";
-  readonly interactionMode: "plan" | "default";
+  readonly runtimeMode: "approval-required" | "full-access";
+  readonly interactionMode: "default";
 } {
   return {
-    runtimeMode: "approval-required",
-    interactionMode: driver === "claudeAgent" ? "plan" : "default",
+    runtimeMode: driver === "codex" ? "approval-required" : "full-access",
+    interactionMode: "default",
   };
 }
 
-const INSTRUCTED_GUARD_LINE = "Told not to edit. BiBCode cannot block edits for this agent.";
+const AUTO_MODE_GUARD_LINE =
+  "Runs in auto mode without asking for permissions. Told not to edit; BiBCode cannot block edits for this agent.";
 
 /** The mechanism each reviewer starts with; never a promise of the outcome (design note table). */
 export function codeReviewGuardLine(reviewer: {
@@ -65,17 +66,13 @@ export function codeReviewGuardLine(reviewer: {
   /** The server's `readOnlyCodexReviews` capability (#376); absent on an older server. */
   readonly readOnlyCodexReviews?: boolean;
 }): string {
-  if (reviewer.driver === "claudeAgent") return "Starts in Claude's plan mode.";
   if (reviewer.driver === "codex") {
     if (reviewer.kind === "terminal") return "Runs in Codex's read-only sandbox.";
     return reviewer.readOnlyCodexReviews === true
       ? "Runs on its own in Codex's read-only sandbox, like the Codex terminal review."
       : "Runs in Codex's read-only sandbox. Writes ask for your approval.";
   }
-  if (reviewer.driver === "opencode" && reviewer.kind === "chat") {
-    return "Edits and commands ask for your approval.";
-  }
-  return INSTRUCTED_GUARD_LINE;
+  return AUTO_MODE_GUARD_LINE;
 }
 
 export const CODE_REVIEW_SERVER_UPDATE_REASON =

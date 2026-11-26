@@ -938,8 +938,8 @@ describe("prompted chat panels (code reviews)", () => {
     providerLabel: "Claude",
     label: "Code review · Claude",
     prompt,
-    runtimeMode: "approval-required" as const,
-    interactionMode: "plan" as const,
+    runtimeMode: "full-access" as const,
+    interactionMode: "default" as const,
     codeReview: true,
   });
   const panelRef = { environmentId: hostRef.environmentId, threadId: "new-panel-thread" };
@@ -977,8 +977,8 @@ describe("prompted chat panels (code reviews)", () => {
         title: "Panel: Code review · Claude",
         threadDefaults: {
           modelSelection: claude,
-          runtimeMode: "approval-required",
-          interactionMode: "plan",
+          runtimeMode: "full-access",
+          interactionMode: "default",
         },
         codeReview: true,
       },
@@ -995,8 +995,8 @@ describe("prompted chat panels (code reviews)", () => {
         threadId: "new-panel-thread",
         message: { messageId: "side-question", role: "user", text: prompt, attachments: [] },
         modelSelection: claude,
-        runtimeMode: "approval-required",
-        interactionMode: "plan",
+        runtimeMode: "full-access",
+        interactionMode: "default",
       },
     });
   });

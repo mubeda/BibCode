@@ -10,8 +10,9 @@ ARM64. Release and native smoke workflows use the matching MSVC toolchain and bu
 NSIS installer. Native ARM64 evidence must come from `windows-11-vs2026-arm`; emulation
 or an x64 application mislabeled as ARM64 does not count.
 
-Standalone server releases provide native ARM64 and x64 `.zip` archives with the
-matching web client.
+GitHub Releases publish Windows desktop `.exe` installers only; standalone
+`bibcode` server builds are compiled and validated locally when needed rather
+than distributed as GitHub Release assets.
 
 Record the exact Windows edition, build, architecture, and whether the host is
 physical or virtual. Do not silently substitute Wine, WSL, or a cross-compiled
@@ -148,7 +149,7 @@ Select focused tests from affected source and verify at least:
   staged progress and active mutation counts while preparing, rejects a forged
   first-attempt bypass, and offers the acknowledged no-backup path only after a
   real protection failure; and
-- Claude, Codex, Cursor, and OpenCode are visible while Grok is absent.
+- Claude, Codex, Cursor, OpenCode, and Antigravity are visible while Grok is absent.
 
 Run affected concurrency-sensitive owners at default, 8, and 12 harness
 threads. Do not replace the default harness with a serial run.
@@ -845,8 +846,10 @@ minimum-size, and relevant Windows DPI states. Verify:
 - from the OS, opening a well-formed `bibcode://pair?code=...` link while the
   packaged app is running focuses that instance and lands on Add Server with
   the code prefilled;
-- provider settings and action menus contain Claude, Codex, Cursor, and
-  OpenCode without Early Access labels and omit Grok/Grok Terminal;
+- provider settings and action menus contain Claude, Codex, Cursor, OpenCode,
+  and Antigravity without preview or Early Access labels (with plain
+  "Authenticated" status rows omitting email and method details) and omit
+  Grok/Grok Terminal;
 - external worktrees group by parent, expose full paths accessibly, adopt
   idempotently through junction/case aliases, and persist across restart;
 - sidebar menus use the in-app menu: separators split the groups and are

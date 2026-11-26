@@ -20735,3 +20735,496 @@ async fn plain_codex_panel_still_opens_cards_for_approvals_and_questions() {
     );
     run.finish().await;
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_review_non_codex_panels_auto_decline_stray_asks_with_no_pending_cards() {
+    use axum::{
+        Json, Router,
+        http::StatusCode,
+        response::sse::Event,
+        routing::{delete, get, post},
+    };
+    use tokio::sync::Mutex as AsyncMutex;
+
+    async fn run_review_panel(
+        provider_instance: &str,
+        instance_config: Value,
+        driver: &str,
+        model: &str,
+        state: &TempDir,
+    ) -> Value {
+        let workspace = state.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let config = test_config(state);
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({
+                "providerInstances": {
+                    provider_instance: {
+                        "driver": driver,
+                        "enabled": true,
+                        "config": instance_config,
+                    }
+                }
+            }),
+        );
+        let handle = ServerRuntime::start(config)
+            .await
+            .expect("production RPC server");
+        let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket");
+        let selection = json!({ "instanceId": provider_instance, "model": model });
+        let mut next_id = 2000_u64;
+        let mut rpc = async |tag: &str, payload: Value| {
+            next_id += 1;
+            tagged_rpc_request(&mut socket, &next_id.to_string(), tag, payload).await
+        };
+        rpc(
+            "orchestration.dispatchCommand",
+            json!({
+                "type": "project.create",
+                "commandId": "rev-proj",
+                "projectId": "rev-proj",
+                "title": "Review",
+                "workspaceRoot": workspace,
+                "defaultModelSelection": null,
+                "createdAt": NOW,
+            }),
+        )
+        .await
+        .expect("project");
+        rpc(
+            "orchestration.dispatchCommand",
+            json!({
+                "type": "thread.create",
+                "commandId": "rev-host",
+                "threadId": "rev-host",
+                "projectId": "rev-proj",
+                "title": "Host",
+                "modelSelection": selection,
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "branch": null,
+                "worktreePath": null,
+                "createdAt": NOW,
+            }),
+        )
+        .await
+        .expect("host thread");
+        rpc(
+            "worktree.createPanel",
+            json!({
+                "commandId": "rev-panel",
+                "hostThreadId": "rev-host",
+                "threadId": "rev-panel",
+                "title": "Code review",
+                "codeReview": true,
+                "threadDefaults": {
+                    "modelSelection": selection,
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                },
+            }),
+        )
+        .await
+        .expect("review panel");
+        rpc(
+            "orchestration.dispatchCommand",
+            json!({
+                "type": "thread.turn.start",
+                "commandId": "rev-turn-1",
+                "threadId": "rev-panel",
+                "message": {
+                    "messageId": "rev-msg-1",
+                    "role": "user",
+                    "text": "Review changes",
+                    "attachments": [],
+                },
+                "modelSelection": selection,
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "createdAt": NOW,
+            }),
+        )
+        .await
+        .expect("turn start");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let shell = loop {
+            let shells = rpc(
+                "orchestration.getThreadShells",
+                json!({ "threadIds": ["rev-panel"] }),
+            )
+            .await
+            .expect("shells");
+            let shell = shells["threads"][0].clone();
+            if shell["latestTurn"]["state"] == "completed"
+                && shell["session"]["activeTurnId"].is_null()
+            {
+                break shell;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{driver}: review turn timed out with shell={shell}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(shell["hasPendingApprovals"], false, "{driver}: {shell}");
+        assert_eq!(shell["hasPendingUserInput"], false, "{driver}: {shell}");
+        socket.close(None).await.expect("close WebSocket");
+        handle.shutdown();
+        handle.join().await.expect("join");
+        shell
+    }
+
+    // 1. Claude (`claudeAgent`) runs in full-access + default and auto-denies Bash + AskUserQuestion.
+    {
+        let state = TempDir::new().expect("claude state");
+        let capture = state.path().join("claude-review-capture.ndjson");
+        let args_capture = state.path().join("claude-review-args.txt");
+        let script = r#"#!/bin/sh
+case "$1" in
+  --version) printf '2.1.231\n'; exit 0;;
+  --help) printf '--include-hook-events --permission-prompts\n'; exit 0;;
+esac
+capture='@CAPTURE@'
+args_capture='@ARGS@'
+session_id='claude-review-session'
+has_session=false
+prev=''
+for arg in "$@"; do
+  case "$prev" in --session-id|--resume) session_id="$arg"; has_session=true;; esac
+  prev="$arg"
+done
+if [ "$has_session" = true ]; then
+  printf '%s\n' "$*" > "$args_capture"
+fi
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$capture"
+  case "$line" in
+    *'"type":"user"'*)
+      printf '%s\n' "$line"
+      printf '{"type":"control_request","request_id":"req-claude-bash","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-bash","input":{"command":"git status"}}}\n'
+      ;;
+    *'"request_id":"req-claude-bash"'*)
+      printf '{"type":"control_request","request_id":"req-claude-ask","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"tool-ask","input":{"questions":[{"question":"Proceed?","header":"Q","options":[{"label":"Yes","description":"Go"}]}]}}}\n'
+      ;;
+    *'"request_id":"req-claude-ask"'*)
+      printf '{"type":"assistant","session_id":"%s","uuid":"claude-msg-1","parent_tool_use_id":null,"message":{"id":"claude-msg-1","role":"assistant","content":[{"type":"text","text":"Claude review findings."}]}}\n' "$session_id"
+      printf '{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"%s","uuid":"claude-res-1"}\n' "$session_id"
+      ;;
+  esac
+done
+"#
+        .replace("@CAPTURE@", &capture.display().to_string())
+        .replace("@ARGS@", &args_capture.display().to_string());
+        let binary = executable_fixture(&state, "claude-review", &script, "");
+        run_review_panel(
+            "claude-review",
+            json!({ "binaryPath": binary }),
+            "claudeAgent",
+            "claude-sonnet",
+            &state,
+        )
+        .await;
+        let args = std::fs::read_to_string(&args_capture).expect("claude args");
+        assert!(
+            args.contains("--permission-mode bypassPermissions"),
+            "Claude review must launch in full-access bypassPermissions: {args}"
+        );
+        let captured = std::fs::read_to_string(&capture).expect("claude capture");
+        assert!(captured.contains("req-claude-bash") && captured.contains("\"behavior\":\"deny\""));
+        assert!(captured.contains("req-claude-ask"));
+    }
+
+    // 2. Cursor (`cursor`) runs in full-access + default and auto-cancels stray permission & question asks.
+    {
+        let state = TempDir::new().expect("cursor state");
+        let capture = state.path().join("cursor-review-capture.ndjson");
+        let script = r#"#!/bin/sh
+capture='@CAPTURE@'
+prompt_id=''
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*|*'"method":"authenticate"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"cursor-rev","modes":{"currentModeId":"ask","availableModes":[{"id":"agent","name":"Agent"},{"id":"ask","name":"Ask"},{"id":"plan","name":"Plan"}]}}}\n' "$id"
+      ;;
+    *'"method":"session/set_mode"'*)
+      printf '%s\n' "$line" >> "$capture"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"session/set_model"'*|*'"method":"session/set_config_option"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      prompt_id="$id"
+      printf '{"jsonrpc":"2.0","id":8001,"method":"session/request_permission","params":{"toolCall":{"title":"`reject-only`"},"options":[{"optionId":"reject","kind":"reject_once"}]}}\n'
+      ;;
+    *'"id":8001'*)
+      printf '%s\n' "$line" >> "$capture"
+      printf '{"jsonrpc":"2.0","id":8002,"method":"cursor/ask_question","params":{"questions":[{"id":"q1","prompt":"Proceed?"}]}}\n'
+      ;;
+    *'"id":8002'*)
+      printf '%s\n' "$line" >> "$capture"
+      printf '{"jsonrpc":"2.0","id":8003,"method":"x.ai/ask_user_question","params":{"questions":[{"question":"Proceed?"}]}}\n'
+      ;;
+    *'"id":8003'*)
+      printf '%s\n' "$line" >> "$capture"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"cursor-rev","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Cursor review findings."}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt_id"
+      ;;
+  esac
+done
+"#
+        .replace("@CAPTURE@", &capture.display().to_string());
+        let binary = executable_fixture(&state, "cursor-review", &script, "");
+        run_review_panel(
+            "cursor-review",
+            json!({ "binaryPath": binary }),
+            "cursor",
+            "gpt-5",
+            &state,
+        )
+        .await;
+        let captured = std::fs::read_to_string(&capture).expect("cursor capture");
+        assert!(captured.contains("\"id\":8001") && captured.contains("\"outcome\":\"cancelled\""));
+        assert!(captured.contains("\"id\":8002"));
+        assert!(captured.contains("\"id\":8003"));
+        assert!(captured.contains("\"modeId\":\"agent\""));
+    }
+
+    // 3. Antigravity (`antigravity`) runs in `auto` mode and cancels stray `session/request_permission`
+    //    even when an allow option is present (never silently approving).
+    {
+        let state = TempDir::new().expect("antigravity state");
+        let capture = state.path().join("antigravity-review-capture.ndjson");
+        let script = r#"#!/bin/sh
+capture='@CAPTURE@'
+mode_val='default'
+prompt_id=''
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$capture"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.13"}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"agy-rev","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"test-model","options":[{"value":"test-model","name":"Test Model"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"default","options":[{"value":"default","name":"default"},{"value":"accept-edits","name":"accept-edits"},{"value":"auto","name":"auto"},{"value":"plan","name":"plan"}]}]}}\n' "$id"
+      ;;
+    *'"method":"session/set_config_option"'*)
+      val=$(printf '%s\n' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+      case "$line" in
+        *'"configId":"mode"'*) mode_val="$val" ;;
+      esac
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"test-model","options":[{"value":"test-model","name":"Test Model"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"%s","options":[{"value":"default","name":"default"},{"value":"accept-edits","name":"accept-edits"},{"value":"auto","name":"auto"},{"value":"plan","name":"plan"}]}]}}\n' "$id" "$mode_val"
+      ;;
+    *'"method":"session/prompt"'*)
+      prompt_id="$id"
+      printf '{"jsonrpc":"2.0","id":8101,"method":"session/request_permission","params":{"sessionId":"agy-rev","toolCall":{"toolCallId":"call-1","kind":"edit","title":"File notes.txt"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}\n'
+      ;;
+    *'"id":8101'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-rev","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Antigravity review findings."}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt_id"
+      ;;
+  esac
+done
+"#
+        .replace("@CAPTURE@", &capture.display().to_string());
+        let binary = executable_fixture(&state, "antigravity-review", &script, "");
+        run_review_panel(
+            "antigravity-review",
+            json!({ "binaryPath": binary }),
+            "antigravity",
+            "test-model",
+            &state,
+        )
+        .await;
+        let captured = std::fs::read_to_string(&capture).expect("antigravity capture");
+        let perm_reply: Value = captured
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|msg| msg["id"] == 8101 && msg.get("result").is_some())
+            .expect("antigravity permission reply");
+        assert_eq!(
+            perm_reply["result"],
+            json!({ "outcome": { "outcome": "cancelled" } }),
+            "Antigravity code review must cancel stray asks and never silently approve: {perm_reply}"
+        );
+        assert!(captured.contains("\"value\":\"auto\""));
+    }
+
+    // 4. OpenCode (`opencode`) V2 starts with full-access permission rules and auto-declines
+    //    stray permissions & forms without opening cards.
+    {
+        #[derive(Default)]
+        struct OcState {
+            sse_tx: AsyncMutex<Option<mpsc::UnboundedSender<Value>>>,
+            created_rules: AsyncMutex<Option<Value>>,
+            perm_declined: AsyncMutex<bool>,
+            form_deleted: AsyncMutex<bool>,
+        }
+        let oc = Arc::new(OcState::default());
+        let app = Router::new()
+            .route(
+                "/api/info",
+                get(|| async { Json(json!({ "version": "2.0.29" })) }),
+            )
+            .route(
+                "/api/agent",
+                get(|| async { Json(json!({ "data": [{ "id": "build", "mode": "primary" }] })) }),
+            )
+            .route("/api/model", get(|| async { Json(json!({ "data": [] })) }))
+            .route(
+                "/api/session",
+                post({
+                    let oc = oc.clone();
+                    move |Json(body): Json<Value>| {
+                        let oc = oc.clone();
+                        async move {
+                            *oc.created_rules.lock().await = body.get("permissions").cloned();
+                            Json(json!({ "data": { "id": "oc-rev" } }))
+                        }
+                    }
+                })
+                .get(|| async { Json(json!({ "data": [] })) }),
+            )
+            .route(
+                "/api/session/{id}/agent",
+                post(|| async { Json(json!({ "data": {} })) }),
+            )
+            .route(
+                "/api/session/{id}/model",
+                post(|| async { Json(json!({ "data": {} })) }),
+            )
+            .route(
+                "/api/session/{id}/prompt",
+                post({
+                    let oc = oc.clone();
+                    move || {
+                        let oc = oc.clone();
+                        async move {
+                            let tx = oc.sse_tx.lock().await.clone().expect("sse tx");
+                            let _ = tx.send(json!({
+                                "type": "session.execution.started",
+                                "data": { "sessionID": "oc-rev" }
+                            }));
+                            let _ = tx.send(json!({
+                                "type": "permission.asked",
+                                "data": { "id": "oc-perm-1", "sessionID": "oc-rev", "permission": "shell" }
+                            }));
+                            let _ = tx.send(json!({
+                                "type": "form.created",
+                                "data": {
+                                    "form": {
+                                        "id": "oc-form-1",
+                                        "sessionID": "oc-rev",
+                                        "title": "Confirm",
+                                        "fields": [{
+                                            "key": "k",
+                                            "type": "string",
+                                            "options": [{ "value": "y", "label": "Yes" }]
+                                        }]
+                                    }
+                                }
+                            }));
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/session/{sid}/permission/{pid}/reply",
+                post({
+                    let oc = oc.clone();
+                    move |Json(body): Json<Value>| {
+                        let oc = oc.clone();
+                        async move {
+                            assert_eq!(body, json!({ "decision": "reject" }));
+                            *oc.perm_declined.lock().await = true;
+                            if *oc.form_deleted.lock().await {
+                                let tx = oc.sse_tx.lock().await.clone().expect("sse");
+                                let _ = tx.send(json!({
+                                    "type": "session.execution.succeeded",
+                                    "data": { "sessionID": "oc-rev" }
+                                }));
+                            }
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/session/{sid}/form/{fid}",
+                delete({
+                    let oc = oc.clone();
+                    move || {
+                        let oc = oc.clone();
+                        async move {
+                            *oc.form_deleted.lock().await = true;
+                            if *oc.perm_declined.lock().await {
+                                let tx = oc.sse_tx.lock().await.clone().expect("sse");
+                                let _ = tx.send(json!({
+                                    "type": "session.execution.succeeded",
+                                    "data": { "sessionID": "oc-rev" }
+                                }));
+                            }
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/event",
+                get({
+                    let oc = oc.clone();
+                    move || {
+                        let oc = oc.clone();
+                        async move {
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            let _ = tx.send(json!({ "type": "server.connected", "data": {} }));
+                            *oc.sse_tx.lock().await = Some(tx);
+                            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                                rx.recv().await.map(|event| {
+                                    (
+                                        Ok::<Event, std::convert::Infallible>(
+                                            Event::default().data(event.to_string()),
+                                        ),
+                                        rx,
+                                    )
+                                })
+                            });
+                            Sse::new(stream)
+                        }
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let state = TempDir::new().expect("opencode state");
+        run_review_panel(
+            "opencode-review",
+            json!({ "serverUrl": format!("http://{addr}") }),
+            "opencode",
+            "openai/gpt-5",
+            &state,
+        )
+        .await;
+        assert_eq!(
+            *oc.created_rules.lock().await,
+            Some(json!([{ "action": "*", "resource": "*", "effect": "allow" }]))
+        );
+        assert!(*oc.perm_declined.lock().await);
+        assert!(*oc.form_deleted.lock().await);
+        server.abort();
+    }
+}

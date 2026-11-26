@@ -48,7 +48,6 @@ import { ProviderModelsSection } from "./ProviderModelsSection";
 import { ProviderSessionDefaultsControls } from "./ProviderSessionDefaultsControls";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
 import { ProviderAccentColorPicker } from "./ProviderAccentColorPicker";
-import { RedactedSensitiveText } from "./RedactedSensitiveText";
 import {
   getProviderVersionAdvisoryPresentation,
   PROVIDER_STATUS_STYLES,
@@ -57,11 +56,11 @@ import {
   type ProviderStatusKey,
 } from "./providerStatus";
 
-/** Google's written position on the Antigravity chat, as `docs/providers/antigravity.md` cites it. */
+/** Google's written position on the Antigravity CLI, as `docs/providers/antigravity.md` cites it. */
 const ANTIGRAVITY_TERMS_NOTE =
   "Google's Antigravity FAQ says tools that wrap the Antigravity CLI are not supported on consumer plans. An API key or an enterprise plan is the route Google supports officially.";
 const ANTIGRAVITY_TERMS_DOCS_URL =
-  "https://github.com/mubeda/BibCode/blob/main/docs/providers/antigravity.md#why-it-is-preview";
+  "https://github.com/mubeda/BibCode/blob/main/docs/providers/antigravity.md#account-terms";
 
 const ENVIRONMENT_VARIABLE_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
@@ -141,28 +140,6 @@ export function deriveProviderModelsForDisplay(input: {
       },
   );
   return [...serverModels, ...customModels];
-}
-
-function ProviderAuthEmail(props: {
-  readonly email: string | undefined;
-  readonly prefix?: string;
-  readonly separator?: boolean;
-}) {
-  const trimmed = props.email?.trim();
-  if (!trimmed) return null;
-
-  return (
-    <span className="inline-flex min-w-0 items-center gap-1.5">
-      {props.separator ? <span aria-hidden>·</span> : null}
-      {props.prefix ? <span className="text-muted-foreground">{props.prefix}</span> : null}
-      <RedactedSensitiveText
-        value={trimmed}
-        ariaLabel="Toggle account email visibility"
-        revealTooltip="Click to reveal email"
-        hideTooltip="Click to hide email"
-      />
-    </span>
-  );
 }
 
 function ProviderEnvironmentSection(props: {
@@ -419,14 +396,7 @@ export function ProviderInstanceCard({
   const statusKey: ProviderStatusKey =
     (liveProvider?.status as ProviderStatusKey | undefined) ?? (enabled ? "warning" : "disabled");
   const statusStyle = PROVIDER_STATUS_STYLES[statusKey];
-  const rawSummary = getProviderSummary(liveProvider);
-  const authEmail = liveProvider?.auth.email;
-  const hasAuthenticatedEmail =
-    liveProvider?.auth.status === "authenticated" && Boolean(authEmail?.trim());
-  const authenticatedDetail = hasAuthenticatedEmail
-    ? (liveProvider?.auth.label ?? liveProvider?.auth.type ?? null)
-    : null;
-  const summary = rawSummary;
+  const summary = getProviderSummary(liveProvider);
   const versionLabel = getProviderVersionLabel(liveProvider?.version);
   const versionAdvisory = getProviderVersionAdvisoryPresentation(liveProvider?.versionAdvisory);
   const hasProviderUpdate = versionAdvisory?.kind === "update";
@@ -605,23 +575,12 @@ export function ProviderInstanceCard({
 
   const authRowNode = (
     <p className="flex min-w-0 flex-wrap items-center gap-x-1 text-xs text-muted-foreground">
-      {hasAuthenticatedEmail ? (
-        <>
-          <span>Authenticated as</span>
-          <ProviderAuthEmail email={authEmail} />
-          {authenticatedDetail ? <span>· {authenticatedDetail}</span> : null}
-        </>
-      ) : (
-        <>
-          <span>{summary.headline}</span>
-          <ProviderAuthEmail email={authEmail} separator prefix="Email" />
-        </>
-      )}
+      <span>{summary.headline}</span>
       {summary.detail ? <span>- {summary.detail}</span> : null}
     </p>
   );
 
-  // What Google has said in writing about the chat's use of the CLI; informative, never a gate.
+  // What Google has said in writing about the CLI; informative, never a gate.
   const antigravityTermsNode =
     driverKind === "antigravity" && (enabled || liveProvider?.installed) ? (
       <p className="text-xs text-muted-foreground">
@@ -633,7 +592,7 @@ export function ProviderInstanceCard({
           className="h-auto px-0 text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
           onClick={() => void readLocalApi()?.shell.openExternal(ANTIGRAVITY_TERMS_DOCS_URL)}
         >
-          Why it is Preview
+          Account terms
           <ExternalLinkIcon aria-hidden />
         </Button>
       </p>

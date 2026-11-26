@@ -1260,7 +1260,8 @@ describe("SourceControlPanel", () => {
   });
 
   describe("Review changes (R90)", () => {
-    const GUARD = "Starts in Claude's plan mode.";
+    const GUARD =
+      "Runs in auto mode without asking for permissions. Told not to edit; BiBCode cannot block edits for this agent.";
     const reviewProps = (unavailableReason: string | null = null, onStart = vi.fn()) =>
       buildProps({
         codeReview: {

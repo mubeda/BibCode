@@ -603,7 +603,9 @@ pub(super) fn parse_usage(stdout: &[u8], now: OffsetDateTime) -> Option<Provider
             used_percent: ((1.0 - remaining) * 100.0).round().clamp(0.0, 100.0) as u32,
             window_minutes: minutes,
             resets_at: bucket.reset_time.0.as_deref().and_then(|text| {
-                OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
+                OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+                    .ok()
+                    .filter(|ts| *ts > OffsetDateTime::UNIX_EPOCH)
             }),
             reset_description: None,
         };
@@ -800,6 +802,30 @@ mod tests {
                 "{reset} is not RFC 3339"
             );
         }
+
+        let mut epoch_zero = payload();
+        *epoch_zero
+            .pointer_mut("/command/data/groups/0/buckets/1/reset_time")
+            .unwrap() = json!("1970-01-01T00:00:00Z");
+        let snapshot = parse(&epoch_zero).expect("shape");
+        assert!(
+            snapshot.window_groups[0]
+                .session
+                .as_ref()
+                .unwrap()
+                .resets_at
+                .is_none(),
+            "Unix epoch-0 sentinel must decode as None"
+        );
+        assert!(
+            snapshot.window_groups[0]
+                .weekly
+                .as_ref()
+                .unwrap()
+                .resets_at
+                .is_some(),
+            "future RFC 3339 reset timestamp must still parse"
+        );
     }
 
     #[test]
@@ -890,7 +916,10 @@ mod tests {
 
     #[test]
     fn the_default_instance_is_read_explicit_first_and_legacy_as_fallback() {
-        assert!(!default_instance_enabled(&json!({})));
+        assert!(default_instance_enabled(&json!({})));
+        assert!(!default_instance_enabled(
+            &json!({"providers": {"antigravity": {"enabled": false}}})
+        ));
         assert!(default_instance_enabled(
             &json!({"providers": {"antigravity": {"enabled": true}}})
         ));
@@ -1162,25 +1191,30 @@ mod tests {
                 "driver": "antigravity",
                 "config": {"binaryPath": path.to_string_lossy()}
             });
-            // Without a legacy entry the built-in default (off) decides, as for the inventory.
-            for document in [
-                json!({
-                    "providers": {"antigravity": {"enabled": false}},
-                    "providerInstances": {"antigravity": instance.clone()}
-                }),
-                json!({ "providerInstances": {"antigravity": instance.clone()} }),
-            ] {
-                std::fs::write(root.join("settings.json"), document.to_string()).expect("settings");
-                let snapshot = (fetcher(ProviderSettingsStore::new(&root), None).fetch)()
-                    .await
-                    .expect("fetch");
-                assert_eq!(
-                    snapshot.error.as_deref(),
-                    Some(MESSAGE_DISABLED),
-                    "{document}"
-                );
-                assert!(fixture.calls().is_empty());
-            }
+            let legacy_disabled = json!({
+                "providers": {"antigravity": {"enabled": false}},
+                "providerInstances": {"antigravity": instance.clone()}
+            });
+            std::fs::write(root.join("settings.json"), legacy_disabled.to_string())
+                .expect("settings");
+            let snapshot = (fetcher(ProviderSettingsStore::new(&root), None).fetch)()
+                .await
+                .expect("fetch");
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some(MESSAGE_DISABLED),
+                "{legacy_disabled}"
+            );
+            assert!(fixture.calls().is_empty());
+
+            let omitted_enabled = json!({ "providerInstances": {"antigravity": instance} });
+            std::fs::write(root.join("settings.json"), omitted_enabled.to_string())
+                .expect("settings");
+            let snapshot = (fetcher(ProviderSettingsStore::new(&root), None).fetch)()
+                .await
+                .expect("fetch");
+            assert_eq!(snapshot.status, ProviderUsageStatus::Ok);
+            assert_eq!(fixture.calls(), ["--version", "-p"]);
         }
 
         #[tokio::test]

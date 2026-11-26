@@ -242,18 +242,25 @@ built-ins. It needs `dump_syms` (pinned to 2.3.9 in CI) with its default
 features, because the lookup of the PDB that a Windows binary names is part of
 the `http` feature.
 
-Release assembly, `scripts/assemble-release-assets.ts`, requires twelve symbol
-archives, `bibcode-{desktop,server}-symbols-<version>-<os>-<arch>.zip` for each
-of the six release targets, and still rejects any file outside its allowlist.
-`bibcode profiler symbolicate --download` fetches exactly these names, so a
-renamed archive breaks symbol downloads for that release; see
-[Symbol assets](../operations/release.md#symbol-assets).
+Release assembly, `scripts/assemble-release-assets.ts`, requires six desktop
+installers and six desktop symbol archives,
+`bibcode-desktop-symbols-<version>-<os>-<arch>.zip` for each of the six release
+targets (plus `latest.json` and the six validated updater `.sig` / payload pairs
+when `--updater` is set), and rejects any file outside that desktop-only
+allowlist (including standalone server archives, `.deb`/`.rpm` packages,
+`bibcode-server-SHA256SUMS`, `.minisig` signatures, and
+`bibcode-server-symbols-*.zip`).
+`bibcode profiler symbolicate --download` fetches the desktop symbol archive
+names for desktop crashes, so a renamed desktop archive breaks desktop symbol
+downloads for that release; see [Symbol assets](../operations/release.md#symbol-assets).
 
 The desktop artifact contains the Tauri host, in-process Rust server, and built
 web assets. It does not stage Node.js, a TypeScript server, or helper sidecars;
 the profiler's crash monitor is the same executable relaunched.
 
 ## Standalone Server Artifacts
+
+These commands are local and manual packaging tools and are not invoked by Release CI:
 
 - `vp run dist:server:artifact -- ...`: generic standalone-server builder.
 - `vp run dist:server:mac:arm64` / `:x64`: macOS server archive.
@@ -262,9 +269,9 @@ the profiler's crash monitor is the same executable relaunched.
 
 The builder stages the native `bibcode` executable, production web client,
 `docs/user/server-installation.md`, and license under one versioned root. Use
-`scripts/smoke-server-distribution.ts` against that staged root. Linux CI additionally
-uses `scripts/test-linux-server-package.ts` to install, start, remove, and verify data
-preservation in the documented native-architecture containers.
+`scripts/smoke-server-distribution.ts` against that staged root, and
+`scripts/test-linux-server-package.ts` to install, start, remove, and verify data
+preservation in local native-architecture containers.
 
 ## Remote update verification tooling
 

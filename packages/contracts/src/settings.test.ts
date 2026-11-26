@@ -111,6 +111,37 @@ describe("ServerSettings Grok defaults", () => {
 });
 
 describe("ServerSettings supported provider defaults", () => {
+  it("enables Antigravity by default for fresh settings while preserving explicit disable and partial legacy fields", () => {
+    expect(decodeServerSettings({}).providers.antigravity).toMatchObject({
+      enabled: true,
+      binaryPath: "agy",
+      customModels: [],
+    });
+    expect(DEFAULT_SERVER_SETTINGS.providers.antigravity).toMatchObject({
+      enabled: true,
+      binaryPath: "agy",
+    });
+    expect(
+      decodeServerSettings({ providers: { antigravity: { enabled: false } } }).providers.antigravity
+        .enabled,
+    ).toBe(false);
+    expect(
+      decodeServerSettings({
+        providers: {
+          antigravity: {
+            binaryPath: "custom-agy",
+            customModels: ["gemini-pro"],
+            unknownExtraField: "ignored-or-dropped",
+          },
+        },
+      }).providers.antigravity,
+    ).toEqual({
+      enabled: true,
+      binaryPath: "custom-agy",
+      customModels: ["gemini-pro"],
+    });
+  });
+
   it("enables Cursor for fresh settings while preserving an explicit disable", () => {
     expect(decodeServerSettings({}).providers.cursor).toMatchObject({
       enabled: true,
@@ -556,13 +587,15 @@ describe("ClientSettings usage status bar", () => {
     });
   });
 
-  it("keeps the Antigravity opt-in its own boolean, off by default, with the item list untouched", () => {
-    expect(decodeClientSettings({}).showAntigravityUsage).toBe(false);
+  it("keeps Antigravity usage its own boolean, on by default, preserving opt-out with the item list untouched", () => {
+    expect(decodeClientSettings({}).showAntigravityUsage).toBe(true);
+    expect(DEFAULT_CLIENT_SETTINGS.showAntigravityUsage).toBe(true);
+    expect(decodeClientSettings({ showAntigravityUsage: false }).showAntigravityUsage).toBe(false);
     const settings = decodeClientSettings({
-      showAntigravityUsage: true,
+      showAntigravityUsage: false,
       statusBarItems: ["claude"],
     });
-    expect(settings.showAntigravityUsage).toBe(true);
+    expect(settings.showAntigravityUsage).toBe(false);
     expect(settings.statusBarItems).toEqual(["claude"]);
     // An unknown item literal resets the list (the downgrade hazard the separate flag avoids).
     expect(

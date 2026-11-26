@@ -57,8 +57,17 @@ If Codex still sends a command approval, a file-change approval or a question on
 such a session, BiBCode answers at once (`decision: decline`, or no answers) and
 records nothing pending, so no card opens and the turn goes on. The server
 advertises this with the `readOnlyCodexReviews` capability. A review panel
-switched to another provider follows the stored mode as before. Claude, Cursor,
-Grok and OpenCode reviews are unchanged.
+switched to another provider follows the stored mode as before. Non-Codex chat
+reviews (Claude, Cursor, OpenCode, and Antigravity) start with `runtimeMode:
+"full-access"`, `interactionMode: "default"`, and `codeReview: true`; while
+those auto-mode settings stay active, each server driver runs its native
+non-prompting mode and auto-declines or cancels stray permission and
+interactive-question callbacks (with Cursor auto-approving permissions that
+offer an allow option and cancelling reject-only/empty permissions and all
+questions). Switching a non-Codex review to `approval-required` (or `plan` on
+providers that support Plan mode) disables code-review auto-decline; on OpenCode
+V1, BiBCode warns that upstream V1 rules remain bound at session creation until
+a fresh session starts.
 
 ## Interaction mode
 

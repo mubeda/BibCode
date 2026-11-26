@@ -38,8 +38,9 @@ and [macOS Desktop Validation](./macos-desktop.md#ios-simulator-previews).
 Never describe compatibility or unavailable evidence as a native pass. A
 complete report separates all three classes.
 
-Native release reports also separate desktop-installer evidence from standalone-server
-archive/package evidence. Each architecture requires its own native result; one
+Native release reports cover desktop-installer evidence for each target
+architecture; standalone server builds are validated locally rather than as
+GitHub Release assets. Each architecture requires its own native result; one
 architecture never proves another.
 
 ## Living documentation and execution reports
@@ -113,7 +114,7 @@ library tests use `crate::test_support::hermetic_providers`.
 `write_hermetic_settings(&config.state_dir(), overlay)` disables update checks
 and pins every built-in driver's legacy `binaryPath` to an absolute missing
 path. It explicitly preserves the built-in enabled defaults in both settings
-readers: Codex, Claude, Cursor, and OpenCode enabled; Grok disabled. It
+readers: Codex, Claude, Cursor, OpenCode, and Antigravity enabled; Grok disabled. It
 deep-merges fixture overrides, including partial `providerInstances`, so
 unspecified drivers stay pinned. `ensure_hermetic_settings` reads existing
 settings as the overlay and writes the hermetic base beneath them; explicit

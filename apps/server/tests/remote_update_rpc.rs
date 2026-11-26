@@ -29,7 +29,8 @@ fn disable_provider_processes(root: &std::path::Path) {
                 "claudeAgent": {"enabled": false},
                 "cursor": {"enabled": false},
                 "grok": {"enabled": false},
-                "opencode": {"enabled": false}
+                "opencode": {"enabled": false},
+                "antigravity": {"enabled": false}
             }
         }),
     );
