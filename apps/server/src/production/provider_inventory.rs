@@ -685,37 +685,50 @@ pub(crate) fn unsupported_instances(settings: &Value) -> Vec<ProviderProbeResult
         .collect()
 }
 
-pub(crate) fn instance_capability_cache_valid(
+pub(crate) struct CapabilityCacheFsCheck {
+    cwd: Option<std::path::PathBuf>,
+    antigravity_binary: Option<(String, Vec<(OsString, OsString)>)>,
+}
+
+impl CapabilityCacheFsCheck {
+    pub(crate) fn paths_exist(&self) -> bool {
+        if let Some(dir) = self.cwd.as_deref()
+            && !dir.is_dir()
+        {
+            return false;
+        }
+        if let Some((binary_path, environment)) = self.antigravity_binary.as_ref()
+            && resolve_provider_executable_with_environment(
+                binary_path,
+                environment
+                    .iter()
+                    .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+            )
+            .is_none()
+        {
+            return false;
+        }
+        true
+    }
+}
+
+pub(crate) fn instance_capability_cache_check(
     settings: &Value,
     instance_id: &str,
-    cwd: Option<&Path>,
-) -> bool {
-    if let Some(dir) = cwd
-        && !dir.is_dir()
-    {
-        return false;
-    }
-    let Some(definition) = definitions(settings).into_iter().find(|definition| {
+    cwd: Option<std::path::PathBuf>,
+) -> Option<CapabilityCacheFsCheck> {
+    let definition = definitions(settings).into_iter().find(|definition| {
         definition.instance_id == instance_id
             && definition.enabled
             && definition.available
             && !definition.missing_secret
-    }) else {
-        return false;
-    };
-    if definition.driver == "antigravity"
-        && resolve_provider_executable_with_environment(
-            &definition.binary_path,
-            definition
-                .environment
-                .iter()
-                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
-        )
-        .is_none()
-    {
-        return false;
-    }
-    true
+    })?;
+    let antigravity_binary = (definition.driver == "antigravity")
+        .then_some((definition.binary_path, definition.environment));
+    Some(CapabilityCacheFsCheck {
+        cwd,
+        antigravity_binary,
+    })
 }
 
 /// `reuse_catalog` skips Antigravity's session probe:

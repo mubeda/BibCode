@@ -244,30 +244,17 @@
     {
       "state": "expanded-card",
       "actions": [],
-      "owners": ["ProviderInstanceCard", "ProviderEnvironmentSection", "ProviderAuthEmail"],
-      "visible_text": ["Authenticated as", "Environment variables", "Sensitive"]
-    },
-    {
-      "state": "revealed-email",
-      "actions": [
-        {
-          "action": "click",
-          "role": "button",
-          "name": "Toggle account email visibility",
-          "selector": "button"
-        }
-      ],
-      "owners": ["ProviderAuthEmail", "RedactedSensitiveText"],
-      "visible_text": ["typography@example.invalid"]
+      "owners": ["ProviderInstanceCard", "ProviderEnvironmentSection"],
+      "visible_text": ["Authenticated", "Environment variables", "Sensitive"]
     }
   ],
   "settings-provider-card-unauthenticated": [
     {
-      "state": "email-prefix-empty-environment",
+      "state": "unauthenticated-empty-environment",
       "actions": [],
-      "owners": ["ProviderEnvironmentSection", "ProviderAuthEmail"],
+      "owners": ["ProviderEnvironmentSection", "ProviderInstanceCard"],
       "visible_text": [
-        "Email",
+        "Not authenticated",
         "Add variables to pass API keys, base URLs, or other per-instance CLI settings."
       ]
     }

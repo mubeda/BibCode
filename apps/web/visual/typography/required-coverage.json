@@ -154,7 +154,7 @@
   },
   {
     "module": "components/settings/ProviderInstanceCard.tsx",
-    "owners": ["ProviderEnvironmentSection", "ProviderInstanceCard", "ProviderAuthEmail"]
+    "owners": ["ProviderEnvironmentSection", "ProviderInstanceCard"]
   },
   {
     "module": "components/settings/ProviderModelsSection.tsx",

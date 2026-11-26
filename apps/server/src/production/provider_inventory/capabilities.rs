@@ -1461,6 +1461,7 @@ exec "$BIBCODE_TEST_EXECUTABLE" --exact production::provider_inventory::capabili
         })
     }
 
+    #[cfg(unix)]
     fn write_antigravity_skill(dir: &Path, name: &str, description: &str) {
         std::fs::create_dir_all(dir).expect("create skill dir");
         std::fs::write(
@@ -1470,6 +1471,7 @@ exec "$BIBCODE_TEST_EXECUTABLE" --exact production::provider_inventory::capabili
         .expect("write SKILL.md");
     }
 
+    #[cfg(unix)]
     fn antigravity_script(sandbox: &TestSandbox, name: &str, body: &str) -> std::path::PathBuf {
         sandbox.executable_script(name, body, "")
     }

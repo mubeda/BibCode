@@ -2350,21 +2350,24 @@ impl NativeServerControl {
                     let settings_json = serde_json::to_value(settings).map_err(|error| {
                         json!({"_tag":"ServerProviderCapabilitiesError","reason":error.to_string()})
                     })?;
-                    let cache_valid = provider_inventory::instance_capability_cache_valid(
+                    let fs_check = provider_inventory::instance_capability_cache_check(
                         &settings_json,
                         &key.0,
-                        (!key.1.is_empty()).then_some(Path::new(&key.1)),
+                        (!key.1.is_empty()).then(|| PathBuf::from(&key.1)),
                     );
                     let mut cache = self
                         .capability_cache
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    if !cache_valid {
-                        cache.entries.remove(&key);
-                        cache.refreshing.remove(&key);
-                        None
-                    } else {
-                        cache.cached(&key, current_generation)
+                    match fs_check {
+                        None => {
+                            cache.entries.remove(&key);
+                            cache.refreshing.remove(&key);
+                            None
+                        }
+                        Some(fs_check) => cache
+                            .cached(&key, current_generation)
+                            .map(|(value, stale)| (fs_check, value, stale)),
                     }
                 }
                 Err(error) => {
@@ -2380,6 +2383,34 @@ impl NativeServerControl {
                     }));
                 }
             }
+        };
+        let cached = if let Some((fs_check, value, stale)) = cached {
+            let fs_task = tokio::task::spawn_blocking(move || fs_check.paths_exist());
+            let paths_valid = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return Err(json!({
+                        "_tag": "RequestCancelled",
+                        "method": "server.getProviderCapabilities",
+                    }));
+                }
+                result = tokio::time::timeout(Duration::from_secs(2), fs_task) => {
+                    matches!(result, Ok(Ok(true)))
+                }
+            };
+            if paths_valid {
+                Some((value, stale))
+            } else {
+                let mut cache = self
+                    .capability_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                cache.entries.remove(&key);
+                cache.refreshing.remove(&key);
+                None
+            }
+        } else {
+            None
         };
         if let Some((value, stale)) = cached {
             if stale {

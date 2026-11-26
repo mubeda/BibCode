@@ -277,24 +277,21 @@ export const settingsFixtures: readonly Fixture[] = [
   },
   {
     id: "settings-provider-card",
-    title: "Provider instance with email and environment",
+    title: "Provider instance with environment",
     modules: [
       "components/settings/ProviderInstanceCard.tsx",
-      "components/settings/RedactedSensitiveText.tsx",
       "components/settings/ProviderModelsSection.tsx",
       "components/settings/ProviderSettingsForm.tsx",
     ],
     owners: [
       "ProviderInstanceCard",
       "ProviderEnvironmentSection",
-      "ProviderAuthEmail",
-      "RedactedSensitiveText",
       "ProviderModelsSection",
       "ProviderSettingsFieldRow",
     ],
     anchors: [
       "Typography provider instance",
-      "Authenticated as",
+      "Authenticated",
       "Environment variables",
       "Sensitive",
       "Sol fixture model",
@@ -303,11 +300,11 @@ export const settingsFixtures: readonly Fixture[] = [
   },
   {
     id: "settings-provider-card-unauthenticated",
-    title: "Provider email prefix and empty environment",
+    title: "Provider unauthenticated status and empty environment",
     modules: ["components/settings/ProviderInstanceCard.tsx"],
-    owners: ["ProviderInstanceCard", "ProviderEnvironmentSection", "ProviderAuthEmail"],
+    owners: ["ProviderInstanceCard", "ProviderEnvironmentSection"],
     anchors: [
-      "Email",
+      "Not authenticated",
       "Add variables to pass API keys, base URLs, or other per-instance CLI settings.",
     ],
     render: () => <ProviderCardFixture authenticated={false} />,
