@@ -1,5 +1,25 @@
 # Changelog
 
+## [v0.18.1] - 2026-11-26
+
+BiBCode v0.18.1 promotes Antigravity to general availability with native `/` slash skills, runs code reviews autonomously across all active providers without blocking on interactive prompts, simplifies provider authentication display in Settings, and streamlines GitHub Releases to desktop assets only. This release includes PR #424 since v0.18.0.
+
+### Antigravity
+
+- Antigravity is now enabled by default for new installations, its usage indicator is shown in the agent status bar by default, and Preview badges and labels are removed from Settings.
+- Antigravity chats now support native `/` slash skills in the composer, merging local workspace and user skills with ACP-advertised commands and keeping capability cache filesystem checks off the settings lock.
+- Provider authentication status in Settings now shows plain **Authenticated** without displaying the signed-in account email address.
+
+### Code reviews
+
+- Code reviews started from Source Control or **Send to agent → Review** using Claude, Cursor, OpenCode (V1 and V2), or Antigravity now launch in non-prompting auto mode and automatically decline or cancel stray permission or question prompts so reviews run to completion without stalling.
+- Codex code reviews continue to use Codex's read-only sandbox with the locked **Read-only review** indicator.
+
+### Releases and packaging
+
+- GitHub Releases now build, verify, and publish desktop assets only—six platform installers, six Breakpad symbol archives, and nine signed updater metadata files—removing standalone server archives, Linux `.deb`/`.rpm` packages, and standalone server symbol archives from release output.
+- Updated the download page, remote manual-update instructions, profiler symbolication handling, publish-approval draft verification, and release documentation to match desktop-only releases.
+
 ## [v0.18.0] - 2026-11-24
 
 BiBCode v0.18.0 adds Antigravity AI Terminal and ACP chat support, remote branch deletion in the Git Manager, desktop and keyboard undo/redo in the Files editor and preview browser, Cursor's parameterized model picker, a Linux software-rendering option for WebKitGTK compositor hangs, and fixes provider startup cancellation, late Stop handling, preview focus return, and AppImage packaging. This release includes PRs #420 and #423 since v0.17.0.
