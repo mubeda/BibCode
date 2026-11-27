@@ -8059,10 +8059,6 @@ fn apply_threads_projector_tx(
                     "DELETE FROM provider_session_runtime WHERE thread_id = ?",
                     [&thread_id],
                 )?;
-                transaction.execute(
-                    "UPDATE projection_thread_messages SET is_streaming = 0 WHERE thread_id = ? AND is_streaming = 1",
-                    [&thread_id],
-                )?;
             }
             "thread.archived" => {
                 transaction.execute("UPDATE projection_threads SET archived_at = ?, updated_at = ? WHERE thread_id = ?", params![required_str(payload,"archivedAt")?, required_str(payload,"updatedAt")?, required_str(payload,"threadId")?])?;
@@ -8407,6 +8403,13 @@ fn apply_messages_projector_tx(
     event: &OrchestrationEvent,
     context: &mut ProjectionContext,
 ) -> Result<(), PersistenceError> {
+    if event.event.event_type == "thread.deleted" {
+        transaction.execute(
+            "UPDATE projection_thread_messages SET is_streaming = 0 WHERE thread_id = ? AND is_streaming = 1",
+            [required_str(&event.event.payload, "threadId")?],
+        )?;
+        return Ok(());
+    }
     if event.event.event_type == "thread.turn-start-requested" {
         let payload = &event.event.payload;
         // Promotion begins a new turn after the preceding response. Apply its

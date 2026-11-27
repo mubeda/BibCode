@@ -15114,12 +15114,16 @@ async fn settle_streaming_assistant_message_rows(
     created_at: &str,
 ) -> Result<(), ProviderRuntimeError> {
     let mut first_persistent_error = None;
+    let mut deleted_threads = std::collections::HashSet::<String>::new();
     for (index, message) in messages
         .into_iter()
         .filter(|message| message.role == "assistant" && message.is_streaming)
         .enumerate()
     {
         let thread_id = message.thread_id;
+        if deleted_threads.contains(&thread_id) {
+            continue;
+        }
         let turn_id = message.turn_id;
         let completion = OrchestrationCommand::ThreadMessageAssistantComplete {
             command_id: format!("{command_id}:assistant-complete:{index}"),
@@ -15130,10 +15134,7 @@ async fn settle_streaming_assistant_message_rows(
         };
         if let Err(error) = engine.dispatch(completion.clone()).await {
             if provider_thread_was_deleted(&engine.repositories(), &thread_id).await {
-                let _ = engine
-                    .repositories()
-                    .clear_streaming_assistant_messages_of_deleted_threads()
-                    .await;
+                deleted_threads.insert(thread_id);
                 continue;
             }
             tracing::warn!(
@@ -15144,10 +15145,7 @@ async fn settle_streaming_assistant_message_rows(
             );
             if let Err(error) = engine.dispatch(completion).await {
                 if provider_thread_was_deleted(&engine.repositories(), &thread_id).await {
-                    let _ = engine
-                        .repositories()
-                        .clear_streaming_assistant_messages_of_deleted_threads()
-                        .await;
+                    deleted_threads.insert(thread_id);
                     continue;
                 }
                 tracing::warn!(
@@ -30155,7 +30153,20 @@ done
                 .await
                 .unwrap();
         }
-        // Simulate a legacy pre-fix database where a deleted thread still holds an is_streaming=1 assistant row.
+        // Live deletion clears is_streaming immediately through the messages projector.
+        let deleted_immediately = engine
+            .repositories()
+            .get_message("msg-deleted".to_owned())
+            .await
+            .unwrap()
+            .expect("deleted thread message row");
+        assert!(
+            !deleted_immediately.is_streaming,
+            "live thread.deleted must clear is_streaming via projection.thread-messages"
+        );
+
+        // Simulate a legacy pre-fix database where a deleted thread AND a missing parent thread
+        // both still hold is_streaming=1 assistant rows.
         engine
             .repositories()
             .database()
@@ -30164,10 +30175,30 @@ done
                     "UPDATE projection_thread_messages SET is_streaming = 1 WHERE message_id = 'msg-deleted'",
                     [],
                 )?;
+                connection.execute(
+                    "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at) VALUES ('msg-missing', 't-missing', 'turn-missing', 'assistant', 'Orphaned missing parent', NULL, 1, '2026-07-16T00:00:01Z', '2026-07-16T00:00:01Z')",
+                    [],
+                )?;
                 Ok(())
             })
             .await
             .unwrap();
+
+        // Independently of startup cleanup, the candidate query itself must return only msg-live.
+        let candidates = engine
+            .repositories()
+            .list_streaming_assistant_messages()
+            .await
+            .unwrap();
+        let candidate_ids: Vec<&str> = candidates
+            .iter()
+            .map(|row| row.message_id.as_str())
+            .collect();
+        assert_eq!(
+            candidate_ids,
+            vec!["msg-live"],
+            "deleted and missing-parent streaming rows must be excluded by list_streaming_assistant_messages"
+        );
 
         super::reconcile_abandoned_provider_sessions(&engine)
             .await
@@ -30183,6 +30214,16 @@ done
             !deleted_msg.is_streaming,
             "deleted thread's streaming flag should be cleared on startup reconciliation"
         );
+        let missing_msg = engine
+            .repositories()
+            .get_message("msg-missing".to_owned())
+            .await
+            .unwrap()
+            .expect("missing parent thread message row");
+        assert!(
+            !missing_msg.is_streaming,
+            "missing-parent thread's streaming flag should be cleared on startup reconciliation"
+        );
         let live_msg = engine
             .repositories()
             .get_message("msg-live".to_owned())
@@ -30192,6 +30233,27 @@ done
         assert!(
             !live_msg.is_streaming,
             "live thread's orphaned streaming assistant message must still settle"
+        );
+
+        // Verify zero completion command receipts for deleted/missing threads and one accepted for t-live.
+        let receipts: Vec<(String, String)> = engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                let mut stmt = connection.prepare(
+                    "SELECT aggregate_id, status FROM orchestration_command_receipts WHERE command_id LIKE 'provider-restart-reconcile-messages:%' ORDER BY aggregate_id",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            receipts,
+            vec![("t-live".to_owned(), "accepted".to_owned())],
+            "only live threads should receive ThreadMessageAssistantComplete during startup reconciliation"
         );
 
         let captured =
@@ -30206,7 +30268,34 @@ done
             "unexpected remained-streaming warning for deleted thread: {captured}"
         );
 
+        // Replaying ONLY projection.thread-messages must match live deletion (is_streaming = 0 before provider reconciliation).
+        let database = engine.repositories().database().clone();
         engine.shutdown().await;
+        database
+            .call(|connection| {
+                connection.execute("DELETE FROM projection_thread_messages", [])?;
+                connection.execute(
+                    "UPDATE projection_state SET last_applied_sequence = 0 WHERE projector = 'projection.thread-messages'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let replayed = super::OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .unwrap();
+        let replayed_deleted = replayed
+            .repositories()
+            .get_message("msg-deleted".to_owned())
+            .await
+            .unwrap()
+            .expect("replayed deleted thread message row");
+        assert!(
+            !replayed_deleted.is_streaming,
+            "rebuilding only projection.thread-messages must clear is_streaming on thread.deleted"
+        );
+        replayed.shutdown().await;
     }
 
     #[tokio::test]
@@ -30241,20 +30330,21 @@ done
         let engine = supervisor_engine().await;
         for command in [
             json!({"type":"thread.create","commandId":"thread-race","threadId":"t-race","projectId":"p1","title":"Race","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
-            json!({"type":"thread.message.assistant.delta","commandId":"delta-race","threadId":"t-race","messageId":"msg-race","delta":"In flight","turnId":"turn-race","createdAt":"2026-07-16T00:00:01Z"}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-race-1","threadId":"t-race","messageId":"msg-race-1","delta":"First in flight","turnId":"turn-race-1","createdAt":"2026-07-16T00:00:01Z"}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-race-2","threadId":"t-race","messageId":"msg-race-2","delta":"Second in flight","turnId":"turn-race-2","createdAt":"2026-07-16T00:00:01Z"}),
         ] {
             engine
                 .dispatch(serde_json::from_value(command).unwrap())
                 .await
                 .unwrap();
         }
-        // Snapshot the streaming row before a concurrent thread deletion arrives.
+        // Snapshot both streaming rows before a concurrent thread deletion arrives.
         let stale_rows = engine
             .repositories()
             .list_streaming_assistant_messages()
             .await
             .unwrap();
-        assert_eq!(stale_rows.len(), 1);
+        assert_eq!(stale_rows.len(), 2);
         engine
             .dispatch(
                 serde_json::from_value(json!({
@@ -30278,6 +30368,25 @@ done
         assert!(
             result.is_ok(),
             "concurrently deleted thread must not fail assistant settlement: {result:?}"
+        );
+        let race_receipts: Vec<String> = engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                let mut stmt = connection.prepare(
+                    "SELECT command_id FROM orchestration_command_receipts WHERE command_id LIKE 'test-concurrent-delete:assistant-complete:%'",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            race_receipts.len(),
+            1,
+            "once deletion is confirmed on the first row, remaining rows for that thread must be skipped without extra rejected commands: {race_receipts:?}"
         );
         let captured =
             String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8");
