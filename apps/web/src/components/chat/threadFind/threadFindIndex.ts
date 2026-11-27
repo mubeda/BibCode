@@ -6,7 +6,6 @@
  * The query never leaves this module's callers: projections do not depend on it, so a worker
  * that projects a large entry receives only the entry's text.
  */
-import type { ServerProviderSkill } from "@bibcode/contracts";
 import { isQueuedTimelineMessage, type QueuedCardStatus } from "../../ChatView.logic";
 import { workEntryIndicatesToolNeutralStatus, type TimelineEntry } from "../../../session-logic";
 import {
@@ -44,7 +43,7 @@ import {
   type FindSource,
 } from "./threadFindText";
 
-type InlineSkill = Pick<ServerProviderSkill, "name" | "displayName">;
+import type { InlineSkill } from "../../chatMarkdownPipeline";
 
 // ---------------------------------------------------------------------------
 // Entries
@@ -248,7 +247,9 @@ interface CachedProjection {
 }
 
 function skillsKey(skills: ReadonlyArray<InlineSkill>): string {
-  return skills.map((skill) => `${skill.name}\u0001${skill.displayName ?? ""}`).join("\u0002");
+  return skills
+    .map((skill) => `${skill.name}\u0001${skill.displayName ?? ""}\u0001${skill.invocation ?? ""}`)
+    .join("\u0002");
 }
 
 /** Everything a source's projection depends on except its text. */

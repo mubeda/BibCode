@@ -175,7 +175,8 @@ describe("collectComposerInlineTokens", () => {
   });
 
   it("collects slash-prefixed skill tokens while rejecting mid-path segments and incomplete tokens", () => {
-    const text = "/docs inspect apps/web/src and https://example.com/foo then /provider:audit now";
+    const text =
+      "/docs inspect apps/web/src and https://example.com/foo then /provider:audit /3d-render /build.docs now";
     expect(collectComposerInlineTokens(text)).toEqual([
       {
         type: "skill",
@@ -191,10 +192,23 @@ describe("collectComposerInlineTokens", () => {
         start: 60,
         end: 75,
       },
+      {
+        type: "skill",
+        value: "3d-render",
+        source: "/3d-render",
+        start: 76,
+        end: 86,
+      },
+      {
+        type: "skill",
+        value: "build.docs",
+        source: "/build.docs",
+        start: 87,
+        end: 98,
+      },
     ]);
     expect(collectComposerInlineTokens("Use /docs")).toEqual([]);
     expect(collectComposerInlineTokens("Inspect /usr/local/bin now")).toEqual([]);
-    expect(collectComposerInlineTokens("Use /9invalid now")).toEqual([]);
   });
 
   it("accepts one preserved trailing token and suppresses identical duplicates", () => {

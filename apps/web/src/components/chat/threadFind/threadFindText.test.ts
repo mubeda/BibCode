@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import type { InlineSkill } from "../../chatMarkdownPipeline";
 import {
   countFindOccurrences,
   foldFindText,
@@ -8,11 +9,11 @@ import {
   type FindSegment,
 } from "./threadFindText";
 
-const SKILLS = [{ name: "review", displayName: "Code Review" }];
+const SKILLS: ReadonlyArray<InlineSkill> = [{ name: "review", displayName: "Code Review" }];
 
 function project(
   text: string,
-  options: { lineBreaks?: boolean; skills?: typeof SKILLS; cwd?: string } = {},
+  options: { lineBreaks?: boolean; skills?: ReadonlyArray<InlineSkill>; cwd?: string } = {},
 ): FindSegment[] {
   return projectFindSource(
     {
@@ -64,6 +65,18 @@ describe("threadFindText projection", () => {
     expect(count("# Use $review", "code review", { skills: SKILLS })).toBe(0);
     expect(count("- use $review", "code review", { skills: SKILLS })).toBe(1);
     expect(count("Use `$review`", "code review", { skills: SKILLS })).toBe(0);
+  });
+
+  it("matches slash skills only with slash prefix and dollar skills only with dollar prefix", () => {
+    const mixedSkills = [
+      { name: "docs", displayName: "API Docs", invocation: "slash" as const },
+      { name: "review", displayName: "Code Review", invocation: "dollar" as const },
+    ];
+    expect(count("Run /docs now", "api docs", { skills: mixedSkills })).toBe(1);
+    expect(count("Run /docs now", "/docs", { skills: mixedSkills })).toBe(0);
+    // Slash-only skill must not chip under `$`, and dollar-only skill must not chip under `/`.
+    expect(count("Run $docs now", "api docs", { skills: mixedSkills })).toBe(0);
+    expect(count("Run /review now", "code review", { skills: mixedSkills })).toBe(0);
   });
 
   it("matches inline and fenced code, never across a block or a table cell", () => {

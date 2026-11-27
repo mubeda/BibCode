@@ -987,7 +987,7 @@ describe("ComposerPromptEditor inline token nodes", () => {
         expect(chip.className).toContain("bg-fuchsia-900/12");
         expect(chip.className).toContain("border-fuchsia-800/25");
         expect(chip.className).toContain("dark:bg-fuchsia-950/70");
-        expect(chip.className).toContain("dark:text-fuchsia-100");
+        expect(chip.className).toContain("dark:text-fuchsia-400");
         expect(chip.className).toContain("dark:border-fuchsia-400/30");
       }
 
@@ -1018,6 +1018,161 @@ describe("ComposerPromptEditor inline token nodes", () => {
       expect(roundTripJson).toContain('"skillPrefix":"/"');
       const parsedState = editor.parseEditorState(roundTripJson);
       expect(parsedState.read(() => $getRoot().getTextContent())).toBe("/docs check API");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      harness.useRealEffects = false;
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("reconciles pasted slash skills, preserves Shift+Arrow selection across chips, and keeps selection on metadata refresh", async () => {
+    harness.useRealEffects = true;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const editorRef = createRef<ComposerPromptEditorHandle>();
+    const onChange = vi.fn();
+    const slashSkills: ReadonlyArray<ServerProviderSkill> = [
+      {
+        name: "docs",
+        displayName: "Docs",
+        path: "/skills/docs/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+      {
+        name: "3d-render",
+        displayName: "3D Render",
+        path: "/skills/3d-render/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+      {
+        name: "build.docs",
+        displayName: "Build Docs",
+        path: "/skills/build.docs/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+    ];
+    const renderMounted = (
+      nextValue: string,
+      nextCursor: number,
+      nextSkills: ReadonlyArray<ServerProviderSkill> = slashSkills,
+    ) => (
+      <ComposerPromptEditor
+        value={nextValue}
+        cursor={nextCursor}
+        terminalContexts={[]}
+        skills={nextSkills}
+        agents={[]}
+        disabled={false}
+        placeholder="Ask anything"
+        onRemoveTerminalContext={vi.fn()}
+        onChange={onChange}
+        onPaste={vi.fn()}
+        editorRef={editorRef}
+      />
+    );
+
+    try {
+      // 1. Direct text insertion / paste of `/docs tail` reconciles into a chip so focusAtEnd() appends at EOF.
+      await act(async () => root.render(renderMounted("", 0)));
+      const editor = lastEditor();
+      await act(async () => {
+        editor.update(
+          () => {
+            const p = $paragraph();
+            const textNode = $createTextNode("/docs tail");
+            p.append(textNode);
+            textNode.select(10, 10);
+          },
+          { discrete: true },
+        );
+      });
+      await act(async () => {
+        await flushMicrotasks();
+        await flushMicrotasks();
+      });
+      expect(container.querySelectorAll('[data-composer-skill-chip="true"]')).toHaveLength(1);
+      expect(editorRef.current?.readSnapshot()).toMatchObject({
+        value: "/docs tail",
+        cursor: 6,
+        expandedCursor: 10,
+      });
+      await act(async () => {
+        editorRef.current?.focusAtEnd();
+      });
+      await act(async () => {
+        editor.update(
+          () => {
+            const selection = $getSelection();
+            if ($isRangeSelection(selection)) {
+              selection.insertText("!");
+            }
+          },
+          { discrete: true },
+        );
+      });
+      expect(readRootText(editor)).toBe("/docs tail!");
+
+      // 2. Leading-digit and dotted slash skill names chip cleanly.
+      await act(async () => root.render(renderMounted("/3d-render /build.docs ", 4)));
+      expect(
+        Array.from(container.querySelectorAll('[data-composer-skill-chip="true"]')).map(
+          (node) => node.textContent,
+        ),
+      ).toEqual(["3D Render", "Build Docs"]);
+
+      // 3. Shift+Left immediately after `/docs` extends the selection across the chip instead of collapsing it.
+      await act(async () => root.render(renderMounted("/docs tail", 1)));
+      await act(async () => {
+        const shiftLeft = {
+          shiftKey: true,
+          preventDefault: vi.fn(),
+          stopPropagation: vi.fn(),
+        } as unknown as KeyboardEvent;
+        expect(editor.dispatchCommand(KEY_ARROW_LEFT_COMMAND, shiftLeft)).toBe(true);
+      });
+      const afterShiftLeft = editor.getEditorState().read(() => {
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection)) return null;
+        return {
+          collapsed: selection.isCollapsed(),
+          text: selection.getTextContent(),
+        };
+      });
+      expect(afterShiftLeft).toEqual({ collapsed: false, text: "/docs" });
+
+      // 4. Skill metadata refresh preserves an active non-collapsed selection (`tail`).
+      await act(async () => {
+        setRangeSelection(editor, () => {
+          const tail = $paragraph().getLastChild();
+          if (!tail) throw new Error("expected trailing text node");
+          return {
+            anchor: { key: tail.getKey(), offset: 1, type: "text" },
+            focus: { key: tail.getKey(), offset: 5, type: "text" },
+          };
+        });
+      });
+      const renamedSkills: ReadonlyArray<ServerProviderSkill> = slashSkills.map((skill) =>
+        skill.name === "docs" ? { ...skill, displayName: "API Docs" } : skill,
+      );
+      await act(async () => root.render(renderMounted("/docs tail", 1, renamedSkills)));
+      const afterRefresh = editor.getEditorState().read(() => {
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection)) return null;
+        return {
+          collapsed: selection.isCollapsed(),
+          text: selection.getTextContent(),
+        };
+      });
+      expect(afterRefresh).toEqual({ collapsed: false, text: "tail" });
+      expect(container.querySelector('[data-composer-skill-chip="true"]')?.textContent).toBe(
+        "API Docs",
+      );
     } finally {
       await act(async () => root.unmount());
       container.remove();

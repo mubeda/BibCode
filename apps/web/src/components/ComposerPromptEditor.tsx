@@ -1074,6 +1074,18 @@ function $setComposerEditorPrompt(
   }
 }
 
+function countComposerInlineTokenNodes(node: LexicalNode): number {
+  if (isComposerInlineTokenNode(node)) {
+    return 1;
+  }
+  if ($isElementNode(node)) {
+    return node
+      .getChildren()
+      .reduce((total, child) => total + countComposerInlineTokenNodes(child), 0);
+  }
+  return 0;
+}
+
 function collectTerminalContextIds(node: LexicalNode): string[] {
   if (node instanceof ComposerTerminalContextNode) {
     return [node.__context.id];
@@ -1280,31 +1292,43 @@ function ComposerInlineTokenArrowPlugin(props: { inlineTokenContext: ComposerInl
     const unregisterLeft = editor.registerCommand(
       KEY_ARROW_LEFT_COMMAND,
       (event) => {
-        let nextOffset: number | null = null;
-        editor.getEditorState().read(() => {
-          const selection = $getSelection();
-          if (!$isRangeSelection(selection) || !selection.isCollapsed()) return;
-          const currentOffset = $readSelectionOffsetFromEditorState(0);
-          if (currentOffset <= 0) return;
-          const promptValue = $getRoot().getTextContent();
-          if (
-            !isCollapsedCursorAdjacentToInlineToken(
-              promptValue,
-              currentOffset,
-              "left",
-              props.inlineTokenContext,
-            )
-          ) {
-            return;
-          }
-          nextOffset = currentOffset - 1;
-        });
-        if (nextOffset === null) return false;
-        const selectionOffset = nextOffset;
+        const extendSelection = Boolean(event?.shiftKey);
+        const target = editor
+          .getEditorState()
+          .read((): { anchor: number; focus: number } | null => {
+            const selection = $getSelection();
+            if (!$isRangeSelection(selection)) return null;
+            if (!extendSelection && !selection.isCollapsed()) return null;
+            const focusOffset = getAbsoluteOffsetForPoint(
+              selection.focus.getNode(),
+              selection.focus.offset,
+            );
+            if (focusOffset <= 0) return null;
+            const promptValue = $getRoot().getTextContent();
+            if (
+              !isCollapsedCursorAdjacentToInlineToken(
+                promptValue,
+                focusOffset,
+                "left",
+                props.inlineTokenContext,
+              )
+            ) {
+              return null;
+            }
+            const anchorOffset = extendSelection
+              ? getAbsoluteOffsetForPoint(selection.anchor.getNode(), selection.anchor.offset)
+              : focusOffset - 1;
+            return { anchor: anchorOffset, focus: focusOffset - 1 };
+          });
+        if (target === null) return false;
         event?.preventDefault();
         event?.stopPropagation();
         editor.update(() => {
-          $setSelectionAtComposerOffset(selectionOffset);
+          if (extendSelection) {
+            $setSelectionRangeAtComposerOffsets(target.anchor, target.focus);
+          } else {
+            $setSelectionAtComposerOffset(target.focus);
+          }
         });
         return true;
       },
@@ -1313,32 +1337,44 @@ function ComposerInlineTokenArrowPlugin(props: { inlineTokenContext: ComposerInl
     const unregisterRight = editor.registerCommand(
       KEY_ARROW_RIGHT_COMMAND,
       (event) => {
-        let nextOffset: number | null = null;
-        editor.getEditorState().read(() => {
-          const selection = $getSelection();
-          if (!$isRangeSelection(selection) || !selection.isCollapsed()) return;
-          const currentOffset = $readSelectionOffsetFromEditorState(0);
-          const composerLength = $getComposerRootLength();
-          if (currentOffset >= composerLength) return;
-          const promptValue = $getRoot().getTextContent();
-          if (
-            !isCollapsedCursorAdjacentToInlineToken(
-              promptValue,
-              currentOffset,
-              "right",
-              props.inlineTokenContext,
-            )
-          ) {
-            return;
-          }
-          nextOffset = currentOffset + 1;
-        });
-        if (nextOffset === null) return false;
-        const selectionOffset = nextOffset;
+        const extendSelection = Boolean(event?.shiftKey);
+        const target = editor
+          .getEditorState()
+          .read((): { anchor: number; focus: number } | null => {
+            const selection = $getSelection();
+            if (!$isRangeSelection(selection)) return null;
+            if (!extendSelection && !selection.isCollapsed()) return null;
+            const focusOffset = getAbsoluteOffsetForPoint(
+              selection.focus.getNode(),
+              selection.focus.offset,
+            );
+            const composerLength = $getComposerRootLength();
+            if (focusOffset >= composerLength) return null;
+            const promptValue = $getRoot().getTextContent();
+            if (
+              !isCollapsedCursorAdjacentToInlineToken(
+                promptValue,
+                focusOffset,
+                "right",
+                props.inlineTokenContext,
+              )
+            ) {
+              return null;
+            }
+            const anchorOffset = extendSelection
+              ? getAbsoluteOffsetForPoint(selection.anchor.getNode(), selection.anchor.offset)
+              : focusOffset + 1;
+            return { anchor: anchorOffset, focus: focusOffset + 1 };
+          });
+        if (target === null) return false;
         event?.preventDefault();
         event?.stopPropagation();
         editor.update(() => {
-          $setSelectionAtComposerOffset(selectionOffset);
+          if (extendSelection) {
+            $setSelectionRangeAtComposerOffsets(target.anchor, target.focus);
+          } else {
+            $setSelectionAtComposerOffset(target.focus);
+          }
         });
         return true;
       },
@@ -1749,6 +1785,7 @@ function ComposerPromptEditorInner({
   const agentMetadata = useSignatureMemo(agentsSignature, () => agentMetadataByName(agents));
   const agentMetadataRef = useRef(agentMetadata);
   const mentionableAgentNames = useMemo(() => new Set(agentMetadata.keys()), [agentMetadata]);
+  const terminalContextsRef = useRef(terminalContexts);
   const terminalContextsSignature = terminalContextSignature(terminalContexts);
   const terminalContextsSignatureRef = useRef(terminalContextsSignature);
   const skillsSignature = skillSignature(skills);
@@ -1782,6 +1819,10 @@ function ComposerPromptEditorInner({
   useEffect(() => {
     onChangeRef.current = onChange;
   }, [onChange]);
+
+  useLayoutEffect(() => {
+    terminalContextsRef.current = terminalContexts;
+  }, [terminalContexts]);
 
   useLayoutEffect(() => {
     agentMetadataRef.current = agentMetadata;
@@ -1862,6 +1903,21 @@ function ComposerPromptEditorInner({
       () => {
         const shouldRewriteEditorState =
           previousSnapshot.value !== value || agentsChanged || contextsChanged || skillsChanged;
+        const existingSelection =
+          shouldRewriteEditorState && previousSnapshot.value === value ? $getSelection() : null;
+        const preservedExpandedRange =
+          $isRangeSelection(existingSelection) && !existingSelection.isCollapsed()
+            ? {
+                anchor: getExpandedAbsoluteOffsetForPoint(
+                  existingSelection.anchor.getNode(),
+                  existingSelection.anchor.offset,
+                ),
+                focus: getExpandedAbsoluteOffsetForPoint(
+                  existingSelection.focus.getNode(),
+                  existingSelection.focus.offset,
+                ),
+              }
+            : null;
         if (shouldRewriteEditorState) {
           const reconstructTrailingReferences =
             reconstructControlledValue || $composerEditorEndsWithConfirmedReferenceNode();
@@ -1873,7 +1929,16 @@ function ComposerPromptEditorInner({
             { reconstructTrailingReferences },
           );
         }
-        if (shouldRewriteEditorState || isFocused) {
+        if (preservedExpandedRange) {
+          $setSelectionRangeAtComposerOffsets(
+            collapseExpandedComposerCursor(
+              value,
+              preservedExpandedRange.anchor,
+              inlineTokenContext,
+            ),
+            collapseExpandedComposerCursor(value, preservedExpandedRange.focus, inlineTokenContext),
+          );
+        } else if (shouldRewriteEditorState || isFocused) {
           $setSelectionAtComposerOffset(normalizedCursor);
         }
       },
@@ -2025,69 +2090,172 @@ function ComposerPromptEditorInner({
 
   const handleEditorChange = useCallback(
     (editorState: EditorState) => {
-      editorState.read(() => {
-        const nextValue = $getRoot().getTextContent();
-        const fallbackCursor = clampCollapsedComposerCursor(
-          nextValue,
-          snapshotRef.current.cursor,
-          inlineTokenContext,
-        );
-        const nextCursor = clampCollapsedComposerCursor(
-          nextValue,
-          $readSelectionOffsetFromEditorState(fallbackCursor),
-          inlineTokenContext,
-        );
-        const fallbackExpandedCursor = clampExpandedCursor(
-          nextValue,
-          snapshotRef.current.expandedCursor,
-        );
-        const nextExpandedCursor = clampExpandedCursor(
-          nextValue,
-          $readExpandedSelectionOffsetFromEditorState(fallbackExpandedCursor),
-        );
-        const terminalContextIds = collectTerminalContextIds($getRoot());
-        const previousSnapshot = snapshotRef.current;
-        if (
-          previousSnapshot.value === nextValue &&
-          previousSnapshot.cursor === nextCursor &&
-          previousSnapshot.expandedCursor === nextExpandedCursor &&
-          previousSnapshot.terminalContextIds.length === terminalContextIds.length &&
-          previousSnapshot.terminalContextIds.every((id, index) => id === terminalContextIds[index])
-        ) {
-          return;
-        }
-        if (isApplyingControlledUpdateRef.current) {
-          return;
-        }
-        snapshotRef.current = {
-          value: nextValue,
-          cursor: nextCursor,
-          expandedCursor: nextExpandedCursor,
-          terminalContextIds,
-        };
-        const cursorAdjacentToMention =
-          isCollapsedCursorAdjacentToInlineToken(
+      const reconcile = editorState.read(
+        (): {
+          value: string;
+          collapsedCursor: number;
+          preservedRange: { anchor: number; focus: number } | null;
+          reconstructTrailingReferences: boolean;
+        } | null => {
+          const nextValue = $getRoot().getTextContent();
+          const fallbackExpandedCursor = clampExpandedCursor(
             nextValue,
-            nextCursor,
-            "left",
-            inlineTokenContext,
-          ) ||
-          isCollapsedCursorAdjacentToInlineToken(
+            snapshotRef.current.expandedCursor,
+          );
+          const nextExpandedCursor = clampExpandedCursor(
             nextValue,
-            nextCursor,
-            "right",
+            $readExpandedSelectionOffsetFromEditorState(fallbackExpandedCursor),
+          );
+          const terminalContextIds = collectTerminalContextIds($getRoot());
+          const reconstructTrailingReferences = $composerEditorEndsWithConfirmedReferenceNode();
+          const currentTokenCount = countComposerInlineTokenNodes($getRoot());
+          const expectedSegments = splitPromptIntoComposerSegments(
+            nextValue,
+            terminalContextsRef.current,
+            new Set(agentMetadataRef.current.keys()),
+            {
+              reconstructTrailingReferences,
+              enabledDollarSkillNames: new Set(skillMetadataRef.current.dollar.keys()),
+              enabledSlashSkillNames: new Set(skillMetadataRef.current.slash.keys()),
+            },
+          );
+          const expectedTokenCount = expectedSegments.reduce(
+            (total, segment) => total + (segment.type === "text" ? 0 : 1),
+            0,
+          );
+          const needsInlineTokenReconcile =
+            !isApplyingControlledUpdateRef.current && currentTokenCount < expectedTokenCount;
+
+          const fallbackCursor = clampCollapsedComposerCursor(
+            nextValue,
+            snapshotRef.current.cursor,
             inlineTokenContext,
           );
-        onChangeRef.current(
-          nextValue,
-          nextCursor,
-          nextExpandedCursor,
-          cursorAdjacentToMention,
-          terminalContextIds,
-        );
-      });
+          const nextCursor = needsInlineTokenReconcile
+            ? collapseExpandedComposerCursor(nextValue, nextExpandedCursor, inlineTokenContext)
+            : clampCollapsedComposerCursor(
+                nextValue,
+                $readSelectionOffsetFromEditorState(fallbackCursor),
+                inlineTokenContext,
+              );
+
+          let pendingTokenReconcile: {
+            value: string;
+            collapsedCursor: number;
+            preservedRange: { anchor: number; focus: number } | null;
+            reconstructTrailingReferences: boolean;
+          } | null = null;
+
+          if (needsInlineTokenReconcile) {
+            const selection = $getSelection();
+            const preservedRange =
+              $isRangeSelection(selection) && !selection.isCollapsed()
+                ? {
+                    anchor: collapseExpandedComposerCursor(
+                      nextValue,
+                      getExpandedAbsoluteOffsetForPoint(
+                        selection.anchor.getNode(),
+                        selection.anchor.offset,
+                      ),
+                      inlineTokenContext,
+                    ),
+                    focus: collapseExpandedComposerCursor(
+                      nextValue,
+                      getExpandedAbsoluteOffsetForPoint(
+                        selection.focus.getNode(),
+                        selection.focus.offset,
+                      ),
+                      inlineTokenContext,
+                    ),
+                  }
+                : null;
+            pendingTokenReconcile = {
+              value: nextValue,
+              collapsedCursor: nextCursor,
+              preservedRange,
+              reconstructTrailingReferences,
+            };
+          }
+
+          const previousSnapshot = snapshotRef.current;
+          if (
+            !needsInlineTokenReconcile &&
+            previousSnapshot.value === nextValue &&
+            previousSnapshot.cursor === nextCursor &&
+            previousSnapshot.expandedCursor === nextExpandedCursor &&
+            previousSnapshot.terminalContextIds.length === terminalContextIds.length &&
+            previousSnapshot.terminalContextIds.every(
+              (id, index) => id === terminalContextIds[index],
+            )
+          ) {
+            return null;
+          }
+          if (isApplyingControlledUpdateRef.current) {
+            return null;
+          }
+          snapshotRef.current = {
+            value: nextValue,
+            cursor: nextCursor,
+            expandedCursor: nextExpandedCursor,
+            terminalContextIds,
+          };
+          const cursorAdjacentToMention =
+            isCollapsedCursorAdjacentToInlineToken(
+              nextValue,
+              nextCursor,
+              "left",
+              inlineTokenContext,
+            ) ||
+            isCollapsedCursorAdjacentToInlineToken(
+              nextValue,
+              nextCursor,
+              "right",
+              inlineTokenContext,
+            );
+          onChangeRef.current(
+            nextValue,
+            nextCursor,
+            nextExpandedCursor,
+            cursorAdjacentToMention,
+            terminalContextIds,
+          );
+          return pendingTokenReconcile;
+        },
+      );
+
+      if (reconcile !== null) {
+        isApplyingControlledUpdateRef.current = true;
+        queueMicrotask(() => {
+          editor.update(
+            () => {
+              if ($getRoot().getTextContent() !== reconcile.value) {
+                return;
+              }
+              $setComposerEditorPrompt(
+                reconcile.value,
+                terminalContextsRef.current,
+                agentMetadataRef.current,
+                skillMetadataRef.current,
+                { reconstructTrailingReferences: reconcile.reconstructTrailingReferences },
+              );
+              if (reconcile.preservedRange) {
+                $setSelectionRangeAtComposerOffsets(
+                  reconcile.preservedRange.anchor,
+                  reconcile.preservedRange.focus,
+                );
+              } else {
+                $setSelectionAtComposerOffset(reconcile.collapsedCursor);
+              }
+            },
+            { tag: HISTORY_MERGE_TAG },
+          );
+          queueMicrotask(() => {
+            isApplyingControlledUpdateRef.current = false;
+          });
+        });
+      }
     },
-    [inlineTokenContext],
+    [editor, inlineTokenContext],
   );
 
   return (

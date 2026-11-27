@@ -307,7 +307,7 @@ export function classifyChatMarkdownLink(
 // Skills
 // ---------------------------------------------------------------------------
 
-export type InlineSkill = Pick<ServerProviderSkill, "name" | "displayName">;
+export type InlineSkill = Pick<ServerProviderSkill, "name" | "displayName" | "invocation">;
 
 export type SkillTextSegment =
   | { readonly kind: "text"; readonly text: string }
@@ -318,24 +318,33 @@ export type SkillTextSegment =
       readonly start: number;
     };
 
-const SKILL_TOKEN_REGEX = /(^|\s)\$([a-zA-Z][a-zA-Z0-9:_-]*)(?=\s|$)/g;
+const SKILL_TOKEN_REGEX =
+  /(^|\s)(?:\$([a-zA-Z][a-zA-Z0-9:._-]*)|\/([a-zA-Z0-9][a-zA-Z0-9:._-]*))(?=\s|$)/g;
 
-/** Splits text at `$skill` tokens that name a known skill. */
+/** Splits text at `$skill` and `/skill` tokens that match an enabled skill's invocation. */
 export function splitSkillTokens(
   text: string,
   skills: ReadonlyArray<InlineSkill>,
 ): ReadonlyArray<SkillTextSegment> {
-  if (skills.length === 0 || !text.includes("$")) {
+  if (skills.length === 0 || (!text.includes("$") && !text.includes("/"))) {
     return [{ kind: "text", text }];
   }
   const segments: SkillTextSegment[] = [];
   let cursor = 0;
   for (const match of text.matchAll(SKILL_TOKEN_REGEX)) {
-    const prefix = match[1] ?? "";
-    const name = match[2] ?? "";
-    const start = (match.index ?? 0) + prefix.length;
-    const rawText = `$${name}`;
-    const skill = skills.find((candidate) => candidate.name === name);
+    const leading = match[1] ?? "";
+    const dollarName = match[2];
+    const slashName = match[3];
+    const name = dollarName ?? slashName ?? "";
+    const expectedInvocation = slashName !== undefined ? "slash" : "dollar";
+    const start = (match.index ?? 0) + leading.length;
+    const rawText = `${expectedInvocation === "slash" ? "/" : "$"}${name}`;
+    const comparableName = name.toLowerCase();
+    const skill = skills.find(
+      (candidate) =>
+        candidate.name.trim().toLowerCase() === comparableName &&
+        (candidate.invocation ?? "dollar") === expectedInvocation,
+    );
     if (!skill) {
       continue;
     }
