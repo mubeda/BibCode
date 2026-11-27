@@ -24,6 +24,7 @@ import {
   XIcon,
 } from "lucide-react";
 import {
+  type ProviderDriverKind,
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
   TerminalImagePasteMimeType,
@@ -634,6 +635,37 @@ const TERMINAL_USER_INPUT_EVENTS = [
 const TERMINAL_USER_INPUT_WINDOW_MS = 500;
 const TERMINAL_FOCUS_IN_REPORT = "\u001b[I";
 const TERMINAL_FOCUS_OUT_REPORT = "\u001b[O";
+const BRACKETED_PASTE_START = "\u001b[200~";
+const BRACKETED_PASTE_END = "\u001b[201~";
+
+/**
+ * Prepares a plain-text clipboard paste for an Antigravity AI Terminal (#431).
+ *
+ * Strips embedded `\x1b[201~` sequences before either wrapping path so clipboard text cannot
+ * prematurely close a bracketed-paste envelope (xterm.js's built-in Clipboard handler does not
+ * strip `\x1b[201~`). When `bracketedPasteMode` is off and the paste is multi-line, normalizes
+ * line endings to `\r` and wraps in a single `\x1b[200~...\x1b[201~` envelope. Returns `null`
+ * when xterm's default paste handler should run untouched.
+ */
+export function prepareAntigravityTextPaste(
+  text: string,
+  bracketedPasteMode: boolean,
+): string | null {
+  const hasEmbeddedEnd = text.includes(BRACKETED_PASTE_END);
+  const isMultiLine = text.includes("\n") || text.includes("\r");
+  if (!hasEmbeddedEnd && (bracketedPasteMode || !isMultiLine)) {
+    return null;
+  }
+  const sanitized = hasEmbeddedEnd ? text.replaceAll(BRACKETED_PASTE_END, "") : text;
+  if (sanitized.length === 0) {
+    return "";
+  }
+  const normalized = sanitized.replace(/\r\n|\n/g, "\r");
+  if (bracketedPasteMode || isMultiLine) {
+    return `${BRACKETED_PASTE_START}${normalized}${BRACKETED_PASTE_END}`;
+  }
+  return normalized;
+}
 
 /**
  * How long a mount must hold its size before an automatic size claim (layout, attach) is
@@ -918,6 +950,8 @@ interface TerminalViewportProps {
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
   command?: TerminalLaunchCommand;
+  /** Live summary fallback for provider terminals revealed by ID without a launch descriptor (#431). */
+  driverKind?: ProviderDriverKind | null;
   /** Marks the session as a host thread's center panel so other clients adopt it. */
   centerPanel?: boolean;
   visible: boolean;
@@ -970,6 +1004,7 @@ export function TerminalViewport({
   worktreePath,
   runtimeEnv,
   command,
+  driverKind = null,
   centerPanel = false,
   visible,
   onSessionExited,
@@ -1221,6 +1256,8 @@ export function TerminalViewport({
     onAddTerminalContext(selection);
   });
   const readTerminalLabel = useEffectEvent(() => terminalLabel);
+  const resolvedDriverKind = command?.activity?.driverKind ?? driverKind ?? null;
+  const readDriverKind = useEffectEvent(() => resolvedDriverKind);
   const hasAuthoritativeHostConfig = serverConfig !== null;
   const hasPersistentWindowsConsoleTheme = usesPersistentWindowsConsoleTheme(command);
   const canAttachTerminal = command === undefined || hasAuthoritativeHostConfig;
@@ -2506,7 +2543,21 @@ export function TerminalViewport({
     };
     const handlePaste = (event: ClipboardEvent) => {
       const data = event.clipboardData;
-      if (!data || data.getData("text/plain") !== "") return;
+      if (!data) return;
+      const text = data.getData("text/plain");
+      if (text !== "") {
+        if (readDriverKind() === "antigravity") {
+          const prepared = prepareAntigravityTextPaste(text, terminal.modes.bracketedPasteMode);
+          if (prepared !== null) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (prepared.length > 0) {
+              sendTerminalInput(prepared, "Failed to paste into terminal");
+            }
+          }
+        }
+        return;
+      }
       const image = Array.from(data.files).find((file) => file.type.startsWith("image/"));
       if (!image) return;
       event.preventDefault();
@@ -3253,6 +3304,8 @@ interface ThreadTerminalPanelProps {
   terminalLabelsById?: ReadonlyMap<string, string>;
   /** Structured launch commands for provider terminals that have not started yet. */
   terminalCommandsById?: ReadonlyMap<string, TerminalLaunchCommand>;
+  /** Resolved provider driver kinds per terminal id (including ID-only reveals from live summaries). */
+  terminalDriverKindsById?: ReadonlyMap<string, ProviderDriverKind>;
   /** Prefer per-session launch locations when the server already knows a terminal. */
   terminalLaunchLocationsById?: ReadonlyMap<string, TerminalLaunchLocation>;
   workspaceUnavailable?: string | null;
@@ -3336,6 +3389,7 @@ export default function ThreadTerminalPanel({
   keybindings,
   terminalLabelsById,
   terminalCommandsById,
+  terminalDriverKindsById,
   terminalLaunchLocationsById,
   workspaceUnavailable = null,
   aiTerminalIds,
@@ -3696,6 +3750,7 @@ export default function ThreadTerminalPanel({
                           {...(terminalCommandsById?.get(terminalId)
                             ? { command: terminalCommandsById.get(terminalId)! }
                             : {})}
+                          driverKind={terminalDriverKindsById?.get(terminalId) ?? null}
                           centerPanel={owner === "center-panel"}
                           visible
                           onSessionExited={() => onCloseTerminal(terminalId)}
@@ -3733,6 +3788,7 @@ export default function ThreadTerminalPanel({
                   {...(terminalCommandsById?.get(resolvedActiveTerminalId)
                     ? { command: terminalCommandsById.get(resolvedActiveTerminalId)! }
                     : {})}
+                  driverKind={terminalDriverKindsById?.get(resolvedActiveTerminalId) ?? null}
                   centerPanel={owner === "center-panel"}
                   visible
                   onSessionExited={() => onCloseTerminal(resolvedActiveTerminalId)}

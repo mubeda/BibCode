@@ -7127,6 +7127,125 @@ describe("TerminalViewport mounted lifecycle", () => {
         "\r\n[terminal] Image paste failed: Attachment exceeds upload size limit\r\n",
       );
     });
+
+    it("protects short and >16 KiB multi-line Antigravity pastes and strips embedded ESC[201~ in both bracketed mode states", async () => {
+      const antigravityCommand = {
+        executable: "agy",
+        args: [],
+        activity: {
+          driverKind: "antigravity" as never,
+          providerInstanceId: "antigravity" as never,
+        },
+      };
+      const mounted = await mount(
+        <TerminalViewport {...viewportProps()} command={antigravityCommand} />,
+      );
+      const terminal = xtermState.terminals[0]!;
+      const screen = mounted.container.querySelector(".xterm-screen")!;
+      const xtermPaste = vi.fn();
+      screen.addEventListener("paste", xtermPaste);
+
+      // 1. Short multi-line paste with bracketedPasteMode OFF and embedded ESC[201~
+      terminal.modes.bracketedPasteMode = false;
+      const shortEvent = pasteEvent("line 1\r\nline \x1b[201~2\nline 3", []);
+      await act(async () => {
+        screen.dispatchEvent(shortEvent);
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(shortEvent.defaultPrevented).toBe(true);
+      expect(xtermPaste).not.toHaveBeenCalled();
+      expect(sentData()).toBe("\x1b[200~line 1\rline 2\rline 3\x1b[201~");
+
+      // 2. >16 KiB multi-line paste with bracketedPasteMode OFF
+      testState.writeCommand.mockClear();
+      const longText = "alpha\nbeta\n".repeat(2_000); // 22 KiB
+      const longEvent = pasteEvent(longText, []);
+      await act(async () => {
+        screen.dispatchEvent(longEvent);
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(longEvent.defaultPrevented).toBe(true);
+      const longSent = sentData();
+      expect(longSent.startsWith("\x1b[200~")).toBe(true);
+      expect(longSent.endsWith("\x1b[201~")).toBe(true);
+      expect(longSent.slice(6, -6)).toBe(longText.replace(/\r\n|\n/g, "\r"));
+
+      // 3. Embedded ESC[201~ even when bracketedPasteMode is ON
+      testState.writeCommand.mockClear();
+      terminal.modes.bracketedPasteMode = true;
+      const hostileEvent = pasteEvent("a\x1b[201~b\nc", []);
+      await act(async () => {
+        screen.dispatchEvent(hostileEvent);
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(hostileEvent.defaultPrevented).toBe(true);
+      expect(sentData()).toBe("\x1b[200~ab\rc\x1b[201~");
+
+      // 4. Single-line paste with bracketedPasteMode OFF must NOT inject stray markers
+      testState.writeCommand.mockClear();
+      terminal.modes.bracketedPasteMode = false;
+      const singleLine = pasteEvent("echo hello", []);
+      await act(async () => {
+        screen.dispatchEvent(singleLine);
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(singleLine.defaultPrevented).toBe(false);
+      expect(xtermPaste).toHaveBeenCalledTimes(1);
+    });
+
+    it("resolves Antigravity driverKind from live summary fallback on ID-only reveals and disables it when switched to a plain shell", async () => {
+      const mounted = await mount(
+        <TerminalViewport {...viewportProps()} driverKind={"antigravity" as never} />,
+      );
+      const terminal = xtermState.terminals[0]!;
+      terminal.modes.bracketedPasteMode = false;
+      const screen = mounted.container.querySelector(".xterm-screen")!;
+
+      const firstPaste = pasteEvent("one\ntwo", []);
+      await act(async () => {
+        screen.dispatchEvent(firstPaste);
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(firstPaste.defaultPrevented).toBe(true);
+      expect(sentData()).toBe("\x1b[200~one\rtwo\x1b[201~");
+
+      // Switch to plain shell (driverKind null) without recreating xterm
+      testState.writeCommand.mockClear();
+      await act(async () => {
+        mounted.root.render(<TerminalViewport {...viewportProps()} driverKind={null} />);
+      });
+      expect(xtermState.terminals).toHaveLength(1);
+      const shellPaste = pasteEvent("three\nfour", []);
+      await act(async () => {
+        screen.dispatchEvent(shellPaste);
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(shellPaste.defaultPrevented).toBe(false);
+      expect(sentData()).toBe("");
+    });
+
+    it.each(["claudeCode", "codex", "opencode", "cursor", "grok", null] as const)(
+      "does not inject bracketed-paste markers for %s terminals when bracketedPasteMode is off",
+      async (driverKind) => {
+        const mounted = await mount(
+          <TerminalViewport {...viewportProps()} driverKind={driverKind as never} />,
+        );
+        const terminal = xtermState.terminals[0]!;
+        terminal.modes.bracketedPasteMode = false;
+        const screen = mounted.container.querySelector(".xterm-screen")!;
+        const xtermPaste = vi.fn();
+        screen.addEventListener("paste", xtermPaste);
+
+        const event = pasteEvent("first\nsecond", []);
+        await act(async () => {
+          screen.dispatchEvent(event);
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        });
+        expect(event.defaultPrevented).toBe(false);
+        expect(xtermPaste).toHaveBeenCalledOnce();
+        expect(sentData()).toBe("");
+      },
+    );
   });
 
   it("leaves context menus alone when selection UI is unavailable", async () => {

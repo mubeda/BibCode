@@ -8,7 +8,7 @@ mod pty;
 mod writer;
 
 pub use input::TerminalInputError;
-pub(crate) use input::{InputReadmissionScope, TerminalInputAdmission};
+pub(crate) use input::{InputReadmissionScope, TerminalInputAdmission, TerminalPasteStage};
 #[cfg(all(test, unix))]
 pub(crate) use manager::MAX_PREPARATION_EXECUTION_BUDGET;
 pub(crate) use manager::TerminalSessionIdentity;

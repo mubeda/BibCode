@@ -2077,7 +2077,9 @@ impl Session {
             worktree_path: self.worktree_path.clone(),
             status: self.status,
             pid: self.pid,
-            history: self.history.snapshot(),
+            history: self
+                .history
+                .snapshot_for_replay(self.status == TerminalStatus::Running),
             exit_code: self.exit_code,
             exit_signal: self.exit_signal,
             console_theme: self.console_theme,
@@ -8431,6 +8433,24 @@ mod tests {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn ordered_staged_write(
+        manager: &TerminalManager,
+        connection: uuid::Uuid,
+        thread_id: &str,
+        terminal_id: &str,
+        input_id: &str,
+        sequence: u64,
+        data: &str,
+        paste_stage: crate::terminal::TerminalPasteStage,
+    ) -> Result<crate::terminal::input::TerminalInputAcknowledgement, TerminalError> {
+        manager
+            .prepare_input_write(connection, thread_id, terminal_id, input_id, sequence, data)?
+            .with_paste_stage(Some(paste_stage))
+            .write()
+            .await
+    }
+
     async fn ordered_input_fixture() -> (
         tempfile::TempDir,
         Arc<HistoryTestBackend>,
@@ -8991,6 +9011,474 @@ mod tests {
         );
         assert!(later.await.is_err());
         assert!(backend.latest().writes().is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn staged_paste_assembles_over_256k_across_two_leases_atomically_without_deadlock() {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        let (root, backend, manager, connection, closed, first_id) = ordered_input_fixture().await;
+        let first_process = backend.latest();
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "other",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("other terminal");
+        let second_process = backend.latest();
+        let second = manager
+            .begin_input(connection, closed, "thread", "other", 0, None)
+            .await
+            .expect("second lease");
+
+        // 20 frames * 16 KiB = 320 KiB per lease (closer in frame 20 > 16 frames and > 256 KiB).
+        let make_frames = |ch: &str| -> Vec<String> {
+            let mut frames = Vec::with_capacity(20);
+            frames.push(format!("\x1b[200~{}", ch.repeat(16 * 1024 - 6)));
+            for _ in 1..19 {
+                frames.push(ch.repeat(16 * 1024));
+            }
+            frames.push(format!("{}\x1b[201~", ch.repeat(16 * 1024 - 6)));
+            frames
+        };
+        let frames_a = make_frames("a");
+        let frames_b = make_frames("b");
+        let expected_a = frames_a.concat();
+        let expected_b = frames_b.concat();
+
+        let send_all = |terminal_id: &'static str, input_id: String, frames: Vec<String>| {
+            let manager = manager.clone();
+            async move {
+                let last = frames.len() - 1;
+                for (seq, chunk) in frames.into_iter().enumerate() {
+                    let stage = if seq == last { Commit } else { Chunk };
+                    ordered_staged_write(
+                        &manager,
+                        connection,
+                        "thread",
+                        terminal_id,
+                        &input_id,
+                        seq as u64,
+                        &chunk,
+                        stage,
+                    )
+                    .await
+                    .expect("staged frame succeeds");
+                }
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                send_all("term", first_id, frames_a),
+                send_all("other", second.input_id, frames_b),
+            );
+        })
+        .await
+        .expect("two >256 KiB staged pastes sharing one connection must not deadlock");
+
+        assert_eq!(first_process.writes(), [expected_a]);
+        assert_eq!(second_process.writes(), [expected_b]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn staged_paste_discards_unpublished_bytes_on_cancel_disconnect_interruption_and_overflow()
+     {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        // 1. Cancel after chunk -> ZERO PTY writes.
+        {
+            let (_root, backend, manager, connection, _closed, input_id) =
+                ordered_input_fixture().await;
+            ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "\x1b[200~part1",
+                Chunk,
+            )
+            .await
+            .expect("chunk staged");
+            manager
+                .cancel_input(connection, "thread", "term", &input_id)
+                .expect("cancel");
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+
+        // 2. Disconnect after chunk -> ZERO PTY writes.
+        {
+            let (_root, backend, manager, connection, closed, input_id) =
+                ordered_input_fixture().await;
+            ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "\x1b[200~part1",
+                Chunk,
+            )
+            .await
+            .expect("chunk staged");
+            closed.cancel();
+            assert!(
+                ordered_staged_write(
+                    &manager,
+                    connection,
+                    "thread",
+                    "term",
+                    &input_id,
+                    1,
+                    "part2\x1b[201~",
+                    Commit,
+                )
+                .await
+                .is_err()
+            );
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+
+        // 3. Interrupted by non-staged frame -> sequence error, ZERO PTY writes.
+        {
+            let (_root, backend, manager, connection, _closed, input_id) =
+                ordered_input_fixture().await;
+            ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "\x1b[200~part1",
+                Chunk,
+            )
+            .await
+            .expect("chunk staged");
+            let err = ordered_write(&manager, connection, "thread", "term", &input_id, 1, "\r")
+                .await
+                .expect_err("non-staged frame interrupts open paste");
+            assert!(matches!(err, TerminalError::Input(e) if e.code == "sequence"));
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+
+        // 4. Overflow > 1 MiB -> capacity error, ZERO PTY writes, permits released for reattach.
+        {
+            let (_root, backend, manager, connection, closed, input_id) =
+                ordered_input_fixture().await;
+            let full_chunk = "x".repeat(16 * 1024);
+            // 64 * 16 KiB = exactly 1 MiB; frame 64 pushes over 1 MiB.
+            for seq in 0..64u64 {
+                ordered_staged_write(
+                    &manager,
+                    connection,
+                    "thread",
+                    "term",
+                    &input_id,
+                    seq,
+                    &full_chunk,
+                    Chunk,
+                )
+                .await
+                .expect("within 1 MiB");
+            }
+            let err = ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                64,
+                "overflow\x1b[201~",
+                Commit,
+            )
+            .await
+            .expect_err("overflow past 1 MiB");
+            assert!(matches!(err, TerminalError::Input(e) if e.code == "capacity"));
+            assert!(backend.latest().writes().is_empty());
+
+            // Next attachment succeeds cleanly with freed permits.
+            let fresh = manager
+                .begin_input(connection, closed, "thread", "term", 1, None)
+                .await
+                .expect("reattach succeeds after overflow");
+            ordered_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &fresh.input_id,
+                0,
+                "ok",
+            )
+            .await
+            .expect("fresh write succeeds");
+            assert_eq!(backend.latest().writes(), ["ok"]);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn staged_paste_deadline_discards_unclosed_prefix_and_frees_next_attachment() {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        let (_root, backend, manager, connection, closed, input_id) = ordered_input_fixture().await;
+        ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            0,
+            "\x1b[200~unclosed multi-line\rpayload",
+            Chunk,
+        )
+        .await
+        .expect("chunk staged");
+
+        // Advance past the 10-second staged-paste deadline.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+
+        // Late continuation must fail cleanly without ever writing the unclosed prefix.
+        let err = ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            1,
+            "tail\x1b[201~",
+            Commit,
+        )
+        .await
+        .expect_err("expired paste rejects late continuation");
+        assert!(
+            matches!(err, TerminalError::Input(e) if e.code == "sequence" || e.code == "closed")
+        );
+        assert!(backend.latest().writes().is_empty());
+
+        // Next attachment works cleanly with zero leaked permits.
+        let fresh = manager
+            .begin_input(connection, closed, "thread", "term", 1, None)
+            .await
+            .expect("reattach succeeds");
+        ordered_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &fresh.input_id,
+            0,
+            "hi",
+        )
+        .await
+        .expect("fresh write succeeds");
+        assert_eq!(backend.latest().writes(), ["hi"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn staged_paste_pty_small_chunk_reader_submits_only_on_explicit_enter() {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        // Simulates a TUI reading stdin in tiny 64-byte chunks, buffering bracketed paste
+        // (`\x1b[200~...\x1b[201~`) without submitting mid-paste `\r`, and submitting once on
+        // explicit `\r` outside bracketed paste.
+        let parse_small_chunks = |writes: &[String]| -> Vec<String> {
+            let mut in_paste = false;
+            let mut buffer = String::new();
+            let mut pending_esc = String::new();
+            let mut submitted = Vec::new();
+            for write in writes {
+                for chunk in write.as_bytes().chunks(64) {
+                    let s = std::str::from_utf8(chunk).expect("ascii test payload");
+                    pending_esc.push_str(s);
+                    let mut i = 0;
+                    let bytes = pending_esc.as_bytes();
+                    while i < bytes.len() {
+                        if bytes[i] == 0x1b {
+                            let rem = &pending_esc[i..];
+                            if rem.starts_with("\x1b[200~") {
+                                in_paste = true;
+                                i += 6;
+                                continue;
+                            }
+                            if rem.starts_with("\x1b[201~") {
+                                in_paste = false;
+                                i += 6;
+                                continue;
+                            }
+                            if "\x1b[200~".starts_with(rem) || "\x1b[201~".starts_with(rem) {
+                                break;
+                            }
+                        }
+                        let ch = pending_esc[i..].chars().next().unwrap();
+                        if ch == '\r' && !in_paste {
+                            submitted.push(std::mem::take(&mut buffer));
+                        } else {
+                            buffer.push(ch);
+                        }
+                        i += ch.len_utf8();
+                    }
+                    pending_esc.drain(..i);
+                }
+            }
+            submitted
+        };
+
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        // 1. Short multi-line bracketed paste -> zero submissions before Enter.
+        let short_body = "short line 1\rshort line 2\rshort line 3";
+        ordered_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            0,
+            &format!("\x1b[200~{short_body}\x1b[201~"),
+        )
+        .await
+        .expect("short paste");
+        assert!(parse_small_chunks(&backend.latest().writes()).is_empty());
+
+        // 2. >16 KiB (32 KiB) multi-line staged paste -> atomic single PTY write, zero early submits.
+        let long_body = "alpha\rbeta\rgamma\r".repeat(1_500); // ~25.5 KiB
+        let full_long = format!("\x1b[200~{long_body}\x1b[201~");
+        let split_at = 16 * 1024;
+        ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            1,
+            &full_long[..split_at],
+            Chunk,
+        )
+        .await
+        .expect("chunk 0");
+        assert_eq!(
+            backend.latest().writes().len(),
+            1,
+            "chunk must not write to PTY"
+        );
+        ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            2,
+            &full_long[split_at..],
+            Commit,
+        )
+        .await
+        .expect("commit");
+        assert_eq!(
+            backend.latest().writes().len(),
+            2,
+            "commit must deliver the entire >16 KiB paste in one contiguous PTY write"
+        );
+        assert!(parse_small_chunks(&backend.latest().writes()).is_empty());
+
+        // 3. Explicit Enter submits exactly ONE complete combined prompt.
+        ordered_write(&manager, connection, "thread", "term", &input_id, 3, "\r")
+            .await
+            .expect("explicit enter");
+        let submitted = parse_small_chunks(&backend.latest().writes());
+        assert_eq!(submitted, [format!("{short_body}{long_body}")]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn running_terminal_snapshot_restores_bracketed_paste_mode_after_clear_and_exited_omits_it()
+     {
+        let root = tempfile::tempdir().expect("root");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("open");
+        let process = backend.latest();
+        process.emit("\x1b[?2004hready\r\n");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snap = manager
+                    .attach(TerminalAttachInput::existing("thread", "term"))
+                    .await
+                    .expect("attach")
+                    .initial;
+                if snap.history.contains("ready") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("output observed");
+
+        manager.clear("thread", "term").await.expect("clear");
+        let cleared_running = manager
+            .attach(TerminalAttachInput::existing("thread", "term"))
+            .await
+            .expect("attach after clear")
+            .initial;
+        assert_eq!(cleared_running.status, TerminalStatus::Running);
+        assert!(
+            cleared_running.history.ends_with("\x1b[?2004h"),
+            "running terminal must restore ?2004h after clear: {:?}",
+            cleared_running.history
+        );
+
+        process.exit(0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snap = manager
+                    .attach(TerminalAttachInput::existing("thread", "term"))
+                    .await
+                    .expect("attach exited")
+                    .initial;
+                if snap.status == TerminalStatus::Exited {
+                    assert!(
+                        !snap.history.ends_with("\x1b[?2004h"),
+                        "exited terminal must not inject ?2004h: {:?}",
+                        snap.history
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exit observed");
         manager.shutdown().await;
     }
 

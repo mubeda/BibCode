@@ -3598,6 +3598,7 @@ fn environment_descriptor(
     });
     // Outside the literal above, which is at `json!`'s recursion limit.
     capabilities["terminalUserInputClaim"] = json!(true);
+    capabilities["terminalPasteAssembly"] = json!(true);
     capabilities["agentMessaging"] = json!(true);
     capabilities["sendRequests"] = json!(true);
     capabilities["readOnlyCodexReviews"] = json!(true);

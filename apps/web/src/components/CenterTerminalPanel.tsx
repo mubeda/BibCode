@@ -68,6 +68,11 @@ export function CenterTerminalPanel({
     () => (command ? new Map([[terminalId, command]]) : undefined),
     [command, terminalId],
   );
+  const terminalDriverKindsById = useMemo(() => {
+    const driverKind =
+      command?.activity?.driverKind ?? activeSummary?.command?.activity?.driverKind;
+    return driverKind ? new Map([[terminalId, driverKind]]) : undefined;
+  }, [activeSummary, command, terminalId]);
   const aiTerminalIds = useMemo(
     () => (isAiTerminal(activeSummary) ? new Set([terminalId]) : undefined),
     [activeSummary, terminalId],
@@ -100,6 +105,7 @@ export function CenterTerminalPanel({
       attachOnly={attachOnly}
       terminalLabelsById={terminalLabelsById}
       {...(terminalCommandsById ? { terminalCommandsById } : {})}
+      {...(terminalDriverKindsById ? { terminalDriverKindsById } : {})}
       keybindings={keybindings}
       workspaceUnavailable={workspaceUnavailable}
       {...(aiTerminalIds ? { aiTerminalIds } : {})}

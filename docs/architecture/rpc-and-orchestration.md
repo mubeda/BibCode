@@ -5315,16 +5315,34 @@ in [Missing-workspace runtime guard](#missing-workspace-runtime-guard).
 
 ## Ordered terminal input
 
-Current servers advertise `terminalOrderedInput`. The client negotiates from
-the actual RPC session's initial configuration; an omitted/false capability
-keeps the serialized `terminal.write` path. A failure on the ordered path does
-not retry through the legacy method.
+Current servers advertise `terminalOrderedInput` and `terminalPasteAssembly`.
+The client negotiates from the actual RPC session's initial configuration; an
+omitted/false `terminalOrderedInput` capability keeps the serialized
+`terminal.write` path (which sends complete bracketed-paste envelopes up to
+64 KiB in a single write instead of slicing at 16 KiB, and fails cleanly above
+64 KiB rather than emitting a partial unclosed envelope). A failure on the
+ordered path does not retry through the legacy method.
 
-| Method                 | Input                                                                 | Successful result                                          |
-| ---------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `terminal.beginInput`  | Thread, terminal, and a monotonically increasing `attachmentSequence` | An opaque `inputId`                                        |
-| `terminal.writeInput`  | Thread, terminal, `inputId`, zero-based frame `sequence`, and `data`  | The matching `inputId` and `sequence`, after the PTY write |
-| `terminal.cancelInput` | Thread, terminal, and `inputId`                                       | Null; unknown/already removed leases are harmless          |
+| Method                 | Input                                                                                       | Successful result                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `terminal.beginInput`  | Thread, terminal, and a monotonically increasing `attachmentSequence`                       | An opaque `inputId`                                                                       |
+| `terminal.writeInput`  | Thread, terminal, `inputId`, zero-based frame `sequence`, `data`, and optional `pasteStage` | The matching `inputId` and `sequence`, after the PTY write (or after staging a `"chunk"`) |
+| `terminal.cancelInput` | Thread, terminal, and `inputId`                                                             | Null; unknown/already removed leases are harmless                                         |
+
+When `terminalPasteAssembly` is advertised, multi-frame bracketed pastes
+(`\x1b[200~...\x1b[201~` spanning more than one 16 KiB frame) carry
+`pasteStage: "chunk"` on intermediate frames and `pasteStage: "commit"` on the
+final frame, while client framing never splits either 6-byte delimiter across
+frame boundaries. Intermediate `"chunk"` frames append into the lease's bounded
+1 MiB staged paste buffer and acknowledge immediately so per-connection frame
+and 256 KiB byte permits are released before later frames arrive; `"commit"`
+writes the complete assembled envelope atomically to `TerminalWriter::enqueue`
+and acknowledges after PTY delivery. Ordinary frames without `pasteStage` keep
+their per-frame PTY-delivery acknowledgement unchanged. Cancelling,
+disconnecting, losing workspace admission, interrupting an open staged paste
+with a non-staged frame, exceeding 1 MiB, or letting an unclosed staged paste
+expire discards the unpublished staged buffer with zero PTY writes and fails
+the lease.
 
 All three use `terminal:operate`. The server binds each lease to the physical
 RPC connection and captured terminal process generation. Reconnecting with the

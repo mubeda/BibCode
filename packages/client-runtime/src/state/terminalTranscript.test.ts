@@ -182,4 +182,41 @@ describe("createTerminalTranscript", () => {
     expect(transcript.snapshot()).toBe("xy");
     expect(transcript.byteLength()).toBe(2);
   });
+
+  it("preserves active DEC ?2004h bracketed paste mode across overflow eviction and clear", () => {
+    const transcript = createTerminalTranscript(32);
+    // Chunk-split multi-parameter DECSET enabling ?2004h
+    transcript.append("\u001b[?1049;");
+    transcript.append("2004;1004h");
+    transcript.append("x".repeat(64));
+
+    const snap = transcript.snapshot();
+    expect(snap.endsWith("\u001b[?2004h")).toBe(true);
+    expect(snap).toContain("x".repeat(32));
+
+    // Preserving modes on clear keeps ?2004h for a running terminal.
+    transcript.clear({ preserveModes: true });
+    expect(transcript.snapshot()).toBe("\u001b[?2004h");
+
+    // DECSTR soft reset turns ?2004h off.
+    transcript.append("\u001b[!p");
+    transcript.append("y".repeat(64));
+    expect(transcript.snapshot()).toBe("y".repeat(32));
+
+    // Re-enable, then RIS (\x1bc) turns ?2004h off.
+    transcript.append("\u001b[?02004h");
+    transcript.append("z".repeat(64));
+    expect(transcript.snapshot().endsWith("\u001b[?2004h")).toBe(true);
+    transcript.append("\u001bc");
+    transcript.append("w".repeat(64));
+    expect(transcript.snapshot()).toBe("w".repeat(32));
+
+    // Re-enable, then ?2004l turns ?2004h off.
+    transcript.append("\u001b[?2004h");
+    transcript.append("a".repeat(64));
+    expect(transcript.snapshot().endsWith("\u001b[?2004h")).toBe(true);
+    transcript.append("\u001b[?2004l");
+    transcript.append("b".repeat(64));
+    expect(transcript.snapshot()).toBe("b".repeat(32));
+  });
 });

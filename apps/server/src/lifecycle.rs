@@ -68,6 +68,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "remoteUpdateControl": true,
             "remoteUpdateProgress": true,
             "terminalOrderedInput": true,
+            "terminalPasteAssembly": true,
             "terminalSizeOwnership": true,
             "terminalUserInputClaim": true,
             "terminalSizeHandOver": true,

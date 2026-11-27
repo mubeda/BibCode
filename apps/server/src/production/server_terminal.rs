@@ -1277,7 +1277,18 @@ fn register_ordered_input_rpcs(registry: &mut RpcRegistry, services: &ServerTerm
                 let origin = terminal_input_origin(request.payload.get("userInputClaim"))?;
                 // In memory only: the session's lease already holds the workspace admission
                 // `terminal.beginInput` took, so a keystroke never waits for the database.
-                let frame = terminal.prepare_input_write(context.connection_id(), &input.thread_id, &input.terminal_id, &input.input_id, input.sequence, &input.data).map_err(terminal_error)?.with_origin(origin);
+                let frame = terminal
+                    .prepare_input_write(
+                        context.connection_id(),
+                        &input.thread_id,
+                        &input.terminal_id,
+                        &input.input_id,
+                        input.sequence,
+                        &input.data,
+                    )
+                    .map_err(terminal_error)?
+                    .with_origin(origin)
+                    .with_paste_stage(input.paste_stage);
                 // Loss of the session's current admission seals it, which fails this frame
                 // wherever it waits; report that loss rather than the sealed session.
                 let seal = frame.seal();
@@ -1751,6 +1762,8 @@ struct TerminalInputFramePayload {
     /// Read from the payload by [`terminal_input_origin`], which tells null from absent.
     #[serde(default, rename = "userInputClaim")]
     _user_input_claim: serde::de::IgnoredAny,
+    #[serde(default)]
+    paste_stage: Option<crate::terminal::TerminalPasteStage>,
 }
 
 #[derive(Deserialize)]

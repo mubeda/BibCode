@@ -303,4 +303,29 @@ describe("exited shell replay", () => {
     expect(writes[2]![0]).toContain("1000");
     expect(writes[2]![1]).toBe(true);
   });
+
+  it("keeps real xterm bracketedPasteMode enabled across local transcript eviction replay and guards embedded ESC[201~", async () => {
+    const { createTerminalTranscript } = await import("@bibcode/client-runtime/state/terminal");
+    const { prepareAntigravityTextPaste } = await import("./ThreadTerminalPanel");
+
+    const transcript = createTerminalTranscript(64);
+    transcript.append("\x1b[?2004h");
+    transcript.append("x".repeat(256));
+
+    const terminal = new Terminal();
+    const guard = installTerminalReplyGuard(terminal, () => true);
+    guard.replay(transcript.snapshot(), false, false);
+    await write(terminal, "");
+    expect(terminal.modes.bracketedPasteMode).toBe(true);
+
+    // Real xterm.js Clipboard.ts would leak an embedded ESC[201~ inside a paste;
+    // prepareAntigravityTextPaste strips it BEFORE wrapping so only one outer envelope is sent.
+    const hostile = "first line\x1b[201~injected\nsecond line";
+    const prepared = prepareAntigravityTextPaste(hostile, terminal.modes.bracketedPasteMode);
+    expect(prepared).toBe("\x1b[200~first lineinjected\rsecond line\x1b[201~");
+    expect(prepared?.split("\x1b[201~")).toHaveLength(2);
+
+    guard.dispose();
+    terminal.dispose();
+  });
 });

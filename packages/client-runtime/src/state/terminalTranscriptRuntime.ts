@@ -184,6 +184,9 @@ export function createTerminalTranscriptRuntime(
   const resetTranscript = (snapshot: TerminalSessionSnapshot, newGeneration = true) => {
     transcript.clear();
     transcript.append(snapshot.history);
+    if (snapshot.status !== "running") {
+      transcript.resetModes();
+    }
     size = snapshot.size;
     oscColorResponderActive = snapshot.oscColorResponderActive ?? false;
     // A resync is the same attachment: a startup grant not used yet stays its owner's.
@@ -335,18 +338,22 @@ export function createTerminalTranscriptRuntime(
         if (size.sizeClaim !== firstAttachmentGrantClaim) firstAttachmentGrantClaim = null;
         fanRender({ type: "resized", size, ...sizePosition() });
         return;
-      case "cleared":
-        transcript.clear();
+      case "cleared": {
+        transcript.clear({ preserveModes: metadata.status === "running" });
         firstAttachmentGrantClaim = null;
         updateMetadata({ status: metadata.status, error: null }, false);
-        fanRender((claim) => createResetSignalAndConsumeGrant("", claim));
+        const clearedSnapshot = transcript.snapshot();
+        fanRender((claim) => createResetSignalAndConsumeGrant(clearedSnapshot, claim));
         notifyMetadata();
         return;
+      }
       case "exited":
+        transcript.resetModes();
         updateMetadata({ status: "exited", error: null }, false);
         notifyMetadata();
         return;
       case "closed":
+        transcript.resetModes();
         updateMetadata({ status: "closed", error: null }, false);
         notifyMetadata();
         return;

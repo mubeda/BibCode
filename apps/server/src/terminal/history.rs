@@ -17,8 +17,164 @@ const DEFAULT_BYTE_LIMIT: usize = 1_048_576;
 /// The cut a released client applies to an attach snapshot: `DEFAULT_MAX_TERMINAL_BUFFER_BYTES`
 /// in `packages/client-runtime/src/state/terminalTranscript.ts` (pinned by a test). A history
 /// retaining more replays only its last this-many bytes in that client.
-#[cfg(unix)]
 const CLIENT_TRANSCRIPT_CUT_BYTES: usize = 512 * 1024;
+
+const BRACKETED_PASTE_ENABLE_SEQUENCE: &str = "\x1b[?2004h";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ModeParseState {
+    #[default]
+    Ground,
+    Esc,
+    EscIntermediate,
+    Osc,
+    StringSeq,
+    StringEsc,
+    CsiStart,
+    CsiBang,
+    CsiDecPrivate {
+        current_param: u32,
+        has_2004: bool,
+        valid: bool,
+    },
+    CsiIgnore,
+}
+
+/// Streaming VT state machine tracking DEC private mode `?2004h`/`?2004l` (bracketed paste)
+/// across arbitrary chunk boundaries, including multi-parameter DECSET/DECRST, RIS (`\x1bc`),
+/// and DECSTR (`\x1b[!p`).
+#[derive(Clone, Copy, Debug, Default)]
+struct BracketedPasteModeTracker {
+    state: ModeParseState,
+    enabled: bool,
+}
+
+impl BracketedPasteModeTracker {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.step(byte);
+        }
+    }
+
+    fn step(&mut self, byte: u8) {
+        match self.state {
+            ModeParseState::Ground => {
+                if byte == 0x1b {
+                    self.state = ModeParseState::Esc;
+                }
+            }
+            ModeParseState::Esc => self.step_esc(byte),
+            ModeParseState::EscIntermediate => {
+                if byte == 0x1b {
+                    self.state = ModeParseState::Esc;
+                } else if !(0x20..=0x2f).contains(&byte) {
+                    self.state = ModeParseState::Ground;
+                }
+            }
+            ModeParseState::Osc => match byte {
+                0x07 | 0x18 | 0x1a => self.state = ModeParseState::Ground,
+                0x1b => self.state = ModeParseState::StringEsc,
+                _ => {}
+            },
+            ModeParseState::StringSeq => match byte {
+                0x18 | 0x1a => self.state = ModeParseState::Ground,
+                0x1b => self.state = ModeParseState::StringEsc,
+                _ => {}
+            },
+            ModeParseState::StringEsc => match byte {
+                b'\\' => self.state = ModeParseState::Ground,
+                0x1b => self.state = ModeParseState::StringEsc,
+                other => self.step_esc(other),
+            },
+            ModeParseState::CsiStart => match byte {
+                b'?' => {
+                    self.state = ModeParseState::CsiDecPrivate {
+                        current_param: 0,
+                        has_2004: false,
+                        valid: true,
+                    };
+                }
+                b'!' => self.state = ModeParseState::CsiBang,
+                0x1b => self.state = ModeParseState::Esc,
+                0x18 | 0x1a | 0x40..=0x7e => self.state = ModeParseState::Ground,
+                0x20..=0x3f => self.state = ModeParseState::CsiIgnore,
+                _ => {}
+            },
+            ModeParseState::CsiBang => match byte {
+                b'p' => {
+                    // DECSTR (`\x1b[!p`) resets DEC private modes including ?2004.
+                    self.enabled = false;
+                    self.state = ModeParseState::Ground;
+                }
+                0x1b => self.state = ModeParseState::Esc,
+                0x18 | 0x1a | 0x40..=0x7e => self.state = ModeParseState::Ground,
+                0x20..=0x3f => self.state = ModeParseState::CsiIgnore,
+                _ => {}
+            },
+            ModeParseState::CsiDecPrivate {
+                mut current_param,
+                mut has_2004,
+                valid,
+            } => match byte {
+                b'0'..=b'9' => {
+                    current_param = current_param
+                        .saturating_mul(10)
+                        .saturating_add(u32::from(byte - b'0'));
+                    self.state = ModeParseState::CsiDecPrivate {
+                        current_param,
+                        has_2004,
+                        valid,
+                    };
+                }
+                b';' => {
+                    if current_param == 2004 {
+                        has_2004 = true;
+                    }
+                    self.state = ModeParseState::CsiDecPrivate {
+                        current_param: 0,
+                        has_2004,
+                        valid,
+                    };
+                }
+                b'h' | b'l' => {
+                    if valid && (has_2004 || current_param == 2004) {
+                        self.enabled = byte == b'h';
+                    }
+                    self.state = ModeParseState::Ground;
+                }
+                0x1b => self.state = ModeParseState::Esc,
+                0x18 | 0x1a | 0x40..=0x7e => self.state = ModeParseState::Ground,
+                0x20..=0x3f => self.state = ModeParseState::CsiIgnore,
+                _ => {}
+            },
+            ModeParseState::CsiIgnore => match byte {
+                0x1b => self.state = ModeParseState::Esc,
+                0x18 | 0x1a | 0x40..=0x7e => self.state = ModeParseState::Ground,
+                _ => {}
+            },
+        }
+    }
+
+    fn step_esc(&mut self, byte: u8) {
+        match byte {
+            b'c' => {
+                // RIS (`\x1bc`)
+                self.enabled = false;
+                self.state = ModeParseState::Ground;
+            }
+            b'[' => self.state = ModeParseState::CsiStart,
+            b']' => self.state = ModeParseState::Osc,
+            b'P' | b'_' | b'^' | b'X' => self.state = ModeParseState::StringSeq,
+            0x20..=0x2f => self.state = ModeParseState::EscIntermediate,
+            0x1b => self.state = ModeParseState::Esc,
+            _ => self.state = ModeParseState::Ground,
+        }
+    }
+}
 
 /// Why replaying a history may not rebuild the program's screen (#348).
 #[cfg(unix)]
@@ -60,6 +216,8 @@ pub(crate) struct TerminalHistory {
     /// Unique to this history in the process: a restarted or reopened terminal gets a new
     /// history whose offsets start again at 0, so a cursor names its history too.
     epoch: u64,
+    /// Cross-platform DEC `?2004h`/`?2004l` state across evicted or cleared prefixes (#431).
+    bracketed_paste: BracketedPasteModeTracker,
 }
 
 /// Hands out history epochs. It starts at a random value, so another server lifetime (a
@@ -186,6 +344,7 @@ impl TerminalHistory {
             byte_limit,
             total_bytes_written: 0,
             epoch: NEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            bracketed_paste: BracketedPasteModeTracker::default(),
         }
     }
 
@@ -207,9 +366,14 @@ impl TerminalHistory {
     }
 
     /// Whether output before the retained bytes is gone: evicted by a limit, or cleared.
-    #[cfg(unix)]
     pub(crate) fn has_discarded_prefix(&self) -> bool {
         self.total_bytes_written > self.total_bytes as u64
+    }
+
+    /// Whether the program currently has DEC `?2004h` (bracketed paste mode) enabled.
+    #[cfg(test)]
+    pub(crate) fn bracketed_paste_enabled(&self) -> bool {
+        self.bracketed_paste.is_enabled()
     }
 
     /// Whether a client replaying this history misses output, and why. O(1): counters only.
@@ -358,6 +522,7 @@ impl TerminalHistory {
 
     pub(crate) fn push(&mut self, data: &str) {
         self.total_bytes_written += data.len() as u64;
+        self.bracketed_paste.feed(data.as_bytes());
         if self.line_limit == 0 || self.byte_limit == 0 {
             self.clear();
             return;
@@ -384,6 +549,20 @@ impl TerminalHistory {
         let mut snapshot = String::with_capacity(capacity);
         for chunk in &self.chunks {
             snapshot.push_str(chunk.retained());
+        }
+        snapshot
+    }
+
+    /// Snapshot for replaying into a terminal renderer. For a running session whose active
+    /// `?2004h` sequence may have been evicted, cleared, or truncated past the client's 512 KiB
+    /// buffer cap, appends `\x1b[?2004h` so bracketed paste remains active after replay (#431).
+    pub(crate) fn snapshot_for_replay(&self, running: bool) -> String {
+        let mut snapshot = self.snapshot();
+        if running
+            && self.bracketed_paste.is_enabled()
+            && (self.has_discarded_prefix() || self.total_bytes > CLIENT_TRANSCRIPT_CUT_BYTES)
+        {
+            snapshot.push_str(BRACKETED_PASTE_ENABLE_SEQUENCE);
         }
         snapshot
     }
@@ -928,5 +1107,54 @@ mod tests {
         }
         let plain = crate::send_requests::service::plain_tail(&history.tail(24).text, true, 100);
         assert_eq!(plain.text, "reddone");
+    }
+
+    #[test]
+    fn bracketed_paste_mode_survives_eviction_clear_and_over_client_cut_while_respecting_resets() {
+        let mut history = TerminalHistory::with_byte_limit(4, 64);
+        // Chunk-split multi-parameter DECSET enabling ?2004h, plus OSC strings (BEL and ST).
+        history.push("\x1b[?1049;");
+        history.push("2004;1004h");
+        history.push("\x1b]0;title [?2004l ignored\x07");
+        history.push("\x1b]2;st title [?2004l\x1b\\");
+        history.push("1\n2\n3\n4\n5\n6\n");
+        assert!(history.bracketed_paste_enabled());
+        assert!(history.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+        // Exited sessions must not inject ?2004h.
+        assert!(!history.snapshot_for_replay(false).ends_with("\x1b[?2004h"));
+
+        // Clear keeps ?2004h active for a running session.
+        history.clear();
+        assert_eq!(history.snapshot_for_replay(true), "\x1b[?2004h");
+        assert_eq!(history.snapshot_for_replay(false), "");
+
+        // DECRQM query (?2004$p) must NOT disable ?2004h.
+        history.push("\x1b[?2004$p");
+        assert!(history.bracketed_paste_enabled());
+
+        // DECSTR (\x1b[!p) disables ?2004h.
+        history.push("\x1b[!p");
+        assert!(!history.bracketed_paste_enabled());
+        assert!(!history.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+
+        // Re-enable with leading zero (?02004h), then RIS (\x1bc) disables it.
+        history.push("\x1b[?02004h");
+        assert!(history.bracketed_paste_enabled());
+        history.push("\x1bc");
+        assert!(!history.bracketed_paste_enabled());
+
+        // Re-enable, then DECRST (?2004l) disables it.
+        history.push("\x1b[?2004h");
+        assert!(history.bracketed_paste_enabled());
+        history.push("\x1b[?1000;2004l");
+        assert!(!history.bracketed_paste_enabled());
+
+        // Over-512 KiB retained history (no server eviction yet) appends ?2004h at the end so
+        // clients applying the 512 KiB suffix cut still enable bracketed paste on replay.
+        let mut large = TerminalHistory::with_byte_limit(100_000, 1024 * 1024);
+        large.push("\x1b[?2004h");
+        large.push(&"x".repeat(CLIENT_TRANSCRIPT_CUT_BYTES + 1024));
+        assert!(!large.has_discarded_prefix());
+        assert!(large.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
     }
 }
