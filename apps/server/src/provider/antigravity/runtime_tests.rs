@@ -2264,6 +2264,7 @@ async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
     {
         let (runtime, mut peer) = started("full-access", "auto").await;
         assert!(!runtime.is_retired());
+        assert!(!runtime.is_transport_closed());
         let receipt = runtime
             .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
             .await
@@ -2280,7 +2281,13 @@ async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
         let completed = &events.last().unwrap().1;
         assert_eq!(completed["errorClass"], "transport_error");
         assert_eq!(completed["errorReason"], "connection_closed");
-        assert!(runtime.is_retired());
+        assert!(
+            completed["errorMessage"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("connection_closed") && !msg.contains(MARKER)),
+            "expected sanitized errorMessage: {completed}"
+        );
+        assert!(runtime.is_transport_closed());
     }
 
     // 2. line_too_long (stdout line exceeds configured max)
@@ -2327,7 +2334,7 @@ async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
         assert_eq!(error.reason(), "line_too_long");
         let events = events_until(&runtime, "turn.completed").await;
         assert_eq!(events.last().unwrap().1["errorReason"], "line_too_long");
-        assert!(runtime.is_retired());
+        assert!(runtime.is_transport_closed());
     }
 
     // 3. invalid_message (malformed JSON on stdout)
@@ -2350,10 +2357,10 @@ async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
         assert_eq!(error.reason(), "invalid_message");
         let events = events_until(&runtime, "turn.completed").await;
         assert_eq!(events.last().unwrap().1["errorReason"], "invalid_message");
-        assert!(runtime.is_retired());
+        assert!(runtime.is_transport_closed());
     }
 
-    // 4. unknown_response (uncorrelated JSON-RPC id on stdout)
+    // 4. unknown_response (uncorrelated string JSON-RPC id must not leak into errorMessage or session.exited)
     {
         let (runtime, mut peer) = started("full-access", "auto").await;
         let receipt = runtime
@@ -2361,7 +2368,7 @@ async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
             .await
             .expect("prompt written");
         let _prompt = peer.expect("session/prompt").await;
-        peer.send(json!({ "jsonrpc": "2.0", "id": 999999, "result": {} }))
+        peer.send(json!({ "jsonrpc": "2.0", "id": format!("secret-id-{MARKER}"), "result": {} }))
             .await;
         let error = receipt
             .completion()
@@ -2370,8 +2377,24 @@ async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
         assert_eq!(error.class(), "transport_error");
         assert_eq!(error.reason(), "unknown_response");
         let events = events_until(&runtime, "turn.completed").await;
-        assert_eq!(events.last().unwrap().1["errorReason"], "unknown_response");
-        assert!(runtime.is_retired());
+        let completed = &events.last().unwrap().1;
+        assert_eq!(completed["errorReason"], "unknown_response");
+        assert!(
+            completed["errorMessage"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("unknown_response") && !msg.contains(MARKER)),
+            "uncorrelated string id leaked into turn.completed errorMessage: {completed}"
+        );
+        for (kind, payload) in &events {
+            if kind == "session.exited" {
+                assert_eq!(payload["errorReason"], "unknown_response");
+                assert!(
+                    !payload.to_string().contains(MARKER),
+                    "uncorrelated string id leaked into session.exited: {payload}"
+                );
+            }
+        }
+        assert!(runtime.is_transport_closed());
     }
 
     // 5. read_failure (stdout read returns io::Error)
@@ -2416,7 +2439,7 @@ async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
         assert_eq!(error.reason(), "read_failure");
         let events = events_until(&runtime, "turn.completed").await;
         assert_eq!(events.last().unwrap().1["errorReason"], "read_failure");
-        assert!(runtime.is_retired());
+        assert!(runtime.is_transport_closed());
     }
 
     // 6. write_failure (stdin write returns io::Error before prompt bytes leave)
@@ -2458,7 +2481,7 @@ async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
         assert_eq!(error.reason(), "write_failure");
         let events = events_until(&runtime, "turn.completed").await;
         assert_eq!(events.last().unwrap().1["errorReason"], "write_failure");
-        assert!(runtime.is_retired());
+        assert!(runtime.is_transport_closed());
     }
 
     let rendered = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();

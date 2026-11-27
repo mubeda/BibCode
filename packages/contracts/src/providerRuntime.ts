@@ -399,6 +399,8 @@ const TurnCompletedPayload = Schema.Struct({
   errorClass: Schema.optional(RuntimeErrorClass),
   /** The provider's own name for why a failed turn ended, such as Claude's `terminal_reason`. */
   providerReason: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** BiBCode's sanitized transport or runtime failure reason when the provider gave no `providerReason`. */
+  errorReason: Schema.optional(TrimmedNonEmptyStringSchema),
   /** A `context_limit` failure: the provider refused the input before any output. */
   beforeOutput: Schema.optional(Schema.Boolean),
   /** A `context_limit` failure: `false` when the provider said compacting cannot help. */

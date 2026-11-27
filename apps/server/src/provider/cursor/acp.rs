@@ -15,6 +15,7 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AcpConnectionConfig {
@@ -101,6 +102,7 @@ struct Inner {
     writer: mpsc::UnboundedSender<WriterMessage>,
     pending: StdMutex<HashMap<String, PendingRequest>>,
     closed: AtomicBool,
+    closed_signal: CancellationToken,
     close_reason: Mutex<Option<String>>,
     next_request_id: AtomicU64,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -255,6 +257,7 @@ impl AcpJsonRpcConnection {
             writer: writer_tx,
             pending: StdMutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            closed_signal: CancellationToken::new(),
             close_reason: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             tasks: Mutex::new(Vec::new()),
@@ -288,7 +291,13 @@ impl AcpJsonRpcConnection {
                                 break;
                             }
                         };
-                        if let Err((error, _)) = write_all_counted(&mut sink, &encoded).await {
+                        let mut bytes_written = 0;
+                        let write_result = tokio::select! {
+                            biased;
+                            () = writer_inner.closed_signal.cancelled() => break,
+                            result = write_all_counted(&mut sink, &encoded, &mut bytes_written) => result,
+                        };
+                        if let Err(error) = write_result {
                             fail_connection(
                                 &writer_inner,
                                 &writer_incoming,
@@ -299,7 +308,12 @@ impl AcpJsonRpcConnection {
                             .await;
                             break;
                         }
-                        if let Err(error) = sink.flush().await {
+                        let flush_result = tokio::select! {
+                            biased;
+                            () = writer_inner.closed_signal.cancelled() => break,
+                            result = sink.flush() => result,
+                        };
+                        if let Err(error) = flush_result {
                             fail_connection(
                                 &writer_inner,
                                 &writer_incoming,
@@ -312,9 +326,26 @@ impl AcpJsonRpcConnection {
                         }
                     }
                     WriterMessage::EncodedRequest { bytes, written } => {
-                        if let Err((error, bytes_written)) =
-                            write_all_counted(&mut sink, &bytes).await
-                        {
+                        let mut bytes_written = 0;
+                        let write_outcome = tokio::select! {
+                            biased;
+                            () = writer_inner.closed_signal.cancelled() => None,
+                            result = write_all_counted(&mut sink, &bytes, &mut bytes_written) => Some(result),
+                        };
+                        let Some(write_result) = write_outcome else {
+                            let reason = writer_inner
+                                .close_reason
+                                .lock()
+                                .await
+                                .clone()
+                                .unwrap_or_else(|| "closed".to_owned());
+                            let _ = written.send(Err(AcpRequestWriteFailure {
+                                error: AcpProtocolError::Closed { reason },
+                                bytes_written: Some(bytes_written),
+                            }));
+                            break;
+                        };
+                        if let Err(error) = write_result {
                             let message = error.to_string();
                             let _ = written.send(Err(AcpRequestWriteFailure {
                                 error: AcpProtocolError::WriteFailure {
@@ -330,7 +361,25 @@ impl AcpJsonRpcConnection {
                             .await;
                             break;
                         }
-                        if let Err(error) = sink.flush().await {
+                        let flush_outcome = tokio::select! {
+                            biased;
+                            () = writer_inner.closed_signal.cancelled() => None,
+                            result = sink.flush() => Some(result),
+                        };
+                        let Some(flush_result) = flush_outcome else {
+                            let reason = writer_inner
+                                .close_reason
+                                .lock()
+                                .await
+                                .clone()
+                                .unwrap_or_else(|| "closed".to_owned());
+                            let _ = written.send(Err(AcpRequestWriteFailure {
+                                error: AcpProtocolError::Closed { reason },
+                                bytes_written: Some(bytes.len()),
+                            }));
+                            break;
+                        };
+                        if let Err(error) = flush_result {
                             let message = error.to_string();
                             let _ = written.send(Err(AcpRequestWriteFailure {
                                 error: AcpProtocolError::WriteFailure {
@@ -557,21 +606,21 @@ impl AcpJsonRpcConnection {
 async fn write_all_counted<W: AsyncWrite + Unpin>(
     sink: &mut W,
     bytes: &[u8],
-) -> Result<usize, (io::Error, usize)> {
-    let mut bytes_written = 0;
-    while bytes_written < bytes.len() {
-        match sink.write(&bytes[bytes_written..]).await {
+    bytes_written: &mut usize,
+) -> Result<(), io::Error> {
+    while *bytes_written < bytes.len() {
+        match sink.write(&bytes[*bytes_written..]).await {
             Ok(0) => {
-                return Err((
-                    io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer"),
-                    bytes_written,
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
                 ));
             }
-            Ok(written) => bytes_written += written,
-            Err(error) => return Err((error, bytes_written)),
+            Ok(written) => *bytes_written += written,
+            Err(error) => return Err(error),
         }
     }
-    Ok(bytes_written)
+    Ok(())
 }
 
 async fn read_stdout_loop<R: AsyncRead + Unpin>(
@@ -648,12 +697,18 @@ async fn route_stdout_message(
             });
         };
         if let Some(error) = object.get("error") {
-            let shape: JsonRpcErrorShape =
-                serde_json::from_value(error.clone()).map_err(|decode_error| {
-                    AcpProtocolError::InvalidMessage {
-                        message: decode_error.to_string(),
-                    }
-                })?;
+            let shape: JsonRpcErrorShape = match serde_json::from_value(error.clone()) {
+                Ok(shape) => shape,
+                Err(decode_error) => {
+                    let message = decode_error.to_string();
+                    let _ = pending
+                        .responder
+                        .send(Err(AcpProtocolError::InvalidMessage {
+                            message: message.clone(),
+                        }));
+                    return Err(AcpProtocolError::InvalidMessage { message });
+                }
+            };
             let _ = pending.responder.send(Err(AcpProtocolError::RemoteRequest {
                 method: pending.method,
                 request_id: correlation_id,
@@ -784,6 +839,7 @@ async fn fail_connection(
         return;
     }
     *inner.close_reason.lock().await = Some(reason.clone());
+    inner.closed_signal.cancel();
     let pending = std::mem::take(&mut *inner.pending());
     for (_, request) in pending {
         let _ = request.responder.send(Err(AcpProtocolError::Closed {
@@ -845,15 +901,19 @@ pub(crate) fn acp_error_reason(error: &AcpProtocolError) -> &'static str {
         AcpProtocolError::InvalidMessage { .. } => "invalid_message",
         AcpProtocolError::UnknownResponse { .. } => "unknown_response",
         AcpProtocolError::Closed { reason } => {
-            if reason.starts_with("ACP JSON-RPC read line exceeded ") {
+            let mut inner = reason.as_str();
+            while let Some(stripped) = inner.strip_prefix("ACP JSON-RPC connection is closed: ") {
+                inner = stripped;
+            }
+            if inner.starts_with("ACP JSON-RPC read line exceeded ") {
                 "line_too_long"
-            } else if reason.starts_with("ACP JSON-RPC read failed on ") {
+            } else if inner.starts_with("ACP JSON-RPC read failed on ") {
                 "read_failure"
-            } else if reason.starts_with("ACP JSON-RPC write failed: ") {
+            } else if inner.starts_with("ACP JSON-RPC write failed: ") {
                 "write_failure"
-            } else if reason.starts_with("ACP JSON-RPC message was invalid: ") {
+            } else if inner.starts_with("ACP JSON-RPC message was invalid: ") {
                 "invalid_message"
-            } else if reason.starts_with("ACP JSON-RPC response for id ") {
+            } else if inner.starts_with("ACP JSON-RPC response for id ") {
                 "unknown_response"
             } else {
                 "connection_closed"
@@ -1004,8 +1064,93 @@ mod tests {
                     expected,
                     "Closed-wrapped {wrapped:?} must preserve {expected}"
                 );
+                let double_wrapped = AcpProtocolError::Closed {
+                    reason: wrapped.to_string(),
+                };
+                assert_eq!(
+                    acp_error_reason(&double_wrapped),
+                    expected,
+                    "Double-wrapped {double_wrapped:?} must preserve {expected}"
+                );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_error_reply_for_matching_id_reports_invalid_message_to_waiter() {
+        let (stdout, mut output) = tokio::io::duplex(4096);
+        let (mut requests, stdin) = tokio::io::duplex(4096);
+        let (stderr_reader, _stderr) = tokio::io::duplex(1024);
+        let (connection, _incoming) = AcpJsonRpcConnection::spawn(
+            stdout,
+            stdin,
+            stderr_reader,
+            AcpConnectionConfig::default(),
+        );
+        let mut receipt = connection
+            .start_request("session/prompt", json!({}))
+            .await
+            .expect("request started");
+        let mut req_buf = [0u8; 512];
+        let _ = requests.read(&mut req_buf).await.expect("read request");
+        receipt.written().await.expect("written");
+        // Matching numeric id 1, but `error` is malformed (missing numeric code/string message).
+        output
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":\"not-an-object\"}\n")
+            .await
+            .expect("write malformed error");
+        let error = receipt
+            .response()
+            .await
+            .expect_err("malformed error reply must fail");
+        assert_eq!(
+            acp_error_reason(&error),
+            "invalid_message",
+            "expected invalid_message instead of connection_closed: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_request_write_wakes_immediately_when_transport_closes() {
+        struct PendingWrite;
+        impl AsyncWrite for PendingWrite {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (stdout, output) = tokio::io::duplex(1024);
+        let (stderr_reader, _stderr) = tokio::io::duplex(1024);
+        let (connection, _incoming) = AcpJsonRpcConnection::spawn(
+            stdout,
+            PendingWrite,
+            stderr_reader,
+            AcpConnectionConfig::default(),
+        );
+        let mut receipt = connection
+            .start_request("session/prompt", json!({ "prompt": "blocked" }))
+            .await
+            .expect("request queued");
+        drop(output);
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(2), receipt.written())
+            .await
+            .expect("blocked write must wake when transport closes")
+            .expect_err("closed transport fails write");
+        assert!(
+            failure.is_definitely_not_sent(),
+            "zero bytes written before transport close must remain definitely unsent: {failure:?}"
+        );
+        assert_eq!(acp_error_reason(&failure.into_error()), "connection_closed");
     }
 
     #[test]
@@ -1051,6 +1196,7 @@ mod tests {
             writer,
             pending: StdMutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            closed_signal: CancellationToken::new(),
             close_reason: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             tasks: Mutex::new(Vec::new()),
@@ -1395,6 +1541,7 @@ mod tests {
             writer,
             pending: StdMutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            closed_signal: CancellationToken::new(),
             close_reason: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             tasks: Mutex::new(Vec::new()),

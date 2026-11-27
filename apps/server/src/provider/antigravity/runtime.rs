@@ -157,6 +157,48 @@ impl AntigravityRuntimeError {
             Self::MalformedConfigAcknowledgement => "malformed_config_acknowledgement",
         }
     }
+
+    /// The sanitized message written into `turn.completed` `errorMessage`: transport errors use
+    /// fixed static descriptions so raw uncorrelated response IDs, paths, or tokens never leak.
+    #[must_use]
+    pub fn turn_error_message(&self) -> String {
+        match self {
+            Self::Protocol(error) if !matches!(error, AcpProtocolError::RemoteRequest { .. }) => {
+                antigravity_transport_message(acp_error_reason(error))
+            }
+            _ => self.to_string(),
+        }
+    }
+}
+
+/// Fixed user-readable description for a sanitized ACP transport failure reason (no em dashes, no
+/// raw stderr, paths, tokens, or uncorrelated response IDs).
+pub(crate) fn antigravity_transport_message(reason: &str) -> String {
+    match reason {
+        "line_too_long" => {
+            "Antigravity sent a message longer than BiBCode accepts (transport_error: line_too_long)"
+                .to_owned()
+        }
+        "connection_closed" => {
+            "Antigravity connection closed unexpectedly (transport_error: connection_closed)"
+                .to_owned()
+        }
+        "read_failure" => {
+            "Antigravity output read failed (transport_error: read_failure)".to_owned()
+        }
+        "write_failure" => {
+            "Antigravity input write failed (transport_error: write_failure)".to_owned()
+        }
+        "invalid_message" => {
+            "Antigravity sent an invalid protocol message (transport_error: invalid_message)"
+                .to_owned()
+        }
+        "unknown_response" => {
+            "Antigravity sent an uncorrelated protocol response (transport_error: unknown_response)"
+                .to_owned()
+        }
+        _ => format!("Antigravity connection failed (transport_error: {reason})"),
+    }
 }
 
 impl OptionRefusal for AntigravityRuntimeError {
@@ -369,11 +411,17 @@ impl AntigravitySessionRuntime {
         self.inner.connection.shutdown();
     }
 
-    /// Whether this runtime's transport closed or the process was abandoned, so the next turn
-    /// must launch a fresh `agy acp` child session.
+    /// Whether this runtime was closed or abandoned and cannot serve further turns.
     #[must_use]
     pub fn is_retired(&self) -> bool {
-        self.inner.retired.load(Ordering::SeqCst) || self.inner.connection.is_closed()
+        self.inner.retired.load(Ordering::SeqCst)
+    }
+
+    /// Whether the underlying ACP transport has closed (so stream-end settlement is imminent or
+    /// running and no new prompts may start on this connection).
+    #[must_use]
+    pub fn is_transport_closed(&self) -> bool {
+        self.inner.connection.is_closed()
     }
 
     /// Whether a failed start lost its connection, so the child is exiting or gone.
@@ -784,6 +832,13 @@ impl AntigravitySessionRuntime {
         input: Option<&str>,
         attachments: Vec<Value>,
     ) -> Result<AntigravityPromptReceipt, AntigravityRuntimeError> {
+        if self.inner.retired.load(Ordering::SeqCst) {
+            return Err(AntigravityRuntimeError::Protocol(
+                AcpProtocolError::Closed {
+                    reason: "Antigravity session retired".to_owned(),
+                },
+            ));
+        }
         let session_id = self.provider_session_id().await?;
         let turn_id = format!("turn-{}", Uuid::new_v4());
         // A mode change landing during the confirmation gets one more confirmation; a second
@@ -858,7 +913,7 @@ impl AntigravitySessionRuntime {
             json!({
                 "state": "failed",
                 "stopReason": "error",
-                "errorMessage": error.to_string(),
+                "errorMessage": error.turn_error_message(),
                 "errorClass": error_class,
                 "errorReason": error_reason,
             }),
@@ -936,7 +991,7 @@ impl AntigravitySessionRuntime {
                             json!({
                                 "state": "failed",
                                 "stopReason": "error",
-                                "errorMessage": error.to_string(),
+                                "errorMessage": error.turn_error_message(),
                                 "errorClass": error_class,
                                 "errorReason": error_reason,
                             }),
@@ -1017,13 +1072,15 @@ impl AntigravitySessionRuntime {
                 provider = PROVIDER,
                 "the provider did not end a cancelled turn; stopping its process"
             );
+            // Mark unavailable for new prompts before publishing cancellation so no prompt slips
+            // in between turn settlement and driver shutdown.
+            runtime.inner.retired.store(true, Ordering::SeqCst);
             runtime.emit(
                 "turn.completed",
                 Some(turn_id),
                 None,
                 json!({ "state": "cancelled", "stopReason": "cancelled" }),
             );
-            runtime.inner.retired.store(true, Ordering::SeqCst);
             runtime.inner.abandon.notify_one();
         });
         Ok(())
@@ -1122,7 +1179,16 @@ impl AntigravitySessionRuntime {
                 );
             }
             IncomingEvent::Closed { reason } => {
-                self.emit("session.exited", None, None, json!({ "reason": reason }));
+                let error_reason = acp_error_reason(&AcpProtocolError::Closed { reason });
+                self.emit(
+                    "session.exited",
+                    None,
+                    None,
+                    json!({
+                        "reason": antigravity_transport_message(error_reason),
+                        "errorReason": error_reason,
+                    }),
+                );
             }
             IncomingEvent::Barrier(reached) => {
                 let _ = reached.send(());

@@ -425,9 +425,13 @@ window, and the thread offers to compact it.
 
 A failed `turn.completed` can also carry `providerReason`, the provider's own
 name for the failure (Claude's `terminal_reason`, Codex's `codexErrorInfo`
-variant, OpenCode's error name), which the shared failed-turn projection
-records in the Profiler as `provider.turn-failed` for every provider, once per
-turn. A `context_limit` failure may add two facts the adapter reads from the
+variant, OpenCode's error name), or BiBCode's sanitized `errorReason` (for
+example ACP transport variants `connection_closed`, `line_too_long`,
+`read_failure`, `write_failure`, `invalid_message`, and `unknown_response`,
+carried through stream-end `session.exited` settlement as well). The shared
+failed-turn projection records `providerReason`, falling back to `errorReason`,
+in the Profiler as `provider.turn-failed` for every provider, once per turn. A
+`context_limit` failure may add two facts the adapter reads from the
 provider, never inferred from text by the engine: `beforeOutput: true` when
 the provider refused the turn's input before any assistant text, tool call or
 compaction, and `compactable: false` when the provider said compacting cannot

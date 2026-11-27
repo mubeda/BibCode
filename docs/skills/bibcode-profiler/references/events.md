@@ -359,11 +359,14 @@ carries message or error text.
 - `provider`: the provider driver, such as `claude`, `codex` or `opencode`;
 - `terminalReason`: the provider's own name for why the run ended (Claude's
   `terminal_reason`, such as `blocking_limit`; Codex's error variant; OpenCode's
-  error name). A camelCase or PascalCase name is rewritten in snake case first,
-  a run of capitals as one word (`contextWindowExceeded` reads
-  `context_window_exceeded`, `APIError` reads `api_error`), so distinct
-  variants stay distinct. It is `other` when the value is not a plain name, or
-  `null` when the provider gave none;
+  error name), or BiBCode's sanitized `errorReason` fallback when the provider
+  gave none (such as ACP `connection_closed`, `line_too_long`, `read_failure`,
+  `write_failure`, `invalid_message`, or `unknown_response`). A camelCase or
+  PascalCase name is rewritten in snake case first, a run of capitals as one
+  word (`contextWindowExceeded` reads `context_window_exceeded`, `APIError`
+  reads `api_error`), so distinct variants stay distinct. It is `other` when the
+  value is not a plain name, or `null` when neither the provider nor BiBCode
+  supplied a reason;
 - `errorClass`: the turn's `RuntimeErrorClass`, such as `context_limit` or
   `provider_error`.
 

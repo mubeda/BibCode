@@ -615,6 +615,11 @@ pub trait ProviderDriver: Send + Sync {
     fn retired(&self) -> bool {
         false
     }
+    /// Whether the underlying transport has already closed and its event pump is draining
+    /// stream-end settlement; new deliveries wait for settlement instead of aborting the pump.
+    fn transport_closed(&self) -> bool {
+        false
+    }
 }
 
 pub trait ProviderDriverFactory: Send + Sync {
@@ -8795,6 +8800,26 @@ async fn run_supervisor(
                         entry.event_cancellation.cancel();
                     }
                     if sessions.get(&thread_id).is_some_and(|entry| {
+                        !entry.event_task.is_finished()
+                            && !entry.event_cancellation.is_cancelled()
+                            && entry.driver.transport_closed()
+                    }) {
+                        let detail =
+                            "Provider session is still settling after its event stream ended."
+                                .to_owned();
+                        let outcome = if frozen_delivery
+                            .as_ref()
+                            .is_some_and(|row| row.mode == TurnDeliveryMode::Steer)
+                        {
+                            ProviderDeliveryOutcome::Rejected { detail }
+                        } else {
+                            ProviderDeliveryOutcome::DefinitelyNotSent { detail }
+                        };
+                        let (response, completion) = oneshot::channel();
+                        let _ = response.send(outcome);
+                        return Ok(ProviderDeliveryHandle { completion });
+                    }
+                    if sessions.get(&thread_id).is_some_and(|entry| {
                         entry.event_task.is_finished()
                             || entry.event_cancellation.is_cancelled()
                             || entry.driver.retired()
@@ -13600,6 +13625,7 @@ fn spawn_event_pump(
             settled_tx
         };
         let mut last_exit_reason: Option<String> = None;
+        let mut last_exit_error_reason: Option<String> = None;
         let mut reasoning = ReasoningCoalescer::default();
         // An ask the resumed session recovered could not be recorded (#187).
         let mut recovered_ask_unprojected = false;
@@ -13655,6 +13681,13 @@ fn spawn_event_pump(
                         last_exit_reason = event
                             .payload
                             .get("reason")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|reason| !reason.is_empty())
+                            .map(str::to_owned);
+                        last_exit_error_reason = event
+                            .payload
+                            .get("errorReason")
                             .and_then(Value::as_str)
                             .map(str::trim)
                             .filter(|reason| !reason.is_empty())
@@ -14016,6 +14049,17 @@ fn spawn_event_pump(
             };
             // A provider may already have settled its turn before announcing exit.
             if let Some(turn_id) = active_turn_id {
+                let mut payload = json!({
+                    "state": "failed",
+                    "errorMessage": stream_end_message,
+                    // The provider's stream died under BiBCode;
+                    // that is our transport, not a fault the
+                    // provider reported about the work itself.
+                    "errorClass": "transport_error",
+                });
+                if let Some(error_reason) = &last_exit_error_reason {
+                    payload["errorReason"] = json!(error_reason);
+                }
                 let failure = ProviderEvent {
                     native_event_id: None,
                     event_type: "turn.completed".to_owned(),
@@ -14023,14 +14067,7 @@ fn spawn_event_pump(
                     turn_id: Some(turn_id),
                     item_id: None,
                     request_id: None,
-                    payload: json!({
-                        "state": "failed",
-                        "errorMessage": stream_end_message,
-                        // The provider's stream died under BiBCode;
-                        // that is our transport, not a fault the
-                        // provider reported about the work itself.
-                        "errorClass": "transport_error",
-                    }),
+                    payload,
                     activity: Vec::new(),
                     activity_controls: Default::default(),
                 };
@@ -18278,8 +18315,9 @@ fn antigravity_error(error: AntigravityRuntimeError) -> ProviderRuntimeError {
         // The CLI's own words reach only the thread's turn error. Logs, delivery details and
         // launch errors get the method we sent, the code, the class, and the sanitized reason.
         AntigravityRuntimeError::Protocol(error) => {
-            use crate::provider::antigravity::acp::{
-                AcpProtocolError, acp_error_class, acp_error_reason,
+            use crate::provider::antigravity::{
+                acp::{AcpProtocolError, acp_error_class, acp_error_reason},
+                runtime::antigravity_transport_message,
             };
             let class = acp_error_class(&error);
             let reason = acp_error_reason(&error);
@@ -18288,31 +18326,7 @@ fn antigravity_error(error: AntigravityRuntimeError) -> ProviderRuntimeError {
                 AcpProtocolError::RemoteRequest { method, code, .. } => {
                     format!("Antigravity answered {method} with error {code} ({class})")
                 }
-                _ => match reason {
-                    "line_too_long" => {
-                        "Antigravity sent a message longer than BiBCode accepts (transport_error: line_too_long)"
-                            .to_owned()
-                    }
-                    "connection_closed" => {
-                        "Antigravity connection closed unexpectedly (transport_error: connection_closed)"
-                            .to_owned()
-                    }
-                    "read_failure" => {
-                        "Antigravity output read failed (transport_error: read_failure)".to_owned()
-                    }
-                    "write_failure" => {
-                        "Antigravity input write failed (transport_error: write_failure)".to_owned()
-                    }
-                    "invalid_message" => {
-                        "Antigravity sent an invalid protocol message (transport_error: invalid_message)"
-                            .to_owned()
-                    }
-                    "unknown_response" => {
-                        "Antigravity sent an uncorrelated protocol response (transport_error: unknown_response)"
-                            .to_owned()
-                    }
-                    _ => format!("Antigravity connection failed ({class}: {reason})"),
-                },
+                _ => antigravity_transport_message(reason),
             };
             let provider = "antigravity".to_owned();
             if line_too_long {
@@ -18528,6 +18542,9 @@ impl ProviderDriver for AntigravityDriver {
     }
     fn retired(&self) -> bool {
         self.runtime.is_retired()
+    }
+    fn transport_closed(&self) -> bool {
+        self.runtime.is_transport_closed()
     }
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
@@ -42904,57 +42921,97 @@ done
                     [],
                 )?;
                 connection.execute(
-                    "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('retry-cmd-1', 'ag-retry', 'retry-msg-1', 'antigravity', 'antigravity', NULL, 'retry-key-1', ?, 'sending', 1, NULL, '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z')",
+                    "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('retry-cmd-1', 'ag-retry', 'retry-msg-1', 'antigravity', 'antigravity', NULL, 'retry-key-1', ?, 'pending', 0, NULL, '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z')",
                     [payload],
                 )?;
                 Ok(())
             })
             .await
             .expect("seed delivery row");
-        let supervisor = antigravity_supervisor(&engine, &temp).await;
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        let supervisor = Arc::new(antigravity_supervisor(&engine, &temp).await);
+        let service = crate::production::turn_delivery::TurnDeliveryService::start(
+            engine.clone(),
+            supervisor.clone(),
+            temp.path().to_path_buf(),
+        );
 
-        let first = timeout(
-            Duration::from_secs(20),
-            super::deliver_durable_orchestration_turn(
-                &supervisor,
-                &engine,
-                &temp.path().to_path_buf(),
-                command.clone(),
-                "retry-key-1".to_owned(),
-            ),
-        )
-        .await
-        .expect("first delivery ends in time");
-        match &first {
-            super::ProviderDeliveryOutcome::Ambiguous { detail } => {
-                assert!(
-                    detail.contains("connection_closed"),
-                    "expected connection_closed detail on broken transport: {detail}"
-                );
+        let uncertain_detail = timeout(Duration::from_secs(20), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("retry-cmd-1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if row.state == super::TurnDeliveryState::Uncertain {
+                    return row.last_error.unwrap_or_default();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            other => panic!("expected Ambiguous outcome on mid-prompt disconnect, got {other:?}"),
-        }
+        })
+        .await
+        .expect("first delivery transitions to Uncertain in time");
+        assert!(
+            uncertain_detail.contains("connection_closed"),
+            "expected connection_closed detail on broken transport: {uncertain_detail}"
+        );
         assert!(
             once_marker.exists(),
             "first launch should have disconnected"
         );
 
-        let retried = timeout(
-            Duration::from_secs(20),
-            super::deliver_durable_orchestration_turn(
-                &supervisor,
-                &engine,
-                &temp.path().to_path_buf(),
-                command,
-                "retry-key-1".to_owned(),
-            ),
-        )
+        // Verify the production event pump recorded `provider.turn-failed` with the sanitized
+        // `connection_closed` reason (never `null`) before or during stream-end settlement.
+        let turn_failed_evidence = timeout(Duration::from_secs(5), async {
+            loop {
+                let recorded = crate::diagnostics::profiler::provider_turns::take_recorded();
+                if let Some((_, evidence)) = recorded.into_iter().find(|(kind, evidence)| {
+                    *kind == "provider.turn-failed" && evidence["provider"] == "antigravity"
+                }) {
+                    return evidence;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
         .await
-        .expect("retry delivery ends in time");
-        assert!(
-            matches!(retried, super::ProviderDeliveryOutcome::Accepted { .. }),
-            "expected Retry to spawn a healthy agy acp session and succeed, got {retried:?}"
+        .expect("production event pump records provider.turn-failed");
+        assert_eq!(turn_failed_evidence["errorClass"], "transport_error");
+        assert_eq!(
+            turn_failed_evidence["terminalReason"], "connection_closed",
+            "production pump must preserve sanitized terminalReason instead of null: {turn_failed_evidence}"
         );
+
+        // Trigger the real Retry outbox transition (`Uncertain` -> `Pending`), wake the delivery
+        // service, and verify it spawns a healthy `agy acp` process and delivers the exact message.
+        engine
+            .dispatch(OrchestrationCommand::ThreadTurnDeliveryResolve {
+                command_id: "retry-resolve-1".to_owned(),
+                thread_id: "ag-retry".to_owned(),
+                message_id: "retry-msg-1".to_owned(),
+                action: crate::orchestration::engine::TurnDeliveryResolutionAction::Retry,
+                created_at: "2026-07-16T00:00:01Z".to_owned(),
+            })
+            .await
+            .expect("retry resolution accepted");
+        service.wake();
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("retry-cmd-1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if row.state == super::TurnDeliveryState::Delivered {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("retried delivery reaches Delivered in time");
 
         let captured = std::fs::read_to_string(&capture).unwrap_or_default();
         let prompt_lines: Vec<Value> = captured
@@ -42983,6 +43040,7 @@ done
             "retry after broken transport must launch a fresh agy acp process"
         );
 
+        service.shutdown().await;
         timeout(Duration::from_secs(10), supervisor.shutdown())
             .await
             .expect("shutdown in time")
