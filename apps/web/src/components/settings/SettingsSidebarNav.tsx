@@ -133,7 +133,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
-      <SidebarSeparator />
+      <SidebarSeparator className="bg-border" />
 
       <SidebarContent className="overflow-x-hidden">
         <SidebarGroup className="px-2 py-3">
@@ -149,7 +149,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
                     className={
                       isActive
                         ? "gap-2.5 px-2.5 py-2 text-left text-[13px] font-medium text-foreground"
-                        : "gap-2.5 px-2.5 py-2 text-left text-[13px] text-muted-foreground/70 hover:text-foreground/80"
+                        : "gap-2.5 px-2.5 py-2 text-left text-[13px] font-medium text-foreground/80 hover:text-foreground"
                     }
                     onClick={() => handleSectionClick(item.to)}
                   >
@@ -170,7 +170,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
       </SidebarContent>
 
       {policy.showRemoteDeviceControls ? (
-        <SidebarFooter className="border-t border-sidebar-border p-2 empty:hidden">
+        <SidebarFooter className="border-t border-border p-2 empty:hidden">
           <BiBCodeConnectSidebarSignIn />
           <BiBCodeConnectSidebarAvatar />
         </SidebarFooter>
