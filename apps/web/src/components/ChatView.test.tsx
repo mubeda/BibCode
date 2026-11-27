@@ -9357,20 +9357,19 @@ describe("ChatView composer model picker provider scope (#347)", () => {
 
     const strip = container.querySelector('[data-testid="composer-context-strip"]');
     expect(strip).not.toBeNull();
+    expect(strip?.className).toContain("pointer-events-auto");
     expect(strip?.closest("[data-chat-composer-footer]")).toBeNull();
     expect(strip?.textContent).toContain("Local");
-    expect(container.querySelector('[data-testid="composer-context-folder"]')?.textContent).toBe(
-      "bibcode",
-    );
-    expect(
-      container.querySelector('[data-testid="composer-context-folder"]')?.getAttribute("title"),
-    ).toBe("/workspace/bibcode");
+    const folder = container.querySelector('[data-testid="composer-context-folder"]');
+    const branch = container.querySelector('[data-testid="composer-context-branch"]');
+    expect(folder?.className).toContain("pointer-events-auto");
+    expect(branch?.className).toContain("pointer-events-auto");
+    expect(folder?.textContent).toBe("bibcode");
+    expect(folder?.getAttribute("title")).toBe("/workspace/bibcode");
     expect(
       container.querySelector('[data-testid="composer-context-checkout-kind"]')?.textContent,
     ).toBe("Main checkout");
-    expect(container.querySelector('[data-testid="composer-context-branch"]')?.textContent).toBe(
-      "main",
-    );
+    expect(branch?.textContent).toBe("main");
   });
 
   it("derives Worktree for a linked worktree thread (#428)", async () => {

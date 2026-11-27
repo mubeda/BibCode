@@ -3,6 +3,7 @@ import { memo, useCallback, useRef } from "react";
 
 import { markKeyboardContextMenuOpened } from "../../contextMenuKeyboard";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
+import { normalizeProjectPathForComparison } from "../../lib/projectPaths";
 import { readLocalApi } from "../../localApi";
 import { isContextMenuShortcut, isKeyboardContextMenuEcho } from "../Sidebar.logic";
 import { toastManager } from "../ui/toast";
@@ -39,24 +40,25 @@ function trimmedOrNull(value: string | null | undefined): string | null {
   return trimmed && trimmed.length > 0 ? trimmed : null;
 }
 
-export function normalizeCheckoutPath(path: string): string {
-  const normalized = path.trim().replaceAll("\\", "/");
-  if (normalized === "/" || /^[A-Za-z]:\/$/.test(normalized)) {
-    return normalized;
-  }
-  const stripped = normalized.replace(/\/+$/, "");
-  if (/^[A-Za-z]:$/.test(stripped)) {
-    return `${stripped}/`;
-  }
-  return stripped || "/";
+function isWindowsStylePath(path: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
 }
 
 export function folderBasename(path: string): string {
-  const trimmed = path.replace(/[\\/]+$/, "");
-  if (!trimmed || /^[A-Za-z]:$/.test(trimmed)) {
+  if (isWindowsStylePath(path)) {
+    const trimmed = path.replace(/[\\/]+$/, "");
+    if (!trimmed || /^[A-Za-z]:$/.test(trimmed)) {
+      return path;
+    }
+    const separatorIndex = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+    return separatorIndex >= 0 ? trimmed.slice(separatorIndex + 1) : trimmed;
+  }
+
+  const trimmed = path.replace(/\/+$/, "");
+  if (!trimmed) {
     return path;
   }
-  const separatorIndex = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  const separatorIndex = trimmed.lastIndexOf("/");
   return separatorIndex >= 0 ? trimmed.slice(separatorIndex + 1) : trimmed;
 }
 
@@ -66,14 +68,15 @@ export function deriveComposerContextStripState(
   const environmentLabel = trimmedOrNull(input.environmentLabel);
   const projectCwd = trimmedOrNull(input.projectCwd);
   const worktreePath = trimmedOrNull(input.worktreePath);
-  const checkoutPath = worktreePath ?? projectCwd;
+  // Gate checkout path, kind, and branch on a resolved project root (matching `gitCwd`).
+  const checkoutPath = projectCwd !== null ? (worktreePath ?? projectCwd) : null;
 
   let checkoutKind: ComposerCheckoutKind | null = null;
-  if (checkoutPath !== null) {
+  if (checkoutPath !== null && projectCwd !== null) {
     checkoutKind =
       worktreePath !== null &&
-      (projectCwd === null ||
-        normalizeCheckoutPath(worktreePath) !== normalizeCheckoutPath(projectCwd))
+      normalizeProjectPathForComparison(worktreePath) !==
+        normalizeProjectPathForComparison(projectCwd)
         ? "Worktree"
         : "Main checkout";
   }
@@ -236,13 +239,13 @@ export const ComposerContextStrip = memo(function ComposerContextStrip({
   return (
     <div
       data-testid="composer-context-strip"
-      className="mx-auto flex w-full max-w-220 min-w-0 items-center gap-3 overflow-hidden pt-1.5 text-xs text-muted-foreground select-none"
+      className="pointer-events-auto mx-auto flex w-full max-w-220 min-w-0 items-center gap-3 overflow-hidden pt-1.5 text-xs text-muted-foreground select-none"
     >
       {environmentLabel ? (
         <span
           data-testid="composer-context-environment"
           title={environmentLabel}
-          className="inline-flex min-w-0 max-w-[30%] shrink-0 items-center gap-1"
+          className="inline-flex min-w-0 max-w-[28%] shrink items-center gap-1"
         >
           <ServerIcon className="size-3.5 shrink-0" aria-hidden="true" />
           <span className="truncate">{environmentLabel}</span>
@@ -259,7 +262,7 @@ export const ComposerContextStrip = memo(function ComposerContextStrip({
                 title={checkoutPath}
                 onContextMenu={handleFolderContextMenu}
                 onKeyDown={handleFolderKeyDown}
-                className="inline-flex min-w-0 max-w-[35%] items-center gap-1 rounded-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                className="pointer-events-auto inline-flex min-w-0 max-w-fit flex-1 items-center gap-1 rounded-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               />
             }
           >
@@ -273,7 +276,7 @@ export const ComposerContextStrip = memo(function ComposerContextStrip({
       ) : null}
 
       {checkoutKind ? (
-        <span data-testid="composer-context-checkout-kind" className="shrink-0">
+        <span data-testid="composer-context-checkout-kind" className="shrink-0 whitespace-nowrap">
           {checkoutKind}
         </span>
       ) : null}
@@ -288,7 +291,7 @@ export const ComposerContextStrip = memo(function ComposerContextStrip({
                 title={branch}
                 onContextMenu={handleBranchContextMenu}
                 onKeyDown={handleBranchKeyDown}
-                className="inline-flex min-w-0 flex-1 items-center gap-1 rounded-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                className="pointer-events-auto inline-flex min-w-0 max-w-fit flex-1 items-center gap-1 rounded-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               />
             }
           >

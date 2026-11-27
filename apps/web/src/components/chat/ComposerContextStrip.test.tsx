@@ -29,9 +29,10 @@ import {
 } from "./ComposerContextStrip";
 
 describe("folderBasename", () => {
-  it("extracts folder names from Unix and Windows paths", () => {
+  it("extracts folder names from Unix and Windows paths without splitting POSIX backslashes", () => {
     expect(folderBasename("/workspace/projects/bibcode")).toBe("bibcode");
     expect(folderBasename("/workspace/projects/bibcode/")).toBe("bibcode");
+    expect(folderBasename("/work/a\\b")).toBe("a\\b");
     expect(folderBasename("C:\\repo\\worktrees\\feat-ui\\")).toBe("feat-ui");
     expect(folderBasename("/")).toBe("/");
     expect(folderBasename("C:\\")).toBe("C:\\");
@@ -39,7 +40,7 @@ describe("folderBasename", () => {
 });
 
 describe("deriveComposerContextStripState", () => {
-  it("derives Main checkout for primary checkouts and Worktree for linked worktrees", () => {
+  it("derives Main checkout for primary checkouts and Worktree for linked worktrees across Windows and POSIX paths", () => {
     const primary = deriveComposerContextStripState({
       environmentLabel: "Local",
       projectCwd: "/workspace/bibcode",
@@ -58,10 +59,10 @@ describe("deriveComposerContextStripState", () => {
       branch: "main",
     });
 
-    const samePath = deriveComposerContextStripState({
+    const sameWindowsPath = deriveComposerContextStripState({
       environmentLabel: "Local",
-      projectCwd: "/workspace/bibcode/",
-      worktreePath: "/workspace/bibcode",
+      projectCwd: "C:\\Work\\Repo",
+      worktreePath: "c:/work/repo/",
       fallbackBranch: null,
       vcsStatus: {
         data: { isRepo: true, refName: "main" },
@@ -69,7 +70,20 @@ describe("deriveComposerContextStripState", () => {
         error: null,
       },
     });
-    expect(samePath.checkoutKind).toBe("Main checkout");
+    expect(sameWindowsPath.checkoutKind).toBe("Main checkout");
+
+    const distinctPosixBackslash = deriveComposerContextStripState({
+      environmentLabel: "Local",
+      projectCwd: "/work/a\\b",
+      worktreePath: "/work/a/b",
+      fallbackBranch: null,
+      vcsStatus: {
+        data: { isRepo: true, refName: "main" },
+        isPending: false,
+        error: null,
+      },
+    });
+    expect(distinctPosixBackslash.checkoutKind).toBe("Worktree");
 
     const linked = deriveComposerContextStripState({
       environmentLabel: "Build Host",
@@ -90,12 +104,12 @@ describe("deriveComposerContextStripState", () => {
     });
   });
 
-  it("omits folder and checkout kind without a path and omits stale branch on non-repo or detached HEAD", () => {
+  it("omits folder and checkout kind without a resolved project and omits stale branch on non-repo or detached HEAD", () => {
     expect(
       deriveComposerContextStripState({
         environmentLabel: "Local",
         projectCwd: null,
-        worktreePath: null,
+        worktreePath: "/workspace/stale-draft-worktree",
         fallbackBranch: "historical-branch",
         vcsStatus: null,
       }),
