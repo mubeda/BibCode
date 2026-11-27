@@ -9346,4 +9346,76 @@ describe("ChatView composer model picker provider scope (#347)", () => {
       new Set([claudeInstanceId, claudeWorkProvider.instanceId]),
     );
   });
+
+  it("renders environment, folder, Main checkout, and live branch below ChatComposer for a primary checkout (#428)", async () => {
+    seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+    h.queryDataByKey.set("vcs.status", { isRepo: true, refName: "main" });
+    seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+    seedServerThread(makeThread({ branch: "stale-thread-branch", worktreePath: null }));
+
+    const container = await mount(serverRoute);
+
+    const strip = container.querySelector('[data-testid="composer-context-strip"]');
+    expect(strip).not.toBeNull();
+    expect(strip?.closest("[data-chat-composer-footer]")).toBeNull();
+    expect(strip?.textContent).toContain("Local");
+    expect(container.querySelector('[data-testid="composer-context-folder"]')?.textContent).toBe(
+      "bibcode",
+    );
+    expect(
+      container.querySelector('[data-testid="composer-context-folder"]')?.getAttribute("title"),
+    ).toBe("/workspace/bibcode");
+    expect(
+      container.querySelector('[data-testid="composer-context-checkout-kind"]')?.textContent,
+    ).toBe("Main checkout");
+    expect(container.querySelector('[data-testid="composer-context-branch"]')?.textContent).toBe(
+      "main",
+    );
+  });
+
+  it("derives Worktree for a linked worktree thread (#428)", async () => {
+    seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+    h.queryDataByKey.set("vcs.status", { isRepo: true, refName: "feat/worktree-row" });
+    seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+    seedServerThread(
+      makeThread({
+        branch: "feat/worktree-row",
+        worktreePath: "/workspace/bibcode-worktrees/feat-row",
+      }),
+    );
+
+    const container = await mount(serverRoute);
+
+    expect(container.querySelector('[data-testid="composer-context-folder"]')?.textContent).toBe(
+      "feat-row",
+    );
+    expect(
+      container.querySelector('[data-testid="composer-context-checkout-kind"]')?.textContent,
+    ).toBe("Worktree");
+    expect(container.querySelector('[data-testid="composer-context-branch"]')?.textContent).toBe(
+      "feat/worktree-row",
+    );
+  });
+
+  it("omits the branch segment when completed vcs status is detached HEAD even with a stale thread branch (#428)", async () => {
+    seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+    seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+    seedServerThread(makeThread({ branch: "historical-branch", worktreePath: null }));
+    h.queryDataByKey.set("vcs.status", { isRepo: true, refName: null });
+
+    const container = await mount(serverRoute);
+
+    expect(container.querySelector('[data-testid="composer-context-branch"]')).toBeNull();
+  });
+
+  it("omits the branch segment when completed vcs status is non-repo even with a stale thread branch (#428)", async () => {
+    seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+    seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+    seedServerThread(makeThread({ branch: "historical-branch", worktreePath: null }));
+    h.queryDataByKey.set("vcs.status", { isRepo: false, refName: null });
+
+    const container = await mount(serverRoute);
+
+    expect(container.querySelector('[data-testid="composer-context-branch"]')).toBeNull();
+  });
 });

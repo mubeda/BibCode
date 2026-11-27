@@ -46,6 +46,7 @@ import {
 import { queuedMessageCache } from "./chat/queuedMessageCache";
 import { mergeQueuedMessageIntoDraft } from "./chat/restoreQueuedMessage";
 import { PanelDiffPendingState } from "./chat/PanelDiffPendingState";
+import { ComposerContextStrip, deriveComposerContextStripState } from "./chat/ComposerContextStrip";
 import { RightPanelThreadContext } from "./chat/rightPanelThread";
 import {
   attachmentUploadFailureCopy,
@@ -3038,6 +3039,39 @@ function ChatViewContent(props: ChatViewProps) {
   // Default true while loading to avoid toolbar flicker.
   const isGitRepo = gitStatusQuery.data?.isRepo ?? true;
   const gitRightPanelAvailable = activeProject !== null && isGitRepo;
+  const composerContextEnvironmentLabel =
+    activeEnvironment?.label ??
+    environmentById.get(environmentId)?.label ??
+    serverConfig?.environment.label ??
+    null;
+  const composerContextStripState = useMemo(
+    () =>
+      deriveComposerContextStripState({
+        environmentLabel: composerContextEnvironmentLabel,
+        projectCwd: activeProjectCwd,
+        worktreePath: activeThreadWorktreePath,
+        fallbackBranch: activeThread?.branch ?? null,
+        vcsStatus:
+          gitCwd === null || workspaceUnavailable !== null
+            ? null
+            : {
+                data: gitStatusQuery.data,
+                isPending: gitStatusQuery.isPending,
+                error: gitStatusQuery.error,
+              },
+      }),
+    [
+      activeProjectCwd,
+      activeThread?.branch,
+      activeThreadWorktreePath,
+      composerContextEnvironmentLabel,
+      gitCwd,
+      gitStatusQuery.data,
+      gitStatusQuery.error,
+      gitStatusQuery.isPending,
+      workspaceUnavailable,
+    ],
+  );
   const terminalShortcutLabelOptions = useMemo(
     () => ({
       context: {
@@ -8394,9 +8428,11 @@ function ChatViewContent(props: ChatViewProps) {
                     <div
                       className={cn(
                         "chat-composer-horizontal-inset chat-composer-lower-chrome relative z-10",
-                        "pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:pb-[calc(env(safe-area-inset-bottom)+1rem)]",
+                        "pb-[calc(env(safe-area-inset-bottom)+0.5rem)] sm:pb-[calc(env(safe-area-inset-bottom)+0.625rem)]",
                       )}
-                    />
+                    >
+                      <ComposerContextStrip {...composerContextStripState} />
+                    </div>
                   </div>
 
                   {pullRequestDialogState ? (
