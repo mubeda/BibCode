@@ -381,6 +381,37 @@ describe("exited shell replay", () => {
       replayedTerm.dispose();
     }
 
+    // Long (>128 char) unfinished OSC title across eviction completes identically in xterm.js
+    // with bracketedPasteMode preserved and full 203-char title intact.
+    const longTitlePrefix = `\x1b[?2004h${"x".repeat(400)}\x1b]0;${"t".repeat(200)}`;
+    const longTitleTail = "END\x07";
+    const liveOscTerm = new Terminal();
+    const replayedOscTerm = new Terminal();
+    let liveTitle = "";
+    let replayedTitle = "";
+    liveOscTerm.onTitleChange((title) => {
+      liveTitle = title;
+    });
+    replayedOscTerm.onTitleChange((title) => {
+      replayedTitle = title;
+    });
+    const oscTranscript = createTerminalTranscript(512);
+    const oscGuard = installTerminalReplyGuard(replayedOscTerm, () => true);
+
+    await write(liveOscTerm, longTitlePrefix);
+    oscTranscript.append(longTitlePrefix);
+    oscGuard.replay(oscTranscript.snapshot(), false, false);
+    await write(replayedOscTerm, "");
+    await write(liveOscTerm, longTitleTail);
+    await write(replayedOscTerm, longTitleTail);
+
+    expect(replayedOscTerm.modes.bracketedPasteMode).toBe(true);
+    expect(replayedTitle).toBe(`${"t".repeat(200)}END`);
+    expect(replayedTitle).toBe(liveTitle);
+    oscGuard.dispose();
+    liveOscTerm.dispose();
+    replayedOscTerm.dispose();
+
     guard.dispose();
     terminal.dispose();
   });

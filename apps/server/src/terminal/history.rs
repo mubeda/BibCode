@@ -51,7 +51,9 @@ enum ModeParseState {
 struct BracketedPasteModeTracker {
     state: ModeParseState,
     enabled: bool,
+    pending_byte_len: usize,
     pending_seq: String,
+    pending_truncated: bool,
 }
 
 impl BracketedPasteModeTracker {
@@ -59,11 +61,19 @@ impl BracketedPasteModeTracker {
         self.enabled
     }
 
-    fn pending_sequence(&self) -> &str {
+    fn pending_byte_len(&self) -> usize {
         if self.state == ModeParseState::Ground {
-            ""
+            0
         } else {
-            &self.pending_seq
+            self.pending_byte_len
+        }
+    }
+
+    fn complete_pending_sequence(&self) -> Option<&str> {
+        if self.state == ModeParseState::Ground || self.pending_truncated {
+            None
+        } else {
+            Some(&self.pending_seq)
         }
     }
 
@@ -75,17 +85,25 @@ impl BracketedPasteModeTracker {
 
     fn enter_ground(&mut self) {
         self.state = ModeParseState::Ground;
+        self.pending_byte_len = 0;
         self.pending_seq.clear();
+        self.pending_truncated = false;
     }
 
     fn begin_pending(&mut self, ch: char) {
+        self.pending_byte_len = ch.len_utf8();
         self.pending_seq.clear();
         self.pending_seq.push(ch);
+        self.pending_truncated = false;
     }
 
     fn append_pending(&mut self, ch: char) {
-        if self.pending_seq.len() + ch.len_utf8() <= MAX_PENDING_ESCAPE_BYTES {
+        let len = ch.len_utf8();
+        self.pending_byte_len += len;
+        if !self.pending_truncated && self.pending_seq.len() + len <= MAX_PENDING_ESCAPE_BYTES {
             self.pending_seq.push(ch);
+        } else {
+            self.pending_truncated = true;
         }
     }
 
@@ -716,20 +734,29 @@ impl TerminalHistory {
         } else {
             ""
         };
-        let pending = self.bracketed_paste.pending_sequence();
-        if restore.is_empty() && pending.is_empty() {
-            return snapshot;
-        }
-        if !pending.is_empty() {
-            if let Some(prefix_len) = snapshot.len().checked_sub(pending.len())
-                && snapshot.ends_with(pending)
+        let pending_len = self.bracketed_paste.pending_byte_len();
+        if pending_len > 0 {
+            // When the entire unfinished control sequence is still retained at the tail of
+            // `snapshot` (even if longer than MAX_PENDING_ESCAPE_BYTES, e.g. a 200+ char OSC),
+            // insert `?2004h` at its exact boundary without duplicating or truncating it.
+            if let Some(split) = snapshot.len().checked_sub(pending_len)
+                && snapshot.is_char_boundary(split)
             {
-                snapshot.truncate(prefix_len);
-                snapshot.push_str(restore);
-                snapshot.push_str(pending);
-            } else {
-                snapshot.push_str(restore);
-                snapshot.push_str(pending);
+                if !restore.is_empty() {
+                    snapshot.insert_str(split, restore);
+                }
+                return snapshot;
+            }
+            // Otherwise the sequence opener was cleared or evicted: replay it only if untruncated
+            // (replacing any retained suffix of the same sequence so nothing is duplicated).
+            if let Some(pending) = self.bracketed_paste.complete_pending_sequence() {
+                let mut rebuilt = String::with_capacity(restore.len() + pending.len());
+                rebuilt.push_str(restore);
+                rebuilt.push_str(pending);
+                return rebuilt;
+            }
+            if !restore.is_empty() {
+                snapshot.insert_str(0, restore);
             }
             return snapshot;
         }
@@ -1359,5 +1386,32 @@ mod tests {
         mid_enable_clear.push("\x1b[?20");
         mid_enable_clear.clear();
         assert_eq!(mid_enable_clear.snapshot_for_replay(true), "\x1b[?20");
+
+        // Long (>128 byte) unfinished OSC sequence after eviction inserts `?2004h` at the exact
+        // sequence boundary without duplicating or truncating the OSC opener.
+        let long_osc = format!("\x1b]0;{}", "t".repeat(200));
+        let mut long_with_mode = TerminalHistory::with_byte_limit(100, 512);
+        long_with_mode.push("\x1b[?2004h");
+        long_with_mode.push(&"x".repeat(400));
+        long_with_mode.push(&long_osc);
+        let long_snap = long_with_mode.snapshot_for_replay(true);
+        assert!(long_snap.ends_with(&format!("\x1b[?2004h{long_osc}")));
+        assert_eq!(long_snap.matches("\x1b]0;").count(), 1);
+
+        let mut long_without_mode = TerminalHistory::with_byte_limit(100, 512);
+        long_without_mode.push(&"x".repeat(400));
+        long_without_mode.push(&long_osc);
+        let long_no_mode_snap = long_without_mode.snapshot_for_replay(true);
+        assert!(long_no_mode_snap.ends_with(&long_osc));
+        assert_eq!(long_no_mode_snap.matches("\x1b]0;").count(), 1);
+
+        // Unfinished OSC larger than the entire history byte limit restores `?2004h` at the start
+        // without appending a truncated duplicate OSC opener.
+        let mut oversized_osc = TerminalHistory::with_byte_limit(100, 64);
+        oversized_osc.push("\x1b[?2004h");
+        oversized_osc.push(&long_osc);
+        let oversized_snap = oversized_osc.snapshot_for_replay(true);
+        assert!(oversized_snap.starts_with("\x1b[?2004h"));
+        assert!(!oversized_snap.contains("\x1b]0;"));
     }
 }

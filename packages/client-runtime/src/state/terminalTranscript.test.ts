@@ -251,5 +251,34 @@ describe("createTerminalTranscript", () => {
     midEnableClear.append("\u001b[?20");
     midEnableClear.clear({ preserveModes: true });
     expect(midEnableClear.snapshot()).toBe("\u001b[?20");
+
+    // Long (>128 chars) unfinished OSC title after history eviction inserts `?2004h` at the exact
+    // sequence boundary without appending a duplicate truncated OSC opener.
+    const longOscPayload = "t".repeat(200);
+    const longOsc = `\u001b]0;${longOscPayload}`;
+    const longWithMode = createTerminalTranscript(512);
+    longWithMode.append("\u001b[?2004h");
+    longWithMode.append("x".repeat(400));
+    longWithMode.append(longOsc);
+    const longSnap = longWithMode.snapshot();
+    expect(longSnap.endsWith(`\u001b[?2004h${longOsc}`)).toBe(true);
+    expect(longSnap.split("\u001b]0;")).toHaveLength(2);
+
+    // Without `?2004h`, a long unfinished OSC after eviction is returned verbatim with no duplication.
+    const longWithoutMode = createTerminalTranscript(512);
+    longWithoutMode.append("x".repeat(400));
+    longWithoutMode.append(longOsc);
+    const longNoModeSnap = longWithoutMode.snapshot();
+    expect(longNoModeSnap.endsWith(longOsc)).toBe(true);
+    expect(longNoModeSnap.split("\u001b]0;")).toHaveLength(2);
+
+    // Unfinished OSC larger than the entire transcript buffer restores `?2004h` at the start
+    // without appending a truncated duplicate OSC opener.
+    const oversizedOsc = createTerminalTranscript(64);
+    oversizedOsc.append("\u001b[?2004h");
+    oversizedOsc.append(longOsc);
+    const oversizedSnap = oversizedOsc.snapshot();
+    expect(oversizedSnap.startsWith("\u001b[?2004h")).toBe(true);
+    expect(oversizedSnap).not.toContain("\u001b]0;");
   });
 });

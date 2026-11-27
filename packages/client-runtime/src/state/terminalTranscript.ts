@@ -36,16 +36,27 @@ class BracketedPasteModeTracker {
   private inSubparam = false;
   private has2004 = false;
   private enabled = false;
-  /** Unfinished control sequence at the end of the fed stream, when not in Ground. */
+  /** Exact UTF-16 length of the unfinished control sequence at the end of the stream (0 in Ground). */
+  private pendingLen = 0;
+  /** Unfinished control sequence prefix, populated up to MAX_PENDING_ESCAPE_CHARS. */
   private pendingSeq = "";
+  private pendingTruncated = false;
 
   isEnabled(): boolean {
     return this.enabled;
   }
 
-  /** Trailing incomplete escape sequence currently in progress (empty when in Ground). */
-  pendingSequence(): string {
-    return this.state === ModeParseState.Ground ? "" : this.pendingSeq;
+  /** Exact UTF-16 length of the unfinished control sequence currently in progress (0 in Ground). */
+  pendingLength(): number {
+    return this.state === ModeParseState.Ground ? 0 : this.pendingLen;
+  }
+
+  /** Full unfinished sequence only when it fit untruncated within MAX_PENDING_ESCAPE_CHARS. */
+  completePendingSequence(): string | null {
+    if (this.state === ModeParseState.Ground || this.pendingTruncated) {
+      return null;
+    }
+    return this.pendingSeq;
   }
 
   reset(): void {
@@ -54,7 +65,9 @@ class BracketedPasteModeTracker {
     this.inSubparam = false;
     this.has2004 = false;
     this.enabled = false;
+    this.pendingLen = 0;
     this.pendingSeq = "";
+    this.pendingTruncated = false;
   }
 
   feed(text: string): void {
@@ -67,16 +80,23 @@ class BracketedPasteModeTracker {
 
   private enterGround(): void {
     this.state = ModeParseState.Ground;
+    this.pendingLen = 0;
     this.pendingSeq = "";
+    this.pendingTruncated = false;
   }
 
   private beginPending(ch: string): void {
+    this.pendingLen = ch.length;
     this.pendingSeq = ch;
+    this.pendingTruncated = false;
   }
 
   private appendPending(ch: string): void {
-    if (this.pendingSeq.length < MAX_PENDING_ESCAPE_CHARS) {
+    this.pendingLen += ch.length;
+    if (!this.pendingTruncated && this.pendingSeq.length + ch.length <= MAX_PENDING_ESCAPE_CHARS) {
       this.pendingSeq += ch;
+    } else {
+      this.pendingTruncated = true;
     }
   }
 
@@ -395,8 +415,7 @@ export function createTerminalTranscript(
       head = 0;
       totalBytes = 0;
       if (options?.preserveModes === true) {
-        const pending = modeTracker.pendingSequence();
-        if (modeTracker.isEnabled() || pending.length > 0) {
+        if (modeTracker.isEnabled() || modeTracker.completePendingSequence() !== null) {
           discardedPrefix = true;
         }
       } else {
@@ -418,20 +437,28 @@ export function createTerminalTranscript(
       if (!discardedPrefix) {
         return joined;
       }
-      const pending = modeTracker.pendingSequence();
       const restore = modeTracker.isEnabled() ? BRACKETED_PASTE_ENABLE_SEQUENCE : "";
-      if (restore.length === 0 && pending.length === 0) {
-        return joined;
-      }
-      // Insert the synthetic `?2004h` at a parser-safe boundary BEFORE any unfinished control
-      // sequence still arriving from the PTY so the next live delta completes it cleanly.
-      if (pending.length > 0) {
-        if (joined.endsWith(pending)) {
-          return `${joined.slice(0, joined.length - pending.length)}${restore}${pending}`;
+      const pendingLen = modeTracker.pendingLength();
+      if (pendingLen > 0) {
+        // When the entire unfinished control sequence is still retained at the tail of `joined`
+        // (even if it is longer than MAX_PENDING_ESCAPE_CHARS, e.g. a 200+ char OSC title),
+        // insert `?2004h` at its exact boundary without duplicating or truncating the sequence.
+        if (pendingLen <= joined.length) {
+          if (restore.length === 0) {
+            return joined;
+          }
+          const split = joined.length - pendingLen;
+          return `${joined.slice(0, split)}${restore}${joined.slice(split)}`;
         }
-        return `${joined}${restore}${pending}`;
+        // Otherwise the sequence opener was cleared or evicted: replay it only if untruncated
+        // (replacing any retained suffix of the same sequence so nothing is duplicated).
+        const completePending = modeTracker.completePendingSequence();
+        if (completePending !== null) {
+          return `${restore}${completePending}`;
+        }
+        return restore.length === 0 ? joined : `${restore}${joined}`;
       }
-      return `${joined}${restore}`;
+      return restore.length === 0 ? joined : `${joined}${restore}`;
     },
     byteLength() {
       return totalBytes;
