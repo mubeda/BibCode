@@ -219,4 +219,37 @@ describe("createTerminalTranscript", () => {
     transcript.append("b".repeat(64));
     expect(transcript.snapshot()).toBe("b".repeat(32));
   });
+
+  it("matches xterm on C1 CSI, colon subparameters, parameterized DECSTR, and mid-sequence replay boundaries", () => {
+    // C1 CSI (`\u009b?2004h`)
+    const c1 = createTerminalTranscript(32);
+    c1.append("\u009b?2004h");
+    c1.append("a".repeat(64));
+    expect(c1.snapshot().endsWith("\u001b[?2004h")).toBe(true);
+
+    // Colon subparameter before `;2004h` (`\x1b[?1:2;2004h`) + parameterized DECSTR (`\x1b[0!p`)
+    const sub = createTerminalTranscript(32);
+    sub.append("\u001b[?1:2;2004h");
+    sub.append("b".repeat(64));
+    expect(sub.snapshot().endsWith("\u001b[?2004h")).toBe(true);
+    sub.append("\u001b[0!p");
+    sub.append("c".repeat(64));
+    expect(sub.snapshot()).toBe("c".repeat(32));
+
+    // Snapshot halfway through `\x1b[?2004l` places `?2004h` BEFORE the unfinished `\x1b[?20`
+    // so the next live delta `"04l"` completes `\x1b[?2004l` cleanly.
+    const midDisable = createTerminalTranscript(32);
+    midDisable.append("\u001b[?2004h");
+    midDisable.append("d".repeat(64));
+    midDisable.append("\u001b[?20");
+    const snap = midDisable.snapshot();
+    expect(snap.endsWith("\u001b[?2004h\u001b[?20")).toBe(true);
+
+    // Clear halfway through `\x1b[?2004h` preserves the unfinished `\x1b[?20` prefix so live
+    // `"04h"` completes the transition.
+    const midEnableClear = createTerminalTranscript(32);
+    midEnableClear.append("\u001b[?20");
+    midEnableClear.clear({ preserveModes: true });
+    expect(midEnableClear.snapshot()).toBe("\u001b[?20");
+  });
 });

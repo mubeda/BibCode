@@ -20,6 +20,7 @@ const DEFAULT_BYTE_LIMIT: usize = 1_048_576;
 const CLIENT_TRANSCRIPT_CUT_BYTES: usize = 512 * 1024;
 
 const BRACKETED_PASTE_ENABLE_SEQUENCE: &str = "\x1b[?2004h";
+const MAX_PENDING_ESCAPE_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ModeParseState {
@@ -31,22 +32,26 @@ enum ModeParseState {
     StringSeq,
     StringEsc,
     CsiStart,
+    CsiParams,
     CsiBang,
     CsiDecPrivate {
         current_param: u32,
+        in_subparam: bool,
         has_2004: bool,
-        valid: bool,
     },
     CsiIgnore,
 }
 
-/// Streaming VT state machine tracking DEC private mode `?2004h`/`?2004l` (bracketed paste)
-/// across arbitrary chunk boundaries, including multi-parameter DECSET/DECRST, RIS (`\x1bc`),
-/// and DECSTR (`\x1b[!p`).
-#[derive(Clone, Copy, Debug, Default)]
+/// Streaming VT state machine aligned with xterm.js tracking DEC private mode `?2004h`/`?2004l`
+/// (bracketed paste) across arbitrary chunk boundaries, including Unicode C1 CSI (`\u{009b}`),
+/// multi-parameter DECSET/DECRST with colon subparameters (`\x1b[?1:2;2004h`), RIS (`\x1bc`),
+/// and parameterized DECSTR (`\x1b[0!p` / `\x1b[!p`). Tracks any unfinished control sequence at
+/// the end of the stream so mode restoration is inserted at a parser-safe boundary (#431).
+#[derive(Clone, Debug, Default)]
 struct BracketedPasteModeTracker {
     state: ModeParseState,
     enabled: bool,
+    pending_seq: String,
 }
 
 impl BracketedPasteModeTracker {
@@ -54,124 +59,263 @@ impl BracketedPasteModeTracker {
         self.enabled
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.step(byte);
+    fn pending_sequence(&self) -> &str {
+        if self.state == ModeParseState::Ground {
+            ""
+        } else {
+            &self.pending_seq
         }
     }
 
-    fn step(&mut self, byte: u8) {
+    fn feed(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.step(ch);
+        }
+    }
+
+    fn enter_ground(&mut self) {
+        self.state = ModeParseState::Ground;
+        self.pending_seq.clear();
+    }
+
+    fn begin_pending(&mut self, ch: char) {
+        self.pending_seq.clear();
+        self.pending_seq.push(ch);
+    }
+
+    fn append_pending(&mut self, ch: char) {
+        if self.pending_seq.len() + ch.len_utf8() <= MAX_PENDING_ESCAPE_BYTES {
+            self.pending_seq.push(ch);
+        }
+    }
+
+    fn step(&mut self, ch: char) {
+        // Anywhere transitions per VT500 / xterm.js EscapeSequenceParser.
+        match ch {
+            '\x18' | '\x1a' | '\u{009c}' => {
+                self.enter_ground();
+                return;
+            }
+            '\u{009b}' => {
+                self.begin_pending(ch);
+                self.state = ModeParseState::CsiStart;
+                return;
+            }
+            '\u{009d}' => {
+                self.begin_pending(ch);
+                self.state = ModeParseState::Osc;
+                return;
+            }
+            '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
+                self.begin_pending(ch);
+                self.state = ModeParseState::StringSeq;
+                return;
+            }
+            _ => {}
+        }
+
+        let code = ch as u32;
         match self.state {
             ModeParseState::Ground => {
-                if byte == 0x1b {
+                if ch == '\x1b' {
+                    self.begin_pending(ch);
                     self.state = ModeParseState::Esc;
                 }
             }
-            ModeParseState::Esc => self.step_esc(byte),
+            ModeParseState::Esc => self.step_esc(ch),
             ModeParseState::EscIntermediate => {
-                if byte == 0x1b {
+                if ch == '\x1b' {
+                    self.begin_pending(ch);
                     self.state = ModeParseState::Esc;
-                } else if !(0x20..=0x2f).contains(&byte) {
-                    self.state = ModeParseState::Ground;
+                } else if (0x20..=0x2f).contains(&code) {
+                    self.append_pending(ch);
+                } else {
+                    self.enter_ground();
                 }
             }
-            ModeParseState::Osc => match byte {
-                0x07 | 0x18 | 0x1a => self.state = ModeParseState::Ground,
-                0x1b => self.state = ModeParseState::StringEsc,
-                _ => {}
+            ModeParseState::Osc => match ch {
+                '\x07' => self.enter_ground(),
+                '\x1b' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::StringEsc;
+                }
+                _ => self.append_pending(ch),
             },
-            ModeParseState::StringSeq => match byte {
-                0x18 | 0x1a => self.state = ModeParseState::Ground,
-                0x1b => self.state = ModeParseState::StringEsc,
-                _ => {}
+            ModeParseState::StringSeq => match ch {
+                '\x1b' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::StringEsc;
+                }
+                _ => self.append_pending(ch),
             },
-            ModeParseState::StringEsc => match byte {
-                b'\\' => self.state = ModeParseState::Ground,
-                0x1b => self.state = ModeParseState::StringEsc,
-                other => self.step_esc(other),
+            ModeParseState::StringEsc => match ch {
+                '\\' => self.enter_ground(),
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                other => {
+                    self.begin_pending('\x1b');
+                    self.step_esc(other);
+                }
             },
-            ModeParseState::CsiStart => match byte {
-                b'?' => {
+            ModeParseState::CsiStart => match ch {
+                '?' => {
+                    self.append_pending(ch);
                     self.state = ModeParseState::CsiDecPrivate {
                         current_param: 0,
+                        in_subparam: false,
                         has_2004: false,
-                        valid: true,
                     };
                 }
-                b'!' => self.state = ModeParseState::CsiBang,
-                0x1b => self.state = ModeParseState::Esc,
-                0x18 | 0x1a | 0x40..=0x7e => self.state = ModeParseState::Ground,
-                0x20..=0x3f => self.state = ModeParseState::CsiIgnore,
-                _ => {}
-            },
-            ModeParseState::CsiBang => match byte {
-                b'p' => {
-                    // DECSTR (`\x1b[!p`) resets DEC private modes including ?2004.
-                    self.enabled = false;
-                    self.state = ModeParseState::Ground;
+                '!' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiBang;
                 }
-                0x1b => self.state = ModeParseState::Esc,
-                0x18 | 0x1a | 0x40..=0x7e => self.state = ModeParseState::Ground,
-                0x20..=0x3f => self.state = ModeParseState::CsiIgnore,
-                _ => {}
+                '0'..='9' | ';' | ':' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiParams;
+                }
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ if code >= 0x20 => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiIgnore;
+                }
+                _ => self.append_pending(ch),
+            },
+            ModeParseState::CsiParams => match ch {
+                '0'..='9' | ';' | ':' => self.append_pending(ch),
+                '!' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiBang;
+                }
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ if code >= 0x20 => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiIgnore;
+                }
+                _ => self.append_pending(ch),
+            },
+            ModeParseState::CsiBang => match ch {
+                'p' => {
+                    // DECSTR (`\x1b[!p` or `\x1b[0!p`) resets DEC private modes including ?2004.
+                    self.enabled = false;
+                    self.enter_ground();
+                }
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ if code >= 0x20 => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiIgnore;
+                }
+                _ => self.append_pending(ch),
             },
             ModeParseState::CsiDecPrivate {
                 mut current_param,
+                mut in_subparam,
                 mut has_2004,
-                valid,
-            } => match byte {
-                b'0'..=b'9' => {
-                    current_param = current_param
-                        .saturating_mul(10)
-                        .saturating_add(u32::from(byte - b'0'));
+            } => match ch {
+                '0'..='9' => {
+                    self.append_pending(ch);
+                    if !in_subparam {
+                        current_param = current_param
+                            .saturating_mul(10)
+                            .saturating_add(code - u32::from(b'0'));
+                    }
                     self.state = ModeParseState::CsiDecPrivate {
                         current_param,
+                        in_subparam,
                         has_2004,
-                        valid,
                     };
                 }
-                b';' => {
+                ':' => {
+                    self.append_pending(ch);
+                    in_subparam = true;
+                    self.state = ModeParseState::CsiDecPrivate {
+                        current_param,
+                        in_subparam,
+                        has_2004,
+                    };
+                }
+                ';' => {
+                    self.append_pending(ch);
                     if current_param == 2004 {
                         has_2004 = true;
                     }
                     self.state = ModeParseState::CsiDecPrivate {
                         current_param: 0,
+                        in_subparam: false,
                         has_2004,
-                        valid,
                     };
                 }
-                b'h' | b'l' => {
-                    if valid && (has_2004 || current_param == 2004) {
-                        self.enabled = byte == b'h';
+                'h' | 'l' => {
+                    if has_2004 || current_param == 2004 {
+                        self.enabled = ch == 'h';
                     }
-                    self.state = ModeParseState::Ground;
+                    self.enter_ground();
                 }
-                0x1b => self.state = ModeParseState::Esc,
-                0x18 | 0x1a | 0x40..=0x7e => self.state = ModeParseState::Ground,
-                0x20..=0x3f => self.state = ModeParseState::CsiIgnore,
-                _ => {}
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ if code >= 0x20 => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiIgnore;
+                }
+                _ => self.append_pending(ch),
             },
-            ModeParseState::CsiIgnore => match byte {
-                0x1b => self.state = ModeParseState::Esc,
-                0x18 | 0x1a | 0x40..=0x7e => self.state = ModeParseState::Ground,
-                _ => {}
+            ModeParseState::CsiIgnore => match ch {
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ => self.append_pending(ch),
             },
         }
     }
 
-    fn step_esc(&mut self, byte: u8) {
-        match byte {
-            b'c' => {
+    fn step_esc(&mut self, ch: char) {
+        let code = ch as u32;
+        match ch {
+            'c' => {
                 // RIS (`\x1bc`)
                 self.enabled = false;
-                self.state = ModeParseState::Ground;
+                self.enter_ground();
             }
-            b'[' => self.state = ModeParseState::CsiStart,
-            b']' => self.state = ModeParseState::Osc,
-            b'P' | b'_' | b'^' | b'X' => self.state = ModeParseState::StringSeq,
-            0x20..=0x2f => self.state = ModeParseState::EscIntermediate,
-            0x1b => self.state = ModeParseState::Esc,
-            _ => self.state = ModeParseState::Ground,
+            '[' => {
+                self.append_pending(ch);
+                self.state = ModeParseState::CsiStart;
+            }
+            ']' => {
+                self.append_pending(ch);
+                self.state = ModeParseState::Osc;
+            }
+            'P' | '_' | '^' | 'X' => {
+                self.append_pending(ch);
+                self.state = ModeParseState::StringSeq;
+            }
+            '\x1b' => {
+                self.begin_pending(ch);
+                self.state = ModeParseState::Esc;
+            }
+            _ if (0x20..=0x2f).contains(&code) => {
+                self.append_pending(ch);
+                self.state = ModeParseState::EscIntermediate;
+            }
+            _ => self.enter_ground(),
         }
     }
 }
@@ -522,7 +666,7 @@ impl TerminalHistory {
 
     pub(crate) fn push(&mut self, data: &str) {
         self.total_bytes_written += data.len() as u64;
-        self.bracketed_paste.feed(data.as_bytes());
+        self.bracketed_paste.feed(data);
         if self.line_limit == 0 || self.byte_limit == 0 {
             self.clear();
             return;
@@ -555,15 +699,41 @@ impl TerminalHistory {
 
     /// Snapshot for replaying into a terminal renderer. For a running session whose active
     /// `?2004h` sequence may have been evicted, cleared, or truncated past the client's 512 KiB
-    /// buffer cap, appends `\x1b[?2004h` so bracketed paste remains active after replay (#431).
+    /// buffer cap, inserts `\x1b[?2004h` at a parser-safe boundary BEFORE any trailing unfinished
+    /// control sequence (and preserves that unfinished prefix across clears) so the next live
+    /// delta completes it identically to an uninterrupted terminal (#431).
     pub(crate) fn snapshot_for_replay(&self, running: bool) -> String {
         let mut snapshot = self.snapshot();
-        if running
-            && self.bracketed_paste.is_enabled()
-            && (self.has_discarded_prefix() || self.total_bytes > CLIENT_TRANSCRIPT_CUT_BYTES)
-        {
-            snapshot.push_str(BRACKETED_PASTE_ENABLE_SEQUENCE);
+        if !running {
+            return snapshot;
         }
+        let lossy = self.has_discarded_prefix() || self.total_bytes > CLIENT_TRANSCRIPT_CUT_BYTES;
+        if !lossy {
+            return snapshot;
+        }
+        let restore = if self.bracketed_paste.is_enabled() {
+            BRACKETED_PASTE_ENABLE_SEQUENCE
+        } else {
+            ""
+        };
+        let pending = self.bracketed_paste.pending_sequence();
+        if restore.is_empty() && pending.is_empty() {
+            return snapshot;
+        }
+        if !pending.is_empty() {
+            if let Some(prefix_len) = snapshot.len().checked_sub(pending.len())
+                && snapshot.ends_with(pending)
+            {
+                snapshot.truncate(prefix_len);
+                snapshot.push_str(restore);
+                snapshot.push_str(pending);
+            } else {
+                snapshot.push_str(restore);
+                snapshot.push_str(pending);
+            }
+            return snapshot;
+        }
+        snapshot.push_str(restore);
         snapshot
     }
 
@@ -1156,5 +1326,38 @@ mod tests {
         large.push(&"x".repeat(CLIENT_TRANSCRIPT_CUT_BYTES + 1024));
         assert!(!large.has_discarded_prefix());
         assert!(large.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+
+        // Xterm parser parity: C1 CSI (`\u{009b}?2004h`), colon subparameter (`\x1b[?1:2;2004h`),
+        // parameterized DECSTR (`\x1b[0!p`), and mid-sequence replay / clear boundaries.
+        let mut c1 = TerminalHistory::with_byte_limit(4, 32);
+        c1.push("\u{009b}?2004h");
+        c1.push(&"a".repeat(64));
+        assert!(c1.bracketed_paste_enabled());
+        assert!(c1.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+
+        let mut subparam = TerminalHistory::with_byte_limit(4, 32);
+        subparam.push("\x1b[?1:2;2004h");
+        subparam.push(&"b".repeat(64));
+        assert!(subparam.bracketed_paste_enabled());
+        assert!(subparam.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+        subparam.push("\x1b[0!p");
+        subparam.push(&"c".repeat(64));
+        assert!(!subparam.bracketed_paste_enabled());
+        assert!(!subparam.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+
+        let mut mid_disable = TerminalHistory::with_byte_limit(4, 32);
+        mid_disable.push("\x1b[?2004h");
+        mid_disable.push(&"d".repeat(64));
+        mid_disable.push("\x1b[?20");
+        assert!(
+            mid_disable
+                .snapshot_for_replay(true)
+                .ends_with("\x1b[?2004h\x1b[?20")
+        );
+
+        let mut mid_enable_clear = TerminalHistory::with_byte_limit(4, 32);
+        mid_enable_clear.push("\x1b[?20");
+        mid_enable_clear.clear();
+        assert_eq!(mid_enable_clear.snapshot_for_replay(true), "\x1b[?20");
     }
 }

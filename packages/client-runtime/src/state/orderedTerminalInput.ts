@@ -98,6 +98,13 @@ export function createOrderedTerminalInputBinding(
   target: TerminalInputTarget,
   context: Context.Context<never> = Context.empty(),
 ): OrderedTerminalInputBinding {
+  // Capture only the session identity fields: callers like `terminal.write` pass the entire
+  // write payload as `target`, and spreading `data` into `beginInput` would trip the 16 KiB
+  // per-frame admission cap on the first >16 KiB paste (#431).
+  const sessionTarget: TerminalInputTarget = {
+    threadId: target.threadId,
+    terminalId: target.terminalId,
+  };
   const attachmentSequence = nextAttachmentSequence.get(session) ?? 0;
   nextAttachmentSequence.set(session, attachmentSequence + 1);
   const runPromise = Effect.runPromiseWith(context);
@@ -150,7 +157,7 @@ export function createOrderedTerminalInputBinding(
   const cancelLease = (lease: string): void => {
     void runPromise(
       requestInSession(session, environmentId, WS_METHODS.terminalCancelInput, {
-        ...target,
+        ...sessionTarget,
         inputId: lease,
       }).pipe(Effect.raceFirst(session.closed), Effect.timeout("5 seconds")),
     ).catch(() => undefined);
@@ -185,7 +192,7 @@ export function createOrderedTerminalInputBinding(
         }
         const lease = await run(
           WS_METHODS.terminalBeginInput,
-          { ...target, attachmentSequence },
+          { ...sessionTarget, attachmentSequence },
           false,
         );
         if (stopped) {
@@ -222,9 +229,6 @@ export function createOrderedTerminalInputBinding(
           const abort = () => dispose();
           signal.addEventListener("abort", abort, { once: true });
           const marked = origin === undefined ? {} : { userInputClaim: origin };
-          // A binding created by a write keeps that write's input as its target: frames take
-          // only the session fields from it, so one write's origin never marks another's.
-          const sessionTarget = { threadId: target.threadId, terminalId: target.terminalId };
           try {
             // Preserve call order across prepare() before claiming ordered sequence numbers.
             const ready = orderedTail.then(() => prepare());

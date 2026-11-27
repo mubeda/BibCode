@@ -639,13 +639,40 @@ const BRACKETED_PASTE_START = "\u001b[200~";
 const BRACKETED_PASTE_END = "\u001b[201~";
 
 /**
+ * Linear O(n) stack sanitizer that removes every occurrence of `\x1b[201~`, including newly
+ * formed delimiters created when removing an inner `\x1b[201~` joins adjacent text
+ * (e.g. `\x1b[20\x1b[201~1~`). Guarantees the returned string contains zero `\x1b[201~`.
+ */
+function stripBracketedPasteEnd(text: string): string {
+  if (!text.includes(BRACKETED_PASTE_END)) return text;
+  const endLen = BRACKETED_PASTE_END.length;
+  const out: string[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    out.push(text[index]!);
+    if (out.length >= endLen && out[out.length - 1] === "~") {
+      let matches = true;
+      for (let offset = 0; offset < endLen; offset += 1) {
+        if (out[out.length - endLen + offset] !== BRACKETED_PASTE_END[offset]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) {
+        out.length -= endLen;
+      }
+    }
+  }
+  return out.join("");
+}
+
+/**
  * Prepares a plain-text clipboard paste for an Antigravity AI Terminal (#431).
  *
- * Strips embedded `\x1b[201~` sequences before either wrapping path so clipboard text cannot
- * prematurely close a bracketed-paste envelope (xterm.js's built-in Clipboard handler does not
- * strip `\x1b[201~`). When `bracketedPasteMode` is off and the paste is multi-line, normalizes
- * line endings to `\r` and wraps in a single `\x1b[200~...\x1b[201~` envelope. Returns `null`
- * when xterm's default paste handler should run untouched.
+ * Strips embedded `\x1b[201~` sequences (including nested/join-forming sequences) before either
+ * wrapping path so clipboard text cannot prematurely close a bracketed-paste envelope (xterm.js's
+ * built-in Clipboard handler does not strip `\x1b[201~`). When `bracketedPasteMode` is off and the
+ * paste is multi-line, normalizes line endings to `\r` and wraps in a single `\x1b[200~...\x1b[201~`
+ * envelope. Returns `null` when xterm's default paste handler should run untouched.
  */
 export function prepareAntigravityTextPaste(
   text: string,
@@ -656,7 +683,7 @@ export function prepareAntigravityTextPaste(
   if (!hasEmbeddedEnd && (bracketedPasteMode || !isMultiLine)) {
     return null;
   }
-  const sanitized = hasEmbeddedEnd ? text.replaceAll(BRACKETED_PASTE_END, "") : text;
+  const sanitized = hasEmbeddedEnd ? stripBracketedPasteEnd(text) : text;
   if (sanitized.length === 0) {
     return "";
   }
@@ -952,6 +979,8 @@ interface TerminalViewportProps {
   command?: TerminalLaunchCommand;
   /** Live summary fallback for provider terminals revealed by ID without a launch descriptor (#431). */
   driverKind?: ProviderDriverKind | null;
+  /** True while an ID-only reveal is still waiting for its live summary metadata (#431). */
+  driverKindPending?: boolean;
   /** Marks the session as a host thread's center panel so other clients adopt it. */
   centerPanel?: boolean;
   visible: boolean;
@@ -1005,6 +1034,7 @@ export function TerminalViewport({
   runtimeEnv,
   command,
   driverKind = null,
+  driverKindPending = false,
   centerPanel = false,
   visible,
   onSessionExited,
@@ -1257,7 +1287,20 @@ export function TerminalViewport({
   });
   const readTerminalLabel = useEffectEvent(() => terminalLabel);
   const resolvedDriverKind = command?.activity?.driverKind ?? driverKind ?? null;
+  const resolvedDriverKindPending =
+    command === undefined && resolvedDriverKind === null && driverKindPending;
   const readDriverKind = useEffectEvent(() => resolvedDriverKind);
+  const readDriverKindPending = useEffectEvent(() => resolvedDriverKindPending);
+  const pendingDriverKindPastesRef = useRef<Array<(driver: ProviderDriverKind | null) => void>>([]);
+  useEffect(() => {
+    if (resolvedDriverKindPending) return;
+    const queued = pendingDriverKindPastesRef.current;
+    if (queued.length === 0) return;
+    pendingDriverKindPastesRef.current = [];
+    for (const resolve of queued) {
+      resolve(resolvedDriverKind);
+    }
+  }, [resolvedDriverKind, resolvedDriverKindPending]);
   const hasAuthoritativeHostConfig = serverConfig !== null;
   const hasPersistentWindowsConsoleTheme = usesPersistentWindowsConsoleTheme(command);
   const canAttachTerminal = command === undefined || hasAuthoritativeHostConfig;
@@ -2538,23 +2581,82 @@ export function TerminalViewport({
     // The program reads its own host's clipboard, never this client's, so a
     // pasted image is uploaded and the path of its server copy is pasted.
     const pasteAborts = new Set<AbortController>();
+    const pendingIdentityPasteTimers = new Set<number>();
     cancelImagePastesRef.current = () => {
       for (const abort of pasteAborts) abort.abort();
+      for (const timer of pendingIdentityPasteTimers) window.clearTimeout(timer);
+      pendingIdentityPasteTimers.clear();
+      pendingDriverKindPastesRef.current = [];
     };
     const handlePaste = (event: ClipboardEvent) => {
       const data = event.clipboardData;
       if (!data) return;
       const text = data.getData("text/plain");
       if (text !== "") {
-        if (readDriverKind() === "antigravity") {
+        const driver = readDriverKind();
+        if (driver === "antigravity") {
           const prepared = prepareAntigravityTextPaste(text, terminal.modes.bracketedPasteMode);
           if (prepared !== null) {
             event.preventDefault();
             event.stopPropagation();
+            if (inputBlocked()) return;
+            terminal.clearSelection();
+            terminal.scrollToBottom();
             if (prepared.length > 0) {
               sendTerminalInput(prepared, "Failed to paste into terminal");
             }
           }
+          return;
+        }
+        // On an ID-only reveal whose live summary has not arrived yet, reserve the paste's
+        // queue slot until summary metadata confirms whether this is an Antigravity terminal
+        // so an immediate multiline paste cannot bypass bracketed-paste protection (#431).
+        if (
+          readDriverKindPending() &&
+          !terminal.modes.bracketedPasteMode &&
+          (text.includes("\n") || text.includes("\r") || text.includes(BRACKETED_PASTE_END))
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!replyGuard.acceptInput() || inputBlocked()) return;
+          terminal.clearSelection();
+          terminal.scrollToBottom();
+          const generation = readTerminalGeneration();
+          const fallback = { remaining: 0, message: "Failed to paste into terminal" };
+          inputBinding.pendingFallbacks.push(fallback);
+          const fill = inputScheduler.reserve(inputOrigin(text));
+          let settled = false;
+          const finish = (resolved: ProviderDriverKind | null) => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            pendingIdentityPasteTimers.delete(timer);
+            if (disposed || inputBlocked() || readTerminalGeneration() !== generation) {
+              fill(null);
+              return;
+            }
+            const bracketed = terminal.modes.bracketedPasteMode;
+            let payload: string;
+            if (resolved === "antigravity") {
+              payload =
+                prepareAntigravityTextPaste(text, bracketed) ??
+                (bracketed
+                  ? `${BRACKETED_PASTE_START}${text.replace(/\r\n|\n/g, "\r")}${BRACKETED_PASTE_END}`
+                  : text.replace(/\r\n|\n/g, "\r"));
+            } else {
+              const normalized = text.replace(/\r\n|\n/g, "\r");
+              payload = bracketed
+                ? `${BRACKETED_PASTE_START}${normalized}${BRACKETED_PASTE_END}`
+                : normalized;
+            }
+            if (payload.length > 0) {
+              fallback.remaining = payload.length;
+            }
+            fill(payload.length > 0 ? payload : null);
+          };
+          const timer = window.setTimeout(() => finish(readDriverKind()), 1500);
+          pendingIdentityPasteTimers.add(timer);
+          pendingDriverKindPastesRef.current.push(finish);
         }
         return;
       }
@@ -3306,6 +3408,8 @@ interface ThreadTerminalPanelProps {
   terminalCommandsById?: ReadonlyMap<string, TerminalLaunchCommand>;
   /** Resolved provider driver kinds per terminal id (including ID-only reveals from live summaries). */
   terminalDriverKindsById?: ReadonlyMap<string, ProviderDriverKind>;
+  /** Terminal ids revealed by ID whose live summary metadata has not arrived yet (#431). */
+  pendingDriverKindTerminalIds?: ReadonlySet<string>;
   /** Prefer per-session launch locations when the server already knows a terminal. */
   terminalLaunchLocationsById?: ReadonlyMap<string, TerminalLaunchLocation>;
   workspaceUnavailable?: string | null;
@@ -3390,6 +3494,7 @@ export default function ThreadTerminalPanel({
   terminalLabelsById,
   terminalCommandsById,
   terminalDriverKindsById,
+  pendingDriverKindTerminalIds,
   terminalLaunchLocationsById,
   workspaceUnavailable = null,
   aiTerminalIds,
@@ -3751,6 +3856,7 @@ export default function ThreadTerminalPanel({
                             ? { command: terminalCommandsById.get(terminalId)! }
                             : {})}
                           driverKind={terminalDriverKindsById?.get(terminalId) ?? null}
+                          driverKindPending={pendingDriverKindTerminalIds?.has(terminalId) ?? false}
                           centerPanel={owner === "center-panel"}
                           visible
                           onSessionExited={() => onCloseTerminal(terminalId)}
@@ -3789,6 +3895,9 @@ export default function ThreadTerminalPanel({
                     ? { command: terminalCommandsById.get(resolvedActiveTerminalId)! }
                     : {})}
                   driverKind={terminalDriverKindsById?.get(resolvedActiveTerminalId) ?? null}
+                  driverKindPending={
+                    pendingDriverKindTerminalIds?.has(resolvedActiveTerminalId) ?? false
+                  }
                   centerPanel={owner === "center-panel"}
                   visible
                   onSessionExited={() => onCloseTerminal(resolvedActiveTerminalId)}

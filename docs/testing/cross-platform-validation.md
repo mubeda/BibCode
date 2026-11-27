@@ -347,7 +347,18 @@ In the center terminal, right-panel terminal, and a provider's terminal view,
 select one line of output and copy with **Ctrl+C**, then paste with **Ctrl+V**
 (**Cmd+C/V** on macOS). Verify the exact selected text reaches the destination
 once. Also check **Ctrl+Shift+C/V**, and multiline paste with an application
-that enables bracketed paste. Selecting text must leave keyboard focus in the
+that enables bracketed paste. In an Antigravity AI Terminal (both directly
+launched and revealed by terminal ID without a launch descriptor), test short
+and >16 KiB multiline pastes (and >256 KiB staged pastes) when bracketed paste
+mode is OFF and ON (including clipboard text containing embedded `\x1b[201~`):
+verify zero premature submissions occur before explicit Enter, and exactly one
+complete normalized prompt submits when Enter is pressed. Verify plain shells
+and other provider AI terminals without `?2004h` receive no stray
+`\x1b[200~`/`\x1b[201~` markers, legacy servers without `terminalOrderedInput`
+send complete bracketed pastes up to 64 KiB in a single write (and fail cleanly
+above 64 KiB without sending a partial unclosed envelope), and remounting or
+clearing a running terminal after history eviction preserves active `?2004h`
+mode while exited terminals still reset it. Selecting text must leave keyboard focus in the
 terminal and must not open the **Add to chat** menu or overwrite the clipboard.
 Right-click the selected text and choose **Add to chat**; the selection must
 still attach to the composer. Right-click it again and choose **Copy**; the

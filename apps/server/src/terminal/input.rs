@@ -24,6 +24,22 @@ const MAX_CONNECTION_LEASES: usize = 64;
 const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
 const GAP_TIMEOUT: Duration = Duration::from_secs(5);
 const STAGED_PASTE_TIMEOUT: Duration = Duration::from_secs(10);
+const BRACKETED_PASTE_START: &str = "\x1b[200~";
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
+
+/// Returns whether `data` forms one valid complete `\x1b[200~...\x1b[201~` envelope with no
+/// embedded `\x1b[201~` closing delimiter inside its body (#431).
+fn is_valid_bracketed_paste_envelope(data: &str) -> bool {
+    if !data.starts_with(BRACKETED_PASTE_START) || !data.ends_with(BRACKETED_PASTE_END) {
+        return false;
+    }
+    let min_len = BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len();
+    if data.len() < min_len {
+        return false;
+    }
+    let body = &data[BRACKETED_PASTE_START.len()..data.len() - BRACKETED_PASTE_END.len()];
+    !body.contains(BRACKETED_PASTE_END)
+}
 
 /// Optional multi-frame bracketed-paste staging marker (#431).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
@@ -243,7 +259,9 @@ impl TerminalInputRegistry {
                 "Too many attached terminal input leases.",
             ));
         }
+        let input_id = Uuid::new_v4().to_string();
         let lease = Arc::new(InputLease {
+            input_id: input_id.clone(),
             connection_id,
             attachment_sequence,
             key: key.clone(),
@@ -266,7 +284,6 @@ impl TerminalInputRegistry {
         if let Some(previous) = previous.and_then(|input_id| state.leases.remove(&input_id)) {
             previous.fail(TerminalInputError::closed());
         }
-        let input_id = Uuid::new_v4().to_string();
         state
             .connections
             .get_mut(&connection_id)
@@ -548,7 +565,13 @@ impl<'a> PreparedTerminalInput<'a> {
                             .staged_paste
                             .as_ref()
                             .map_or(0, |staged| staged.buffer.len());
-                        if existing_len.saturating_add(data.len()) > MAX_STAGED_PASTE_BYTES {
+                        if state.staged_paste.is_none() && !data.starts_with(BRACKETED_PASTE_START)
+                        {
+                            Err(TerminalInputError::new(
+                                "sequence",
+                                "Terminal paste envelope is malformed. Reconnect the terminal before typing again.",
+                            ))
+                        } else if existing_len.saturating_add(data.len()) > MAX_STAGED_PASTE_BYTES {
                             state.staged_paste = None;
                             Err(TerminalInputError::new(
                                 "capacity",
@@ -596,20 +619,28 @@ impl<'a> PreparedTerminalInput<'a> {
                             "sequence",
                             "Terminal paste did not finish in time. Reconnect the terminal before typing again.",
                         ))
-                    } else {
-                        let staged = state.staged_paste.take();
-                        let existing_len = staged.as_ref().map_or(0, |paste| paste.buffer.len());
-                        if existing_len.saturating_add(data.len()) > MAX_STAGED_PASTE_BYTES {
+                    } else if let Some(mut paste) = state.staged_paste.take() {
+                        if paste.buffer.len().saturating_add(data.len()) > MAX_STAGED_PASTE_BYTES {
                             Err(TerminalInputError::new(
                                 "capacity",
                                 "Terminal paste exceeded the 1 MiB limit. Reconnect the terminal before typing again.",
                             ))
-                        } else if let Some(mut paste) = staged {
-                            paste.buffer.push_str(data);
-                            Ok(std::borrow::Cow::Owned(paste.buffer))
                         } else {
-                            Ok(std::borrow::Cow::Borrowed(data))
+                            paste.buffer.push_str(data);
+                            if !is_valid_bracketed_paste_envelope(&paste.buffer) {
+                                Err(TerminalInputError::new(
+                                    "sequence",
+                                    "Terminal paste envelope is malformed. Reconnect the terminal before typing again.",
+                                ))
+                            } else {
+                                Ok(std::borrow::Cow::Owned(paste.buffer))
+                            }
                         }
+                    } else {
+                        Err(TerminalInputError::new(
+                            "sequence",
+                            "Terminal paste commit arrived without a staged prefix. Reconnect the terminal before typing again.",
+                        ))
                     }
                 };
                 match assembled {
@@ -654,6 +685,8 @@ impl<'a> PreparedTerminalInput<'a> {
             let enqueue = lease.identity.enqueue_input(
                 payload_to_write.as_ref(),
                 origin,
+                &lease.input_id,
+                paste_stage.is_none(),
                 &lease.closed,
                 &lease.connection_closed,
             );
@@ -678,6 +711,14 @@ impl<'a> PreparedTerminalInput<'a> {
                 let lost = lease.admission_lost();
                 tokio::select! {
                     biased;
+                    () = lease.closed.cancelled() => {
+                        pending.cancel();
+                        break Err(TerminalError::PublicationCancelled);
+                    }
+                    () = lease.connection_closed.cancelled() => {
+                        pending.cancel();
+                        break Err(TerminalError::PublicationCancelled);
+                    }
                     written = pending.wait() => break written,
                     () = async { if let Some(lost) = &lost { lost.cancelled().await } else { std::future::pending().await } } => {
                         if lease.seal_on_current_admission_loss() {
@@ -757,6 +798,7 @@ struct LeaseAdmission {
 }
 
 struct InputLease {
+    input_id: String,
     connection_id: Uuid,
     attachment_sequence: u64,
     key: (String, String),
@@ -843,6 +885,7 @@ impl InputLease {
         state.pending.clear();
         state.staged_paste = None;
         drop(state);
+        self.identity.release_delimiter_fence(&self.input_id);
         self.closed.cancel();
         self.changed.notify_waiters();
     }

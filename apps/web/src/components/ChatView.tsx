@@ -1001,7 +1001,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       ),
     [knownTerminalSessions],
   );
-  const terminalDriverKindsById = useMemo(() => {
+  const { terminalDriverKindsById, pendingDriverKindTerminalIds } = useMemo(() => {
     const kinds = new Map<
       string,
       NonNullable<
@@ -1010,12 +1010,23 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
         >["activity"]
       >["driverKind"]
     >();
+    const knownIds = new Set<string>();
     for (const session of knownTerminalSessions) {
+      if (session.state.summary !== null) {
+        knownIds.add(session.target.terminalId);
+      }
       const driverKind = session.state.summary?.command?.activity?.driverKind;
       if (driverKind) kinds.set(session.target.terminalId, driverKind);
     }
-    return kinds.size > 0 ? kinds : undefined;
-  }, [knownTerminalSessions]);
+    const pending = new Set<string>();
+    for (const terminalId of surface.terminalIds) {
+      if (!knownIds.has(terminalId)) pending.add(terminalId);
+    }
+    return {
+      terminalDriverKindsById: kinds.size > 0 ? kinds : undefined,
+      pendingDriverKindTerminalIds: pending.size > 0 ? pending : undefined,
+    };
+  }, [knownTerminalSessions, surface.terminalIds]);
 
   if (!project || !cwd) return null;
 
@@ -1052,6 +1063,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       terminalLabelsById={terminalLabelsById}
       terminalLaunchLocationsById={terminalLaunchLocationsById}
       {...(terminalDriverKindsById ? { terminalDriverKindsById } : {})}
+      {...(pendingDriverKindTerminalIds ? { pendingDriverKindTerminalIds } : {})}
       aiTerminalIds={aiTerminalIds}
       keybindings={keybindings}
     />

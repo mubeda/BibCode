@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Deferred from "effect/Deferred";
 import type { RpcSession } from "../rpc/session.ts";
+import { withInputAdmission } from "../rpc/inputAdmission.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   createOrderedTerminalInputBinding,
@@ -431,6 +432,37 @@ describe("ordered terminal input binding", () => {
         // Must not have sent a partial unclosed bracketed paste envelope.
         expect(h.frames.map((f) => f.data)).toEqual([mediumPaste]);
         binding.dispose();
+      }),
+  );
+
+  it.effect(
+    "does not spread >16 KiB write payload into terminal.beginInput on an unprepared binding through withInputAdmission",
+    () =>
+      Effect.gen(function* () {
+        const start = "\u001b[200~";
+        const end = "\u001b[201~";
+        const h = harness(true);
+        (h.session as { initialConfig: RpcSession["initialConfig"] }).initialConfig =
+          Effect.succeed({
+            environment: {
+              capabilities: { terminalOrderedInput: true, terminalPasteAssembly: true },
+            },
+          } as unknown as ServerConfig);
+        const admittedSession: RpcSession = {
+          ...h.session,
+          client: withInputAdmission(
+            h.session.client as unknown as WsRpcProtocolClient,
+          ) as unknown as RpcSession["client"],
+        };
+        const registry = createTerminalInputBindingRegistry();
+        const paste = `${start}${"p".repeat(18 * 1024)}${end}`;
+        // Matches terminal.ts:275 where the whole write input (including `data`) is passed as `target`.
+        const writeInput = { ...target, data: paste } as typeof target;
+        yield* registry.write(admittedSession, "env", writeInput, paste, yield* Effect.context());
+        expect(h.begins()).toBe(1);
+        expect(h.frames.length).toBe(2);
+        expect(h.frames.map((f) => f.data).join("")).toBe(paste);
+        registry.reset("env", target);
       }),
   );
 });

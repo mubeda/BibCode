@@ -13,173 +13,287 @@ const ModeParseState = {
   StringSeq: 4,
   StringEsc: 5,
   CsiStart: 6,
-  CsiBang: 7,
-  CsiDecPrivate: 8,
-  CsiIgnore: 9,
+  CsiParams: 7,
+  CsiBang: 8,
+  CsiDecPrivate: 9,
+  CsiIgnore: 10,
 } as const;
 type ModeParseState = (typeof ModeParseState)[keyof typeof ModeParseState];
 
+const MAX_PENDING_ESCAPE_CHARS = 128;
+
 /**
- * Streaming VT state machine tracking DEC private mode `?2004h`/`?2004l` (bracketed paste)
- * across arbitrary chunk boundaries, including multi-parameter DECSET/DECRST, RIS (`\x1bc`),
- * and DECSTR (`\x1b[!p`).
+ * Streaming VT state machine aligned with xterm.js tracking DEC private mode `?2004h`/`?2004l`
+ * (bracketed paste) across arbitrary chunk boundaries, including C1 CSI (`\u009b`),
+ * multi-parameter DECSET/DECRST with colon subparameters (`\x1b[?1:2;2004h`), RIS (`\x1bc`),
+ * and parameterized DECSTR (`\x1b[0!p` / `\x1b[!p`). Also remembers any unfinished escape prefix
+ * at the end of the stream so mode restoration is inserted at a parser-safe boundary and never
+ * aborts an in-flight control sequence (#431).
  */
 class BracketedPasteModeTracker {
   private state: ModeParseState = ModeParseState.Ground;
   private currentParam = 0;
+  private inSubparam = false;
   private has2004 = false;
-  private validPrivate = true;
   private enabled = false;
+  /** Unfinished control sequence at the end of the fed stream, when not in Ground. */
+  private pendingSeq = "";
 
   isEnabled(): boolean {
     return this.enabled;
   }
 
+  /** Trailing incomplete escape sequence currently in progress (empty when in Ground). */
+  pendingSequence(): string {
+    return this.state === ModeParseState.Ground ? "" : this.pendingSeq;
+  }
+
   reset(): void {
     this.state = ModeParseState.Ground;
     this.currentParam = 0;
+    this.inSubparam = false;
     this.has2004 = false;
-    this.validPrivate = true;
     this.enabled = false;
+    this.pendingSeq = "";
   }
 
-  feed(bytes: Uint8Array): void {
-    for (let index = 0; index < bytes.byteLength; index += 1) {
-      const byte = bytes[index]!;
-      this.step(byte);
+  feed(text: string): void {
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      const ch = text[index]!;
+      this.step(code, ch);
     }
   }
 
-  private step(byte: number): void {
+  private enterGround(): void {
+    this.state = ModeParseState.Ground;
+    this.pendingSeq = "";
+  }
+
+  private beginPending(ch: string): void {
+    this.pendingSeq = ch;
+  }
+
+  private appendPending(ch: string): void {
+    if (this.pendingSeq.length < MAX_PENDING_ESCAPE_CHARS) {
+      this.pendingSeq += ch;
+    }
+  }
+
+  private enterCsi(prefixChar: string, startNew: boolean): void {
+    if (startNew) this.beginPending(prefixChar);
+    else this.appendPending(prefixChar);
+    this.state = ModeParseState.CsiStart;
+  }
+
+  private step(code: number, ch: string): void {
+    // Anywhere transitions per VT500 / xterm.js EscapeSequenceParser:
+    // CAN (0x18), SUB (0x1a) abort to ground; ESC (0x1b) starts ESC (except ST handled in StringEsc);
+    // C1 controls 0x9b (CSI), 0x9d (OSC), 0x90/0x98/0x9e/0x9f (DCS/SOS/PM/APC), 0x9c (ST).
+    if (code === 0x18 || code === 0x1a || code === 0x9c) {
+      this.enterGround();
+      return;
+    }
+    if (code === 0x9b) {
+      this.enterCsi(ch, true);
+      return;
+    }
+    if (code === 0x9d) {
+      this.beginPending(ch);
+      this.state = ModeParseState.Osc;
+      return;
+    }
+    if (code === 0x90 || code === 0x98 || code === 0x9e || code === 0x9f) {
+      this.beginPending(ch);
+      this.state = ModeParseState.StringSeq;
+      return;
+    }
+
     switch (this.state) {
       case ModeParseState.Ground:
-        if (byte === 0x1b) this.state = ModeParseState.Esc;
+        if (code === 0x1b) {
+          this.beginPending(ch);
+          this.state = ModeParseState.Esc;
+        }
         return;
       case ModeParseState.Esc:
-        this.stepEsc(byte);
+        this.stepEsc(code, ch);
         return;
       case ModeParseState.EscIntermediate:
-        if (byte === 0x1b) {
+        if (code === 0x1b) {
+          this.beginPending(ch);
           this.state = ModeParseState.Esc;
-        } else if (byte >= 0x20 && byte <= 0x2f) {
-          // Stay in intermediate state.
+        } else if (code >= 0x20 && code <= 0x2f) {
+          this.appendPending(ch);
         } else {
-          this.state = ModeParseState.Ground;
+          this.enterGround();
         }
         return;
       case ModeParseState.Osc:
-        if (byte === 0x07 || byte === 0x18 || byte === 0x1a) {
-          this.state = ModeParseState.Ground;
-        } else if (byte === 0x1b) {
+        if (code === 0x07) {
+          this.enterGround();
+        } else if (code === 0x1b) {
+          this.appendPending(ch);
           this.state = ModeParseState.StringEsc;
+        } else {
+          this.appendPending(ch);
         }
         return;
       case ModeParseState.StringSeq:
-        if (byte === 0x18 || byte === 0x1a) {
-          this.state = ModeParseState.Ground;
-        } else if (byte === 0x1b) {
+        if (code === 0x1b) {
+          this.appendPending(ch);
           this.state = ModeParseState.StringEsc;
+        } else {
+          this.appendPending(ch);
         }
         return;
       case ModeParseState.StringEsc:
-        if (byte === 0x5c) {
+        if (code === 0x5c) {
           // ST (`\x1b\\`)
-          this.state = ModeParseState.Ground;
-        } else if (byte === 0x1b) {
-          this.state = ModeParseState.StringEsc;
+          this.enterGround();
+        } else if (code === 0x1b) {
+          this.beginPending(ch);
+          this.state = ModeParseState.Esc;
         } else {
-          this.stepEsc(byte);
+          this.beginPending("\u001b");
+          this.stepEsc(code, ch);
         }
         return;
       case ModeParseState.CsiStart:
-        if (byte === 0x3f) {
+        if (code === 0x3f) {
           // `?`
+          this.appendPending(ch);
           this.state = ModeParseState.CsiDecPrivate;
           this.currentParam = 0;
+          this.inSubparam = false;
           this.has2004 = false;
-          this.validPrivate = true;
-        } else if (byte === 0x21) {
+        } else if (code === 0x21) {
           // `!`
+          this.appendPending(ch);
           this.state = ModeParseState.CsiBang;
-        } else if (byte === 0x1b) {
+        } else if ((code >= 0x30 && code <= 0x39) || code === 0x3b || code === 0x3a) {
+          // Parameter digits/separators before `!p` (e.g. `\x1b[0!p`) or other CSI finals
+          this.appendPending(ch);
+          this.state = ModeParseState.CsiParams;
+        } else if (code === 0x1b) {
+          this.beginPending(ch);
           this.state = ModeParseState.Esc;
-        } else if (byte === 0x18 || byte === 0x1a) {
-          this.state = ModeParseState.Ground;
-        } else if (byte >= 0x40 && byte <= 0x7e) {
-          this.state = ModeParseState.Ground;
-        } else if (byte >= 0x20) {
+        } else if (code >= 0x40 && code <= 0x7e) {
+          this.enterGround();
+        } else if (code >= 0x20) {
+          this.appendPending(ch);
           this.state = ModeParseState.CsiIgnore;
+        } else {
+          this.appendPending(ch);
+        }
+        return;
+      case ModeParseState.CsiParams:
+        if ((code >= 0x30 && code <= 0x39) || code === 0x3b || code === 0x3a) {
+          this.appendPending(ch);
+        } else if (code === 0x21) {
+          // `!` intermediate after numeric params: parameterized DECSTR (`\x1b[0!p`)
+          this.appendPending(ch);
+          this.state = ModeParseState.CsiBang;
+        } else if (code === 0x1b) {
+          this.beginPending(ch);
+          this.state = ModeParseState.Esc;
+        } else if (code >= 0x40 && code <= 0x7e) {
+          this.enterGround();
+        } else if (code >= 0x20) {
+          this.appendPending(ch);
+          this.state = ModeParseState.CsiIgnore;
+        } else {
+          this.appendPending(ch);
         }
         return;
       case ModeParseState.CsiBang:
-        if (byte === 0x70) {
-          // DECSTR (`\x1b[!p`) resets DEC private modes including ?2004.
+        if (code === 0x70) {
+          // DECSTR (`\x1b[!p` or `\x1b[0!p`) resets DEC private modes including ?2004.
           this.enabled = false;
-          this.state = ModeParseState.Ground;
-        } else if (byte === 0x1b) {
+          this.enterGround();
+        } else if (code === 0x1b) {
+          this.beginPending(ch);
           this.state = ModeParseState.Esc;
-        } else if (byte === 0x18 || byte === 0x1a) {
-          this.state = ModeParseState.Ground;
-        } else if (byte >= 0x40 && byte <= 0x7e) {
-          this.state = ModeParseState.Ground;
-        } else if (byte >= 0x20) {
+        } else if (code >= 0x40 && code <= 0x7e) {
+          this.enterGround();
+        } else if (code >= 0x20) {
+          this.appendPending(ch);
           this.state = ModeParseState.CsiIgnore;
+        } else {
+          this.appendPending(ch);
         }
         return;
       case ModeParseState.CsiDecPrivate:
-        if (byte >= 0x30 && byte <= 0x39) {
-          this.currentParam = Math.min(999_999, this.currentParam * 10 + (byte - 0x30));
-        } else if (byte === 0x3b) {
-          // `;`
+        if (code >= 0x30 && code <= 0x39) {
+          this.appendPending(ch);
+          if (!this.inSubparam) {
+            this.currentParam = Math.min(999_999, this.currentParam * 10 + (code - 0x30));
+          }
+        } else if (code === 0x3a) {
+          // `:` starts a subparameter on the current parameter (e.g. `?1:2;2004h`).
+          this.appendPending(ch);
+          this.inSubparam = true;
+        } else if (code === 0x3b) {
+          // `;` advances to the next parameter.
+          this.appendPending(ch);
           if (this.currentParam === 2004) this.has2004 = true;
           this.currentParam = 0;
-        } else if (byte === 0x68 || byte === 0x6c) {
+          this.inSubparam = false;
+        } else if (code === 0x68 || code === 0x6c) {
           // `h` (DECSET) or `l` (DECRST)
-          if (this.validPrivate && (this.has2004 || this.currentParam === 2004)) {
-            this.enabled = byte === 0x68;
+          if (this.has2004 || this.currentParam === 2004) {
+            this.enabled = code === 0x68;
           }
-          this.state = ModeParseState.Ground;
-        } else if (byte === 0x1b) {
+          this.enterGround();
+        } else if (code === 0x1b) {
+          this.beginPending(ch);
           this.state = ModeParseState.Esc;
-        } else if (byte === 0x18 || byte === 0x1a) {
-          this.state = ModeParseState.Ground;
-        } else if (byte >= 0x40 && byte <= 0x7e) {
-          this.state = ModeParseState.Ground;
-        } else if (byte >= 0x20) {
-          this.validPrivate = false;
+        } else if (code >= 0x40 && code <= 0x7e) {
+          this.enterGround();
+        } else if (code >= 0x20) {
+          this.appendPending(ch);
           this.state = ModeParseState.CsiIgnore;
+        } else {
+          this.appendPending(ch);
         }
         return;
       case ModeParseState.CsiIgnore:
-        if (byte === 0x1b) {
+        if (code === 0x1b) {
+          this.beginPending(ch);
           this.state = ModeParseState.Esc;
-        } else if (byte === 0x18 || byte === 0x1a || (byte >= 0x40 && byte <= 0x7e)) {
-          this.state = ModeParseState.Ground;
+        } else if (code >= 0x40 && code <= 0x7e) {
+          this.enterGround();
+        } else {
+          this.appendPending(ch);
         }
         return;
     }
   }
 
-  private stepEsc(byte: number): void {
-    if (byte === 0x63) {
+  private stepEsc(code: number, ch: string): void {
+    if (code === 0x63) {
       // RIS (`\x1bc`)
       this.enabled = false;
-      this.state = ModeParseState.Ground;
-    } else if (byte === 0x5b) {
+      this.enterGround();
+    } else if (code === 0x5b) {
       // `[`
-      this.state = ModeParseState.CsiStart;
-    } else if (byte === 0x5d) {
+      this.enterCsi(ch, false);
+    } else if (code === 0x5d) {
       // `]`
+      this.appendPending(ch);
       this.state = ModeParseState.Osc;
-    } else if (byte === 0x50 || byte === 0x5f || byte === 0x5e || byte === 0x58) {
+    } else if (code === 0x50 || code === 0x5f || code === 0x5e || code === 0x58) {
       // DCS (`P`), APC (`_`), PM (`^`), SOS (`X`)
+      this.appendPending(ch);
       this.state = ModeParseState.StringSeq;
-    } else if (byte >= 0x20 && byte <= 0x2f) {
+    } else if (code >= 0x20 && code <= 0x2f) {
+      this.appendPending(ch);
       this.state = ModeParseState.EscIntermediate;
-    } else if (byte === 0x1b) {
+    } else if (code === 0x1b) {
+      this.beginPending(ch);
       this.state = ModeParseState.Esc;
     } else {
-      this.state = ModeParseState.Ground;
+      this.enterGround();
     }
   }
 }
@@ -269,7 +383,7 @@ export function createTerminalTranscript(
       }
 
       const encoded = encoder.encode(delta);
-      modeTracker.feed(encoded);
+      modeTracker.feed(delta);
       chunks.push({ bytes: encoded, start: 0 });
       totalBytes += encoded.byteLength;
       if (totalBytes > maxBufferBytes) {
@@ -281,7 +395,8 @@ export function createTerminalTranscript(
       head = 0;
       totalBytes = 0;
       if (options?.preserveModes === true) {
-        if (modeTracker.isEnabled()) {
+        const pending = modeTracker.pendingSequence();
+        if (modeTracker.isEnabled() || pending.length > 0) {
           discardedPrefix = true;
         }
       } else {
@@ -294,15 +409,29 @@ export function createTerminalTranscript(
       modeTracker.reset();
     },
     snapshot() {
-      const retainedText: Array<string> = [];
+      const retainedParts: Array<string> = [];
       for (let index = head; index < chunks.length; index += 1) {
         const chunk = chunks[index]!;
-        retainedText.push(decoder.decode(chunk.bytes.subarray(chunk.start)));
+        retainedParts.push(decoder.decode(chunk.bytes.subarray(chunk.start)));
       }
-      if (discardedPrefix && modeTracker.isEnabled()) {
-        retainedText.push(BRACKETED_PASTE_ENABLE_SEQUENCE);
+      const joined = retainedParts.join("");
+      if (!discardedPrefix) {
+        return joined;
       }
-      return retainedText.join("");
+      const pending = modeTracker.pendingSequence();
+      const restore = modeTracker.isEnabled() ? BRACKETED_PASTE_ENABLE_SEQUENCE : "";
+      if (restore.length === 0 && pending.length === 0) {
+        return joined;
+      }
+      // Insert the synthetic `?2004h` at a parser-safe boundary BEFORE any unfinished control
+      // sequence still arriving from the PTY so the next live delta completes it cleanly.
+      if (pending.length > 0) {
+        if (joined.endsWith(pending)) {
+          return `${joined.slice(0, joined.length - pending.length)}${restore}${pending}`;
+        }
+        return `${joined}${restore}${pending}`;
+      }
+      return `${joined}${restore}`;
     },
     byteLength() {
       return totalBytes;

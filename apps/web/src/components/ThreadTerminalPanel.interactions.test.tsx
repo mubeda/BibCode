@@ -7145,16 +7145,21 @@ describe("TerminalViewport mounted lifecycle", () => {
       const xtermPaste = vi.fn();
       screen.addEventListener("paste", xtermPaste);
 
-      // 1. Short multi-line paste with bracketedPasteMode OFF and embedded ESC[201~
+      // 1. Short multi-line paste with bracketedPasteMode OFF and nested join-forming ESC[201~
       terminal.modes.bracketedPasteMode = false;
-      const shortEvent = pasteEvent("line 1\r\nline \x1b[201~2\nline 3", []);
+      terminal.clearSelection.mockClear();
+      terminal.scrollToBottom.mockClear();
+      const shortEvent = pasteEvent("line 1\r\nline \x1b[20\x1b[201~1~2\nline 3", []);
       await act(async () => {
         screen.dispatchEvent(shortEvent);
         await new Promise((resolve) => window.setTimeout(resolve, 0));
       });
       expect(shortEvent.defaultPrevented).toBe(true);
       expect(xtermPaste).not.toHaveBeenCalled();
+      expect(terminal.clearSelection).toHaveBeenCalledOnce();
+      expect(terminal.scrollToBottom).toHaveBeenCalledOnce();
       expect(sentData()).toBe("\x1b[200~line 1\rline 2\rline 3\x1b[201~");
+      expect(sentData().slice(6, -6)).not.toContain("\x1b[201~");
 
       // 2. >16 KiB multi-line paste with bracketedPasteMode OFF
       testState.writeCommand.mockClear();
@@ -7170,16 +7175,17 @@ describe("TerminalViewport mounted lifecycle", () => {
       expect(longSent.endsWith("\x1b[201~")).toBe(true);
       expect(longSent.slice(6, -6)).toBe(longText.replace(/\r\n|\n/g, "\r"));
 
-      // 3. Embedded ESC[201~ even when bracketedPasteMode is ON
+      // 3. Embedded & join-forming ESC[201~ even when bracketedPasteMode is ON
       testState.writeCommand.mockClear();
       terminal.modes.bracketedPasteMode = true;
-      const hostileEvent = pasteEvent("a\x1b[201~b\nc", []);
+      const hostileEvent = pasteEvent("a\x1b[20\x1b[201~1~b\nc", []);
       await act(async () => {
         screen.dispatchEvent(hostileEvent);
         await new Promise((resolve) => window.setTimeout(resolve, 0));
       });
       expect(hostileEvent.defaultPrevented).toBe(true);
       expect(sentData()).toBe("\x1b[200~ab\rc\x1b[201~");
+      expect(sentData().slice(6, -6)).not.toContain("\x1b[201~");
 
       // 4. Single-line paste with bracketedPasteMode OFF must NOT inject stray markers
       testState.writeCommand.mockClear();
@@ -7222,6 +7228,38 @@ describe("TerminalViewport mounted lifecycle", () => {
       });
       expect(shellPaste.defaultPrevented).toBe(false);
       expect(sentData()).toBe("");
+    });
+
+    it("holds a multiline paste on an ID-only reveal until live summary metadata resolves driverKind", async () => {
+      const mounted = await mount(
+        <TerminalViewport {...viewportProps()} driverKind={null} driverKindPending />,
+      );
+      const terminal = xtermState.terminals[0]!;
+      terminal.modes.bracketedPasteMode = false;
+      const screen = mounted.container.querySelector(".xterm-screen")!;
+
+      const pendingPaste = pasteEvent("first\nsecond", []);
+      await act(async () => {
+        screen.dispatchEvent(pendingPaste);
+        // Enter typed while summary is still loading must wait behind the reserved paste.
+        terminal.dataHandler?.("\r");
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(pendingPaste.defaultPrevented).toBe(true);
+      expect(sentData()).toBe("");
+
+      // Summary arrives identifying Antigravity: paste wraps in bracketed-paste before Enter.
+      await act(async () => {
+        mounted.root.render(
+          <TerminalViewport
+            {...viewportProps()}
+            driverKind={"antigravity" as never}
+            driverKindPending={false}
+          />,
+        );
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(sentData()).toBe("\x1b[200~first\rsecond\x1b[201~\r");
     });
 
     it.each(["claudeCode", "codex", "opencode", "cursor", "grok", null] as const)(
