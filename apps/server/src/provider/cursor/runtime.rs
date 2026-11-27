@@ -1403,6 +1403,7 @@ impl CursorSessionRuntime {
             IncomingEvent::Barrier(reached) => {
                 let _ = reached.send(());
             }
+            IncomingEvent::ResponseObserved { .. } => {}
         }
     }
 

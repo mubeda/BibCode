@@ -550,6 +550,7 @@ impl GrokSessionRuntime {
             IncomingEvent::Barrier(reached) => {
                 let _ = reached.send(());
             }
+            IncomingEvent::ResponseObserved { .. } => {}
         }
     }
 

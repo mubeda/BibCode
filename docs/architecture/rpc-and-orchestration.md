@@ -3673,8 +3673,12 @@ accepted attempt. Unfrozen fresh starts remain outside this recovery policy. The
 settled turn retains its partial assistant text and ends as error.
 
 `ThreadTurnSteer` validates the queued head, a running session with an active
-turn, and the driver-owned capability shared with inventory. It atomically
-moves the row to pending/steer, clears its hold, and emits
+turn, and the driver-owned steering capability (for Antigravity, admission also
+requires that no pending approval/question is open and that the running start
+delivery has already received its first update, while provider inventory
+advertises `supportsTurnSteer` for Antigravity only when `agy >= 1.5.0` and the
+runtime enforces the same version floor). It atomically moves the row to
+pending/steer, clears its hold, and emits
 `thread.turn-steer-requested { turnId }` plus a complete nested delivery update.
 It creates no turn-start event or pending turn and never changes session state.
 The requested turn ID remains durable in that event; delivery rechecks it against

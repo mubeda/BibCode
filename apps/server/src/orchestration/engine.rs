@@ -5721,10 +5721,19 @@ async fn plan_command(
             }
             if row.provider_kind == "antigravity" {
                 let ask_thread_id = thread_id.clone();
-                let open_ask = repositories
+                let (open_ask, awaiting_first_update) = repositories
                     .database()
                     .call(move |connection| {
-                        crate::agent_messaging::store::has_open_ask(connection, &ask_thread_id)
+                        let open_ask = crate::agent_messaging::store::has_open_ask(
+                            connection,
+                            &ask_thread_id,
+                        )?;
+                        let awaiting_first_update: bool = connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND mode = 'start' AND state IN ('pending', 'sending'))",
+                            params![ask_thread_id],
+                            |row| row.get(0),
+                        )?;
+                        Ok((open_ask, awaiting_first_update))
                     })
                     .await
                     .map_err(wrap_persistence)?;
@@ -5732,6 +5741,12 @@ async fn plan_command(
                     return invariant(
                         command,
                         "Respond to the pending approval or question before steering.".to_owned(),
+                    );
+                }
+                if awaiting_first_update {
+                    return invariant(
+                        command,
+                        "Wait for the running turn to start responding before steering.".to_owned(),
                     );
                 }
             }
@@ -6705,10 +6720,17 @@ async fn persist_command(
                 }) else {
                     return Ok(Err(STALE_QUEUED_DELIVERY));
                 };
-                if head.provider_kind == "antigravity"
-                    && crate::agent_messaging::store::has_open_ask(&transaction, &thread_id)?
-                {
-                    return Ok(Err(STALE_QUEUED_DELIVERY));
+                if head.provider_kind == "antigravity" {
+                    let awaiting_first_update: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND mode = 'start' AND state IN ('pending', 'sending'))",
+                        params![thread_id],
+                        |row| row.get(0),
+                    )?;
+                    if awaiting_first_update
+                        || crate::agent_messaging::store::has_open_ask(&transaction, &thread_id)?
+                    {
+                        return Ok(Err(STALE_QUEUED_DELIVERY));
+                    }
                 }
                 let updated = transaction.execute(
                     "UPDATE provider_turn_outbox SET state = 'pending', mode = 'steer', held = 0, last_error = NULL, updated_at = ?

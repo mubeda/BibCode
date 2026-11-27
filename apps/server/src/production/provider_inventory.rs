@@ -5593,8 +5593,21 @@ done
             true
         );
         assert_eq!(
+            antigravity_with_version(Some("1.5.1-rc.1"))["supportsTurnSteer"],
+            true
+        );
+        assert_eq!(
             antigravity_with_version(Some("1.5.15"))["supportsTurnSteer"],
             true
+        );
+        assert_eq!(
+            antigravity_with_version(Some("1.10.0"))["supportsTurnSteer"],
+            true
+        );
+        assert!(
+            antigravity_with_version(Some("1.5.0-rc.1"))
+                .get("supportsTurnSteer")
+                .is_none()
         );
         assert!(
             antigravity_with_version(Some("1.4.9"))

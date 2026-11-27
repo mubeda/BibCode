@@ -61,6 +61,11 @@ pub enum IncomingEvent {
     },
     /// Queued by `AcpJsonRpcConnection::barrier`; the consumer answers it when it reaches it.
     Barrier(oneshot::Sender<()>),
+    /// Emitted in exact stdout wire order when a correlated JSON-RPC response arrives on stdout,
+    /// strictly between earlier notifications and later notifications.
+    ResponseObserved {
+        correlation_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Error)]
@@ -194,6 +199,11 @@ pub struct AcpRequestReceipt {
 }
 
 impl AcpRequestReceipt {
+    #[must_use]
+    pub fn correlation_id(&self) -> Option<&str> {
+        self.registration.correlation_id.as_deref()
+    }
+
     /// Cancel-safe: a caller that stops waiting, such as a timeout, can wait again and still gets
     /// the writer's answer. The confirmation is dropped only once it has resolved.
     #[allow(clippy::result_large_err)]
@@ -709,6 +719,9 @@ async fn route_stdout_message(
                     return Err(AcpProtocolError::InvalidMessage { message });
                 }
             };
+            let _ = incoming.send(IncomingEvent::ResponseObserved {
+                correlation_id: correlation_id.clone(),
+            });
             let _ = pending.responder.send(Err(AcpProtocolError::RemoteRequest {
                 method: pending.method,
                 request_id: correlation_id,
@@ -718,6 +731,7 @@ async fn route_stdout_message(
             }));
             return Ok(());
         }
+        let _ = incoming.send(IncomingEvent::ResponseObserved { correlation_id });
         let _ = pending
             .responder
             .send(Ok(object.get("result").cloned().unwrap_or(Value::Null)));

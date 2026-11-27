@@ -2565,15 +2565,29 @@ async fn steer_sends_concurrent_session_prompt_without_cancel_and_keeps_turn_ali
         "steer must be a distinct concurrent session/prompt request"
     );
 
+    // A late update emitted before Prompt 1 settles does NOT accept Prompt 2 or unlock a second steer.
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "late first chunk" },
+        }),
+    )
+    .await;
+    let late_events = events_until(&runtime, "content.delta").await;
+    assert_eq!(late_events.last().unwrap().1["delta"], "late first chunk");
+    assert!(
+        runtime
+            .steer_turn(Some("nested steer too early"), Vec::new(), &turn_id)
+            .await
+            .is_err(),
+        "late Prompt 1 update must not unlock a second steer before Prompt 2 responds"
+    );
+
     // `agy >= 1.5.0` resolves the superseded first prompt with `stopReason: "end_turn"` without
-    // ending or failing the running turn, and streams updates for the steered prompt.
+    // ending or failing the running turn, then streams updates for Prompt 2 (which accepts Prompt 2).
     peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
         .await;
-    steer_receipt
-        .accepted()
-        .await
-        .expect("steer accepted once first prompt ended cleanly");
-
     peer.update(
         SESSION,
         json!({
@@ -2582,6 +2596,11 @@ async fn steer_sends_concurrent_session_prompt_without_cancel_and_keeps_turn_ali
         }),
     )
     .await;
+    steer_receipt
+        .accepted()
+        .await
+        .expect("steer accepted once Prompt 2 produced its first update");
+
     peer.reply(&second_prompt, json!({ "stopReason": "end_turn" }))
         .await;
 
@@ -2597,6 +2616,88 @@ async fn steer_sends_concurrent_session_prompt_without_cancel_and_keeps_turn_ali
         peer.silent().await,
         "non-cancelling steer must never emit session/cancel"
     );
+}
+
+#[tokio::test]
+async fn rejected_steer_preserves_running_or_settled_prompt_one() {
+    // Case A: Prompt 2 is rejected while Prompt 1 is still running -> Prompt 1 keeps running and
+    // completes cleanly without premature failure.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "working" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("rejected steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+        peer.fail(&second_prompt, -32602, "steer unsupported").await;
+        assert!(
+            steer_receipt.accepted().await.is_err(),
+            "rejected steer must fail acceptance so delivery requeues it"
+        );
+
+        // Prompt 1 is still running and finishes cleanly.
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "still running" },
+            }),
+        )
+        .await;
+        peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+        let remaining = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&remaining), ["content.delta", "turn.completed"]);
+        assert_eq!(remaining[0].1["delta"], "still running");
+        assert_eq!(remaining[1].1["state"], "completed");
+    }
+
+    // Case B: Prompt 1 finishes with `end_turn` BEFORE Prompt 2 is rejected -> Prompt 2 must NOT
+    // be accepted, and Prompt 1's deferred `turn.completed` must settle once cleanly.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "working" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("late rejected steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+        peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+        peer.fail(&second_prompt, -32602, "steer rejected").await;
+        assert!(
+            steer_receipt.accepted().await.is_err(),
+            "Prompt 1 ending must never acknowledge a rejected Prompt 2"
+        );
+        let remaining = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&remaining), ["turn.completed"]);
+        assert_eq!(remaining[0].1["state"], "completed");
+    }
 }
 
 #[tokio::test]

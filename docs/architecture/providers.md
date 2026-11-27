@@ -228,7 +228,7 @@ protocol:
 | Codex       | Codex App Server JSON-RPC                      | `turn/steer`          | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
 | Claude      | Claude stream-JSON CLI and authenticated hooks | Stream-JSON user line | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
 | Cursor      | Agent Client Protocol                          | Unsupported           | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
-| Antigravity | `agy acp`, Agent Client Protocol               | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
+| Antigravity | `agy acp`, Agent Client Protocol               | Concurrent `session/prompt` (`agy >= 1.5.0`) | Files only, with notice | No structured Activity observation.                                                        |
 | Grok        | Agent Client Protocol                          | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
 | OpenCode    | OpenCode server/events API                     | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
 
@@ -562,9 +562,13 @@ Idle suspension must never stop work the provider still runs:
   starts itself), the session is also projected `running` with that turn unless
   it already reads so. Antigravity and Cursor are projected the same way: each
   announces a prompt as it writes it and ends every announced turn, an unsent
-  one included, with `turn.completed`, while its delivery is accepted only when
-  ACP answers the prompt, at the end of the turn, too late to mark it running.
-  Such a late acceptance publishes nothing. OpenCode and Grok announce a turn before BiBCode
+  one included, with `turn.completed`. Cursor's delivery is accepted only when
+  ACP answers the prompt at the end of the turn (too late to mark it running, so
+  that late acceptance publishes nothing). Antigravity's delivery is accepted as
+  soon as the CLI proves it took the prompt (first turn `session/update`,
+  `session/request_permission`, or `session/prompt` completion), so a running
+  turn releases the per-thread outbox slot for mid-turn steering (`agy >= 1.5.0`)
+  while keeping unanswered cancel timeouts `Ambiguous`. OpenCode and Grok announce a turn before BiBCode
   sends it, so their announcement does not change the projection: a send that
   fails reports no completion (OpenCode settles a turn whose request it never
   accepted, a 4xx refusal or a connection that never opened, with a `cancelled`

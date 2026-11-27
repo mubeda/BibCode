@@ -47,15 +47,31 @@ pub(crate) const ANTIGRAVITY_MIN_STEER_VERSION: (u64, u64, u64) = (1, 5, 0);
 
 /// Parses the first `major.minor.patch` version triple from a provider version string.
 pub(crate) fn parse_semver_triple(text: &str) -> Option<(u64, u64, u64)> {
-    text.split(|character: char| !(character.is_ascii_digit() || character == '.'))
-        .find_map(|token| {
-            let mut parts = token.split('.');
-            Some((
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-            ))
-        })
+    parse_semver_with_prerelease(text).map(|(triple, _)| triple)
+}
+
+/// Parses the first `major.minor.patch` version triple along with whether a SemVer prerelease
+/// identifier (`-...`) immediately follows it.
+pub(crate) fn parse_semver_with_prerelease(text: &str) -> Option<((u64, u64, u64), bool)> {
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+'))
+    })
+    .find_map(|token| {
+        let token = token.trim_start_matches(['v', 'V']);
+        let without_build = token.split('+').next().unwrap_or(token);
+        let (core, prerelease) = match without_build.split_once('-') {
+            Some((core, pre)) if !pre.is_empty() => (core, true),
+            _ => (without_build, false),
+        };
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(((major, minor, patch), prerelease))
+    })
 }
 
 /// Driver-owned capability used by durable steer admission.
@@ -67,12 +83,20 @@ pub(crate) fn supports_turn_steer(provider: &str) -> bool {
 }
 
 /// Version-aware capability advertised as `supportsTurnSteer` in provider inventory.
+///
+/// Follows SemVer 2.0.0 prerelease precedence: `1.5.0-rc.1 < 1.5.0`, while `1.5.0`, `1.5.1-rc.1`,
+/// and `1.5.15` all satisfy `>= 1.5.0`. (Antigravity chat startup independently requires `>= 1.5.4`.)
 pub(crate) fn supports_turn_steer_for_version(provider: &str, version: Option<&str>) -> bool {
     match provider {
         "codex" | "claudeAgent" => true,
-        "antigravity" => version
-            .and_then(parse_semver_triple)
-            .is_some_and(|parsed| parsed >= ANTIGRAVITY_MIN_STEER_VERSION),
+        "antigravity" => {
+            version
+                .and_then(parse_semver_with_prerelease)
+                .is_some_and(|(triple, prerelease)| {
+                    triple > ANTIGRAVITY_MIN_STEER_VERSION
+                        || (triple == ANTIGRAVITY_MIN_STEER_VERSION && !prerelease)
+                })
+        }
         _ => false,
     }
 }
