@@ -2757,3 +2757,50 @@ async fn steer_refuses_while_permission_pending_or_on_older_cli_version() {
     let events = events_until(&runtime, "turn.completed").await;
     assert_eq!(events.last().unwrap().1["state"], "completed");
 }
+
+#[tokio::test]
+async fn permission_request_from_previous_prompt_does_not_accept_unconfirmed_steer() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+    let turn_id = first_receipt.turn_id.clone();
+
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "working" },
+        }),
+    )
+    .await;
+    let _ = events_until(&runtime, "content.delta").await;
+    first_receipt.accepted().await.expect("first accepted");
+
+    let steer_receipt = runtime
+        .steer_turn(Some("unconfirmed steer"), Vec::new(), &turn_id)
+        .await
+        .expect("steer written");
+    let second_prompt = peer.expect("session/prompt").await;
+
+    // Prompt 1 has not ended on the wire yet and opens a permission request.
+    peer.permission(allow_or_deny()).await;
+    let request_id = opened_request_id(&runtime).await;
+
+    // The CLI rejects Prompt 2: Prompt 1's approval must NOT have accepted the steer.
+    peer.fail(&second_prompt, -32602, "steer rejected").await;
+    assert!(
+        steer_receipt.accepted().await.is_err(),
+        "an approval opened before Prompt 1 ends must not acknowledge a rejected concurrent steer"
+    );
+
+    // Prompt 1's approval and turn remain alive and finish cleanly.
+    runtime
+        .respond_to_request(&request_id, "accept")
+        .await
+        .expect("approve");
+    let _ = peer.next().await;
+    peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    let remaining = events_until(&runtime, "turn.completed").await;
+    assert_eq!(types(&remaining), ["request.resolved", "turn.completed"]);
+    assert_eq!(remaining.last().unwrap().1["state"], "completed");
+}

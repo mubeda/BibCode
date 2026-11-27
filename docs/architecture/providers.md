@@ -223,14 +223,14 @@ No identity or label is inferred from a description.
 Each driver translates between the common orchestration model and its native
 protocol:
 
-| Provider    | Native integration                             | Steer                 | Checkpoint revert       | Activity support                                                                           |
-| ----------- | ---------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
-| Codex       | Codex App Server JSON-RPC                      | `turn/steer`          | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
-| Claude      | Claude stream-JSON CLI and authenticated hooks | Stream-JSON user line | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
-| Cursor      | Agent Client Protocol                          | Unsupported           | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
+| Provider    | Native integration                             | Steer                                        | Checkpoint revert       | Activity support                                                                           |
+| ----------- | ---------------------------------------------- | -------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
+| Codex       | Codex App Server JSON-RPC                      | `turn/steer`                                 | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Claude      | Claude stream-JSON CLI and authenticated hooks | Stream-JSON user line                        | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
+| Cursor      | Agent Client Protocol                          | Unsupported                                  | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
 | Antigravity | `agy acp`, Agent Client Protocol               | Concurrent `session/prompt` (`agy >= 1.5.0`) | Files only, with notice | No structured Activity observation.                                                        |
-| Grok        | Agent Client Protocol                          | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
-| OpenCode    | OpenCode server/events API                     | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Grok        | Agent Client Protocol                          | Unsupported                                  | Files only, with notice | No structured Activity observation.                                                        |
+| OpenCode    | OpenCode server/events API                     | Unsupported                                  | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
 
 Codex, Cursor, and Grok keep the provider's JSON-RPC request ID for their wire
 response. BiBCode gives each approval or question an opaque request ID scoped

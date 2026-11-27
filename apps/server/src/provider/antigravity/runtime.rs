@@ -1855,8 +1855,18 @@ impl AntigravitySessionRuntime {
                 reject_once: find_option_id(&options, "reject_once"),
             },
         );
-        // The CLI proved it accepted the prompt by opening an approval for it.
-        gate.resolve_pending_accept(Ok(()));
+        // The CLI proved it accepted the prompt by opening an approval for it —
+        // only once any previous prompt has finished on the wire, so an approval
+        // belonging to Prompt 1 cannot acknowledge an unconfirmed concurrent steer.
+        if gate
+            .previous_prompt
+            .as_ref()
+            .is_none_or(|prev| prev.wire_ended || prev.settled.is_some())
+        {
+            gate.previous_prompt = None;
+            gate.active_turn_has_update = true;
+            gate.resolve_pending_accept(Ok(()));
+        }
         // Emitted under the gate, so a cancel cannot resolve the request before it opens.
         self.emit(
             "request.opened",
