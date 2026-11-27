@@ -166,6 +166,7 @@ function toRemoteStatusPart(status: VcsStatusResult): VcsStatusRemoteResult {
       ? {}
       : { aheadOfDefaultCount: status.aheadOfDefaultCount }),
     pr: status.pr,
+    ...(status.prLookupError === undefined ? {} : { prLookupError: status.prLookupError }),
   };
 }
 

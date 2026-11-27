@@ -223,6 +223,39 @@ describe("applyGitStatusStreamEvent", () => {
     expect(remoteUpdated.operationInProgress).toBe("merge");
   });
 
+  it("preserves prLookupError across same-branch local updates and clears it on branch change or recovery", () => {
+    const failedRemote: VcsStatusRemoteResult = {
+      ...remoteStatus,
+      prLookupError: "not_authenticated",
+    };
+    const snapshot = applyGitStatusStreamEvent(null, {
+      _tag: "snapshot",
+      local: localStatus,
+      remote: failedRemote,
+    });
+    expect(snapshot.prLookupError).toBe("not_authenticated");
+
+    const sameBranchLocal = applyGitStatusStreamEvent(snapshot, {
+      _tag: "localUpdated",
+      local: { ...localStatus, hasWorkingTreeChanges: false },
+    });
+    expect(sameBranchLocal.prLookupError).toBe("not_authenticated");
+
+    const switchedBranch = applyGitStatusStreamEvent(sameBranchLocal, {
+      _tag: "localUpdated",
+      local: { ...localStatus, refName: "feature/other" },
+    });
+    expect(switchedBranch.prLookupError).toBeUndefined();
+    expect(Object.hasOwn(switchedBranch, "prLookupError")).toBe(false);
+
+    const recovered = applyGitStatusStreamEvent(sameBranchLocal, {
+      _tag: "remoteUpdated",
+      remote: { ...remoteStatus },
+    });
+    expect(recovered.prLookupError).toBeUndefined();
+    expect(Object.hasOwn(recovered, "prLookupError")).toBe(false);
+  });
+
   it("treats a remote-only update as a repository when local state is missing", () => {
     const remote: VcsStatusRemoteResult = {
       hasUpstream: true,
