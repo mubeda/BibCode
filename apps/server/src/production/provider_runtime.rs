@@ -3149,6 +3149,14 @@ pub async fn reconcile_abandoned_provider_sessions(
             tracing::warn!(%error, "failed to read running turns for startup reconciliation");
         }
     }
+    // Deleted threads can never accept ThreadMessageAssistantComplete; clear any legacy
+    // orphaned streaming rows left on deleted threads before listing live threads to settle.
+    if let Err(error) = repositories
+        .clear_streaming_assistant_messages_of_deleted_threads()
+        .await
+    {
+        tracing::warn!(%error, "failed to clear streaming assistant messages on deleted threads");
+    }
     // No session is live, so an assistant message still streaming is orphaned too. A stop after
     // a turn ended but before its reply settled leaves no active turn for the loops above to
     // settle. This runs after them, so an abandoned turn is failed before its reply settles;
@@ -15121,6 +15129,13 @@ async fn settle_streaming_assistant_message_rows(
             created_at: created_at.to_owned(),
         };
         if let Err(error) = engine.dispatch(completion.clone()).await {
+            if provider_thread_was_deleted(&engine.repositories(), &thread_id).await {
+                let _ = engine
+                    .repositories()
+                    .clear_streaming_assistant_messages_of_deleted_threads()
+                    .await;
+                continue;
+            }
             tracing::warn!(
                 %error,
                 %thread_id,
@@ -15128,6 +15143,13 @@ async fn settle_streaming_assistant_message_rows(
                 "assistant terminal settlement failed; retrying once"
             );
             if let Err(error) = engine.dispatch(completion).await {
+                if provider_thread_was_deleted(&engine.repositories(), &thread_id).await {
+                    let _ = engine
+                        .repositories()
+                        .clear_streaming_assistant_messages_of_deleted_threads()
+                        .await;
+                    continue;
+                }
                 tracing::warn!(
                     %error,
                     %thread_id,
@@ -30087,6 +30109,183 @@ done
                 false
             )]
         );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_skips_and_clears_streaming_assistant_messages_on_deleted_threads()
+     {
+        use std::io;
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("captured log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+
+        let engine = supervisor_engine().await;
+        for command in [
+            json!({"type":"thread.create","commandId":"thread-deleted","threadId":"t-deleted","projectId":"p1","title":"Deleted","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.create","commandId":"thread-live","threadId":"t-live","projectId":"p1","title":"Live","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-deleted","threadId":"t-deleted","messageId":"msg-deleted","delta":"Partial reply","turnId":"turn-deleted","createdAt":"2026-07-16T00:00:01Z"}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-live","threadId":"t-live","messageId":"msg-live","delta":"Orphaned live reply","turnId":"turn-live","createdAt":"2026-07-16T00:00:01Z"}),
+            json!({"type":"thread.delete","commandId":"delete-t-deleted","threadId":"t-deleted","createdAt":"2026-07-16T00:00:02Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        // Simulate a legacy pre-fix database where a deleted thread still holds an is_streaming=1 assistant row.
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute(
+                    "UPDATE projection_thread_messages SET is_streaming = 1 WHERE message_id = 'msg-deleted'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        super::reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .unwrap();
+
+        let deleted_msg = engine
+            .repositories()
+            .get_message("msg-deleted".to_owned())
+            .await
+            .unwrap()
+            .expect("deleted thread message row");
+        assert!(
+            !deleted_msg.is_streaming,
+            "deleted thread's streaming flag should be cleared on startup reconciliation"
+        );
+        let live_msg = engine
+            .repositories()
+            .get_message("msg-live".to_owned())
+            .await
+            .unwrap()
+            .expect("live thread message row");
+        assert!(
+            !live_msg.is_streaming,
+            "live thread's orphaned streaming assistant message must still settle"
+        );
+
+        let captured =
+            String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8");
+        assert!(
+            !captured.contains("assistant terminal settlement failed"),
+            "unexpected settlement failure warning for deleted thread: {captured}"
+        );
+        assert!(
+            !captured
+                .contains("assistant messages remained streaming after startup reconciliation"),
+            "unexpected remained-streaming warning for deleted thread: {captured}"
+        );
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn settle_streaming_assistant_message_rows_does_not_retry_deleted_thread() {
+        use std::io;
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("captured log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+
+        let engine = supervisor_engine().await;
+        for command in [
+            json!({"type":"thread.create","commandId":"thread-race","threadId":"t-race","projectId":"p1","title":"Race","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-race","threadId":"t-race","messageId":"msg-race","delta":"In flight","turnId":"turn-race","createdAt":"2026-07-16T00:00:01Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        // Snapshot the streaming row before a concurrent thread deletion arrives.
+        let stale_rows = engine
+            .repositories()
+            .list_streaming_assistant_messages()
+            .await
+            .unwrap();
+        assert_eq!(stale_rows.len(), 1);
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.delete",
+                    "commandId": "delete-t-race",
+                    "threadId": "t-race",
+                    "createdAt": "2026-07-16T00:00:02Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = super::settle_streaming_assistant_message_rows(
+            &engine,
+            stale_rows,
+            "test-concurrent-delete",
+            "2026-07-16T00:00:03Z",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "concurrently deleted thread must not fail assistant settlement: {result:?}"
+        );
+        let captured =
+            String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8");
+        assert!(
+            !captured.contains("retrying once") && !captured.contains("failed after retry"),
+            "deleted thread must not retry settlement: {captured}"
+        );
+
         engine.shutdown().await;
     }
 

@@ -8046,10 +8046,22 @@ fn apply_threads_projector_tx(
         let payload = &event.event.payload;
         match event.event.event_type.as_str() {
             "thread.deleted" => {
-                transaction.execute("UPDATE projection_threads SET deleted_at = ?, updated_at = ? WHERE thread_id = ?", params![required_str(payload,"deletedAt")?, required_str(payload,"deletedAt")?, required_str(payload,"threadId")?])?;
+                let thread_id = required_str(payload, "threadId")?;
+                transaction.execute(
+                    "UPDATE projection_threads SET deleted_at = ?, updated_at = ? WHERE thread_id = ?",
+                    params![
+                        required_str(payload, "deletedAt")?,
+                        required_str(payload, "deletedAt")?,
+                        &thread_id
+                    ],
+                )?;
                 transaction.execute(
                     "DELETE FROM provider_session_runtime WHERE thread_id = ?",
-                    [required_str(payload, "threadId")?],
+                    [&thread_id],
+                )?;
+                transaction.execute(
+                    "UPDATE projection_thread_messages SET is_streaming = 0 WHERE thread_id = ? AND is_streaming = 1",
+                    [&thread_id],
                 )?;
             }
             "thread.archived" => {

@@ -1635,18 +1635,30 @@ impl Repositories {
             })
             .await
     }
-    /// Every assistant message still streaming, in any thread.
+    /// Every assistant message still streaming on a non-deleted thread.
     pub async fn list_streaming_assistant_messages(&self) -> Result<Vec<ProjectionThreadMessage>> {
         self.database
             .call(move |connection| {
                 collect(
                     connection,
                     &format!(
-                        "{MESSAGE_SELECT} WHERE role = 'assistant' AND is_streaming = 1 ORDER BY thread_id ASC, rowid ASC"
+                        "{MESSAGE_SELECT} WHERE role = 'assistant' AND is_streaming = 1 AND NOT EXISTS (SELECT 1 FROM projection_threads t WHERE t.thread_id = projection_thread_messages.thread_id AND t.deleted_at IS NOT NULL) ORDER BY thread_id ASC, rowid ASC"
                     ),
                     [],
                     decode_message,
                 )
+            })
+            .await
+    }
+    /// Clears `is_streaming` on assistant messages belonging to already-deleted threads so
+    /// startup reconciliation never retries the deleted-thread invariant across boots.
+    pub async fn clear_streaming_assistant_messages_of_deleted_threads(&self) -> Result<usize> {
+        self.database
+            .call(move |connection| {
+                Ok(connection.execute(
+                    "UPDATE projection_thread_messages SET is_streaming = 0 WHERE role = 'assistant' AND is_streaming = 1 AND EXISTS (SELECT 1 FROM projection_threads t WHERE t.thread_id = projection_thread_messages.thread_id AND t.deleted_at IS NOT NULL)",
+                    [],
+                )?)
             })
             .await
     }
