@@ -29,7 +29,11 @@ snapshots. Other providers leave it absent until their adapter implements an
 equivalent status source; clients keep the control visible but disabled.
 
 `supportsTurnSteer` is also inventory-owned: Codex and Claude advertise native
-steering; Cursor, Grok, and OpenCode omit it. The server checks the same driver
+steering unconditionally; Antigravity advertises it when the installed `agy`
+CLI version is `>= 1.5.0` (steering sends a second concurrent ACP
+`session/prompt` without `session/cancel`, refused while a permission approval
+or clarifying question is pending or before the running prompt's first update
+arrives); Cursor, Grok, and OpenCode omit it. The server checks the same driver
 capability when admitting a steer of the oldest queued message.
 
 `supportsConversationRewind` comes from the same driver capability: `true`

@@ -2510,3 +2510,149 @@ async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
     );
     child.complete();
 }
+
+#[tokio::test]
+async fn steer_sends_concurrent_session_prompt_without_cancel_and_keeps_turn_alive_when_first_prompt_ends()
+ {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+    let turn_id = first_receipt.turn_id.clone();
+
+    // Before the first update arrives, steer is refused and sends nothing on the wire.
+    let too_early = runtime
+        .steer_turn(Some("steer too early"), Vec::new(), &turn_id)
+        .await
+        .expect_err("steer before first update must be refused");
+    assert!(matches!(
+        too_early,
+        AntigravityRuntimeError::SteerUnavailable { .. }
+    ));
+    assert!(peer.silent().await, "refused steer must write nothing");
+
+    // Once the first update arrives, Turn 1 is accepted and steer can send a second concurrent
+    // `session/prompt` without ever sending `session/cancel`.
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "initial chunk" },
+        }),
+    )
+    .await;
+    let first_events = events_until(&runtime, "content.delta").await;
+    assert_eq!(first_events.last().unwrap().1["delta"], "initial chunk");
+    first_receipt
+        .accepted()
+        .await
+        .expect("first turn accepted on first update");
+
+    let steer_receipt = runtime
+        .steer_turn(Some("steered instruction"), Vec::new(), &turn_id)
+        .await
+        .expect("steer written");
+    assert_eq!(steer_receipt.turn_id, turn_id);
+
+    let second_prompt = peer.expect("session/prompt").await;
+    assert_eq!(second_prompt["params"]["sessionId"], SESSION);
+    assert!(
+        second_prompt["params"]["prompt"]
+            .to_string()
+            .contains("steered instruction"),
+        "expected steered prompt text: {second_prompt}"
+    );
+    assert_ne!(
+        second_prompt["id"], first_prompt["id"],
+        "steer must be a distinct concurrent session/prompt request"
+    );
+
+    // `agy >= 1.5.0` resolves the superseded first prompt with `stopReason: "end_turn"` without
+    // ending or failing the running turn, and streams updates for the steered prompt.
+    peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    steer_receipt
+        .accepted()
+        .await
+        .expect("steer accepted once first prompt ended cleanly");
+
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "steered reply" },
+        }),
+    )
+    .await;
+    peer.reply(&second_prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+
+    let remaining = events_until(&runtime, "turn.completed").await;
+    assert_eq!(
+        types(&remaining),
+        ["content.delta", "turn.completed"],
+        "first prompt end_turn must not emit a premature turn.completed: {remaining:?}"
+    );
+    assert_eq!(remaining[0].1["delta"], "steered reply");
+    assert_eq!(remaining[1].1["state"], "completed");
+    assert!(
+        peer.silent().await,
+        "non-cancelling steer must never emit session/cancel"
+    );
+}
+
+#[tokio::test]
+async fn steer_refuses_while_permission_pending_or_on_older_cli_version() {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+    let turn_id = first_receipt.turn_id.clone();
+
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "working" },
+        }),
+    )
+    .await;
+    let _ = events_until(&runtime, "content.delta").await;
+    first_receipt.accepted().await.expect("first turn accepted");
+
+    // Open a permission request: steer must be refused while any approval is pending.
+    peer.permission(allow_or_deny()).await;
+    let request_id = opened_request_id(&runtime).await;
+    let blocked = runtime
+        .steer_turn(Some("cannot steer during approval"), Vec::new(), &turn_id)
+        .await
+        .expect_err("steer must refuse while permission is pending");
+    assert!(matches!(
+        blocked,
+        AntigravityRuntimeError::SteerUnavailable { .. }
+    ));
+    assert!(peer.silent().await);
+
+    // Resolve the approval, then downgrade the recorded CLI version below 1.5.0: steer must refuse.
+    runtime
+        .respond_to_request(&request_id, "accept")
+        .await
+        .expect("approve");
+    let _ = peer.next().await;
+
+    for unsupported_version in [Some((1, 4, 9)), Some((1, 4, 99)), None] {
+        runtime
+            .set_agent_version_for_test(unsupported_version)
+            .await;
+        let refused = runtime
+            .steer_turn(Some("old cli steer"), Vec::new(), &turn_id)
+            .await
+            .expect_err("steer on agy < 1.5.0 or unknown version must be refused");
+        assert!(
+            matches!(refused, AntigravityRuntimeError::SteerUnavailable { .. }),
+            "{unsupported_version:?}: {refused:?}"
+        );
+        assert!(peer.silent().await);
+    }
+
+    peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    let events = events_until(&runtime, "turn.completed").await;
+    assert_eq!(events.last().unwrap().1["state"], "completed");
+}

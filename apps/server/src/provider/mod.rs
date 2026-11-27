@@ -41,9 +41,40 @@ mod request_scope_tests {
     }
 }
 
-/// Driver-owned capability used by both inventory and durable steer admission.
+/// Minimum `agy` CLI version that supports mid-turn steering via a second concurrent ACP
+/// `session/prompt` (#434).
+pub(crate) const ANTIGRAVITY_MIN_STEER_VERSION: (u64, u64, u64) = (1, 5, 0);
+
+/// Parses the first `major.minor.patch` version triple from a provider version string.
+pub(crate) fn parse_semver_triple(text: &str) -> Option<(u64, u64, u64)> {
+    text.split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find_map(|token| {
+            let mut parts = token.split('.');
+            Some((
+                parts.next()?.parse().ok()?,
+                parts.next()?.parse().ok()?,
+                parts.next()?.parse().ok()?,
+            ))
+        })
+}
+
+/// Driver-owned capability used by durable steer admission.
+///
+/// Antigravity is further version-gated (`agy >= 1.5.0`) in provider inventory via
+/// [`supports_turn_steer_for_version`] and inside the Antigravity runtime.
 pub(crate) fn supports_turn_steer(provider: &str) -> bool {
-    matches!(provider, "codex" | "claudeAgent")
+    matches!(provider, "codex" | "claudeAgent" | "antigravity")
+}
+
+/// Version-aware capability advertised as `supportsTurnSteer` in provider inventory.
+pub(crate) fn supports_turn_steer_for_version(provider: &str, version: Option<&str>) -> bool {
+    match provider {
+        "codex" | "claudeAgent" => true,
+        "antigravity" => version
+            .and_then(parse_semver_triple)
+            .is_some_and(|parsed| parsed >= ANTIGRAVITY_MIN_STEER_VERSION),
+        _ => false,
+    }
 }
 
 /// Driver-owned capability used by inventory, `thread.compact` admission and context-limit

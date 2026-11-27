@@ -5719,6 +5719,22 @@ async fn plan_command(
             if !crate::provider::supports_turn_steer(&row.provider_kind) {
                 return invariant(command, "provider does not support steering".to_owned());
             }
+            if row.provider_kind == "antigravity" {
+                let ask_thread_id = thread_id.clone();
+                let open_ask = repositories
+                    .database()
+                    .call(move |connection| {
+                        crate::agent_messaging::store::has_open_ask(connection, &ask_thread_id)
+                    })
+                    .await
+                    .map_err(wrap_persistence)?;
+                if open_ask {
+                    return invariant(
+                        command,
+                        "Respond to the pending approval or question before steering.".to_owned(),
+                    );
+                }
+            }
             Ok(vec![
                 make_event(
                     "thread.turn-steer-requested",
@@ -6683,7 +6699,15 @@ async fn persist_command(
             }
             if let Some((thread_id, message_id, created_at, turn_id)) = steering {
                 let head = crate::persistence::queued_provider_turn_head_on(&transaction, &thread_id)?;
-                if !head.is_some_and(|row| row.message_id == message_id && crate::provider::supports_turn_steer(&row.provider_kind)) {
+                let Some(head) = head.filter(|row| {
+                    row.message_id == message_id
+                        && crate::provider::supports_turn_steer(&row.provider_kind)
+                }) else {
+                    return Ok(Err(STALE_QUEUED_DELIVERY));
+                };
+                if head.provider_kind == "antigravity"
+                    && crate::agent_messaging::store::has_open_ask(&transaction, &thread_id)?
+                {
                     return Ok(Err(STALE_QUEUED_DELIVERY));
                 }
                 let updated = transaction.execute(

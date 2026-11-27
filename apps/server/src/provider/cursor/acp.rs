@@ -63,7 +63,7 @@ pub enum IncomingEvent {
     Barrier(oneshot::Sender<()>),
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum AcpProtocolError {
     #[error("ACP JSON-RPC connection is closed: {reason}")]
     Closed { reason: String },

@@ -2982,7 +2982,7 @@ fn snapshot_owned_message(
     if let Some(message) = message {
         result["message"] = json!(message);
     }
-    if crate::provider::supports_turn_steer(&definition.driver) {
+    if crate::provider::supports_turn_steer_for_version(&definition.driver, version.as_deref()) {
         result["supportsTurnSteer"] = json!(true);
     }
     // Always present: a client reads an absent flag (an older server) as unknown.
@@ -5570,6 +5570,47 @@ done
         assert!(cursor.get("supportsTurnSteer").is_none());
         assert!(grok.get("supportsTurnSteer").is_none());
         assert!(opencode.get("supportsTurnSteer").is_none());
+
+        let antigravity_def = definitions
+            .iter()
+            .find(|definition| definition.driver == "antigravity")
+            .expect("built-in antigravity definition");
+        let antigravity_with_version = |version: Option<&str>| {
+            snapshot_owned_message(
+                antigravity_def,
+                true,
+                version.map(str::to_owned),
+                "ready",
+                json!({ "status": "authenticated" }),
+                Vec::new(),
+                ProviderCapabilities::default(),
+                None,
+                "2026-08-01T00:00:00.000Z".to_owned(),
+            )
+        };
+        assert_eq!(
+            antigravity_with_version(Some("1.5.0"))["supportsTurnSteer"],
+            true
+        );
+        assert_eq!(
+            antigravity_with_version(Some("1.5.15"))["supportsTurnSteer"],
+            true
+        );
+        assert!(
+            antigravity_with_version(Some("1.4.9"))
+                .get("supportsTurnSteer")
+                .is_none()
+        );
+        assert!(
+            antigravity_with_version(Some("1.4.99"))
+                .get("supportsTurnSteer")
+                .is_none()
+        );
+        assert!(
+            antigravity_with_version(None)
+                .get("supportsTurnSteer")
+                .is_none()
+        );
         assert_eq!(codex["supportsMcpStatus"], true);
         assert_eq!(claude["supportsMcpStatus"], true);
         assert!(cursor.get("supportsMcpStatus").is_none());

@@ -9764,9 +9764,37 @@ async fn spawn_delivery(
                 .await
             {
                 Ok(Some(turn_id)) => {
-                    driver
-                        .steer(message.text, message.attachments, turn_id, delivery_key)
-                        .await
+                    let blocked_by_open_ask = if row.provider_kind == "antigravity" {
+                        let ask_thread_id = row.thread_id.clone();
+                        repositories
+                            .database()
+                            .call(move |connection| {
+                                crate::agent_messaging::store::has_open_ask(
+                                    connection,
+                                    &ask_thread_id,
+                                )
+                            })
+                            .await
+                    } else {
+                        Ok(false)
+                    };
+                    match blocked_by_open_ask {
+                        Ok(true) => ProviderDeliveryOutcome::Rejected {
+                            detail: "Respond to the pending approval or question before steering."
+                                .to_owned(),
+                        },
+                        Ok(false) => {
+                            driver
+                                .steer(message.text, message.attachments, turn_id, delivery_key)
+                                .await
+                        }
+                        Err(error) => ProviderDeliveryOutcome::DefinitelyNotSent {
+                            detail: delivery_detail(
+                                &ProviderRuntimeError::Persistence(error.to_string()),
+                                None,
+                            ),
+                        },
+                    }
                 }
                 Ok(None) => ProviderDeliveryOutcome::Rejected {
                     detail: STEER_TARGET_GONE_DETAIL.to_owned(),
@@ -18422,10 +18450,66 @@ impl ProviderDriver for AntigravityDriver {
                 Err(error) => return antigravity_unsent_outcome(error),
             };
             let turn_id = receipt.turn_id.clone();
-            match receipt.completion().await {
+            match receipt.accepted().await {
                 Ok(()) => ProviderDeliveryOutcome::Accepted {
                     turn_id: Some(turn_id),
                 },
+                Err(
+                    error @ (AntigravityRuntimeError::SignInRequired
+                    | AntigravityRuntimeError::AccountDisabled { .. }
+                    | AntigravityRuntimeError::Protocol(
+                        crate::provider::antigravity::acp::AcpProtocolError::RemoteRequest {
+                            ..
+                        },
+                    )),
+                ) => ProviderDeliveryOutcome::Rejected {
+                    detail: delivery_detail(&antigravity_error(error), None),
+                },
+                Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: delivery_detail(&antigravity_error(error), None),
+                },
+            }
+        })
+    }
+    fn steer(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        expected_turn_id: String,
+        _: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
+                Ok(input) => input,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: delivery_detail(&error, None),
+                    };
+                }
+            };
+            let receipt = match self
+                .runtime
+                .steer_turn(Some(&text), attachments, &expected_turn_id)
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(AntigravityRuntimeError::SteerUnavailable { detail }) => {
+                    return ProviderDeliveryOutcome::Rejected { detail };
+                }
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: delivery_detail(&antigravity_error(error), None),
+                    };
+                }
+            };
+            let turn_id = receipt.turn_id.clone();
+            match receipt.accepted().await {
+                Ok(()) => ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn_id),
+                },
+                Err(AntigravityRuntimeError::SteerUnavailable { detail }) => {
+                    ProviderDeliveryOutcome::Rejected { detail }
+                }
                 Err(
                     error @ (AntigravityRuntimeError::SignInRequired
                     | AntigravityRuntimeError::AccountDisabled { .. }
@@ -43038,6 +43122,300 @@ done
         assert_eq!(
             init_count, 2,
             "retry after broken transport must launch a fresh agy acp process"
+        );
+
+        service.shutdown().await;
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("shutdown in time")
+            .expect("shutdown");
+        engine.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_durable_steer_delivers_second_prompt_without_cancel_and_blocks_on_open_approval()
+     {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture = temp.path().join("requests.jsonl");
+        let steer_fixture = r#"#!/bin/sh
+capture='@CAPTURE@'
+first_prompt_id=''
+prompt_count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$capture"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.15"}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"agy-steer","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"auto","options":[{"value":"auto","name":"Auto"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"default","options":[{"value":"default","name":"default"},{"value":"accept-edits","name":"accept-edits"},{"value":"auto","name":"auto"},{"value":"plan","name":"plan"}]}]}}\n' "$id"
+      ;;
+    *'"method":"session/set_config_option"'*)
+      val=$(printf '%s\n' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"auto","options":[{"value":"auto","name":"Auto"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"%s","options":[{"value":"default","name":"default"},{"value":"accept-edits","name":"accept-edits"},{"value":"auto","name":"auto"},{"value":"plan","name":"plan"}]}]}}\n' "$id" "$val"
+      ;;
+    *'"method":"session/prompt"'*)
+      prompt_count=$((prompt_count + 1))
+      if [ "$prompt_count" -eq 1 ]; then
+        first_prompt_id="$id"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-steer","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"First turn working..."}}}}\n'
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$first_prompt_id"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-steer","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Steered answer."}}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      fi
+      ;;
+  esac
+done
+"#
+        .replace("@CAPTURE@", &capture.display().to_string());
+        let binary = executable_fixture(&temp, "agy-steer", &steer_fixture)
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&json!({
+                "providerInstances": {
+                    "antigravity": {
+                        "driver": "antigravity",
+                        "enabled": true,
+                        "config": { "binaryPath": binary }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let engine = supervisor_engine().await;
+        for command in [
+            json!({"type":"project.create","commandId":"ag-steer-proj","projectId":"ag-steer","title":"Antigravity","workspaceRoot":temp.path(),"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.create","commandId":"ag-steer-thread","threadId":"ag-steer","projectId":"ag-steer","title":"Thread","kind":"workspace","modelSelection":{"instanceId":"antigravity","model":"auto"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        let supervisor = Arc::new(antigravity_supervisor(&engine, &temp).await);
+        let service = crate::production::turn_delivery::TurnDeliveryService::start(
+            engine.clone(),
+            supervisor.clone(),
+            temp.path().to_path_buf(),
+        );
+
+        // Start Turn 1 via durable orchestration command.
+        let turn1: OrchestrationCommand = serde_json::from_value(json!({
+            "type": "thread.turn.start",
+            "commandId": "steer-cmd-1",
+            "threadId": "ag-steer",
+            "message": { "messageId": "steer-msg-1", "role": "user", "text": "Start long task", "attachments": [] },
+            "modelSelection": { "instanceId": "antigravity", "model": "auto" },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "createdAt": "2026-07-16T00:00:00Z",
+        }))
+        .unwrap();
+        let mut turn1_payload = serde_json::to_value(&turn1).unwrap();
+        super::freeze_delivery_route(
+            &engine,
+            &temp.path().to_path_buf(),
+            &turn1,
+            &mut turn1_payload,
+        )
+        .await
+        .expect("freeze turn 1");
+        engine
+            .repositories()
+            .database()
+            .call({
+                let payload = turn1_payload.to_string();
+                move |connection| {
+                    connection.execute(
+                        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('steer-cmd-1', 'thread', 'ag-steer', '2026-07-16T00:00:00Z', 0, 'accepted', NULL, 'd1')",
+                        [],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('steer-cmd-1', 'ag-steer', 'steer-msg-1', 'antigravity', 'antigravity', NULL, 'k1', ?, 'pending', 0, NULL, '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z')",
+                        [payload],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("seed turn 1");
+        service.wake();
+
+        // Wait until Turn 1 is Delivered (first update received) while the turn is still running.
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("steer-cmd-1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let session = engine
+                    .repositories()
+                    .get_thread_session("ag-steer".to_owned())
+                    .await
+                    .unwrap();
+                if row.state == super::TurnDeliveryState::Delivered
+                    && session
+                        .as_ref()
+                        .is_some_and(|session| session.status == "running")
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Turn 1 accepted on first update while still running");
+
+        // Queue follow-up message 2.
+        let turn2: OrchestrationCommand = serde_json::from_value(json!({
+            "type": "thread.turn.start",
+            "commandId": "steer-cmd-2",
+            "threadId": "ag-steer",
+            "message": { "messageId": "steer-msg-2", "role": "user", "text": "Switch to plan B", "attachments": [] },
+            "modelSelection": { "instanceId": "antigravity", "model": "auto" },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "queued": true,
+            "createdAt": "2026-07-16T00:00:01Z",
+        }))
+        .unwrap();
+        let mut turn2_payload = serde_json::to_value(&turn2).unwrap();
+        super::freeze_delivery_route(
+            &engine,
+            &temp.path().to_path_buf(),
+            &turn2,
+            &mut turn2_payload,
+        )
+        .await
+        .expect("freeze turn 2");
+        engine
+            .repositories()
+            .database()
+            .call({
+                let payload = turn2_payload.to_string();
+                move |connection| {
+                    connection.execute(
+                        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('steer-cmd-2', 'thread', 'ag-steer', '2026-07-16T00:00:01Z', 0, 'accepted', NULL, 'd2')",
+                        [],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('steer-cmd-2', 'ag-steer', 'steer-msg-2', 'antigravity', 'antigravity', NULL, 'k2', ?, 'queued', 0, NULL, '2026-07-16T00:00:01Z', '2026-07-16T00:00:01Z')",
+                        [payload],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("seed queued follow-up");
+
+        // While a pending approval exists on the thread, ThreadTurnSteer must be rejected and keep
+        // the follow-up queued.
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute(
+                    "INSERT INTO projection_pending_approvals (request_id, thread_id, turn_id, status, decision, created_at, resolved_at) VALUES ('pending-apr-1', 'ag-steer', 'turn-x', 'pending', NULL, '2026-07-16T00:00:01Z', NULL)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed pending approval");
+        let blocked = engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.turn.steer",
+                    "commandId": "steer-req-blocked",
+                    "threadId": "ag-steer",
+                    "messageId": "steer-msg-2",
+                    "createdAt": "2026-07-16T00:00:02Z",
+                }))
+                .unwrap(),
+            )
+            .await;
+        assert!(
+            blocked.is_err(),
+            "steer must be refused while a pending approval is open: {blocked:?}"
+        );
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute(
+                    "DELETE FROM projection_pending_approvals WHERE request_id = 'pending-apr-1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("clear pending approval");
+
+        // Now steer the queued follow-up mid-turn!
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.turn.steer",
+                    "commandId": "steer-req-ok",
+                    "threadId": "ag-steer",
+                    "messageId": "steer-msg-2",
+                    "createdAt": "2026-07-16T00:00:03Z",
+                }))
+                .unwrap(),
+            )
+            .await
+            .expect("steer admitted");
+        service.wake();
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("steer-cmd-2".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let session = engine
+                    .repositories()
+                    .get_thread_session("ag-steer".to_owned())
+                    .await
+                    .unwrap();
+                if row.state == super::TurnDeliveryState::Delivered
+                    && session
+                        .as_ref()
+                        .is_some_and(|session| session.status == "ready")
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("steered follow-up delivered and turn settled");
+
+        let methods = captured_methods(&capture);
+        assert_eq!(
+            methods.iter().filter(|m| *m == "session/prompt").count(),
+            2,
+            "expected two concurrent session/prompt calls: {methods:?}"
+        );
+        assert!(
+            !methods.contains(&"session/cancel".to_owned()),
+            "Antigravity steer must never send session/cancel: {methods:?}"
+        );
+        assert_eq!(
+            methods.iter().filter(|m| *m == "initialize").count(),
+            1,
+            "steer must reuse the running agy acp session: {methods:?}"
         );
 
         service.shutdown().await;

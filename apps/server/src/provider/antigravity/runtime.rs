@@ -29,8 +29,9 @@ use super::acp::{
     acp_error_reason, acp_turn_state,
 };
 use crate::provider::{
-    OptionRefusal, RefusedOption, model_unavailable_refusal, option_needs_value_refusal,
-    option_without_id_refusal, unsupported_option_refusal,
+    ANTIGRAVITY_MIN_STEER_VERSION, OptionRefusal, RefusedOption, model_unavailable_refusal,
+    option_needs_value_refusal, option_without_id_refusal, parse_semver_triple,
+    unsupported_option_refusal,
 };
 
 const PROVIDER: &str = "antigravity";
@@ -77,7 +78,7 @@ pub struct AntigravityRuntimeEvent {
     pub payload: Value,
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum AntigravityRuntimeError {
     #[error(transparent)]
     Protocol(#[from] AcpProtocolError),
@@ -119,6 +120,10 @@ pub enum AntigravityRuntimeError {
     UnsupportedOption(RefusedOption),
     #[error("Antigravity config update acknowledgement omitted configOptions")]
     MalformedConfigAcknowledgement,
+    /// Steering could not be applied to the running turn (for example, CLI version `< 1.5.0`,
+    /// pending approval/question, or no turn update yet); the message returns to the queue.
+    #[error("{detail}")]
+    SteerUnavailable { detail: String },
 }
 
 impl AntigravityRuntimeError {
@@ -137,6 +142,7 @@ impl AntigravityRuntimeError {
             Self::MissingProviderSessionId
             | Self::PendingRequestNotFound { .. }
             | Self::MalformedConfigAcknowledgement => "runtime_error",
+            Self::SteerUnavailable { .. } => "steer_unavailable",
         }
     }
 
@@ -155,6 +161,7 @@ impl AntigravityRuntimeError {
             Self::MissingProviderSessionId => "missing_provider_session_id",
             Self::PendingRequestNotFound { .. } => "pending_request_not_found",
             Self::MalformedConfigAcknowledgement => "malformed_config_acknowledgement",
+            Self::SteerUnavailable { .. } => "steer_unavailable",
         }
     }
 
@@ -222,11 +229,24 @@ fn unsupported_version_message(version: Option<&str>) -> String {
 #[derive(Debug)]
 pub struct AntigravityPromptReceipt {
     pub turn_id: String,
+    accepted: oneshot::Receiver<Result<(), AntigravityRuntimeError>>,
     completion: oneshot::Receiver<Result<(), AntigravityRuntimeError>>,
 }
 
 impl AntigravityPromptReceipt {
-    /// Resolves when the CLI answers the prompt, that is when the turn ends.
+    /// Resolves as soon as the CLI proves it accepted the prompt (first turn update, permission
+    /// request, superseded-prompt completion, or the prompt's own completion), or fails if the
+    /// prompt errors before any such signal arrives.
+    pub async fn accepted(self) -> Result<(), AntigravityRuntimeError> {
+        self.accepted.await.unwrap_or_else(|_| {
+            Err(AcpProtocolError::Closed {
+                reason: "Antigravity prompt acceptance task ended without an outcome".to_owned(),
+            }
+            .into())
+        })
+    }
+
+    /// Resolves when the CLI answers the prompt, that is when the prompt finishes.
     pub async fn completion(self) -> Result<(), AntigravityRuntimeError> {
         self.completion.await.unwrap_or_else(|_| {
             Err(AcpProtocolError::Closed {
@@ -270,7 +290,18 @@ struct Gate {
     /// `None` until the open call and every update queued before its answer are handled, so a
     /// replayed history is dropped and no request during the open is answered.
     session_id: Option<String>,
+    agent_version: Option<(u64, u64, u64)>,
     active_turn: Option<String>,
+    active_prompt_seq: u64,
+    next_prompt_seq: u64,
+    /// True once the currently running prompt has produced at least one turn update.
+    active_turn_has_update: bool,
+    /// Non-none while a concurrent steer prompt is being written to the CLI.
+    steer_in_flight: Option<u64>,
+    /// Deferred response of the previous prompt if it finished while a steer write was in flight.
+    deferred_completion: Option<(u64, String, Result<Value, AcpProtocolError>)>,
+    /// Acceptance channel for the current active prompt (`active_prompt_seq`).
+    pending_accept: Option<(u64, oneshot::Sender<Result<(), AntigravityRuntimeError>>)>,
     cancelled_turn: Option<String>,
     runtime_mode: String,
     interaction_mode: String,
@@ -285,6 +316,31 @@ struct Gate {
 }
 
 impl Gate {
+    fn allocate_prompt_seq(&mut self) -> u64 {
+        self.next_prompt_seq = self.next_prompt_seq.saturating_add(1);
+        self.next_prompt_seq
+    }
+
+    fn resolve_pending_accept(&mut self, outcome: Result<(), AntigravityRuntimeError>) {
+        if let Some((_, tx)) = self.pending_accept.take() {
+            let _ = tx.send(outcome);
+        }
+    }
+
+    fn resolve_pending_accept_for(
+        &mut self,
+        seq: u64,
+        outcome: Result<(), AntigravityRuntimeError>,
+    ) {
+        if self
+            .pending_accept
+            .as_ref()
+            .is_some_and(|(pending_seq, _)| *pending_seq == seq)
+            && let Some((_, tx)) = self.pending_accept.take()
+        {
+            let _ = tx.send(outcome);
+        }
+    }
     fn mode_target(&self) -> &'static str {
         mode_for(&self.runtime_mode, &self.interaction_mode)
     }
@@ -328,7 +384,14 @@ impl AntigravitySessionRuntime {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let gate = Gate {
             session_id: None,
+            agent_version: None,
             active_turn: None,
+            active_prompt_seq: 0,
+            next_prompt_seq: 0,
+            active_turn_has_update: false,
+            steer_in_flight: None,
+            deferred_completion: None,
+            pending_accept: None,
             cancelled_turn: None,
             runtime_mode: options.runtime_mode.clone(),
             interaction_mode: options.interaction_mode.clone(),
@@ -477,6 +540,7 @@ impl AntigravitySessionRuntime {
                 version: Some(format!("{major}.{minor}.{patch}")),
             });
         }
+        self.inner.gate.lock().await.agent_version = Some(version);
         let capabilities = initialized.get("agentCapabilities");
         let session_capabilities = capabilities.and_then(|capabilities| {
             capabilities
@@ -841,15 +905,24 @@ impl AntigravitySessionRuntime {
         }
         let session_id = self.provider_session_id().await?;
         let turn_id = format!("turn-{}", Uuid::new_v4());
+        let (accepted_tx, accepted) = oneshot::channel();
         // A mode change landing during the confirmation gets one more confirmation; a second
         // one sends no prompt.
         let mut attempts = 0;
+        let prompt_seq;
         loop {
             {
                 let mut gate = self.inner.gate.lock().await;
                 if !gate.mode_unconfirmed {
+                    let seq = gate.allocate_prompt_seq();
                     gate.active_turn = Some(turn_id.clone());
+                    gate.active_prompt_seq = seq;
+                    gate.active_turn_has_update = false;
+                    gate.steer_in_flight = None;
+                    gate.deferred_completion = None;
+                    gate.pending_accept = Some((seq, accepted_tx));
                     gate.cancelled_turn = None;
+                    prompt_seq = seq;
                     break;
                 }
                 if attempts == 2 {
@@ -872,28 +945,182 @@ impl AntigravitySessionRuntime {
             .await
         {
             Ok(request) => request,
-            Err(error) => return Err(self.end_unsent_turn(&turn_id, error).await),
+            Err(error) => return Err(self.end_unsent_turn(&turn_id, prompt_seq, error).await),
         };
         let completion = match request.written().await {
-            Ok(()) => self.track_prompt_response(turn_id.clone(), request.response()),
+            Ok(()) => self.track_prompt_response(turn_id.clone(), prompt_seq, request.response()),
             Err(failure) if failure.is_definitely_not_sent() => {
-                return Err(self.end_unsent_turn(&turn_id, failure.into_error()).await);
+                return Err(self
+                    .end_unsent_turn(&turn_id, prompt_seq, failure.into_error())
+                    .await);
             }
             Err(failure) => self.track_prompt_response(
                 turn_id.clone(),
+                prompt_seq,
                 std::future::ready(Err(failure.into_error())),
             ),
         };
         Ok(AntigravityPromptReceipt {
             turn_id,
+            accepted,
             completion,
         })
+    }
+
+    /// Steers the currently running Antigravity turn by sending a second concurrent ACP
+    /// `session/prompt` on the same session without ever sending `session/cancel` (#434).
+    ///
+    /// Refuses steering (leaving the follow-up queued) if the installed `agy` CLI version is
+    /// `< 1.5.0`, the expected turn is no longer active or was cancelled, any permission/question
+    /// is pending, or the running prompt has not yet produced its first update.
+    pub async fn steer_turn(
+        &self,
+        input: Option<&str>,
+        attachments: Vec<Value>,
+        expected_turn_id: &str,
+    ) -> Result<AntigravityPromptReceipt, AntigravityRuntimeError> {
+        if self.inner.retired.load(Ordering::SeqCst) || self.inner.connection.is_closed() {
+            return Err(AntigravityRuntimeError::SteerUnavailable {
+                detail: "The Antigravity session ended before the steer could be sent.".to_owned(),
+            });
+        }
+        let (accepted_tx, accepted) = oneshot::channel();
+        let (session_id, prev_seq, prev_has_update, new_seq) = {
+            let mut gate = self.inner.gate.lock().await;
+            if !gate
+                .agent_version
+                .is_some_and(|version| version >= ANTIGRAVITY_MIN_STEER_VERSION)
+            {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Antigravity CLI 1.5.0 or later is required to steer a running turn."
+                        .to_owned(),
+                });
+            }
+            let Some(session_id) = gate.session_id.clone() else {
+                return Err(AntigravityRuntimeError::MissingProviderSessionId);
+            };
+            if gate.active_turn.as_deref() != Some(expected_turn_id)
+                || gate.cancelled_turn.as_deref() == Some(expected_turn_id)
+            {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "The running turn ended before the steer could be sent.".to_owned(),
+                });
+            }
+            if !gate.pending.is_empty() {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Respond to the pending approval or question before steering."
+                        .to_owned(),
+                });
+            }
+            if !gate.active_turn_has_update {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Wait for the running turn to start responding before steering."
+                        .to_owned(),
+                });
+            }
+            if gate.mode_unconfirmed {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Wait for the mode update to finish before steering.".to_owned(),
+                });
+            }
+            if gate.steer_in_flight.is_some() {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Another steer is already in progress.".to_owned(),
+                });
+            }
+            let prev_seq = gate.active_prompt_seq;
+            let prev_has_update = gate.active_turn_has_update;
+            let new_seq = gate.allocate_prompt_seq();
+            gate.active_prompt_seq = new_seq;
+            gate.active_turn_has_update = false;
+            gate.steer_in_flight = Some(new_seq);
+            gate.deferred_completion = None;
+            gate.pending_accept = Some((new_seq, accepted_tx));
+            (session_id, prev_seq, prev_has_update, new_seq)
+        };
+
+        let turn_id = expected_turn_id.to_owned();
+        let connection = self.inner.connection.clone();
+        let prompt = crate::provider::attachments::prompt_parts(input, attachments);
+        let mut request = match connection
+            .start_request(
+                "session/prompt",
+                json!({ "sessionId": session_id, "prompt": prompt }),
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                self.rollback_unsent_steer(prev_seq, prev_has_update, new_seq)
+                    .await;
+                return Err(classify(error));
+            }
+        };
+        let completion = match request.written().await {
+            Ok(()) => {
+                self.commit_written_steer(new_seq).await;
+                self.track_prompt_response(turn_id.clone(), new_seq, request.response())
+            }
+            Err(failure) if failure.is_definitely_not_sent() => {
+                self.rollback_unsent_steer(prev_seq, prev_has_update, new_seq)
+                    .await;
+                return Err(classify(failure.into_error()));
+            }
+            Err(failure) => {
+                self.commit_written_steer(new_seq).await;
+                self.track_prompt_response(
+                    turn_id.clone(),
+                    new_seq,
+                    std::future::ready(Err(failure.into_error())),
+                )
+            }
+        };
+        Ok(AntigravityPromptReceipt {
+            turn_id,
+            accepted,
+            completion,
+        })
+    }
+
+    async fn rollback_unsent_steer(&self, prev_seq: u64, prev_has_update: bool, new_seq: u64) {
+        let deferred = {
+            let mut gate = self.inner.gate.lock().await;
+            if gate.steer_in_flight == Some(new_seq) {
+                gate.steer_in_flight = None;
+            }
+            if gate.active_prompt_seq == new_seq {
+                gate.active_prompt_seq = prev_seq;
+                gate.active_turn_has_update = prev_has_update;
+                gate.pending_accept = None;
+            }
+            gate.deferred_completion.take()
+        };
+        if let Some((deferred_seq, deferred_turn_id, deferred_result)) = deferred
+            && deferred_seq == prev_seq
+        {
+            let _ = self
+                .settle_active_prompt_completion(deferred_turn_id, deferred_seq, deferred_result)
+                .await;
+        }
+    }
+
+    async fn commit_written_steer(&self, new_seq: u64) {
+        let mut gate = self.inner.gate.lock().await;
+        if gate.steer_in_flight == Some(new_seq) {
+            gate.steer_in_flight = None;
+        }
+        // If the superseded prompt already ended cleanly while the steer was being written,
+        // that proves the steer took over cleanly.
+        if let Some((_, _, Ok(_))) = gate.deferred_completion.take() {
+            gate.resolve_pending_accept_for(new_seq, Ok(()));
+        }
     }
 
     /// A prompt that never reached the CLI: its turn is no longer active and ends as failed.
     async fn end_unsent_turn(
         &self,
         turn_id: &str,
+        prompt_seq: u64,
         error: AcpProtocolError,
     ) -> AntigravityRuntimeError {
         let error = classify(error);
@@ -905,7 +1132,8 @@ impl AntigravitySessionRuntime {
             error_reason,
             "antigravity turn failed before prompt delivery"
         );
-        self.finish_turn(turn_id).await;
+        self.finish_turn(turn_id, Some(prompt_seq), Err(error.clone()))
+            .await;
         self.emit(
             "turn.completed",
             Some(turn_id.to_owned()),
@@ -922,11 +1150,25 @@ impl AntigravitySessionRuntime {
     }
 
     /// Clears the turn if it is still the active one and closes the approvals it left open.
-    async fn finish_turn(&self, turn_id: &str) {
+    async fn finish_turn(
+        &self,
+        turn_id: &str,
+        prompt_seq: Option<u64>,
+        accept_outcome: Result<(), AntigravityRuntimeError>,
+    ) {
         let pending = {
             let mut gate = self.inner.gate.lock().await;
+            if let Some(seq) = prompt_seq {
+                gate.resolve_pending_accept_for(seq, accept_outcome);
+            } else {
+                gate.resolve_pending_accept(accept_outcome);
+            }
             if gate.active_turn.as_deref() == Some(turn_id) {
                 gate.active_turn = None;
+                gate.active_prompt_seq = 0;
+                gate.active_turn_has_update = false;
+                gate.steer_in_flight = None;
+                gate.deferred_completion = None;
             }
             gate.take_pending(turn_id)
         };
@@ -940,9 +1182,65 @@ impl AntigravitySessionRuntime {
         }
     }
 
+    async fn settle_active_prompt_completion(
+        &self,
+        turn_id: String,
+        prompt_seq: u64,
+        result: Result<Value, AcpProtocolError>,
+    ) -> Result<(), AntigravityRuntimeError> {
+        let abandoned = self.inner.abandoned_turns.lock().await.remove(&turn_id);
+        match result {
+            Ok(response) => {
+                self.finish_turn(&turn_id, Some(prompt_seq), Ok(())).await;
+                let stop_reason = response
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("end_turn");
+                let (state, failure_message) = acp_turn_state(stop_reason);
+                let mut payload = json!({ "state": state, "stopReason": stop_reason });
+                if let Some(message) = failure_message {
+                    payload["errorMessage"] = json!(message);
+                }
+                if !abandoned {
+                    self.emit("turn.completed", Some(turn_id), None, payload);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let error = classify(error);
+                self.finish_turn(&turn_id, Some(prompt_seq), Err(error.clone()))
+                    .await;
+                let error_class = error.class();
+                let error_reason = error.reason();
+                if !abandoned {
+                    tracing::warn!(
+                        provider = PROVIDER,
+                        error_class,
+                        error_reason,
+                        "antigravity turn failed"
+                    );
+                    self.emit(
+                        "turn.completed",
+                        Some(turn_id),
+                        None,
+                        json!({
+                            "state": "failed",
+                            "stopReason": "error",
+                            "errorMessage": error.turn_error_message(),
+                            "errorClass": error_class,
+                            "errorReason": error_reason,
+                        }),
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn track_prompt_response<F>(
         &self,
         turn_id: String,
+        prompt_seq: u64,
         response: F,
     ) -> oneshot::Receiver<Result<(), AntigravityRuntimeError>>
     where
@@ -954,50 +1252,39 @@ impl AntigravitySessionRuntime {
             let result = response.await;
             // Chunks the agent wrote before its answer may still wait in the incoming queue.
             let _ = runtime.inner.connection.barrier().await;
-            runtime.finish_turn(&turn_id).await;
-            // An abandoned turn already completed as cancelled.
-            let abandoned = runtime.inner.abandoned_turns.lock().await.remove(&turn_id);
-            let outcome = match result {
-                Ok(response) => {
-                    let stop_reason = response
-                        .get("stopReason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("end_turn");
-                    let (state, failure_message) = acp_turn_state(stop_reason);
-                    let mut payload = json!({ "state": state, "stopReason": stop_reason });
-                    if let Some(message) = failure_message {
-                        payload["errorMessage"] = json!(message);
+            let disposition = {
+                let mut gate = runtime.inner.gate.lock().await;
+                if gate.active_prompt_seq != prompt_seq {
+                    if gate.steer_in_flight.is_some() {
+                        let outcome = match &result {
+                            Ok(_) => Ok(()),
+                            Err(error) => Err(classify(error.clone())),
+                        };
+                        gate.deferred_completion = Some((prompt_seq, turn_id.clone(), result));
+                        Ok(outcome)
+                    } else {
+                        // A newer steered `session/prompt` now owns this turn: when `agy` ends the
+                        // superseded prompt with `stopReason: "end_turn"`, accept the steer without
+                        // completing or failing the running turn.
+                        match result {
+                            Ok(_) => {
+                                let active_seq = gate.active_prompt_seq;
+                                gate.resolve_pending_accept_for(active_seq, Ok(()));
+                                Ok(Ok(()))
+                            }
+                            Err(error) => Ok(Err(classify(error))),
+                        }
                     }
-                    if !abandoned {
-                        runtime.emit("turn.completed", Some(turn_id), None, payload);
-                    }
-                    Ok(())
+                } else {
+                    Err(result)
                 }
-                Err(error) => {
-                    let error = classify(error);
-                    let error_class = error.class();
-                    let error_reason = error.reason();
-                    if !abandoned {
-                        tracing::warn!(
-                            provider = PROVIDER,
-                            error_class,
-                            error_reason,
-                            "antigravity turn failed"
-                        );
-                        runtime.emit(
-                            "turn.completed",
-                            Some(turn_id),
-                            None,
-                            json!({
-                                "state": "failed",
-                                "stopReason": "error",
-                                "errorMessage": error.turn_error_message(),
-                                "errorClass": error_class,
-                                "errorReason": error_reason,
-                            }),
-                        );
-                    }
-                    Err(error)
+            };
+            let outcome = match disposition {
+                Ok(outcome) => outcome,
+                Err(result) => {
+                    runtime
+                        .settle_active_prompt_completion(turn_id, prompt_seq, result)
+                        .await
                 }
             };
             let _ = completion_tx.send(outcome);
@@ -1061,6 +1348,11 @@ impl AntigravitySessionRuntime {
                     return;
                 }
                 gate.active_turn = None;
+                gate.active_prompt_seq = 0;
+                gate.active_turn_has_update = false;
+                gate.steer_in_flight = None;
+                gate.deferred_completion = None;
+                gate.resolve_pending_accept(Ok(()));
                 runtime
                     .inner
                     .abandoned_turns
@@ -1141,6 +1433,11 @@ impl AntigravitySessionRuntime {
             .keys()
             .cloned()
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_agent_version_for_test(&self, version: Option<(u64, u64, u64)>) {
+        self.inner.gate.lock().await.agent_version = version;
     }
 
     async fn handle_incoming(&self, event: IncomingEvent) {
@@ -1235,6 +1532,19 @@ impl AntigravitySessionRuntime {
         let (turn_id, has_active_turn) = turn_id;
         if has_active_turn && turn_id.is_none() {
             return;
+        }
+        let is_handled_turn_update = matches!(
+            kind,
+            Some(
+                "agent_message_chunk" | "tool_call" | "tool_call_update" | "usage_update" | "plan"
+            )
+        );
+        if is_handled_turn_update && turn_id.is_some() {
+            let mut gate = self.inner.gate.lock().await;
+            if gate.active_turn.as_deref() == turn_id.as_deref() {
+                gate.active_turn_has_update = true;
+                gate.resolve_pending_accept(Ok(()));
+            }
         }
         match kind {
             Some("agent_message_chunk") => {
@@ -1428,6 +1738,8 @@ impl AntigravitySessionRuntime {
                 reject_once: find_option_id(&options, "reject_once"),
             },
         );
+        // The CLI proved it accepted the prompt by opening an approval for it.
+        gate.resolve_pending_accept(Ok(()));
         // Emitted under the gate, so a cancel cannot resolve the request before it opens.
         self.emit(
             "request.opened",
@@ -1608,15 +1920,7 @@ fn find_option_id(options: &[Value], kind: &str) -> Option<String> {
 
 /// The first `major.minor.patch` in `text`.
 fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
-    text.split(|character: char| !(character.is_ascii_digit() || character == '.'))
-        .find_map(|token| {
-            let mut parts = token.split('.');
-            Some((
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-            ))
-        })
+    parse_semver_triple(text)
 }
 
 /// A `model` and a `thought_level` option without a category, as the inventory's catalog test
