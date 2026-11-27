@@ -84,7 +84,9 @@ pub(crate) fn classify_process_error(error: &ProcessError, stderr: &str) -> &'st
         }
         ProcessError::Timeout { .. } | ProcessError::Cancelled { .. } => "timeout",
         ProcessError::OutputLimit { .. } => "output_limit",
-        ProcessError::NonZeroExit { .. } => classify_stderr(stderr),
+        ProcessError::NonZeroExit { stdout, .. } => classify_stderr_optional(stderr)
+            .or_else(|| classify_stderr_optional(stdout))
+            .unwrap_or("host_rejected"),
         _ => "host_rejected",
     }
 }
@@ -117,10 +119,6 @@ pub fn from_process_error(
     result
 }
 
-pub(crate) fn classify_stderr(stderr: &str) -> &'static str {
-    classify_stderr_optional(stderr).unwrap_or("host_rejected")
-}
-
 pub(crate) fn classify_stderr_optional(stderr: &str) -> Option<&'static str> {
     let lower = stderr.to_lowercase();
     for (needles, code) in [
@@ -131,6 +129,8 @@ pub(crate) fn classify_stderr_optional(stderr: &str) -> Option<&'static str> {
                 "authenticated with glab",
                 "no token found",
                 "unauthorized",
+                "az login",
+                "az devops login",
                 "401",
             ][..],
             "not_authenticated",
@@ -139,11 +139,6 @@ pub(crate) fn classify_stderr_optional(stderr: &str) -> Option<&'static str> {
         (&["could not resolve", "404", "not found"][..], "not_found"),
         (&["403", "forbidden", "permission"][..], "forbidden"),
         (
-            &["head sha", "expected head", "sha does not match", "stale"][..],
-            "stale_head",
-        ),
-        (&["unknown flag", "unknown command"][..], "cli_too_old"),
-        (
             &[
                 "dial tcp",
                 "no such host",
@@ -151,10 +146,15 @@ pub(crate) fn classify_stderr_optional(stderr: &str) -> Option<&'static str> {
                 "could not reach",
                 "failed to connect",
                 "name or service not known",
-                "timeout",
             ][..],
             "host_unreachable",
         ),
+        (
+            &["head sha", "expected head", "sha does not match", "stale"][..],
+            "stale_head",
+        ),
+        (&["unknown flag", "unknown command"][..], "cli_too_old"),
+        (&["timeout"][..], "host_unreachable"),
     ] {
         if needles.iter().any(|needle| lower.contains(needle)) {
             return Some(code);

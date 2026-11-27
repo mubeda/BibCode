@@ -939,19 +939,35 @@ impl StatusBroadcaster {
         }
     }
 
+    /// The open pull request and sanitized lookup error last recorded for
+    /// `ref_name`, while it is the canonical worktree's branch.
+    pub(crate) fn known_pull_request_state(
+        &self,
+        cwd: &Path,
+        ref_name: Option<&str>,
+    ) -> (Option<ChangeRequest>, Option<String>) {
+        let state = self.lock_state();
+        let Some(entry) = state.repositories.get(cwd) else {
+            return (None, None);
+        };
+        if entry.local.ref_name.as_deref() != ref_name {
+            return (None, None);
+        }
+        let Some(remote) = entry.remote.as_ref().and_then(Option::as_ref) else {
+            return (None, None);
+        };
+        (remote.pr.clone(), remote.pr_lookup_error.clone())
+    }
+
     /// The open pull request last found for `ref_name`, while it is the canonical worktree's
     /// branch. It lives in the cached remote, so every snapshot and remote update carries it.
+    #[cfg(test)]
     pub(crate) fn known_pull_request(
         &self,
         cwd: &Path,
         ref_name: Option<&str>,
     ) -> Option<ChangeRequest> {
-        let state = self.lock_state();
-        let entry = state.repositories.get(cwd)?;
-        if entry.local.ref_name.as_deref() != ref_name {
-            return None;
-        }
-        entry.remote.clone().flatten()?.pr
+        self.known_pull_request_state(cwd, ref_name).0
     }
 
     /// Runs `task` for the repository's status subscribers, until the last one leaves or the
@@ -1005,8 +1021,48 @@ impl StatusBroadcaster {
             entry.pr_recorded_at = Some(tokio::time::Instant::now());
             if let Some(remote) = entry.remote.as_mut().and_then(Option::as_mut) {
                 remote.pr = pull_request;
+                remote.pr_lookup_error = None;
             }
         }
+    }
+
+    /// Records a failed pull-request lookup with its sanitized error code on the
+    /// cached remote status, and clears a stale remembered pull request when the
+    /// last success is older than [`PULL_REQUEST_STALE_AFTER`]. Returns `true`
+    /// when either `pr` or `pr_lookup_error` changed.
+    pub(crate) fn note_failed_pull_request_lookup_with_error(
+        &self,
+        cwd: &Path,
+        ref_name: Option<&str>,
+        error_code: &'static str,
+    ) -> bool {
+        let mut state = self.lock_state();
+        if state.closed {
+            return false;
+        }
+        let Some(entry) = state
+            .repositories
+            .get_mut(cwd)
+            .filter(|entry| entry.local.ref_name.as_deref() == ref_name)
+        else {
+            return false;
+        };
+        let stale = entry
+            .pr_recorded_at
+            .is_some_and(|recorded| recorded.elapsed() >= PULL_REQUEST_STALE_AFTER);
+        let Some(remote) = entry.remote.as_mut().and_then(Option::as_mut) else {
+            return false;
+        };
+        let mut changed = false;
+        if stale && remote.pr.is_some() {
+            remote.pr = None;
+            changed = true;
+        }
+        if remote.pr_lookup_error.as_deref() != Some(error_code) {
+            remote.pr_lookup_error = Some(error_code.to_owned());
+            changed = true;
+        }
+        changed
     }
 
     /// A lookup for `ref_name` failed. When the last success for that branch is older than
@@ -1020,6 +1076,7 @@ impl StatusBroadcaster {
     /// RPC's own cancellation is not the lookup's result. The late lookup a refresh hands to
     /// subscribers ends `None` after shutdown, which this refuses because the broadcaster is
     /// closed.
+    #[cfg(test)]
     pub(crate) fn note_failed_pull_request_lookup(
         &self,
         cwd: &Path,
@@ -2436,10 +2493,13 @@ fn clear_remote_for_ref_change(entry: &mut RepositoryState) {
 /// A remote read never finds the pull request, so a newer remote for the same branch keeps
 /// the one the cache holds.
 fn keep_pull_request(remote: &mut Option<VcsStatusRemoteResult>, entry: &RepositoryState) {
-    if let (Some(remote), Some(Some(cached))) = (remote.as_mut(), entry.remote.as_ref())
-        && remote.pr.is_none()
-    {
-        remote.pr.clone_from(&cached.pr);
+    if let (Some(remote), Some(Some(cached))) = (remote.as_mut(), entry.remote.as_ref()) {
+        if remote.pr.is_none() {
+            remote.pr.clone_from(&cached.pr);
+        }
+        if remote.pr_lookup_error.is_none() {
+            remote.pr_lookup_error.clone_from(&cached.pr_lookup_error);
+        }
     }
 }
 
@@ -5297,6 +5357,7 @@ mod tests {
                 behind_count: 0,
                 ahead_of_default_count: Some(0),
                 pr: None,
+                pr_lookup_error: None,
             },
         };
         let retirement = broadcaster
@@ -5425,6 +5486,7 @@ mod tests {
                 behind_count: 0,
                 ahead_of_default_count: Some(0),
                 pr: None,
+                pr_lookup_error: None,
             },
         };
         let retirement = broadcaster
@@ -6238,6 +6300,7 @@ mod tests {
                             behind_count: 0,
                             ahead_of_default_count: None,
                             pr: None,
+                            pr_lookup_error: None,
                         },
                     },
                     &fence,
@@ -6902,6 +6965,36 @@ mod tests {
         assert!(!broadcaster.note_failed_pull_request_lookup(&cwd, Some("old")));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_publishes_pr_lookup_error_and_recovery_clears_it() {
+        let (_root, cwd, broadcaster, _events) = remembering_a_pull_request();
+        assert!(broadcaster.note_failed_pull_request_lookup_with_error(
+            &cwd,
+            Some("old"),
+            "not_authenticated"
+        ));
+        assert_eq!(
+            broadcaster
+                .known_pull_request_state(&cwd, Some("old"))
+                .1
+                .as_deref(),
+            Some("not_authenticated")
+        );
+        // Repeating the same failure while PR is still fresh reports no change.
+        assert!(!broadcaster.note_failed_pull_request_lookup_with_error(
+            &cwd,
+            Some("old"),
+            "not_authenticated"
+        ));
+        // Recovery clears the lookup error.
+        broadcaster.record_pull_request(&cwd, Some("old"), None);
+        assert_eq!(
+            broadcaster.known_pull_request_state(&cwd, Some("old")),
+            (None, None)
+        );
+        broadcaster.shutdown().await;
+    }
+
     #[tokio::test]
     async fn a_snapshot_under_a_new_epoch_keeps_the_known_pull_request() {
         let root = tempfile::tempdir().expect("repository folder");
@@ -7088,6 +7181,7 @@ mod tests {
                             behind_count: 0,
                             ahead_of_default_count: None,
                             pr: None,
+                            pr_lookup_error: None,
                         },
                     },
                     &fence,
@@ -7676,6 +7770,7 @@ mod tests {
                             behind_count: 0,
                             ahead_of_default_count: Some(0),
                             pr: None,
+                            pr_lookup_error: None,
                         },
                     })
                 },
@@ -7773,6 +7868,7 @@ mod tests {
                     behind_count: 0,
                     ahead_of_default_count: Some(0),
                     pr: None,
+                    pr_lookup_error: None,
                 })),
                 // As if `local` was published under the current epoch.
                 local_fence: futures_util::FutureExt::now_or_never(

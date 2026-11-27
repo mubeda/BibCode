@@ -372,6 +372,8 @@ const VcsStatusRemoteShape = {
   behindCount: NonNegativeInt,
   aheadOfDefaultCount: Schema.optional(NonNegativeInt),
   pr: Schema.NullOr(VcsStatusChangeRequest),
+  /** Sanitized error code when the open pull-request lookup failed; absent on success or older servers. */
+  prLookupError: Schema.optionalKey(TrimmedNonEmptyString),
 };
 
 export const VcsStatusLocalResult = Schema.Struct(VcsStatusLocalShape);

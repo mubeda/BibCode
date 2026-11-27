@@ -2818,6 +2818,7 @@ impl GitRepository {
             behind_count: observation.behind_count,
             ahead_of_default_count,
             pr: None::<ChangeRequest>,
+            pr_lookup_error: None,
         })
     }
 
@@ -2942,6 +2943,7 @@ impl GitRepository {
                 behind_count: 0,
                 ahead_of_default_count: Some(0),
                 pr: None,
+                pr_lookup_error: None,
             }
         };
         Ok(VcsStatusResult {

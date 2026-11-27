@@ -8,6 +8,7 @@ pub mod repository_identity;
 
 pub(crate) use discovery::provider_install_hint;
 pub use hosts::{IdentifiedProvider, ProviderHosts};
+pub(crate) use open_pull_request_lookups::classify_open_pull_request_error;
 
 #[allow(unused_imports)]
 pub use discovery::{
