@@ -1487,22 +1487,31 @@ impl PullRequestService {
             )
             .await
             .map_err(|error| {
+                let code = crate::pull_requests::error::classify_process_error(&error, "");
                 process_error(
                     provider,
                     cwd,
                     operation,
                     command.label(),
+                    code,
                     error.safe_facts(),
                 )
             })?;
         if output.exit_code == 0 || allowed_non_zero_exit_codes.contains(&output.exit_code) {
             Ok(output)
         } else {
+            let diagnostic = if output.stderr.trim().is_empty() {
+                output.stdout.as_str()
+            } else {
+                output.stderr.as_str()
+            };
+            let code = crate::pull_requests::error::classify_stderr(diagnostic);
             Err(process_error(
                 provider,
                 cwd,
                 operation,
                 command.label(),
+                code,
                 ProcessFailureFacts::exited(output.exit_code),
             ))
         }
@@ -1870,6 +1879,7 @@ fn process_error(
     cwd: &std::path::Path,
     operation: &str,
     command: &str,
+    code: &'static str,
     facts: ProcessFailureFacts,
 ) -> SourceControlProviderError {
     let mut error = operation_error(
@@ -1881,7 +1891,7 @@ fn process_error(
         &facts.message(provider_program(provider)),
     );
     error.command_failure = Some(Box::new(ProviderCommandFailure {
-        code: "host_rejected",
+        code,
         host_detail: None,
         process_failure: Some(facts),
     }));
@@ -4038,6 +4048,65 @@ printf '%s\n' '{{"iid":43,"title":"Draft: Add grid","web_url":"https://gitlab.te
         assert!(
             error.detail.contains("reviewer_ids is invalid"),
             "{error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_current_classifies_gitlab_cli_failures_without_leaking_host_in_detail() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+        let sandbox = TestSandbox::new("gitlab-open-pr-classify");
+
+        let missing_glab = sandbox.root().join("missing-glab-binary");
+        let missing_service = PullRequestService::with_provider_commands(
+            "unused-gh",
+            missing_glab.to_string_lossy(),
+            "unused-az",
+        );
+        let missing_err = missing_service
+            .resolve_current_optional(
+                ResolvePullRequestInput {
+                    cwd: sandbox.root().to_path_buf(),
+                    provider: ProviderKind::Gitlab,
+                    reference: "main".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("missing glab binary should fail");
+        assert_eq!(
+            missing_err.command_failure.as_deref().map(|f| f.code),
+            Some("cli_missing")
+        );
+
+        let unauth_glab = sandbox.executable_script(
+            "glab-unauth",
+            "#!/bin/sh\nprintf '%s\\n' 'no GitLab instances have been authenticated with glab for gitlab.example.test' >&2\nexit 1\n",
+            "",
+        );
+        let unauth_service = PullRequestService::with_provider_commands(
+            "unused-gh",
+            unauth_glab.to_string_lossy(),
+            "unused-az",
+        );
+        let unauth_err = unauth_service
+            .resolve_current_optional(
+                ResolvePullRequestInput {
+                    cwd: sandbox.root().to_path_buf(),
+                    provider: ProviderKind::Gitlab,
+                    reference: "main".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("unauthenticated glab should fail");
+        assert_eq!(
+            unauth_err.command_failure.as_deref().map(|f| f.code),
+            Some("not_authenticated")
+        );
+        assert!(
+            !unauth_err.detail.contains("gitlab.example.test"),
+            "{unauth_err:?}"
         );
     }
 }

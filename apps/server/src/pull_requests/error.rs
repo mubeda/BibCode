@@ -77,13 +77,8 @@ impl PullRequestsOperationError {
     }
 }
 
-pub fn from_process_error(
-    operation: &str,
-    cli: &str,
-    error: &ProcessError,
-    stderr: &str,
-) -> PullRequestsOperationError {
-    let code = match error {
+pub(crate) fn classify_process_error(error: &ProcessError, stderr: &str) -> &'static str {
+    match error {
         ProcessError::Spawn { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
             "cli_missing"
         }
@@ -91,7 +86,16 @@ pub fn from_process_error(
         ProcessError::OutputLimit { .. } => "output_limit",
         ProcessError::NonZeroExit { .. } => classify_stderr(stderr),
         _ => "host_rejected",
-    };
+    }
+}
+
+pub fn from_process_error(
+    operation: &str,
+    cli: &str,
+    error: &ProcessError,
+    stderr: &str,
+) -> PullRequestsOperationError {
+    let code = classify_process_error(error, stderr);
     let mut result = PullRequestsOperationError::new(operation, code);
     if code == "cli_missing" {
         result.message = format!("`{cli}` is not installed on this environment");
@@ -113,11 +117,22 @@ pub fn from_process_error(
     result
 }
 
-fn classify_stderr(stderr: &str) -> &'static str {
+pub(crate) fn classify_stderr(stderr: &str) -> &'static str {
+    classify_stderr_optional(stderr).unwrap_or("host_rejected")
+}
+
+pub(crate) fn classify_stderr_optional(stderr: &str) -> Option<&'static str> {
     let lower = stderr.to_lowercase();
     for (needles, code) in [
         (
-            &["not logged in", "authentication", "401"][..],
+            &[
+                "not logged in",
+                "authentication",
+                "authenticated with glab",
+                "no token found",
+                "unauthorized",
+                "401",
+            ][..],
             "not_authenticated",
         ),
         (&["rate limit", "429"][..], "rate_limited"),
@@ -129,15 +144,23 @@ fn classify_stderr(stderr: &str) -> &'static str {
         ),
         (&["unknown flag", "unknown command"][..], "cli_too_old"),
         (
-            &["dial tcp", "no such host", "connection refused", "timeout"][..],
+            &[
+                "dial tcp",
+                "no such host",
+                "connection refused",
+                "could not reach",
+                "failed to connect",
+                "name or service not known",
+                "timeout",
+            ][..],
             "host_unreachable",
         ),
     ] {
         if needles.iter().any(|needle| lower.contains(needle)) {
-            return code;
+            return Some(code);
         }
     }
-    "host_rejected"
+    None
 }
 
 #[cfg(test)]
