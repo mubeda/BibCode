@@ -21,6 +21,7 @@ import {
   SidebarContent,
   SidebarFooter,
   SidebarGroup,
+  SidebarHeader,
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
@@ -118,6 +119,22 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
 
   return (
     <>
+      <SidebarHeader className="shrink-0 p-2">
+        <SidebarMenu className="min-w-0">
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              size="sm"
+              className="gap-2 px-2 py-2 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+              onClick={handleBackClick}
+            >
+              <ArrowLeftIcon className="size-4" />
+              <span>Back</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarHeader>
+      <SidebarSeparator />
+
       <SidebarContent className="overflow-x-hidden">
         <SidebarGroup className="px-2 py-3">
           <SidebarMenu>
@@ -152,25 +169,12 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
         </SidebarGroup>
       </SidebarContent>
 
-      <SidebarSeparator />
-      <SidebarFooter className="p-2">
-        {policy.showRemoteDeviceControls ? <BiBCodeConnectSidebarSignIn /> : null}
-        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
-          <SidebarMenu className="min-w-0">
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                size="sm"
-                className="gap-2 px-2 py-2 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
-                onClick={handleBackClick}
-              >
-                <ArrowLeftIcon className="size-4" />
-                <span>Back</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
-          {policy.showRemoteDeviceControls ? <BiBCodeConnectSidebarAvatar /> : null}
-        </div>
-      </SidebarFooter>
+      {policy.showRemoteDeviceControls ? (
+        <SidebarFooter className="border-t border-sidebar-border p-2 empty:hidden">
+          <BiBCodeConnectSidebarSignIn />
+          <BiBCodeConnectSidebarAvatar />
+        </SidebarFooter>
+      ) : null}
     </>
   );
 }

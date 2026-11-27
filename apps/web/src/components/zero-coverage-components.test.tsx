@@ -74,8 +74,15 @@ vi.mock("./ui/sidebar", () => {
     // AppSidebarLayout reads this to seed its initial width; this suite
     // doesn't exercise sidebar-width behavior, so simulate "nothing saved".
     readStoredSidebarWidth: () => null,
-    SidebarContent: Container,
-    SidebarFooter: Container,
+    SidebarHeader: (props: ComponentPropsWithoutRef<"div">) => (
+      <div data-slot="sidebar-header" {...props} />
+    ),
+    SidebarContent: (props: ComponentPropsWithoutRef<"div">) => (
+      <div data-slot="sidebar-content" {...props} />
+    ),
+    SidebarFooter: (props: ComponentPropsWithoutRef<"div">) => (
+      <div data-slot="sidebar-footer" {...props} />
+    ),
     SidebarGroup: Container,
     SidebarMenu: Container,
     SidebarMenuButton: ({ isActive, size: _size, ...props }: Record<string, unknown>) => (
@@ -713,6 +720,15 @@ describe("layout and navigation surfaces", () => {
   it("navigates settings on mobile and chooses history or home for Back", async () => {
     h.sidebarIsMobile = true;
     const mounted = await mount(<SettingsSidebarNav pathname="/settings/providers" />);
+    const header = mounted.container.querySelector('[data-slot="sidebar-header"]');
+    const content = mounted.container.querySelector('[data-slot="sidebar-content"]');
+    expect(header?.textContent).toContain("Back");
+    expect(content?.textContent).not.toContain("Back");
+    expect(
+      header &&
+        content &&
+        Boolean(header.compareDocumentPosition(content) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
     expect(mounted.container.querySelector('button[data-active="true"]')?.textContent).toContain(
       "Providers",
     );
@@ -720,15 +736,35 @@ describe("layout and navigation surfaces", () => {
     expect(h.setOpenMobile).toHaveBeenCalledWith(false);
     expect(h.navigate).toHaveBeenCalledWith({ to: "/settings/general", replace: true });
 
+    // Isolate Back click on mobile to verify close runs before navigation.
+    h.setOpenMobile.mockClear();
+    h.navigate.mockClear();
+    const callOrder: string[] = [];
+    h.setOpenMobile.mockImplementationOnce(() => {
+      callOrder.push("close-mobile");
+    });
+    h.navigate.mockImplementationOnce(() => {
+      callOrder.push("navigate-home");
+    });
     await click(buttonWithText(mounted.container, "Back"));
+    expect(h.setOpenMobile).toHaveBeenCalledWith(false);
     expect(h.navigate).toHaveBeenCalledWith({ to: "/" });
+    expect(callOrder).toEqual(["close-mobile", "navigate-home"]);
 
-    const back = vi.spyOn(window.history, "back").mockImplementation(() => undefined);
+    const back = vi.spyOn(window.history, "back").mockImplementation(() => {
+      callOrder.push("history-back");
+    });
     h.canGoBack = true;
-    h.sidebarIsMobile = false;
+    h.sidebarIsMobile = true;
+    h.setOpenMobile.mockClear();
+    callOrder.length = 0;
+    h.setOpenMobile.mockImplementationOnce(() => {
+      callOrder.push("close-mobile");
+    });
     await rerender(mounted, <SettingsSidebarNav pathname="/settings/keybindings" />);
     await click(buttonWithText(mounted.container, "Back"));
     expect(back).toHaveBeenCalledOnce();
+    expect(callOrder).toEqual(["close-mobile", "history-back"]);
   });
 
   it("handles desktop menu navigation, shortcut toggles, and resize acceptance", async () => {
