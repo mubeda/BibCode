@@ -2181,3 +2181,309 @@ async fn code_review_non_auto_and_ordinary_chats_keep_showing_permission_cards()
         .await;
     let _ = events_until(&review, "turn.completed").await;
 }
+
+#[tokio::test]
+async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct FailAfterRead {
+        inner: DuplexStream,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for FailAfterRead {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("synthetic read failure {MARKER}"),
+                )));
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    struct FailAfterWrite {
+        inner: DuplexStream,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for FailAfterWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("synthetic write failure {MARKER}"),
+                )));
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let Some(child) = crate::test_support::in_own_process(
+        "provider::antigravity::runtime::tests::transport_errors_log_sanitized_reason_variants_and_retire_runtime",
+    ) else {
+        return;
+    };
+    let log = CapturedLog::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish(),
+    );
+
+    let prompt_secret = format!("prompt secret {MARKER} /workspace/private/path");
+
+    // 1. connection_closed (peer drops stdout mid-turn)
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        assert!(!runtime.is_retired());
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        drop(peer);
+        let error = receipt
+            .completion()
+            .await
+            .expect_err("closed transport fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "connection_closed");
+        let events = events_until(&runtime, "turn.completed").await;
+        let completed = &events.last().unwrap().1;
+        assert_eq!(completed["errorClass"], "transport_error");
+        assert_eq!(completed["errorReason"], "connection_closed");
+        assert!(runtime.is_retired());
+    }
+
+    // 2. line_too_long (stdout line exceeds configured max)
+    {
+        let (stdout, output) = duplex(1 << 16);
+        let (requests, stdin) = duplex(1 << 16);
+        let (stderr_reader, stderr) = duplex(4096);
+        let (connection, incoming) = AcpJsonRpcConnection::spawn(
+            stdout,
+            stdin,
+            stderr_reader,
+            AcpConnectionConfig {
+                max_stdout_line_bytes: 2048,
+                max_stderr_line_bytes: 4096,
+            },
+        );
+        let runtime = AntigravitySessionRuntime::new(options("full-access"), connection, incoming);
+        let mut peer = Peer {
+            requests: BufReader::new(requests).lines(),
+            output,
+            stderr,
+        };
+        let start = spawn_start(&runtime);
+        let init = peer.expect("initialize").await;
+        peer.reply(&init, initialize_result("1.5.13", 1, all_capabilities()))
+            .await;
+        let new = peer.expect("session/new").await;
+        peer.reply(&new, session_result(SESSION, standard_options("default")))
+            .await;
+        answer_mode(&mut peer, "auto").await;
+        finish(start).await.expect("started");
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        let oversized = format!("{{\"oversized\":\"{}\"}}\n", "x".repeat(4096));
+        let _ = peer.output.write_all(oversized.as_bytes()).await;
+        let error = receipt
+            .completion()
+            .await
+            .expect_err("oversized line fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "line_too_long");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(events.last().unwrap().1["errorReason"], "line_too_long");
+        assert!(runtime.is_retired());
+    }
+
+    // 3. invalid_message (malformed JSON on stdout)
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        let _ = peer
+            .output
+            .write_all(format!("not-json-{MARKER}\n").as_bytes())
+            .await;
+        let error = receipt
+            .completion()
+            .await
+            .expect_err("invalid message fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "invalid_message");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(events.last().unwrap().1["errorReason"], "invalid_message");
+        assert!(runtime.is_retired());
+    }
+
+    // 4. unknown_response (uncorrelated JSON-RPC id on stdout)
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        peer.send(json!({ "jsonrpc": "2.0", "id": 999999, "result": {} }))
+            .await;
+        let error = receipt
+            .completion()
+            .await
+            .expect_err("unknown response fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "unknown_response");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(events.last().unwrap().1["errorReason"], "unknown_response");
+        assert!(runtime.is_retired());
+    }
+
+    // 5. read_failure (stdout read returns io::Error)
+    {
+        let (stdout, output) = duplex(1 << 16);
+        let (requests, stdin) = duplex(1 << 16);
+        let (stderr_reader, stderr) = duplex(4096);
+        let fail_read = Arc::new(AtomicBool::new(false));
+        let (connection, incoming) = AcpJsonRpcConnection::spawn(
+            FailAfterRead {
+                inner: stdout,
+                fail: fail_read.clone(),
+            },
+            stdin,
+            stderr_reader,
+            AcpConnectionConfig::default(),
+        );
+        let runtime = AntigravitySessionRuntime::new(options("full-access"), connection, incoming);
+        let mut peer = Peer {
+            requests: BufReader::new(requests).lines(),
+            output,
+            stderr,
+        };
+        let start = spawn_start(&runtime);
+        let init = peer.expect("initialize").await;
+        peer.reply(&init, initialize_result("1.5.13", 1, all_capabilities()))
+            .await;
+        let new = peer.expect("session/new").await;
+        peer.reply(&new, session_result(SESSION, standard_options("default")))
+            .await;
+        answer_mode(&mut peer, "auto").await;
+        finish(start).await.expect("started");
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        fail_read.store(true, Ordering::SeqCst);
+        let _ = peer.output.write_all(b"{}\n").await;
+        let error = receipt.completion().await.expect_err("read failure fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "read_failure");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(events.last().unwrap().1["errorReason"], "read_failure");
+        assert!(runtime.is_retired());
+    }
+
+    // 6. write_failure (stdin write returns io::Error before prompt bytes leave)
+    {
+        let (stdout, output) = duplex(1 << 16);
+        let (requests, stdin) = duplex(1 << 16);
+        let (stderr_reader, stderr) = duplex(4096);
+        let fail_write = Arc::new(AtomicBool::new(false));
+        let (connection, incoming) = AcpJsonRpcConnection::spawn(
+            stdout,
+            FailAfterWrite {
+                inner: stdin,
+                fail: fail_write.clone(),
+            },
+            stderr_reader,
+            AcpConnectionConfig::default(),
+        );
+        let runtime = AntigravitySessionRuntime::new(options("full-access"), connection, incoming);
+        let mut peer = Peer {
+            requests: BufReader::new(requests).lines(),
+            output,
+            stderr,
+        };
+        let start = spawn_start(&runtime);
+        let init = peer.expect("initialize").await;
+        peer.reply(&init, initialize_result("1.5.13", 1, all_capabilities()))
+            .await;
+        let new = peer.expect("session/new").await;
+        peer.reply(&new, session_result(SESSION, standard_options("default")))
+            .await;
+        answer_mode(&mut peer, "auto").await;
+        finish(start).await.expect("started");
+        fail_write.store(true, Ordering::SeqCst);
+        let error = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect_err("write failure fails unsent turn");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "write_failure");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(events.last().unwrap().1["errorReason"], "write_failure");
+        assert!(runtime.is_retired());
+    }
+
+    let rendered = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    for reason in [
+        "connection_closed",
+        "line_too_long",
+        "invalid_message",
+        "unknown_response",
+        "read_failure",
+        "write_failure",
+    ] {
+        assert!(
+            rendered.contains(&format!("error_reason=\"{reason}\""))
+                || rendered.contains(&format!("error_reason={reason}")),
+            "expected sanitized WARN log for {reason}:\n{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("error_class=\"transport_error\"")
+            || rendered.contains("error_class=transport_error"),
+        "expected transport_error class in WARN log:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(MARKER) && !rendered.contains("/workspace/private/path"),
+        "prompt text or paths leaked into WARN log:\n{rendered}"
+    );
+    child.complete();
+}

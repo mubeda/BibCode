@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use super::acp::{
     AcpJsonRpcConnection, AcpProtocolError, IncomingEvent, JsonRpcErrorShape, acp_error_class,
-    acp_turn_state,
+    acp_error_reason, acp_turn_state,
 };
 use crate::provider::{
     OptionRefusal, RefusedOption, model_unavailable_refusal, option_needs_value_refusal,
@@ -139,6 +139,24 @@ impl AntigravityRuntimeError {
             | Self::MalformedConfigAcknowledgement => "runtime_error",
         }
     }
+
+    /// The sanitized failure reason a log line or turn completion event may carry without raw text.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Protocol(error) => acp_error_reason(error),
+            Self::SignInRequired => "sign_in_required",
+            Self::AccountDisabled { .. } => "account_disabled",
+            Self::UnsupportedVersion { .. } => "unsupported_version",
+            Self::ModeUnavailable { .. } => "mode_unavailable",
+            Self::ControlTimedOut => "control_timeout",
+            Self::SessionMismatch => "session_mismatch",
+            Self::UnsupportedOption(_) => "unsupported_option",
+            Self::MissingProviderSessionId => "missing_provider_session_id",
+            Self::PendingRequestNotFound { .. } => "pending_request_not_found",
+            Self::MalformedConfigAcknowledgement => "malformed_config_acknowledgement",
+        }
+    }
 }
 
 impl OptionRefusal for AntigravityRuntimeError {
@@ -196,6 +214,8 @@ struct RuntimeInner {
     legacy_models: AtomicBool,
     /// The start failed because the connection to the child broke, not on a refusal.
     start_lost_connection: AtomicBool,
+    /// True once the runtime was closed or abandoned and cannot serve further turns.
+    retired: AtomicBool,
     /// Google's message, when the CLI wrote on its error output that the account is disabled.
     account_disabled: std::sync::Mutex<Option<String>>,
     abandoned_turns: Mutex<HashSet<String>>,
@@ -284,6 +304,7 @@ impl AntigravitySessionRuntime {
                 config_options: Mutex::new(Vec::new()),
                 legacy_models: AtomicBool::new(false),
                 start_lost_connection: AtomicBool::new(false),
+                retired: AtomicBool::new(false),
                 account_disabled: std::sync::Mutex::new(None),
                 abandoned_turns: Mutex::new(HashSet::new()),
                 events_tx,
@@ -344,7 +365,15 @@ impl AntigravitySessionRuntime {
     /// Closes the connection: the writer task ends and the CLI's stdin closes. The readers, and
     /// this runtime's reader task, end when the CLI's output closes.
     pub fn close(&self) {
+        self.inner.retired.store(true, Ordering::SeqCst);
         self.inner.connection.shutdown();
+    }
+
+    /// Whether this runtime's transport closed or the process was abandoned, so the next turn
+    /// must launch a fresh `agy acp` child session.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.inner.retired.load(Ordering::SeqCst) || self.inner.connection.is_closed()
     }
 
     /// Whether a failed start lost its connection, so the child is exiting or gone.
@@ -813,6 +842,14 @@ impl AntigravitySessionRuntime {
         error: AcpProtocolError,
     ) -> AntigravityRuntimeError {
         let error = classify(error);
+        let error_class = error.class();
+        let error_reason = error.reason();
+        tracing::warn!(
+            provider = PROVIDER,
+            error_class,
+            error_reason,
+            "antigravity turn failed before prompt delivery"
+        );
         self.finish_turn(turn_id).await;
         self.emit(
             "turn.completed",
@@ -822,7 +859,8 @@ impl AntigravitySessionRuntime {
                 "state": "failed",
                 "stopReason": "error",
                 "errorMessage": error.to_string(),
-                "errorClass": error.class(),
+                "errorClass": error_class,
+                "errorReason": error_reason,
             }),
         );
         error
@@ -882,7 +920,15 @@ impl AntigravitySessionRuntime {
                 }
                 Err(error) => {
                     let error = classify(error);
+                    let error_class = error.class();
+                    let error_reason = error.reason();
                     if !abandoned {
+                        tracing::warn!(
+                            provider = PROVIDER,
+                            error_class,
+                            error_reason,
+                            "antigravity turn failed"
+                        );
                         runtime.emit(
                             "turn.completed",
                             Some(turn_id),
@@ -891,7 +937,8 @@ impl AntigravitySessionRuntime {
                                 "state": "failed",
                                 "stopReason": "error",
                                 "errorMessage": error.to_string(),
-                                "errorClass": error.class(),
+                                "errorClass": error_class,
+                                "errorReason": error_reason,
                             }),
                         );
                     }
@@ -976,6 +1023,7 @@ impl AntigravitySessionRuntime {
                 None,
                 json!({ "state": "cancelled", "stopReason": "cancelled" }),
             );
+            runtime.inner.retired.store(true, Ordering::SeqCst);
             runtime.inner.abandon.notify_one();
         });
         Ok(())

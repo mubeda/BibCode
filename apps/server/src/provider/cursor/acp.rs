@@ -402,6 +402,12 @@ impl AcpJsonRpcConnection {
         let _ = self.inner.writer.send(WriterMessage::Shutdown);
     }
 
+    /// Whether the transport has failed or closed and can no longer serve requests.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, AcpProtocolError> {
         let mut receipt = self.start_request(method, params).await?;
         receipt
@@ -825,6 +831,37 @@ pub(crate) fn acp_error_class(error: &AcpProtocolError) -> &'static str {
     }
 }
 
+/// Sanitized transport or protocol failure reason safe for logs, telemetry, and delivery notices.
+///
+/// `fail_connection` wraps underlying transport failures into `Closed { reason: error.to_string() }`
+/// for pending waiters, so `Closed` maps the known static `AcpProtocolError` prefixes back to their
+/// specific transport reason without exposing raw stderr, paths, or message text.
+pub(crate) fn acp_error_reason(error: &AcpProtocolError) -> &'static str {
+    match error {
+        AcpProtocolError::RemoteRequest { .. } => "remote_request",
+        AcpProtocolError::LineTooLong { .. } => "line_too_long",
+        AcpProtocolError::ReadFailure { .. } => "read_failure",
+        AcpProtocolError::WriteFailure { .. } => "write_failure",
+        AcpProtocolError::InvalidMessage { .. } => "invalid_message",
+        AcpProtocolError::UnknownResponse { .. } => "unknown_response",
+        AcpProtocolError::Closed { reason } => {
+            if reason.starts_with("ACP JSON-RPC read line exceeded ") {
+                "line_too_long"
+            } else if reason.starts_with("ACP JSON-RPC read failed on ") {
+                "read_failure"
+            } else if reason.starts_with("ACP JSON-RPC write failed: ") {
+                "write_failure"
+            } else if reason.starts_with("ACP JSON-RPC message was invalid: ") {
+                "invalid_message"
+            } else if reason.starts_with("ACP JSON-RPC response for id ") {
+                "unknown_response"
+            } else {
+                "connection_closed"
+            }
+        }
+    }
+}
+
 /// Map an ACP `stopReason` to a canonical turn state and, when the turn did not
 /// succeed, a message explaining why.
 ///
@@ -900,6 +937,74 @@ mod tests {
                 "transport_error",
                 "{transport:?} is BiBCode's transport, not the agent's fault"
             );
+        }
+    }
+
+    #[test]
+    fn acp_error_reason_distinguishes_direct_and_closed_wrapped_variants() {
+        let cases = [
+            (
+                AcpProtocolError::RemoteRequest {
+                    method: "session/prompt".to_owned(),
+                    request_id: "1".to_owned(),
+                    code: -32000,
+                    message: "prompt rejected".to_owned(),
+                    data: None,
+                },
+                "remote_request",
+            ),
+            (
+                AcpProtocolError::Closed {
+                    reason: "stdout ended".to_owned(),
+                },
+                "connection_closed",
+            ),
+            (
+                AcpProtocolError::LineTooLong {
+                    stream: "stdout",
+                    maximum: 128 * 1024,
+                },
+                "line_too_long",
+            ),
+            (
+                AcpProtocolError::ReadFailure {
+                    stream: "stdout",
+                    message: "broken pipe".to_owned(),
+                },
+                "read_failure",
+            ),
+            (
+                AcpProtocolError::WriteFailure {
+                    message: "broken pipe".to_owned(),
+                },
+                "write_failure",
+            ),
+            (
+                AcpProtocolError::InvalidMessage {
+                    message: "expected value".to_owned(),
+                },
+                "invalid_message",
+            ),
+            (
+                AcpProtocolError::UnknownResponse {
+                    request_id: "99".to_owned(),
+                },
+                "unknown_response",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(acp_error_reason(&error), expected, "{error:?}");
+            if expected != "remote_request" {
+                let wrapped = AcpProtocolError::Closed {
+                    reason: error.to_string(),
+                };
+                assert_eq!(
+                    acp_error_reason(&wrapped),
+                    expected,
+                    "Closed-wrapped {wrapped:?} must preserve {expected}"
+                );
+            }
         }
     }
 

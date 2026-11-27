@@ -14815,9 +14815,14 @@ async fn project_provider_event(
         let last_error = failed.then(|| provider_completion_error(&event.payload));
         let last_error_class = failed.then(|| provider_completion_error_class(&event.payload));
         if let Some(class) = &last_error_class {
+            let provider_reason = event
+                .payload
+                .get("providerReason")
+                .and_then(Value::as_str)
+                .or_else(|| event.payload.get("errorReason").and_then(Value::as_str));
             crate::diagnostics::profiler::provider_turns::record_turn_failure(
                 &launch.provider,
-                event.payload.get("providerReason").and_then(Value::as_str),
+                provider_reason,
                 class,
             );
         }
@@ -18271,26 +18276,43 @@ fn antigravity_error(error: AntigravityRuntimeError) -> ProviderRuntimeError {
         // Option values stay out of the Display; only the refusal names them.
         AntigravityRuntimeError::UnsupportedOption(_) => option_error("antigravity", error),
         // The CLI's own words reach only the thread's turn error. Logs, delivery details and
-        // launch errors get the method we sent, the code and the class.
+        // launch errors get the method we sent, the code, the class, and the sanitized reason.
         AntigravityRuntimeError::Protocol(error) => {
-            use crate::provider::antigravity::acp::{AcpProtocolError, acp_error_class};
-            let class = acp_error_class(&error);
-            let line_too_long = match &error {
-                AcpProtocolError::LineTooLong { .. } => true,
-                AcpProtocolError::Closed { reason } => {
-                    reason.starts_with("ACP JSON-RPC read line exceeded ")
-                }
-                _ => false,
+            use crate::provider::antigravity::acp::{
+                AcpProtocolError, acp_error_class, acp_error_reason,
             };
+            let class = acp_error_class(&error);
+            let reason = acp_error_reason(&error);
+            let line_too_long = reason == "line_too_long";
             let detail = match &error {
                 AcpProtocolError::RemoteRequest { method, code, .. } => {
                     format!("Antigravity answered {method} with error {code} ({class})")
                 }
-                _ if line_too_long => {
-                    "Antigravity sent a message longer than BiBCode accepts (transport_error)"
-                        .to_owned()
-                }
-                _ => format!("Antigravity connection failed ({class})"),
+                _ => match reason {
+                    "line_too_long" => {
+                        "Antigravity sent a message longer than BiBCode accepts (transport_error: line_too_long)"
+                            .to_owned()
+                    }
+                    "connection_closed" => {
+                        "Antigravity connection closed unexpectedly (transport_error: connection_closed)"
+                            .to_owned()
+                    }
+                    "read_failure" => {
+                        "Antigravity output read failed (transport_error: read_failure)".to_owned()
+                    }
+                    "write_failure" => {
+                        "Antigravity input write failed (transport_error: write_failure)".to_owned()
+                    }
+                    "invalid_message" => {
+                        "Antigravity sent an invalid protocol message (transport_error: invalid_message)"
+                            .to_owned()
+                    }
+                    "unknown_response" => {
+                        "Antigravity sent an uncorrelated protocol response (transport_error: unknown_response)"
+                            .to_owned()
+                    }
+                    _ => format!("Antigravity connection failed ({class}: {reason})"),
+                },
             };
             let provider = "antigravity".to_owned();
             if line_too_long {
@@ -18503,6 +18525,9 @@ impl ProviderDriver for AntigravityDriver {
     }
     fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
         Box::pin(std::future::ready(exited_child(&self.child)))
+    }
+    fn retired(&self) -> bool {
+        self.runtime.is_retired()
     }
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
@@ -42709,6 +42734,260 @@ done
                 && launch.to_string().contains("-32603"),
             "{launch}"
         );
+    }
+
+    #[test]
+    fn antigravity_transport_errors_surface_distinct_sanitized_reasons() {
+        use crate::provider::antigravity::{
+            AntigravityRuntimeError as Error, acp::AcpProtocolError,
+        };
+        const MARKER: &str = "SYNTHETIC-SECRET-PATH-/workspace/private";
+        let variants = [
+            (
+                AcpProtocolError::Closed {
+                    reason: format!("stdout ended {MARKER}"),
+                },
+                "connection_closed",
+                false,
+            ),
+            (
+                AcpProtocolError::LineTooLong {
+                    stream: "stdout",
+                    maximum: 128 * 1024,
+                },
+                "line_too_long",
+                true,
+            ),
+            (
+                AcpProtocolError::ReadFailure {
+                    stream: "stdout",
+                    message: format!("io err {MARKER}"),
+                },
+                "read_failure",
+                false,
+            ),
+            (
+                AcpProtocolError::WriteFailure {
+                    message: format!("io err {MARKER}"),
+                },
+                "write_failure",
+                false,
+            ),
+            (
+                AcpProtocolError::InvalidMessage {
+                    message: format!("bad json {MARKER}"),
+                },
+                "invalid_message",
+                false,
+            ),
+            (
+                AcpProtocolError::UnknownResponse {
+                    request_id: "404".to_owned(),
+                },
+                "unknown_response",
+                false,
+            ),
+        ];
+
+        let mut seen_details = std::collections::HashSet::new();
+        for (protocol_error, expected_reason, is_line_too_long) in variants {
+            let wrapped = AcpProtocolError::Closed {
+                reason: protocol_error.to_string(),
+            };
+            for candidate in [protocol_error, wrapped] {
+                let mapped = super::antigravity_error(Error::Protocol(candidate));
+                assert_eq!(
+                    matches!(
+                        mapped,
+                        super::ProviderRuntimeError::TransportLineTooLong { .. }
+                    ),
+                    is_line_too_long,
+                    "{expected_reason}: {mapped:?}"
+                );
+                let detail = super::delivery_detail(&mapped, None);
+                assert!(
+                    detail.contains(expected_reason),
+                    "expected {expected_reason} in {detail}"
+                );
+                assert!(!detail.contains(MARKER), "leaked marker in {detail}");
+                assert!(!detail.contains('—'), "em dash in {detail}");
+                if is_line_too_long {
+                    assert!(
+                        detail.contains("longer than BiBCode accepts"),
+                        "dedicated line_too_long wording missing: {detail}"
+                    );
+                }
+                seen_details.insert((expected_reason, detail));
+            }
+        }
+        assert_eq!(
+            seen_details
+                .iter()
+                .map(|(_, detail)| detail.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            6,
+            "every ACP transport error variant must produce a distinct readable detail"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_retry_recycles_broken_session_and_delivers_exact_message() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture = temp.path().join("requests.jsonl");
+        let once_marker = temp.path().join("disconnected-once");
+        let fixture = executable_fixture(&temp, "agy-fixture", ANTIGRAVITY_FIXTURE);
+        let binary = executable_fixture(
+            &temp,
+            "agy",
+            &format!(
+                "#!/bin/sh\nif [ ! -e '{}' ]; then\n  : > '{}'\n  BIBCODE_TEST_DISCONNECT_AFTER_PROMPT=1 BIBCODE_TEST_REQUEST_CAPTURE='{}' exec '{}' \"$@\"\nelse\n  BIBCODE_TEST_REQUEST_CAPTURE='{}' exec '{}' \"$@\"\nfi\n",
+                once_marker.display(),
+                once_marker.display(),
+                capture.display(),
+                fixture.display(),
+                capture.display(),
+                fixture.display(),
+            ),
+        )
+        .to_string_lossy()
+        .into_owned();
+        std::fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&json!({
+                "providerInstances": {
+                    "antigravity": {
+                        "driver": "antigravity",
+                        "enabled": true,
+                        "config": { "binaryPath": binary }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let engine = supervisor_engine().await;
+        for command in [
+            json!({"type":"project.create","commandId":"ag-retry-proj","projectId":"ag-retry","title":"Antigravity","workspaceRoot":temp.path(),"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.create","commandId":"ag-retry-thread","threadId":"ag-retry","projectId":"ag-retry","title":"Thread","kind":"workspace","modelSelection":{"instanceId":"antigravity","model":"auto"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        let prompt_text = "Retry exact prompt payload 433";
+        let command: OrchestrationCommand = serde_json::from_value(json!({
+            "type": "thread.turn.start",
+            "commandId": "retry-cmd-1",
+            "threadId": "ag-retry",
+            "message": { "messageId": "retry-msg-1", "role": "user", "text": prompt_text, "attachments": [] },
+            "modelSelection": { "instanceId": "antigravity", "model": "auto" },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "createdAt": "2026-07-16T00:00:00Z",
+        }))
+        .unwrap();
+        let mut payload = serde_json::to_value(&command).unwrap();
+        super::freeze_delivery_route(&engine, &temp.path().to_path_buf(), &command, &mut payload)
+            .await
+            .expect("freeze Antigravity route");
+        let payload = payload.to_string();
+        engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('retry-cmd-1', 'thread', 'ag-retry', '2026-07-16T00:00:00Z', 0, 'accepted', NULL, 'retry-digest')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('retry-cmd-1', 'ag-retry', 'retry-msg-1', 'antigravity', 'antigravity', NULL, 'retry-key-1', ?, 'sending', 1, NULL, '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z')",
+                    [payload],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed delivery row");
+        let supervisor = antigravity_supervisor(&engine, &temp).await;
+
+        let first = timeout(
+            Duration::from_secs(20),
+            super::deliver_durable_orchestration_turn(
+                &supervisor,
+                &engine,
+                &temp.path().to_path_buf(),
+                command.clone(),
+                "retry-key-1".to_owned(),
+            ),
+        )
+        .await
+        .expect("first delivery ends in time");
+        match &first {
+            super::ProviderDeliveryOutcome::Ambiguous { detail } => {
+                assert!(
+                    detail.contains("connection_closed"),
+                    "expected connection_closed detail on broken transport: {detail}"
+                );
+            }
+            other => panic!("expected Ambiguous outcome on mid-prompt disconnect, got {other:?}"),
+        }
+        assert!(
+            once_marker.exists(),
+            "first launch should have disconnected"
+        );
+
+        let retried = timeout(
+            Duration::from_secs(20),
+            super::deliver_durable_orchestration_turn(
+                &supervisor,
+                &engine,
+                &temp.path().to_path_buf(),
+                command,
+                "retry-key-1".to_owned(),
+            ),
+        )
+        .await
+        .expect("retry delivery ends in time");
+        assert!(
+            matches!(retried, super::ProviderDeliveryOutcome::Accepted { .. }),
+            "expected Retry to spawn a healthy agy acp session and succeed, got {retried:?}"
+        );
+
+        let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+        let prompt_lines: Vec<Value> = captured
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|msg| msg["method"] == "session/prompt")
+            .collect();
+        assert_eq!(
+            prompt_lines.len(),
+            2,
+            "expected initial attempt + retry prompt: {captured}"
+        );
+        assert!(
+            prompt_lines[1]["params"]["prompt"]
+                .to_string()
+                .contains(prompt_text),
+            "retry must send the exact same message: {}",
+            prompt_lines[1]
+        );
+        let init_count = captured_methods(&capture)
+            .iter()
+            .filter(|method| *method == "initialize")
+            .count();
+        assert_eq!(
+            init_count, 2,
+            "retry after broken transport must launch a fresh agy acp process"
+        );
+
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("shutdown in time")
+            .expect("shutdown");
+        engine.shutdown().await;
     }
 
     #[test]
