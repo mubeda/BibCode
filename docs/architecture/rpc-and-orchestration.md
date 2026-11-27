@@ -648,48 +648,65 @@ because the forge CLI (`gh pr list`, `glab mr list`, `az repos pr list`) or
 Bitbucket request takes hundreds of milliseconds to seconds while local status
 takes tens. Entries are keyed by worktree path, provider, and branch, so a
 branch change or another repository never reads them. A successful answer,
-including no open request, is reused for 10 seconds; a failed or cancelled
-lookup is never reused. Concurrent callers for one key, such as a unary refresh
-and the stream enrichment of the publication it causes, share one provider run
-that holds a lease per waiting caller: a stream replacing its enrichment does
-not cancel a waiting refresh, and the last caller leaving cancels the run.
-Creating a request through the service, every finished Git Manager or VCS
-mutation (pushes included), and every reported local change such as a terminal
-command exiting forget that worktree's entries; a run in flight across such an
-invalidation still answers its waiters but is not stored. At most 64 entries
-are held.
+including no open request, is reused for 10 seconds and clears failure-warning
+suppression. A failed lookup is remembered for 5 seconds on transient errors or
+60 seconds on persistent classes (`cli_missing`, `cli_too_old`,
+`not_authenticated`, `forbidden`, `not_found`) so repeated status reads do not
+re-run a failing forge CLI on every poll; it emits a `warn` log carrying only
+`provider`, sanitized `error_code` (allowlisted to `timeout`,
+`not_authenticated`, `forbidden`, `cli_missing`, `cli_too_old`,
+`host_unreachable`, `rate_limited`, `not_found`, or `unknown`), and
+`backoff_secs` once per failure transition until recovery, invalidation, or a
+different error class. A cancelled lookup (its last caller left, or shutdown) is
+never stored. Concurrent callers for one key, such as a unary refresh and the
+stream enrichment of the publication it causes, share one provider run that
+holds a lease per waiting caller: a stream replacing its enrichment does not
+cancel a waiting refresh, and the last caller leaving cancels the run. Creating
+a request through the service, every finished Git Manager or VCS mutation
+(pushes included), and every reported local change such as a terminal command
+exiting forget that worktree's entries and reset warning suppression; a run in
+flight across such an invalidation still answers its waiters but is not stored.
+At most 64 entries are held; when full, expired and abandoned entries are
+evicted first, then the entry closest to expiring, and a lookup with no cache
+room still runs uncoalesced and unstored while keeping deduplicated failure
+warnings.
 
-The broadcaster's cached remote for a worktree owns the open request known for
-its current branch. A remote read never finds a request, so a newer remote or
-snapshot for the same branch keeps the cached one, and a branch change clears
-it with the rest of the remote. A lookup that ends with an open request or with
-none open records its answer there. A failed or cancelled lookup records
-nothing, so the known request stays. Each status stream folds what it sent the
-way the client reducer does. A snapshot or remote update is sent with the
-request known for its branch, so a publication queued before a lookup answered
-does not briefly show an older request. After every event it sends, the stream compares
-the request its subscriber shows with the known one and sends a remote update
-when they differ. That send uses the fence of the newest event the subscriber
-received, so an answer that arrives across an epoch change waits for the next
-event that passes its fence and is delivered once. An event for the same branch
-leaves the stream's lookup running, so repeated events cannot keep a slow
-forge from answering. Any event for the same branch that arrives meanwhile,
-a local update included, asks for one more lookup when the running one ends,
-because it may follow an invalidation that made the running answer outdated.
-That lookup reads the cache unless the invalidation dropped it. A branch change
-stops the lookup.
+The broadcaster's cached remote for a worktree owns both the open request and
+the optional sanitized `prLookupError` code known for its current branch. A
+remote read never finds a request, so a newer remote or snapshot for the same
+branch keeps the cached request and lookup error, and a branch change clears
+both with the rest of the remote. A lookup that ends with an open request or
+with none open records its answer there and clears `prLookupError`. A failed
+lookup preserves the last known request and records the sanitized
+`prLookupError` code so callers and status subscribers can surface why the
+lookup failed without leaking raw stderr, tokens, or remote addresses; a
+cancelled lookup records nothing. Each status stream folds what it sent the way
+the client reducer does. A snapshot or remote update is sent with the request
+and `prLookupError` known for its branch, so a publication queued before a
+lookup answered does not briefly show stale state. After every event it sends,
+the stream compares the request and `prLookupError` its subscriber shows with the
+known state and sends a remote update when either differs. That send uses the
+fence of the newest event the subscriber received, so an answer that arrives
+across an epoch change waits for the next event that passes its fence and is
+delivered once. An event for the same branch leaves the stream's lookup running,
+so repeated events cannot keep a slow forge from answering. Any event for the
+same branch that arrives meanwhile, a local update included, asks for one more
+lookup when the running one ends, because it may follow an invalidation that
+made the running answer outdated. That lookup reads the cache unless the
+invalidation dropped it. A branch change stops the lookup.
 
 When nothing current is held, `vcs.refreshStatus` waits for the lookup for at
 most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). At the bound it answers
-with the known request for the same branch. Only status subscribers need the
-late answer, so the lookup keeps its lease in a task of the worktree's status
-lifecycle. The broadcaster cancels that task when the last status subscriber
-leaves, even while a Git Manager signal subscription keeps the worktree's
-entry, and at shutdown. A workspace loss ends every status stream, so it ends
-the task too. With no status subscriber the lookup is dropped at the bound. When the lookup ends with an answer, that task
-records it and calls `notify_pull_request_change`, so each stream publishes it
-without starting the forge CLI again. The passive summary, the
-pre-creation existence check in `git.runStackedAction`, and
+with the known request and `prLookupError` for the same branch. Only status
+subscribers need the late answer, so the lookup keeps its lease in a task of the
+worktree's status lifecycle. The broadcaster cancels that task when the last
+status subscriber leaves, even while a Git Manager signal subscription keeps the
+worktree's entry, and at shutdown. A workspace loss ends every status stream, so
+it ends the task too. With no status subscriber the lookup is dropped at the
+bound. When the late lookup ends with an answer or a new failure error code,
+that task records it and calls `notify_pull_request_change`, so each stream
+publishes the update without starting the forge CLI again. The passive summary,
+the pre-creation existence check in `git.runStackedAction`, and
 `gitManager.listPullRequests` keep asking the hosting service directly.
 
 A physical observation starts with one
