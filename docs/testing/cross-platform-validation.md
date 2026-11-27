@@ -623,6 +623,16 @@ late acceptance must not restore a session that has already settled. Test local
 Claude settlement/interrupt during writer contention, late user echoes, and a
 failed target lookup after a durable claim. Unwritten input returns to the
 queue or pending; input that may have reached the provider stays uncertain.
+For Antigravity, verify the `agy >= 1.5.0` capability gate (`1.5.0-rc.1` and
+`< 1.5.0` omit `supportsTurnSteer`), refusal while the initial start is still
+in flight or any permission request is pending, non-cancelling concurrent
+`session/prompt` delivery that keeps the active turn open when the original
+prompt settles first, preservation of the original prompt (or its single
+deferred `turn.completed`) when a concurrent steer is rejected, fencing of
+previous-prompt updates and permission requests against acknowledging an
+unconfirmed steer, and Stop/Retry behaviour (unanswered cancel retires the
+child as `Ambiguous`, while transport errors settle cleanly and recycle the
+session on Retry).
 
 The native Codex and Claude steer fixtures use subprocess pipes, not real
 providers or sockets. They currently run on Unix; record Windows native-protocol
@@ -922,9 +932,15 @@ screenshots:
    tool-free reply as the next Claude turn. Its matching text echo may include
    attachments and arrive after completion; tool-result lines cannot acknowledge
    it. Verify attribution to the runtime turn current at acknowledgement.
-4. On Cursor, Grok, and OpenCode where available, verify the explanation that
-   steering is unsupported and confirm automatic sending still works. Record
-   unavailable providers explicitly.
+4. On Antigravity (`agy >= 1.5.0`), verify head-only Steer sends a concurrent
+   `session/prompt` without cancelling the running turn, refuses while a
+   permission approval is pending or before the initial prompt starts streaming,
+   keeps the running turn alive when the first prompt settles first, returns a
+   rejected steer to the queue without failing the running turn, and cleanly
+   supports Stop and Retry after transport failure. On older Antigravity
+   (`agy < 1.5.0`), Cursor, Grok, and OpenCode where available, verify the
+   explanation that steering is unsupported and confirm automatic sending still
+   works. Record unavailable providers explicitly.
 5. Cancel a queued card with another client connected: it disappears in both,
    while only the cancelling client's draft receives its text and locally cached
    attachments. Preserve an existing draft and report unavailable or excess files.
