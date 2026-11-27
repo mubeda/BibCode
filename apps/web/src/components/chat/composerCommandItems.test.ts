@@ -58,6 +58,16 @@ function inputFor(text: string, overrides: InputOverrides = {}): ComposerCommand
       slashCommands,
       slashSkills,
       dollarSkills,
+      enabledSlashSkillNames: new Set(
+        slashSkills
+          .filter((skill) => skill.enabled)
+          .map((skill) => skill.name.trim().toLowerCase()),
+      ),
+      enabledDollarSkillNames: new Set(
+        dollarSkills
+          .filter((skill) => skill.enabled)
+          .map((skill) => skill.name.trim().toLowerCase()),
+      ),
       mentionableAgents: agents,
       mentionableAgentNames: new Set(agents.map((agent) => agent.name)),
     },

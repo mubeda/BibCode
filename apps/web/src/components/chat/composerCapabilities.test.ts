@@ -176,7 +176,9 @@ describe("deriveComposerCapabilityProfile", () => {
 
     expect(profile.slashCommands.map((command) => command.name)).toEqual(["review", "help"]);
     expect(profile.slashSkills.map((skill) => skill.name)).toEqual(["audit", "design"]);
+    expect([...profile.enabledSlashSkillNames]).toEqual(["audit", "review", "design"]);
     expect(profile.dollarSkills.map((skill) => skill.name)).toEqual(["fix", "format"]);
+    expect([...profile.enabledDollarSkillNames]).toEqual(["fix", "format"]);
     expect(profile.mentionableAgents.map((agent) => agent.name)).toEqual(["reviewer", "explorer"]);
     expect([...profile.mentionableAgentNames]).toEqual(["reviewer", "explorer"]);
   });

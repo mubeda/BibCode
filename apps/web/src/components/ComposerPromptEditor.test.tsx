@@ -914,6 +914,118 @@ describe("ComposerPromptEditor inline token nodes", () => {
     }
   });
 
+  it("renders slash-invoked and command-registered skills as darkened chips, keeps non-skill commands plain, and preserves /name on edit", async () => {
+    harness.useRealEffects = true;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const editorRef = createRef<ComposerPromptEditorHandle>();
+    const onChange = vi.fn();
+    const slashAndDollarSkills: ReadonlyArray<ServerProviderSkill> = [
+      {
+        name: "docs",
+        displayName: "Docs",
+        description: "Look up documentation",
+        path: "/skills/docs/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+      {
+        name: "review-branch",
+        displayName: "Review Branch",
+        description: "Registered both as a command and a slash skill",
+        path: "/skills/review-branch/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+      {
+        name: "refactor",
+        displayName: "Refactor",
+        description: "Refactor code",
+        path: "/skills/refactor/SKILL.md",
+        enabled: true,
+        invocation: "dollar",
+      },
+    ];
+    const source = "/docs /review-branch @src/main.ts /plan apps/web/src /foo $refactor ";
+    const renderMounted = (nextValue: string, nextCursor: number) => (
+      <ComposerPromptEditor
+        value={nextValue}
+        cursor={nextCursor}
+        terminalContexts={[]}
+        skills={slashAndDollarSkills}
+        agents={[]}
+        disabled={false}
+        placeholder="Ask anything"
+        onRemoveTerminalContext={vi.fn()}
+        onChange={onChange}
+        onPaste={vi.fn()}
+        editorRef={editorRef}
+      />
+    );
+
+    try {
+      await act(async () => root.render(renderMounted(source, source.length)));
+      const skillChips = Array.from(
+        container.querySelectorAll<HTMLElement>('[data-composer-skill-chip="true"]'),
+      );
+      const mentionChips = Array.from(
+        container.querySelectorAll<HTMLElement>('[data-composer-mention-chip="true"]'),
+      );
+
+      // /docs, /review-branch (command-registered slash skill), and $refactor become chips;
+      // /plan (non-skill command), apps/web/src (path), and /foo (unknown) remain plain text.
+      expect(skillChips.map((chip) => chip.textContent)).toEqual([
+        "Docs",
+        "Review Branch",
+        "Refactor",
+      ]);
+      expect(mentionChips).toHaveLength(1);
+      for (const chip of skillChips) {
+        expect(chip.className).toContain("text-fuchsia-950");
+        expect(chip.className).toContain("bg-fuchsia-900/12");
+        expect(chip.className).toContain("border-fuchsia-800/25");
+        expect(chip.className).toContain("dark:bg-fuchsia-950/70");
+        expect(chip.className).toContain("dark:text-fuchsia-100");
+        expect(chip.className).toContain("dark:border-fuchsia-400/30");
+      }
+
+      // Serialized text preserves exact / vs $ trigger prefixes.
+      const initialSnapshot = editorRef.current?.readSnapshot();
+      expect(initialSnapshot?.value).toBe(source);
+
+      // Typing after a slash skill preserves exact collapsed & expanded cursor offsets and submits `/docs <edited text>`.
+      await act(async () => root.render(renderMounted("/docs ", 2)));
+      onChange.mockClear();
+      const editor = lastEditor();
+      await act(async () => {
+        editor.update(
+          () => {
+            $paragraph().append($createTextNode("check API"));
+          },
+          { discrete: true },
+        );
+      });
+      const editedSnapshot = editorRef.current?.readSnapshot();
+      expect(editedSnapshot?.value).toBe("/docs check API");
+      expect(onChange).toHaveBeenCalled();
+      expect(onChange.mock.calls.at(-1)?.[0]).toBe("/docs check API");
+
+      // JSON export/import round-trips the slash prefix rather than reverting to `$`.
+      const serialized = editor.getEditorState().toJSON();
+      const roundTripJson = JSON.stringify(serialized);
+      expect(roundTripJson).toContain('"skillPrefix":"/"');
+      const parsedState = editor.parseEditorState(roundTripJson);
+      expect(parsedState.read(() => $getRoot().getTextContent())).toBe("/docs check API");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      harness.useRealEffects = false;
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
   it("leaves focus where it is when skills arrive while the composer is unfocused", async () => {
     harness.useRealEffects = true;
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;

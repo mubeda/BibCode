@@ -124,6 +124,7 @@ type SerializedComposerAgentNode = Spread<
 type SerializedComposerSkillNode = Spread<
   {
     skillName: string;
+    skillPrefix?: "$" | "/";
     skillLabel?: string;
     skillDescription?: string;
     type: "composer-skill";
@@ -358,29 +359,40 @@ type ComposerSkillMetadata = {
   description: string | null;
 };
 
+type ComposerSkillMetadataIndex = {
+  readonly dollar: ReadonlyMap<string, ComposerSkillMetadata>;
+  readonly slash: ReadonlyMap<string, ComposerSkillMetadata>;
+};
+
 function skillMetadataByName(
   skills: ReadonlyArray<ServerProviderSkill>,
-): ReadonlyMap<string, ComposerSkillMetadata> {
-  return new Map(
-    skills
-      .filter((skill) => skill.enabled && skill.invocation === "dollar")
-      .map((skill) => [
-        skill.name.trim().toLowerCase(),
-        {
-          label: formatProviderSkillDisplayName(skill),
-          description: resolveSkillDescription(skill),
-        },
-      ]),
-  );
+): ComposerSkillMetadataIndex {
+  const dollar = new Map<string, ComposerSkillMetadata>();
+  const slash = new Map<string, ComposerSkillMetadata>();
+  for (const skill of skills) {
+    if (!skill.enabled) {
+      continue;
+    }
+    if (skill.invocation !== "dollar" && skill.invocation !== "slash") {
+      continue;
+    }
+    const target = skill.invocation === "slash" ? slash : dollar;
+    target.set(skill.name.trim().toLowerCase(), {
+      label: formatProviderSkillDisplayName(skill),
+      description: resolveSkillDescription(skill),
+    });
+  }
+  return { dollar, slash };
 }
 
 function composerInlineTokenContext(
   agentMetadata: ReadonlyMap<string, ComposerAgentMetadata>,
-  skillMetadata: ReadonlyMap<string, ComposerSkillMetadata>,
+  skillMetadata: ComposerSkillMetadataIndex,
 ): ComposerInlineTokenContext {
   return {
     mentionableAgentNames: new Set(agentMetadata.keys()),
-    enabledDollarSkillNames: new Set(skillMetadata.keys()),
+    enabledDollarSkillNames: new Set(skillMetadata.dollar.keys()),
+    enabledSlashSkillNames: new Set(skillMetadata.slash.keys()),
   };
 }
 
@@ -417,6 +429,7 @@ function ComposerSkillDecorator(props: { skillLabel: string; skillDescription: s
 
 class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
   __skillName: string;
+  __skillPrefix: "$" | "/";
   __skillLabel: string;
   __skillDescription: string | null;
 
@@ -429,15 +442,19 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
       node.__skillName,
       node.__skillLabel,
       node.__skillDescription,
+      node.__skillPrefix,
       node.__key,
     );
   }
 
   static override importJSON(serializedNode: SerializedComposerSkillNode): ComposerSkillNode {
+    const prefix =
+      serializedNode.skillPrefix ?? (serializedNode.skillName.startsWith("/") ? "/" : "$");
     return $createComposerSkillNode(
       serializedNode.skillName,
       serializedNode.skillLabel ?? serializedNode.skillName,
       serializedNode.skillDescription ?? null,
+      prefix,
     ).updateFromJSON(serializedNode);
   }
 
@@ -445,11 +462,14 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
     skillName: string,
     skillLabel: string,
     skillDescription: string | null,
+    skillPrefix: "$" | "/" = "$",
     key?: NodeKey,
   ) {
     super(key);
-    const normalizedSkillName = skillName.startsWith("$") ? skillName.slice(1) : skillName;
+    const normalizedSkillName =
+      skillName.startsWith("$") || skillName.startsWith("/") ? skillName.slice(1) : skillName;
     this.__skillName = normalizedSkillName;
+    this.__skillPrefix = skillPrefix;
     this.__skillLabel = skillLabel;
     this.__skillDescription = skillDescription;
   }
@@ -458,6 +478,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
     return {
       ...super.exportJSON(),
       skillName: this.__skillName,
+      skillPrefix: this.__skillPrefix,
       skillLabel: this.__skillLabel,
       ...(this.__skillDescription ? { skillDescription: this.__skillDescription } : {}),
       type: "composer-skill",
@@ -476,7 +497,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
   }
 
   override getTextContent(): string {
-    return `$${this.__skillName}`;
+    return `${this.__skillPrefix}${this.__skillName}`;
   }
 
   override isInline(): true {
@@ -497,8 +518,11 @@ function $createComposerSkillNode(
   skillName: string,
   skillLabel: string,
   skillDescription: string | null,
+  skillPrefix: "$" | "/" = "$",
 ): ComposerSkillNode {
-  return $applyNodeReplacement(new ComposerSkillNode(skillName, skillLabel, skillDescription));
+  return $applyNodeReplacement(
+    new ComposerSkillNode(skillName, skillLabel, skillDescription, skillPrefix),
+  );
 }
 
 function ComposerTerminalContextDecorator(props: { context: TerminalContextDraft }) {
@@ -994,7 +1018,7 @@ function $setComposerEditorPrompt(
   prompt: string,
   terminalContexts: ReadonlyArray<TerminalContextDraft>,
   agentMetadata: ReadonlyMap<string, ComposerAgentMetadata>,
-  skillMetadata: ReadonlyMap<string, ComposerSkillMetadata>,
+  skillMetadata: ComposerSkillMetadataIndex,
   segmentOptions: SplitPromptIntoComposerSegmentsOptions = {},
 ): void {
   const root = $getRoot();
@@ -1008,7 +1032,8 @@ function $setComposerEditorPrompt(
     new Set(agentMetadata.keys()),
     {
       ...segmentOptions,
-      enabledDollarSkillNames: new Set(skillMetadata.keys()),
+      enabledDollarSkillNames: new Set(skillMetadata.dollar.keys()),
+      enabledSlashSkillNames: new Set(skillMetadata.slash.keys()),
     },
   );
   for (const segment of segments) {
@@ -1026,12 +1051,15 @@ function $setComposerEditorPrompt(
       continue;
     }
     if (segment.type === "skill") {
-      const metadata = skillMetadata.get(segment.name.toLowerCase());
+      const metadata = (segment.prefix === "/" ? skillMetadata.slash : skillMetadata.dollar).get(
+        segment.name.toLowerCase(),
+      );
       paragraph.append(
         $createComposerSkillNode(
           segment.name,
           metadata?.label ?? formatProviderSkillDisplayName({ name: segment.name }),
           metadata?.description ?? null,
+          segment.prefix,
         ),
       );
       continue;
@@ -1730,7 +1758,8 @@ function ComposerPromptEditorInner({
   const inlineTokenContext = useMemo<ComposerInlineTokenContext>(
     () => ({
       mentionableAgentNames,
-      enabledDollarSkillNames: new Set(skillMetadata.keys()),
+      enabledDollarSkillNames: new Set(skillMetadata.dollar.keys()),
+      enabledSlashSkillNames: new Set(skillMetadata.slash.keys()),
     }),
     [mentionableAgentNames, skillMetadata],
   );

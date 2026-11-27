@@ -25,6 +25,7 @@ export type ComposerPromptSegment =
   | {
       type: "skill";
       name: string;
+      prefix: "$" | "/";
     }
   | {
       type: "terminal-context";
@@ -34,10 +35,15 @@ export type ComposerPromptSegment =
 export interface SplitPromptIntoComposerSegmentsOptions {
   readonly reconstructTrailingReferences?: boolean;
   /**
-   * When provided, only matching names reconstruct as skill segments.
+   * When provided, only matching `$name` tokens reconstruct as skill segments.
    * Omission preserves provider-agnostic parsing for cursor utilities.
    */
   readonly enabledDollarSkillNames?: ReadonlySet<string>;
+  /**
+   * When provided, matching `/name` tokens reconstruct as skill segments.
+   * Non-skill slash commands and omitted inventories remain plain text.
+   */
+  readonly enabledSlashSkillNames?: ReadonlySet<string>;
 }
 
 function rangeIncludesIndex(start: number, end: number, index: number): boolean {
@@ -166,6 +172,7 @@ function splitPromptTextIntoComposerSegments(
   text: string,
   mentionableAgentNames: ReadonlySet<string>,
   enabledDollarSkillNames: ReadonlySet<string> | null,
+  enabledSlashSkillNames: ReadonlySet<string> | null,
   parseTrailingReference: boolean,
 ): ComposerPromptSegment[] {
   const segments: ComposerPromptSegment[] = [];
@@ -213,11 +220,20 @@ function splitPromptTextIntoComposerSegments(
           source: match.source,
         });
       }
+    } else if (match.source.startsWith("/")) {
+      if (
+        enabledSlashSkillNames !== null &&
+        enabledSlashSkillNames.has(match.value.toLowerCase())
+      ) {
+        segments.push({ type: "skill", name: match.value, prefix: "/" });
+      } else {
+        pushTextSegment(segments, match.source);
+      }
     } else if (
       enabledDollarSkillNames === null ||
       enabledDollarSkillNames.has(match.value.toLowerCase())
     ) {
-      segments.push({ type: "skill", name: match.value });
+      segments.push({ type: "skill", name: match.value, prefix: "$" });
     } else {
       pushTextSegment(segments, match.source);
     }
@@ -281,6 +297,10 @@ export function splitPromptIntoComposerSegments(
     options.enabledDollarSkillNames === undefined
       ? null
       : new Set([...options.enabledDollarSkillNames].map((name) => name.trim().toLowerCase()));
+  const enabledSlashSkillNames =
+    options.enabledSlashSkillNames === undefined
+      ? null
+      : new Set([...options.enabledSlashSkillNames].map((name) => name.trim().toLowerCase()));
   let terminalContextIndex = 0;
   forEachPromptSegmentSlice(prompt, (slice) => {
     if (slice.type === "text") {
@@ -289,6 +309,7 @@ export function splitPromptIntoComposerSegments(
           slice.text,
           mentionableAgentNames,
           enabledDollarSkillNames,
+          enabledSlashSkillNames,
           options.reconstructTrailingReferences === true || slice.terminatedByTerminalContext,
         ),
       );

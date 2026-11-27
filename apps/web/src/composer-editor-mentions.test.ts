@@ -145,7 +145,7 @@ describe("splitPromptIntoComposerSegments", () => {
       }),
     ).toEqual([
       { type: "text", text: "Use " },
-      { type: "skill", name: "review-follow-up" },
+      { type: "skill", name: "review-follow-up", prefix: "$" },
       { type: "text", text: " please" },
     ]);
   });
@@ -165,8 +165,32 @@ describe("splitPromptIntoComposerSegments", () => {
       }),
     ).toEqual([
       { type: "text", text: "Use " },
-      { type: "skill", name: "REFACTOR" },
+      { type: "skill", name: "REFACTOR", prefix: "$" },
       { type: "text", text: " please" },
+    ]);
+  });
+
+  it("splits enabled slash skill tokens into skill segments and keeps non-skill commands plain", () => {
+    expect(
+      splitPromptIntoComposerSegments(
+        "/DOCS inspect @AGENTS.md and /review and apps/web/src and /foo please",
+        [],
+        new Set(),
+        {
+          enabledSlashSkillNames: new Set(["docs"]),
+        },
+      ),
+    ).toEqual([
+      { type: "skill", name: "DOCS", prefix: "/" },
+      { type: "text", text: " inspect " },
+      { type: "mention", path: "AGENTS.md", source: "@AGENTS.md" },
+      { type: "text", text: " and /review and apps/web/src and /foo please" },
+    ]);
+  });
+
+  it("keeps slash tokens as plain text when enabledSlashSkillNames is omitted", () => {
+    expect(splitPromptIntoComposerSegments("/docs please")).toEqual([
+      { type: "text", text: "/docs please" },
     ]);
   });
 
@@ -234,7 +258,7 @@ describe("splitPromptIntoComposerSegments", () => {
     ).toEqual([
       { type: "text", text: "Inspect " },
       { type: "terminal-context", context: null },
-      { type: "skill", name: "review-follow-up" },
+      { type: "skill", name: "review-follow-up", prefix: "$" },
       { type: "text", text: " after " },
       { type: "mention", path: "AGENTS.md", source: "@AGENTS.md" },
       { type: "text", text: " " },

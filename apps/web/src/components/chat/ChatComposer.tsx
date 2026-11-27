@@ -930,9 +930,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const composerInlineTokenContext = useMemo<ComposerInlineTokenContext>(
     () => ({
       mentionableAgentNames: composerCapabilities.mentionableAgentNames,
-      enabledDollarSkillNames: new Set(
-        composerCapabilities.dollarSkills.map((skill) => skill.name),
-      ),
+      enabledDollarSkillNames: composerCapabilities.enabledDollarSkillNames,
+      enabledSlashSkillNames: composerCapabilities.enabledSlashSkillNames,
     }),
     [composerCapabilities],
   );

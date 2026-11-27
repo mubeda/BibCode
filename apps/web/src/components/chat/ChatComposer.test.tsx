@@ -2338,6 +2338,67 @@ describe("ChatComposer menu selection", () => {
     onSelect(items[0]!);
 
     expect(draftOf(threadRef)?.prompt).toBe("/docs ");
+    // `/docs` renders as a 1-slot skill chip + trailing space => collapsed cursor 2.
+    expect(setStateValues(STATE.cursor)).toContain(2);
+  });
+
+  it("collapses cursor for command-registered slash skills while keeping non-skill commands plain", () => {
+    const antigravityId = ProviderInstanceId.make("antigravity");
+    const provider: ServerProvider = {
+      ...codexProvider,
+      instanceId: antigravityId,
+      driver: ProviderDriverKind.make("antigravity"),
+      slashCommands: [
+        { name: "plan", description: "Plan mode" },
+        { name: "review-branch", description: "Registered skill command" },
+      ],
+      skills: [
+        {
+          name: "review-branch",
+          description: "Review local branch",
+          path: "/ws/.agents/skills/review-branch/SKILL.md",
+          scope: "project",
+          enabled: true,
+          invocation: "slash",
+        },
+      ],
+      agents: [],
+    };
+    const renderOverlap = () =>
+      renderComposer({
+        providerBindingInstanceId: antigravityId,
+        providerStatuses: [codexProvider, provider],
+        activeProjectDefaultModelSelection: {
+          instanceId: antigravityId,
+          model: "gpt-5.4",
+        },
+      });
+
+    // Selecting the command-registered skill `/review-branch` collapses cursor to 2 (chip + space).
+    seedPrompt("/rev");
+    renderOverlap();
+    setEditorSnapshot("/rev", 4);
+    const skillMenu = findCapture("ComposerCommandMenu");
+    const skillItems = skillMenu["items"] as Array<Record<string, unknown>>;
+    (skillMenu["onSelect"] as (item: Record<string, unknown>) => void)(
+      skillItems.find((item) => item["id"] === "provider-command:antigravity:review-branch")!,
+    );
+    expect(draftOf(threadRef)?.prompt).toBe("/review-branch ");
+    expect(setStateValues(STATE.cursor)).toContain(2);
+
+    // Selecting the non-skill slash command `/plan` keeps plain-text cursor length (6).
+    h.captures.length = 0;
+    h.setStateCalls.length = 0;
+    seedPrompt("/pl");
+    renderOverlap();
+    setEditorSnapshot("/pl", 3);
+    const cmdMenu = findCapture("ComposerCommandMenu");
+    const cmdItems = cmdMenu["items"] as Array<Record<string, unknown>>;
+    (cmdMenu["onSelect"] as (item: Record<string, unknown>) => void)(
+      cmdItems.find((item) => item["id"] === "provider-command:antigravity:plan")!,
+    );
+    expect(draftOf(threadRef)?.prompt).toBe("/plan ");
+    expect(setStateValues(STATE.cursor)).toContain("/plan ".length);
   });
 
   describe("Antigravity slash skills and commands", () => {

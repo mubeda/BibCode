@@ -174,6 +174,29 @@ describe("collectComposerInlineTokens", () => {
     expect(collectComposerInlineTokens("Use $9invalid now")).toEqual([]);
   });
 
+  it("collects slash-prefixed skill tokens while rejecting mid-path segments and incomplete tokens", () => {
+    const text = "/docs inspect apps/web/src and https://example.com/foo then /provider:audit now";
+    expect(collectComposerInlineTokens(text)).toEqual([
+      {
+        type: "skill",
+        value: "docs",
+        source: "/docs",
+        start: 0,
+        end: 5,
+      },
+      {
+        type: "skill",
+        value: "provider:audit",
+        source: "/provider:audit",
+        start: 60,
+        end: 75,
+      },
+    ]);
+    expect(collectComposerInlineTokens("Use /docs")).toEqual([]);
+    expect(collectComposerInlineTokens("Inspect /usr/local/bin now")).toEqual([]);
+    expect(collectComposerInlineTokens("Use /9invalid now")).toEqual([]);
+  });
+
   it("accepts one preserved trailing token and suppresses identical duplicates", () => {
     const token = {
       type: "mention" as const,
