@@ -63,6 +63,18 @@ const RECONCILIATION_PENDING_MUTATION_LIMIT: usize =
     MAX_TRACKED_ACTORS * 3 + MAX_TRACKED_WORK_ITEMS * 3 + RECONCILIATION_MUTATION_LIMIT;
 const MCP_STATUS_PRE_ROOT_BUFFER_LIMIT: usize = 64;
 
+/// Opaque RAII guard handle kept alive across a Codex async follow-up `turn/start` RPC.
+pub(crate) type FollowupTurnGuardHandle = Box<dyn std::any::Any + Send>;
+
+/// Async callback invoked right before Codex starts a follow-up turn for an async user-input
+/// answer (either post-turn or after `turn/steer` learns the turn just ended).
+pub(crate) type FollowupTurnGuardFn = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<FollowupTurnGuardHandle, String>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 fn stderr_activity(raw: &str) -> Option<(&'static str, String)> {
     let (clean, _) = crate::ansi::strip_escapes(raw);
     let line = clean.trim();
@@ -1816,7 +1828,7 @@ impl CodexSessionRuntime {
         request_id: &str,
         answers: Value,
     ) -> Result<(), RuntimeError> {
-        self.respond_to_user_input_internal(request_id, answers, None)
+        self.respond_to_user_input_internal(request_id, answers, None, None)
             .await
     }
 
@@ -1826,8 +1838,47 @@ impl CodexSessionRuntime {
         answers: Value,
         disposition: crate::provider::UserInputResponseDisposition,
     ) -> Result<(), RuntimeError> {
-        self.respond_to_user_input_internal(request_id, answers, Some(disposition))
+        self.respond_to_user_input_internal(request_id, answers, Some(disposition), None)
             .await
+    }
+
+    pub(crate) async fn respond_to_user_input_with_disposition_and_guard(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+        followup_guard: Option<FollowupTurnGuardFn>,
+    ) -> Result<(), RuntimeError> {
+        self.respond_to_user_input_internal(request_id, answers, Some(disposition), followup_guard)
+            .await
+    }
+
+    async fn start_async_followup_turn(
+        &self,
+        steer_text: String,
+        answer_timeout: Duration,
+        followup_guard: Option<&FollowupTurnGuardFn>,
+    ) -> Result<(), RuntimeError> {
+        let _guard = match followup_guard {
+            Some(guard) => Some(
+                guard()
+                    .await
+                    .map_err(|message| RuntimeError::InvalidPayload { message })?,
+            ),
+            None => None,
+        };
+        match tokio::time::timeout(
+            answer_timeout,
+            self.send_turn_inner(Some(steer_text), Vec::new(), None, None, false),
+        )
+        .await
+        {
+            Ok(res) => res.map(|_| ()),
+            Err(_) => Err(RuntimeError::InvalidPayload {
+                message: "Codex timed out while starting a follow-up turn for your answer."
+                    .to_owned(),
+            }),
+        }
     }
 
     async fn respond_to_user_input_internal(
@@ -1835,6 +1886,7 @@ impl CodexSessionRuntime {
         request_id: &str,
         answers: Value,
         disposition: Option<crate::provider::UserInputResponseDisposition>,
+        followup_guard: Option<FollowupTurnGuardFn>,
     ) -> Result<(), RuntimeError> {
         let pending = self
             .inner
@@ -1882,25 +1934,14 @@ impl CodexSessionRuntime {
                     {
                         Ok(Ok(_)) => Ok(()),
                         Ok(Err(steer_error)) if is_codex_steer_turn_ended_error(&steer_error) => {
-                            // Codex confirmed the turn already ended on `turn/steer`; start a
-                            // follow-up turn with the answers instead of failing the card.
-                            match tokio::time::timeout(
+                            // Codex confirmed the turn already ended on `turn/steer`; guard and
+                            // start a follow-up turn with the answers instead of failing the card.
+                            self.start_async_followup_turn(
+                                steer_text,
                                 answer_timeout,
-                                self.send_turn_inner(
-                                    Some(steer_text),
-                                    Vec::new(),
-                                    None,
-                                    None,
-                                    false,
-                                ),
+                                followup_guard.as_ref(),
                             )
                             .await
-                            {
-                                Ok(res) => res.map(|_| ()),
-                                Err(_) => Err(RuntimeError::InvalidPayload {
-                                    message: "Codex timed out while starting a follow-up turn for your answer.".to_owned(),
-                                }),
-                            }
                         }
                         Ok(Err(steer_error)) => Err(steer_error),
                         Err(_) => Err(RuntimeError::InvalidPayload {
@@ -1908,19 +1949,12 @@ impl CodexSessionRuntime {
                         }),
                     }
                 } else {
-                    match tokio::time::timeout(
+                    self.start_async_followup_turn(
+                        steer_text,
                         answer_timeout,
-                        self.send_turn_inner(Some(steer_text), Vec::new(), None, None, false),
+                        followup_guard.as_ref(),
                     )
                     .await
-                    {
-                        Ok(res) => res.map(|_| ()),
-                        Err(_) => Err(RuntimeError::InvalidPayload {
-                            message:
-                                "Codex timed out while starting a follow-up turn for your answer."
-                                    .to_owned(),
-                        }),
-                    }
                 };
                 if let Err(error) = delivery_result {
                     self.inner
@@ -10267,5 +10301,194 @@ mod tests {
         let expired = runtime.next_event().await.expect("expired B");
         assert_eq!(expired.event_type, "user-input.expired");
         assert_eq!(expired.request_id.as_deref(), Some(second_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn async_followup_guard_runs_on_steer_turn_ended_and_preserves_pending_on_refusal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (connection, incoming, mut server_write, server_read, _stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        let mut reader = BufReader::new(server_read);
+
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "thread/started",
+                "params": { "thread": { "id": "codex-thread-guard" } }
+            }),
+        )
+        .await;
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "turn/started",
+                "params": { "threadId": "codex-thread-guard", "turn": { "id": "turn-ending" } }
+            }),
+        )
+        .await;
+        let started = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("turn started timeout")
+            .expect("turn started");
+        assert_eq!(started.event_type, "turn.started");
+
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": "codex-thread-guard",
+                    "turnId": "turn-ending",
+                    "item": {
+                        "id": "msg-guard-1",
+                        "type": "agentMessage",
+                        "delivery": "async",
+                        "text": "Pick one",
+                        "questions": [
+                            { "title": "Roast?", "options": ["Light", "Dark"] }
+                        ]
+                    }
+                }
+            }),
+        )
+        .await;
+        let _completed_msg = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("assistant msg timeout")
+            .expect("assistant msg");
+        let requested = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("requested timeout")
+            .expect("requested event");
+        assert_eq!(requested.event_type, "user-input.requested");
+        let req_id = requested.request_id.expect("request id");
+
+        let guard_calls = Arc::new(AtomicUsize::new(0));
+        let refuse_guard: FollowupTurnGuardFn = {
+            let guard_calls = guard_calls.clone();
+            Arc::new(move || {
+                guard_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err("checkpoint capture still pending".to_owned()) })
+            })
+        };
+
+        // First attempt: `turn/steer` reports that the turn just ended, so Codex invokes the
+        // follow-up guard before calling `turn/start`. The guard refuses, so `turn/start` is NOT
+        // sent and the pending card stays open for retry.
+        let runtime_first = runtime.clone();
+        let req_id_first = req_id.clone();
+        let first_handle = tokio::spawn(async move {
+            runtime_first
+                .respond_to_user_input_with_disposition_and_guard(
+                    &req_id_first,
+                    json!({ "async-q-1": "Light" }),
+                    crate::provider::UserInputResponseDisposition::Answered,
+                    Some(refuse_guard),
+                )
+                .await
+        });
+        let steer_msg = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = read_runtime_test_json(&mut reader).await;
+                if frame["method"] == "turn/steer" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("turn/steer timeout");
+        assert_eq!(steer_msg["method"], "turn/steer");
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": steer_msg["id"],
+                "error": { "code": -32000, "message": "no active turn to steer" }
+            }),
+        )
+        .await;
+        let first_err = first_handle
+            .await
+            .expect("first join")
+            .expect_err("guard refusal should fail delivery");
+        assert!(
+            first_err
+                .to_string()
+                .contains("checkpoint capture still pending"),
+            "unexpected error: {first_err}"
+        );
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            runtime.has_pending_requests().await,
+            "pending request must remain open after guard refusal"
+        );
+
+        // Retry after guard clears: `turn/start` proceeds and settles the card cleanly.
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "codex-thread-guard",
+                    "turn": { "id": "turn-ending", "status": "completed" }
+                }
+            }),
+        )
+        .await;
+        let _turn_done = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("turn completed timeout")
+            .expect("turn completed");
+        let allow_guard: FollowupTurnGuardFn = {
+            let guard_calls = guard_calls.clone();
+            Arc::new(move || {
+                guard_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(Box::new(()) as FollowupTurnGuardHandle) })
+            })
+        };
+        let runtime_retry = runtime.clone();
+        let req_id_retry = req_id.clone();
+        let retry_handle = tokio::spawn(async move {
+            runtime_retry
+                .respond_to_user_input_with_disposition_and_guard(
+                    &req_id_retry,
+                    json!({ "async-q-1": "Light" }),
+                    crate::provider::UserInputResponseDisposition::Skipped,
+                    Some(allow_guard),
+                )
+                .await
+        });
+        let start_msg = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = read_runtime_test_json(&mut reader).await;
+                if frame["method"] == "turn/start" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("turn/start timeout");
+        assert_eq!(start_msg["method"], "turn/start");
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": start_msg["id"],
+                "result": { "turn": { "id": "turn-followup-1", "status": "inProgress" } }
+            }),
+        )
+        .await;
+        retry_handle
+            .await
+            .expect("retry join")
+            .expect("retry succeeds once guard admits");
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 2);
+        assert!(!runtime.has_pending_requests().await);
     }
 }

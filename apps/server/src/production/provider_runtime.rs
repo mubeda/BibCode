@@ -538,6 +538,15 @@ pub trait ProviderDriver: Send + Sync {
         answers: Value,
         disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
+    fn answer_with_followup_guard(
+        &self,
+        request_id: String,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+        _followup_guard: Option<crate::provider::codex::runtime::FollowupTurnGuardFn>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.answer(request_id, answers, disposition)
+    }
     fn set_mode(&self, mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn set_interaction_mode(
         &self,
@@ -8518,37 +8527,21 @@ async fn run_supervisor(
                         answers
                     };
                     // Run user-input answers off the shared supervisor loop so a slow or wedged
-                    // provider RPC cannot stall other threads. For post-turn Codex async answers
-                    // that may start a follow-up turn, wait for checkpoint capture and acquire
-                    // checkout admission first.
+                    // provider RPC cannot stall other threads. For Codex answers that may start a
+                    // follow-up turn (either post-turn or after a mid-turn steer learns the turn
+                    // just ended), enforce thread reservation, checkpoint settlement, and checkout
+                    // admission right at the follow-up-start decision.
                     tokio::spawn(async move {
-                        let result = if provider == "codex"
+                        let followup_guard = if provider == "codex"
                             && !disposition.is_effective_skip_or_cancel(&answers)
                         {
-                            match engine
-                                .repositories()
-                                .get_thread_session(thread_id.clone())
-                                .await
-                            {
-                                Ok(Some(session))
-                                    if matches!(
-                                        session.status.as_str(),
-                                        "running" | "starting"
-                                    ) =>
-                                {
-                                    driver.answer(request_id, answers, disposition).await
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        %thread_id,
-                                        "failed to inspect Codex session state before answering async question"
-                                    );
-                                    Err(ProviderRuntimeError::Persistence(error.to_string()))
-                                }
-                                Ok(_) => {
-                                    let _reservation =
-                                        engine.reserve_thread_turns(&thread_id).await;
+                            let guard_engine = engine.clone();
+                            let guard_thread_id = thread_id.clone();
+                            Some(Arc::new(move || {
+                                let engine = guard_engine.clone();
+                                let thread_id = guard_thread_id.clone();
+                                Box::pin(async move {
+                                    let reservation = engine.reserve_thread_turns(&thread_id).await;
                                     let deadline = tokio::time::Instant::now()
                                         + std::time::Duration::from_secs(10);
                                     while engine.turns_held_for_checkpoint(&thread_id)
@@ -8560,30 +8553,50 @@ async fn run_supervisor(
                                     if engine.turns_held_for_checkpoint(&thread_id) {
                                         tracing::warn!(
                                             %thread_id,
-                                            "checkpoint capture did not settle before post-turn Codex async answer"
+                                            "checkpoint capture did not settle before post-turn Codex async answer; refusing follow-up turn start"
+                                        );
+                                        return Err(
+                                            "A checkpoint is still being captured for the previous turn. Try submitting your answer again in a moment."
+                                                .to_owned(),
                                         );
                                     }
-                                    let Some(_admission) =
+                                    let Some(admission) =
                                         crate::production::orchestration_effects::admit_thread_turn(
                                             &engine, &thread_id,
                                         )
                                         .await
                                     else {
-                                        return {
-                                            let _ = response.send(Err(
-                                                ProviderRuntimeError::Provider {
-                                                    provider: "codex".to_owned(),
-                                                    detail: "A workspace restore is in progress. Try submitting your answer again once it finishes.".to_owned(),
-                                                },
-                                            ));
-                                        };
+                                        return Err(
+                                            "A workspace restore is in progress. Try submitting your answer again once it finishes."
+                                                .to_owned(),
+                                        );
                                     };
-                                    driver.answer(request_id, answers, disposition).await
-                                }
-                            }
+                                    Ok(Box::new((reservation, admission))
+                                        as crate::provider::codex::runtime::FollowupTurnGuardHandle)
+                                })
+                                    as std::pin::Pin<
+                                        Box<
+                                            dyn std::future::Future<
+                                                    Output = Result<
+                                                        crate::provider::codex::runtime::FollowupTurnGuardHandle,
+                                                        String,
+                                                    >,
+                                                > + Send,
+                                        >,
+                                    >
+                            })
+                                as crate::provider::codex::runtime::FollowupTurnGuardFn)
                         } else {
-                            driver.answer(request_id, answers, disposition).await
+                            None
                         };
+                        let result = driver
+                            .answer_with_followup_guard(
+                                request_id,
+                                answers,
+                                disposition,
+                                followup_guard,
+                            )
+                            .await;
                         let _ = response.send(result);
                     });
                     continue;
@@ -17873,6 +17886,25 @@ impl ProviderDriver for CodexDriver {
         Box::pin(async move {
             self.runtime
                 .respond_to_user_input_with_disposition(&request_id, answers, disposition)
+                .await
+                .map_err(provider_error("codex"))
+        })
+    }
+    fn answer_with_followup_guard(
+        &self,
+        request_id: String,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+        followup_guard: Option<crate::provider::codex::runtime::FollowupTurnGuardFn>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .respond_to_user_input_with_disposition_and_guard(
+                    &request_id,
+                    answers,
+                    disposition,
+                    followup_guard,
+                )
                 .await
                 .map_err(provider_error("codex"))
         })
