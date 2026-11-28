@@ -181,4 +181,20 @@ describe("project surface root routes", () => {
       kind: "pullRequest",
     });
   });
+
+  it("clears stale embedded pipeline detail when redirecting from the Pipelines list route", async () => {
+    const hostRef = { environmentId: "env-1" as never, threadId: "live" as never };
+    h.threads = [makeThread("live", "2026-10-10T00:00:00.000Z")];
+    useRightPanelStore
+      .getState()
+      .setEmbeddedPipeline(hostRef, { pipelineId: 77, attempt: 1, jobId: 9, jobLogOffset: null });
+    const PipelinesComponent = PipelinesRoute.options.component as ComponentType;
+    await act(async () => root.render(<PipelinesComponent />));
+
+    expect(
+      useRightPanelStore.getState().embeddedPipelineByThreadKey[
+        `${hostRef.environmentId}:${hostRef.threadId}`
+      ],
+    ).toBeUndefined();
+  });
 });

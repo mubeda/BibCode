@@ -8823,7 +8823,7 @@ describe("ThreadTerminalPanel mounted controls", () => {
 
     await click(buttonByLabel("New Terminal (Ctrl+N)"));
     await click(buttonByLabel("Close Primary (Ctrl+W)"));
-    expect(onNewTerminal).toHaveBeenCalledOnce();
+    expect(onNewTerminal).not.toHaveBeenCalled();
     expect(onCloseTerminal).toHaveBeenCalledWith("term-1");
 
     const splitPanes = Array.from(

@@ -3289,18 +3289,22 @@ Start with this read-only packaged smoke on each native target; retain the
 screenshots and route evidence in the execution report:
 
 - Open the project's **Pull Requests** sidebar button (accessible label
-  `Pull Requests for <project>`), assert the URL contains `/pull-requests`, and
-  capture the list with the project header still highlighted.
+  `Pull Requests for <project>`). When the project has at least one eligible
+  thread, assert the host thread opens with the right-panel **Pull Request**
+  singleton active (`[data-right-panel-icon-bar] button[aria-label="Pull Request"][data-active-icon="true"]`);
+  when no eligible thread exists, assert the standalone `/pull-requests` route
+  opens with the project header still highlighted.
 - With a configured, authenticated GitHub/GitLab host and a readable request,
   open a row, capture the detail title/state, then select **Files changed** /
-  **Changes**. Verify `?tab=files`, a real text patch rendered by FileDiff and
-  retained selection after reload. An empty or unavailable repository is
-  availability evidence only; it does not pass the list/detail/files smoke.
+  **Changes**. Verify a real text patch rendered by FileDiff and retained
+  selection after reload (and `?tab=files` on standalone detail routes). An
+  empty or unavailable repository is availability evidence only; it does not
+  pass the list/detail/files smoke.
 - With the disposable no-remote packaged fixture, record the actionable
-  unavailable state instead. The Pull Requests sibling beside the Git Manager
-  navigation in `apps/desktop/e2e/specs/pierre-diffs.e2e.ts` checks only route
-  entry and saves `pierre-pull-requests-route.png`; it does not substitute for
-  the authenticated list/detail/files pass or authorize host writes.
+  unavailable state instead. The Pull Requests check beside Git Manager in
+  `apps/desktop/e2e/specs/pierre-diffs.e2e.ts` verifies right-panel entry and
+  saves `pierre-pull-requests-route.png`; it does not substitute for the
+  authenticated list/detail/files pass or authorize host writes.
 
 Run the regression tripwires without a browser:
 

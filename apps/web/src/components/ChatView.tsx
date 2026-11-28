@@ -203,6 +203,7 @@ import {
 } from "../rightPanelLayout";
 import {
   isDynamicRightPanelSurface,
+  readPersistedRightPanelOverflowCheck,
   resolveFallbackSingletonKind,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
@@ -3106,22 +3107,26 @@ function ChatViewContent(props: ChatViewProps) {
   const pipelinesSettingEnabled = settings.pipelinesEnabled !== false;
   const pullRequestsSettingEnabled = settings.pullRequestsEnabled !== false;
   const serverCapabilities = serverConfig?.environment.capabilities ?? null;
-  const pipelinesSupportedByServer = serverCapabilities?.pipelinesReads !== false;
-  const pullRequestsSupportedByServer = serverCapabilities?.pullRequestsReads !== false;
+  const pipelinesSupportedByServer = serverCapabilities?.pipelinesReads === true;
+  const pullRequestsSupportedByServer = serverCapabilities?.pullRequestsReads === true;
   const pipelinesRightPanelAvailable =
     gitRightPanelAvailable && pipelinesSettingEnabled && pipelinesSupportedByServer;
   const pullRequestRightPanelAvailable =
     gitRightPanelAvailable && pullRequestsSettingEnabled && pullRequestsSupportedByServer;
   const pipelinesRightPanelDisabledReason = !pipelinesSettingEnabled
     ? "Pipelines are turned off in Settings → Source Control."
-    : !pipelinesSupportedByServer
-      ? "Update this environment's server to use Pipelines."
-      : undefined;
+    : serverCapabilities === null
+      ? "Waiting for Pipelines capabilities."
+      : !pipelinesSupportedByServer
+        ? "Update this environment's server to use Pipelines."
+        : undefined;
   const pullRequestRightPanelDisabledReason = !pullRequestsSettingEnabled
     ? "Pull requests are turned off in Settings → Source Control."
-    : !pullRequestsSupportedByServer
-      ? "This environment does not support Pull Requests."
-      : undefined;
+    : serverCapabilities === null
+      ? "Waiting for Pull Requests capabilities."
+      : !pullRequestsSupportedByServer
+        ? "This environment does not support Pull Requests."
+        : undefined;
   const composerContextEnvironmentLabel =
     activeEnvironment?.label ??
     environmentById.get(environmentId)?.label ??
@@ -3618,10 +3623,15 @@ function ChatViewContent(props: ChatViewProps) {
       useRightPanelStore.getState().byThreadKey,
       activeThreadRef,
     ).surfaces.flatMap((surface) => (surface.kind === "terminal" ? surface.terminalIds : []));
+    const pendingOverflowIds =
+      useRightPanelStore.getState().migratedOverflowTerminalIdsByThreadKey[
+        scopedThreadKey(activeThreadRef)
+      ] ?? [];
     return reserveTerminalId(activeThreadRef, [
       ...activeKnownTerminalIds,
       ...centerTerminalIds,
       ...rightTerminalIds,
+      ...pendingOverflowIds,
     ]);
   }, [activeKnownTerminalIds, activeThreadRef]);
   const openReservedRightPanelTerminal = useCallback(
@@ -3720,23 +3730,56 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     const threadKey = scopedThreadKey(activeThreadRef);
+    const centerTerminalIds = new Set(
+      selectThreadCenterPanelState(
+        useCenterPanelStore.getState().byThreadKey,
+        activeThreadRef,
+      ).surfaces.flatMap((surface) => (surface.kind === "terminal" ? [surface.terminalId] : [])),
+    );
+    const rightTerminalIds = new Set(
+      selectThreadRightPanelState(
+        useRightPanelStore.getState().byThreadKey,
+        activeThreadRef,
+      ).surfaces.flatMap((surface) => (surface.kind === "terminal" ? surface.terminalIds : [])),
+    );
+    const persistedCheck = readPersistedRightPanelOverflowCheck(activeThreadRef);
+    const staleOverflowIds: string[] = [];
     for (const terminalId of pendingMigratedOverflowTerminalIds) {
       const retireKey = `${threadKey}:${terminalId}`;
       if (retiringOverflowTerminalKeysRef.current.has(retireKey)) continue;
+      // Never retire an ID that is already live in this window, referenced in persisted
+      // surfaces by another window, or already acknowledged in shared storage by another window.
+      const alreadyRetiredOrReused =
+        centerTerminalIds.has(terminalId) ||
+        rightTerminalIds.has(terminalId) ||
+        (persistedCheck.hasPersistedState &&
+          (!persistedCheck.pendingOverflowIds.has(terminalId) ||
+            persistedCheck.activeTerminalIds.has(terminalId)));
+      if (alreadyRetiredOrReused) {
+        staleOverflowIds.push(terminalId);
+        continue;
+      }
       retiringOverflowTerminalKeysRef.current.add(retireKey);
       void retireTerminalResource({
         environmentId: activeThreadRef.environmentId,
         threadId: activeThreadRef.threadId,
         terminalId,
       })
-        .then(() => {
-          useRightPanelStore
-            .getState()
-            .acknowledgeMigratedOverflowTerminalIds(activeThreadRef, [terminalId]);
+        .then((result) => {
+          if (result === "closed") {
+            useRightPanelStore
+              .getState()
+              .acknowledgeMigratedOverflowTerminalIds(activeThreadRef, [terminalId]);
+          }
         })
         .finally(() => {
           retiringOverflowTerminalKeysRef.current.delete(retireKey);
         });
+    }
+    if (staleOverflowIds.length > 0) {
+      useRightPanelStore
+        .getState()
+        .acknowledgeMigratedOverflowTerminalIds(activeThreadRef, staleOverflowIds);
     }
   }, [activeThreadRef, pendingMigratedOverflowTerminalIds, retireTerminalResource]);
   const splitPanelTerminal = useCallback(

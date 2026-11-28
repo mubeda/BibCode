@@ -62,6 +62,7 @@ function PipelinesListRouteView() {
     if (!sameFilters(currentFilters, nextFilters)) {
       pipelinesStore.setFilters(projectRef, nextFilters);
     }
+    useRightPanelStore.getState().setEmbeddedPipeline(hostThreadRef, null);
     useRightPanelStore.getState().open(hostThreadRef, "pipelines");
     void navigate({
       to: "/$environmentId/$threadId",

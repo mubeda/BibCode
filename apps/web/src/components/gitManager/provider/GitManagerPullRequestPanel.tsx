@@ -81,14 +81,14 @@ const PullRequestRow = memo(function PullRequestRow({
             {pullRequest.state}
           </p>
           {projectRef ? (
-            onOpenPullRequest && providerKind ? (
+            onOpenPullRequest ? (
               <button
                 type="button"
                 className="mt-1 inline-block text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
                 onClick={() =>
                   onOpenPullRequest({
                     number: pullRequest.number,
-                    provider: providerKind,
+                    provider: providerKind ?? "unknown",
                     cwd,
                   })
                 }

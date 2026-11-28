@@ -872,7 +872,11 @@ function makeEnvironmentPresentation(
       label: "Local",
       platform: { os: "linux" as const, arch: "x64" as const },
       // An older server: the revert dialog opens without a shared-checkout preview.
-      capabilities: { conversationOnlyRewind: false },
+      capabilities: {
+        conversationOnlyRewind: false,
+        pipelinesReads: true,
+        pullRequestsReads: true,
+      },
     },
   };
   return {

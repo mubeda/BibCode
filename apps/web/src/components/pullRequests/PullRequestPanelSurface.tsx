@@ -136,18 +136,23 @@ function PullRequestPanelSurfaceContent({
       },
       requestGone: clearSelection,
       discardDeleted: () => {
-        if (selectedNumber === null) return;
+        if (selectedNumber === null || selectedProvider === null) return;
         const current = selectThreadRightPanelState(store().byThreadKey, threadRef).surfaces.find(
           (entry): entry is PullRequestRightPanelSurface => entry.kind === "pullRequest",
         );
-        if (current?.selection?.number === selectedNumber) {
+        const currentEffectiveCwd = current?.selection?.cwd ?? gitCwd;
+        if (
+          current?.selection?.number === selectedNumber &&
+          current.selection.provider === selectedProvider &&
+          currentEffectiveCwd === effectiveCwd
+        ) {
           setFileAnchor(null);
           store().clearPullRequestSelection(threadRef, { preserveFocus: true });
         }
       },
       back: goBack,
     };
-  }, [effectiveCwd, selectedNumber, selectedProvider, threadRef]);
+  }, [effectiveCwd, gitCwd, selectedNumber, selectedProvider, threadRef]);
   const scope = useMemo(
     () => ({ environmentId, cwd: effectiveCwd ?? "" }),
     [effectiveCwd, environmentId],
@@ -186,13 +191,20 @@ function PullRequestPanelSurfaceContent({
   if ((query.error !== null && !storedContext) || query.data?.status === "unavailable") {
     const unavailable = query.data?.status === "unavailable" ? query.data : null;
     return (
-      <PullRequestsUnavailableState
-        reason={query.error ?? unavailable!.message}
-        authCommand={unavailable?.authCommand ?? null}
-        installHint={unavailable?.installHint ?? null}
-        onRescan={rescan}
-        isPending={query.isPending}
-      />
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div className="flex shrink-0 items-center border-b border-border/60 px-3 py-1.5">
+          <Button type="button" size="xs" variant="ghost" onClick={() => navigation.back?.()}>
+            Back
+          </Button>
+        </div>
+        <PullRequestsUnavailableState
+          reason={query.error ?? unavailable!.message}
+          authCommand={unavailable?.authCommand ?? null}
+          installHint={unavailable?.installHint ?? null}
+          onRescan={rescan}
+          isPending={query.isPending}
+        />
+      </div>
     );
   }
   if (query.data === null) {

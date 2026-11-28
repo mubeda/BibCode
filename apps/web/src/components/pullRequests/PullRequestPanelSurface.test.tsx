@@ -334,7 +334,7 @@ describe("PullRequestPanelSurface", () => {
     expect(h.detailProps).toBeNull();
   });
 
-  it("explains when the repository has no supported host", async () => {
+  it("explains when the repository has no supported host and offers Back to recover", async () => {
     h.context = {
       status: "unavailable",
       message: "No GitHub or GitLab remote.",
@@ -344,6 +344,35 @@ describe("PullRequestPanelSurface", () => {
     await render();
     expect(container.textContent).toContain("No GitHub or GitLab remote.");
     expect(h.detailProps).toBeNull();
+    const backButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent?.trim() === "Back",
+    );
+    expect(backButton).toBeDefined();
+    await act(async () => backButton!.click());
+    expect(panelState().surfaces).toEqual([{ id: "pullRequest", kind: "pullRequest" }]);
+  });
+
+  it("ignores a late discardDeleted receipt when the same PR number belongs to another checkout", async () => {
+    await render({
+      surface: {
+        id: "pullRequest",
+        kind: "pullRequest",
+        selection: { number: 89, provider: "gitlab", tab: "conversation", cwd: "/repo/checkout-a" },
+      },
+    });
+    const discardDeleted = (h.navigation as PullRequestsNavigation).discardDeleted!;
+    useRightPanelStore
+      .getState()
+      .openPullRequest(threadRef, { number: 89, provider: "gitlab", cwd: "/repo/checkout-b" });
+    await act(async () => root.render(null));
+    discardDeleted();
+    expect(panelState().surfaces).toEqual([
+      {
+        id: "pullRequest",
+        kind: "pullRequest",
+        selection: { number: 89, provider: "gitlab", tab: "conversation", cwd: "/repo/checkout-b" },
+      },
+    ]);
   });
 
   it("gives the detail view the panel's full width", async () => {

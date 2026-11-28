@@ -1005,7 +1005,12 @@ function makeEnvironmentPresentation(
     environment: {
       label: "Local",
       platform: { os: "linux" as const, arch: "x64" as const },
-      capabilities: { activityProtocolVersion: 2 as const, worktreeCatalog: true },
+      capabilities: {
+        activityProtocolVersion: 2 as const,
+        worktreeCatalog: true,
+        pipelinesReads: true,
+        pullRequestsReads: true,
+      },
     },
   };
   return {
@@ -8836,7 +8841,12 @@ describe("ChatView long-lived handlers (#204)", () => {
       providers: [compactingProvider],
       environment: {
         label: "Local",
-        capabilities: { activityProtocolVersion: 2 as const, worktreeCatalog: true },
+        capabilities: {
+          activityProtocolVersion: 2 as const,
+          worktreeCatalog: true,
+          pipelinesReads: true,
+          pullRequestsReads: true,
+        },
       },
     };
     const local = makeEnvironmentPresentation({

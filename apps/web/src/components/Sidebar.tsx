@@ -2067,9 +2067,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   // dependency arrays (avoids invalidating every thread-row memo on each
   // thread-list change).
   const sidebarThreadByKeyRef = useRef(sidebarThreadByKey);
+  const activeRouteThreadKeyRef = useRef(activeRouteThreadKey);
   useLayoutEffect(() => {
     sidebarThreadByKeyRef.current = sidebarThreadByKey;
-  }, [sidebarThreadByKey]);
+    activeRouteThreadKeyRef.current = activeRouteThreadKey;
+  }, [activeRouteThreadKey, sidebarThreadByKey]);
   const projectThreads = sidebarThreads;
   const projectPreferenceKeys = useMemo(() => projectExpansionPreferenceKeys(project), [project]);
   const projectToggleKeys = useMemo(() => projectExpansionToggleKeys(project), [project]);
@@ -2732,8 +2734,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       const memberThreads = Array.from(sidebarThreadByKeyRef.current.values()).filter(
         (thread) => thread.environmentId === member.environmentId && thread.projectId === member.id,
       );
-      const currentThreadRef = activeRouteThreadKey
-        ? parseScopedThreadKey(activeRouteThreadKey)
+      const latestRouteThreadKey = activeRouteThreadKeyRef.current;
+      const currentThreadRef = latestRouteThreadKey
+        ? parseScopedThreadKey(latestRouteThreadKey)
         : null;
       const hostThreadRef = selectHostThreadForProjectSurface({
         threads: memberThreads,
@@ -2759,7 +2762,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         params: { environmentId: member.environmentId, projectId: member.id },
       });
     },
-    [activeRouteThreadKey, isMobile, navigate, setOpenMobile],
+    [isMobile, navigate, setOpenMobile],
   );
 
   const openGitManagerForProjectMember = useCallback(

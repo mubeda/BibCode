@@ -3615,14 +3615,17 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   instead; GitHub views refresh on the visible timer at the cadences in the
   contract, with no server poller. See
   [Pipelines contract boundary](./rpc-and-orchestration.md#pipelines-contract-boundary).
-- The right panel (`rightPanelStore`) can show one request per tab, with no new
-  server contract. `pullRequest` surfaces (`pullRequest:<number>`, with the
-  provider and the selected detail tab) host `PullRequestsDetailView` per
-  thread, scoped to the thread's checkout. The detail view and its file links
-  read a `PullRequestsNavigation` (methods only) from React context instead of
-  the router: the full page provides `PullRequestsRouteNavigation` (URLs
-  unchanged), the panel a store adapter (tab, revert-opens-a-tab,
-  delete-closes-the-tab). The Changes tab's file anchor travels in a separate
+- The right panel (`rightPanelStore`) hosts one singleton `pullRequest` surface
+  (`id: "pullRequest"`) per thread with an optional selected request (`number`,
+  `provider`, `tab`, and originating checkout `cwd`), with no new server
+  contract. With no selection, the surface renders the embedded
+  `PullRequestsPanel` list; selecting a request swaps to `PullRequestsDetailView`
+  scoped to that checkout, and **Back** returns to the embedded list (or to
+  `pipelines` when opened from a pipeline MR link). The detail view and its file
+  links read a `PullRequestsNavigation` (methods only) from React context
+  instead of the router: the full page provides `PullRequestsRouteNavigation`
+  (URLs unchanged), the panel a store adapter (tab, revert-opens-in-place,
+  delete-clears-selection). The Changes tab's file anchor travels in a separate
   `PullRequestsFileAnchorContext`, so an anchor change does not re-render the
   whole view; on the full page it is the URL hash, in the panel component
   state. The detail view and the Changes tab's file tree switch layout at the
@@ -3632,12 +3635,12 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   `bibcode:changed-files-nav-width`. Its paint is clamped to the detail's live
   width, leaving room for the diffs, without rewriting the stored preference;
   only a drag that moves, a divider key, or the double-click reset commits.
-  A request opens in the panel from the Source Control create
-  dialog's **Done** and the panel's **Open MR in panel** items, and from the
-  full page's **Open beside a thread…**; the first two are gated by
-  `canOpenPullRequestInPanel` (Pull Requests setting on, not Bitbucket or Azure
-  DevOps). Persisted `pullRequest` entries are validated on load, so a corrupted
-  one drops without losing the thread's other tabs.
+  A request opens in the panel from the Source Control create dialog's **Done**
+  and the panel's **Open MR in panel** items, from embedded Pipelines and Git
+  Manager PR links, and from the full page's **Open beside a thread…**; the
+  first two are gated by `canOpenPullRequestInPanel` (Pull Requests setting on,
+  not Bitbucket or Azure DevOps). Persisted `pullRequest` entries are validated
+  on load, so a corrupted one drops without losing the thread's other surfaces.
 - The Diff panel's Compare file list reuses `useResizableWidth`, persisting its
   width in `bibcode:diff-compare-file-list-width`. It clamps the painted width
   to 224–720 px and reserves 384 px for the diff without rewriting the saved

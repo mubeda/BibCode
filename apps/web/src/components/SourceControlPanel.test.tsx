@@ -861,6 +861,7 @@ describe("SourceControlPanel", () => {
     expect(testState.openPullRequest).toHaveBeenCalledWith(props.threadRef, {
       number: 89,
       provider: "gitlab",
+      cwd: "C:/repo",
     });
     expect(testState.openPullRequestLink).not.toHaveBeenCalled();
   });
@@ -880,6 +881,7 @@ describe("SourceControlPanel", () => {
       expect(testState.openPullRequest).toHaveBeenCalledWith(props.threadRef, {
         number: 89,
         provider: "gitlab",
+        cwd: "C:/repo",
       });
       expect(testState.openPullRequestLink).not.toHaveBeenCalled();
     }
@@ -926,6 +928,7 @@ describe("SourceControlPanel", () => {
     expect(testState.openPullRequest).toHaveBeenCalledWith(props.threadRef, {
       number: 89,
       provider: "gitlab",
+      cwd: "C:/repo",
     });
   });
 
@@ -942,6 +945,7 @@ describe("SourceControlPanel", () => {
       expect(testState.openPullRequest).toHaveBeenCalledWith(props.threadRef, {
         number: 89,
         provider: "github",
+        cwd: "C:/repo",
       });
       expect(testState.openPullRequestLink).not.toHaveBeenCalled();
     }
@@ -1028,6 +1032,7 @@ describe("SourceControlPanel", () => {
     expect(testState.openPullRequest).toHaveBeenCalledWith(props.threadRef, {
       number: 89,
       provider: "gitlab",
+      cwd: "C:/repo",
     });
   });
 

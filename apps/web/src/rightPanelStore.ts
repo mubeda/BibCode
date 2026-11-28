@@ -789,6 +789,77 @@ export function migratePersistedRightPanelStateWithOverflow(
   return { byThreadKey, overflowTerminalIdsByThreadKey };
 }
 
+export function readPersistedRightPanelOverflowCheck(ref: ScopedThreadRef): {
+  readonly hasPersistedState: boolean;
+  readonly pendingOverflowIds: ReadonlySet<string>;
+  readonly activeTerminalIds: ReadonlySet<string>;
+} {
+  if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+    return {
+      hasPersistedState: false,
+      pendingOverflowIds: new Set(),
+      activeTerminalIds: new Set(),
+    };
+  }
+  try {
+    const raw = window.localStorage.getItem(RIGHT_PANEL_STORAGE_KEY);
+    if (!raw) {
+      return {
+        hasPersistedState: false,
+        pendingOverflowIds: new Set(),
+        activeTerminalIds: new Set(),
+      };
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed) || !isRecord(parsed.state)) {
+      return {
+        hasPersistedState: false,
+        pendingOverflowIds: new Set(),
+        activeTerminalIds: new Set(),
+      };
+    }
+    const threadKey = scopedThreadKey(ref);
+    const persistedState = parsed.state;
+    const pendingOverflowIds = new Set<string>();
+    if (isRecord(persistedState.migratedOverflowTerminalIdsByThreadKey)) {
+      const rawIds = persistedState.migratedOverflowTerminalIdsByThreadKey[threadKey];
+      if (Array.isArray(rawIds)) {
+        for (const id of rawIds) {
+          if (typeof id === "string" && id.length > 0) pendingOverflowIds.add(id);
+        }
+      }
+    }
+    const activeTerminalIds = new Set<string>();
+    if (isRecord(persistedState.byThreadKey)) {
+      const threadState = persistedState.byThreadKey[threadKey];
+      if (isRecord(threadState) && Array.isArray(threadState.surfaces)) {
+        for (const surface of threadState.surfaces) {
+          if (!isRecord(surface) || surface.kind !== "terminal") continue;
+          if (typeof surface.resourceId === "string" && surface.resourceId.length > 0) {
+            activeTerminalIds.add(surface.resourceId);
+          }
+          if (Array.isArray(surface.terminalIds)) {
+            for (const id of surface.terminalIds) {
+              if (typeof id === "string" && id.length > 0) activeTerminalIds.add(id);
+            }
+          }
+        }
+      }
+    }
+    return {
+      hasPersistedState: true,
+      pendingOverflowIds,
+      activeTerminalIds,
+    };
+  } catch {
+    return {
+      hasPersistedState: false,
+      pendingOverflowIds: new Set(),
+      activeTerminalIds: new Set(),
+    };
+  }
+}
+
 export function migratePersistedRightPanelState(persistedState: unknown): {
   byThreadKey: Record<string, ThreadRightPanelState>;
 } {
@@ -925,14 +996,14 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             const existing = current.surfaces.find(
               (surface): surface is PullRequestRightPanelSurface => surface.kind === "pullRequest",
             );
-            const nextTab =
-              tab ??
-              (existing?.selection?.number === request.number
-                ? existing.selection.tab
-                : "conversation");
-            const nextCwd =
-              request.cwd ??
-              (existing?.selection?.number === request.number ? existing.selection.cwd : undefined);
+            const existingSelection = existing?.selection;
+            const sameTarget =
+              existingSelection !== undefined &&
+              existingSelection.number === request.number &&
+              existingSelection.provider === request.provider &&
+              (request.cwd === undefined || existingSelection.cwd === request.cwd);
+            const nextTab = tab ?? (sameTarget ? existingSelection.tab : "conversation");
+            const nextCwd = request.cwd;
             const nextSurface: PullRequestRightPanelSurface = {
               id: "pullRequest",
               kind: "pullRequest",
