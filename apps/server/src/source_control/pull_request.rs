@@ -1846,7 +1846,11 @@ fn truncate_detail(value: &str) -> String {
 fn parse_state(value: &str, merged: bool) -> ChangeRequestState {
     if merged || value.eq_ignore_ascii_case("merged") || value.eq_ignore_ascii_case("completed") {
         ChangeRequestState::Merged
-    } else if value.eq_ignore_ascii_case("open") || value.eq_ignore_ascii_case("active") {
+    } else if value.eq_ignore_ascii_case("open")
+        || value.eq_ignore_ascii_case("opened")
+        || value.eq_ignore_ascii_case("active")
+    {
+        // GitHub and Bitbucket say `open`; GitLab's `glab mr list` says `opened`.
         ChangeRequestState::Open
     } else {
         ChangeRequestState::Closed
@@ -2917,6 +2921,16 @@ esac
         .expect("Azure pull request");
         assert_eq!(parsed.base_branch, "main");
         assert_eq!(parsed.state, ChangeRequestState::Merged);
+    }
+
+    #[test]
+    fn gitlab_opened_state_is_an_open_merge_request() {
+        let parsed = parse_gitlab_merge_request(
+            r#"{"iid":43,"title":"GitLab MR","web_url":"https://gitlab.test/43","target_branch":"main","source_branch":"feature","state":"opened"}"#,
+        )
+        .expect("gitlab merge request");
+        assert_eq!(parsed.state, ChangeRequestState::Open);
+        assert_eq!(parsed.number, 43);
     }
 
     #[test]
