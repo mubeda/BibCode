@@ -774,7 +774,11 @@ pub enum OrchestrationCommand {
         #[serde(rename = "requestId")]
         request_id: String,
         answers: Value,
-        #[serde(default, deserialize_with = "deserialize_non_null_disposition")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_non_null_disposition"
+        )]
         disposition: Option<crate::provider::UserInputResponseDisposition>,
         #[serde(rename = "createdAt")]
         created_at: String,
@@ -5893,10 +5897,14 @@ async fn plan_command(
             created_at,
         } => {
             require_thread(model, command, thread_id)?;
+            let persisted_answers = match disposition {
+                Some(crate::provider::UserInputResponseDisposition::Cancelled) => json!({}),
+                _ => answers.clone(),
+            };
             let mut payload = json!({
                 "threadId": thread_id,
                 "requestId": request_id,
-                "answers": answers,
+                "answers": persisted_answers,
                 "createdAt": created_at,
             });
             if let Some(disposition) = disposition {
@@ -16347,6 +16355,21 @@ mod timestamp_tie_tests {
             }
         ));
 
+        let legacy_encoded = serde_json::to_value(&legacy).expect("legacy command serializes");
+        assert!(
+            legacy_encoded.get("disposition").is_none(),
+            "omitted disposition must not serialize as explicit null: {legacy_encoded}"
+        );
+        let legacy_round_trip: OrchestrationCommand =
+            serde_json::from_value(legacy_encoded).expect("serialized legacy command round-trips");
+        assert!(matches!(
+            legacy_round_trip,
+            OrchestrationCommand::ThreadUserInputRespond {
+                disposition: None,
+                ..
+            }
+        ));
+
         for (wire, expected) in [
             (
                 "answered",
@@ -16393,5 +16416,79 @@ mod timestamp_tie_tests {
             explicit_null.is_err(),
             "explicit null disposition must be rejected to match the TS wire contract"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_user_input_respond_clears_answers_in_durable_event() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("database");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("in-memory engine");
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "project.create",
+                    "commandId": "proj-1",
+                    "projectId": "project-1",
+                    "title": "Sample",
+                    "workspaceRoot": "/tmp/sample",
+                    "createdAt": "2026-11-28T00:00:00.000Z"
+                }))
+                .expect("project create"),
+            )
+            .await
+            .expect("project created");
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.create",
+                    "commandId": "thread-1-create",
+                    "threadId": "thread-1",
+                    "projectId": "project-1",
+                    "title": "Clarify",
+                    "modelSelection": { "provider": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "createdAt": "2026-11-28T00:00:01.000Z"
+                }))
+                .expect("thread create"),
+            )
+            .await
+            .expect("thread created");
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.user-input.respond",
+                    "commandId": "cancel-1",
+                    "threadId": "thread-1",
+                    "requestId": "req-1",
+                    "answers": { "q1": "unsent draft" },
+                    "disposition": "cancelled",
+                    "createdAt": "2026-11-28T00:00:02.000Z"
+                }))
+                .expect("cancel respond"),
+            )
+            .await
+            .expect("cancel dispatched");
+        let events = engine.read_events(0).await.expect("events read");
+        let cancel_event = events
+            .iter()
+            .find(|event| event.event.event_type == "thread.user-input-response-requested")
+            .expect("durable user-input response event exists");
+        assert_eq!(
+            cancel_event.event.payload["disposition"],
+            json!("cancelled")
+        );
+        assert_eq!(cancel_event.event.payload["answers"], json!({}));
+        engine.shutdown().await;
     }
 }

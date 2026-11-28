@@ -444,4 +444,40 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
     await click(reopenBtn!);
     expect(onToggleCollapsed).toHaveBeenCalledTimes(2);
   });
+
+  it("ignores digit shortcuts in the host pane when focus is inside a sibling chat surface", async () => {
+    const onHostToggleOption = vi.fn();
+    const onHostAdvance = vi.fn();
+    const q = question("q1", [
+      { label: "Alpha", description: "First" },
+      { label: "Beta", description: "Second" },
+    ]);
+
+    await mount(
+      <div>
+        <div data-chat-surface="">
+          {renderPanel({
+            pendingUserInputs: [prompt(q)],
+            shortcutsEnabled: true,
+            onToggleOption: onHostToggleOption,
+            onAdvance: onHostAdvance,
+          })}
+        </div>
+        <div data-chat-surface="">
+          <button type="button" id="side-chat-action">
+            Side chat button
+          </button>
+        </div>
+      </div>,
+    );
+
+    const sideButton = document.getElementById("side-chat-action") as HTMLButtonElement;
+    expect(sideButton).not.toBeNull();
+    await act(async () => {
+      sideButton.focus();
+      sideButton.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+    });
+    expect(onHostToggleOption).not.toHaveBeenCalled();
+    expect(onHostAdvance).not.toHaveBeenCalled();
+  });
 });

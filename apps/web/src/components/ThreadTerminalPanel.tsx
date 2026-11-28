@@ -2633,9 +2633,22 @@ export function TerminalViewport({
           inputBinding.pendingFallbacks.push(fallback);
           const fill = inputScheduler.reserve(inputOrigin(text));
           let settled = false;
+          let pendingEntry: {
+            resolve: (kind: ProviderDriverKind | null) => void;
+            cancel: () => void;
+          } | null = null;
+          const removePendingEntry = () => {
+            if (!pendingEntry) return;
+            const index = pendingDriverKindPastesRef.current.indexOf(pendingEntry);
+            if (index !== -1) {
+              pendingDriverKindPastesRef.current.splice(index, 1);
+            }
+            pendingEntry = null;
+          };
           const finish = (resolved: ProviderDriverKind | null) => {
             if (settled) return;
             settled = true;
+            removePendingEntry();
             window.clearTimeout(timer);
             pendingIdentityPasteTimers.delete(timer);
             if (disposed || inputBlocked() || readTerminalGeneration() !== generation) {
@@ -2664,6 +2677,7 @@ export function TerminalViewport({
           const cancel = () => {
             if (settled) return;
             settled = true;
+            removePendingEntry();
             window.clearTimeout(timer);
             pendingIdentityPasteTimers.delete(timer);
             fill(null);
@@ -2682,7 +2696,8 @@ export function TerminalViewport({
             finish(readDriverKind());
           }, 1500);
           pendingIdentityPasteTimers.add(timer);
-          pendingDriverKindPastesRef.current.push({ resolve: finish, cancel });
+          pendingEntry = { resolve: finish, cancel };
+          pendingDriverKindPastesRef.current.push(pendingEntry);
         }
         return;
       }

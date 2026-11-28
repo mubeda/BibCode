@@ -2550,42 +2550,24 @@ function ChatViewContent(props: ChatViewProps) {
     supportsUserInputDisposition &&
     providerSupportsPendingUserInputCancel(activeThread?.session?.providerName ?? selectedProvider);
   const activePendingUserInputCanSkipAll = supportsUserInputDisposition;
+  const activeThreadLoadState = useThreadFindLoadState(
+    routeKind === "server" ? routeThreadRef : null,
+  );
+  const activeThreadIsLive =
+    routeKind !== "server" ||
+    (activeThreadLoadState.status === "live" &&
+      activeThreadLoadState.hasData &&
+      serverThread !== null);
   useEffect(() => {
-    // Clear drafts explicitly for requests confirmed resolved or expired in loaded activities.
-    for (const activity of threadActivities) {
-      if (activity.kind !== "user-input.resolved" && activity.kind !== "user-input.expired") {
-        continue;
-      }
-      const payload =
-        activity.payload && typeof activity.payload === "object"
-          ? (activity.payload as Record<string, unknown>)
-          : null;
-      const requestId =
-        payload && typeof payload.requestId === "string" && payload.requestId.trim().length > 0
-          ? payload.requestId.trim()
-          : null;
-      if (requestId) {
-        clearPendingUserInputDraft(routeThreadKey, requestId);
-      }
-    }
-    // Only prune remaining drafts once thread detail has actually hydrated (never while a
-    // shell-only cold reload still has empty activities and messages).
-    const detailHydrated =
-      routeKind !== "server" ||
-      threadActivities.length > 0 ||
-      (activeThread?.messages.length ?? 0) > 0;
-    if (!detailHydrated) {
+    // Only prune drafts against a live thread snapshot, never a stale cached snapshot
+    // that could predate a newer pending question, and never clear a request currently
+    // open in `pendingUserInputs` (e.g. reopened after an earlier expiry in history).
+    if (!activeThreadIsLive) {
       return;
     }
     const openIds = new Set(pendingUserInputs.map((entry) => entry.requestId));
     prunePendingUserInputDraftsForThread(routeThreadKey, openIds);
-  }, [
-    activeThread?.messages.length,
-    pendingUserInputs,
-    routeKind,
-    routeThreadKey,
-    threadActivities,
-  ]);
+  }, [activeThreadIsLive, pendingUserInputs, routeThreadKey]);
   const activePendingProgress = useMemo(
     () =>
       activePendingUserInput

@@ -212,8 +212,19 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
         if (focusedCard !== cardRef.current) {
           return;
         }
-      } else if (!shortcutsEnabled) {
-        return;
+      } else {
+        const focusedSurface =
+          activeElement instanceof HTMLElement
+            ? activeElement.closest("[data-chat-surface]")
+            : null;
+        const ownSurface = cardRef.current?.closest("[data-chat-surface]") ?? null;
+        if (focusedSurface) {
+          if (focusedSurface !== ownSurface) {
+            return;
+          }
+        } else if (!shortcutsEnabled) {
+          return;
+        }
       }
       const digit = Number.parseInt(event.key, 10);
       if (Number.isNaN(digit) || digit < 1 || digit > 9) return;

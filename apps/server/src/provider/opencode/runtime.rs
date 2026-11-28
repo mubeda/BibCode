@@ -517,6 +517,50 @@ struct SettledOutcome {
     answers: Value,
 }
 
+/// Normalizes OpenCode v1 `question.replied` SSE answers (`string[][]` ordered by question index,
+/// or an already-keyed object) into a question-ID-keyed object for `user-input.resolved` receipts.
+fn parse_v1_sse_question_answers(raw: &Value, questions: &[Value]) -> Value {
+    if raw.is_object() {
+        return raw.clone();
+    }
+    let Some(entries) = raw.as_array() else {
+        return json!({});
+    };
+    let mut map = serde_json::Map::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let values: Vec<Value> = match entry {
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(|text| Value::String(text.to_owned()))
+                })
+                .collect(),
+            Value::String(text) if !text.trim().is_empty() => {
+                vec![Value::String(text.trim().to_owned())]
+            }
+            _ => Vec::new(),
+        };
+        if values.is_empty() {
+            continue;
+        }
+        let key = questions
+            .get(index)
+            .and_then(|question| {
+                question
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| question.get("header").and_then(Value::as_str))
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("q{index}"));
+        map.insert(key, Value::Array(values));
+    }
+    Value::Object(map)
+}
+
 #[derive(Default)]
 struct V2State {
     translator: Option<V2TurnTranslator>,
@@ -2244,33 +2288,67 @@ impl OpenCodeSessionRuntime {
                 Ok(())
             }
             .await;
-            let (pending, sse_outcome) = {
+            let (pending, sse_outcome, sent_ok) = {
                 let mut v2 = self.inner.v2.lock().await;
                 v2.answering.remove(request_id);
                 let settled = v2.settled_while_answering.remove(request_id);
+                let sent_ok = sent.is_ok();
                 if settled.is_none() {
                     sent?;
                 }
-                (v2.forms.remove(request_id), settled.flatten())
+                (v2.forms.remove(request_id), settled.flatten(), sent_ok)
             };
             let Some(form) = pending else {
                 return Ok(());
             };
-            let (recorded_answers, final_disposition) = match sse_outcome {
-                Some(outcome) if outcome.disposition.is_skip_or_cancel() => {
-                    (json!({}), Some(outcome.disposition))
-                }
-                Some(outcome) if is_skip_or_cancel_only => {
-                    (outcome.answers, Some(outcome.disposition))
-                }
-                _ => (
+            let (recorded_answers, final_disposition) = if sent_ok {
+                (
                     if is_skip_or_cancel_only {
                         json!({})
                     } else {
                         answers
                     },
                     disposition,
-                ),
+                )
+            } else {
+                match sse_outcome {
+                    Some(outcome) if outcome.disposition.is_skip_or_cancel() => (
+                        json!({}),
+                        if is_skip_or_cancel_only {
+                            disposition.or(Some(outcome.disposition))
+                        } else {
+                            Some(outcome.disposition)
+                        },
+                    ),
+                    Some(outcome) => {
+                        if !is_skip_or_cancel_only && outcome.answers == answer {
+                            (answers, disposition)
+                        } else if outcome
+                            .answers
+                            .as_object()
+                            .is_some_and(|map| !map.is_empty())
+                        {
+                            (outcome.answers, Some(outcome.disposition))
+                        } else {
+                            (
+                                if is_skip_or_cancel_only {
+                                    json!({})
+                                } else {
+                                    answers
+                                },
+                                Some(outcome.disposition),
+                            )
+                        }
+                    }
+                    None => (
+                        if is_skip_or_cancel_only {
+                            json!({})
+                        } else {
+                            answers
+                        },
+                        disposition,
+                    ),
+                }
             };
             let resolved_payload = match final_disposition {
                 Some(disp) => crate::provider::build_user_input_resolved_payload(
@@ -2363,33 +2441,71 @@ impl OpenCodeSessionRuntime {
             Ok(())
         }
         .await;
-        let (pending, sse_outcome) = {
+        let (pending, sse_outcome, sent_ok) = {
             let mut pending_map = self.inner.pending_questions.lock().await;
             let mut sync = self.inner.v1_question_sync.lock().await;
             sync.answering.remove(request_id);
             let settled = sync.settled_while_answering.remove(request_id);
+            let sent_ok = sent.is_ok();
             if settled.is_none() {
                 sent?;
             }
             sync.mark_settled(request_id);
-            (pending_map.remove(request_id), settled)
+            (pending_map.remove(request_id), settled, sent_ok)
         };
         let Some(pending) = pending else {
             return Ok(());
         };
-        let (recorded_answers, final_disposition) = match sse_outcome {
-            Some(outcome) if outcome.disposition.is_skip_or_cancel() => {
-                (json!({}), Some(outcome.disposition))
-            }
-            Some(outcome) if is_skip_or_cancel_only => (outcome.answers, Some(outcome.disposition)),
-            _ => (
+        let (recorded_answers, final_disposition) = if sent_ok {
+            (
                 if is_skip_or_cancel_only {
                     json!({})
                 } else {
                     answers
                 },
                 disposition,
-            ),
+            )
+        } else {
+            let expected_sse_answers =
+                parse_v1_sse_question_answers(&Value::Array(normalized), &pending.questions);
+            match sse_outcome {
+                Some(outcome) if outcome.disposition.is_skip_or_cancel() => (
+                    json!({}),
+                    if is_skip_or_cancel_only {
+                        disposition.or(Some(outcome.disposition))
+                    } else {
+                        Some(outcome.disposition)
+                    },
+                ),
+                Some(outcome) => {
+                    if !is_skip_or_cancel_only && outcome.answers == expected_sse_answers {
+                        (answers, disposition)
+                    } else if outcome
+                        .answers
+                        .as_object()
+                        .is_some_and(|map| !map.is_empty())
+                    {
+                        (outcome.answers, Some(outcome.disposition))
+                    } else {
+                        (
+                            if is_skip_or_cancel_only {
+                                json!({})
+                            } else {
+                                answers
+                            },
+                            Some(outcome.disposition),
+                        )
+                    }
+                }
+                None => (
+                    if is_skip_or_cancel_only {
+                        json!({})
+                    } else {
+                        answers
+                    },
+                    disposition,
+                ),
+            }
         };
         let resolved_payload = match final_disposition {
             Some(disp) => crate::provider::build_user_input_resolved_payload(
@@ -3281,8 +3397,13 @@ impl OpenCodeSessionRuntime {
                     };
                     let sse_answers = properties
                         .get("answers")
-                        .cloned()
-                        .filter(Value::is_object)
+                        .map(|raw| {
+                            let pending_questions = pending
+                                .get(&request_id)
+                                .map(|question| question.questions.as_slice())
+                                .unwrap_or(&[]);
+                            parse_v1_sse_question_answers(raw, pending_questions)
+                        })
                         .unwrap_or_else(|| json!({}));
                     if sync.answering.contains(&request_id) {
                         sync.settled_while_answering.insert(
@@ -10711,6 +10832,44 @@ mod code_review_auto_decline_tests {
         let resolved_skip = runtime.next_event().await.expect("resolved skip");
         assert_eq!(resolved_skip.payload["disposition"], json!("skipped"));
         assert_eq!(resolved_skip.payload["answers"], json!({}));
+
+        // 4. External client reply via `question.replied` SSE with ordered `string[][]` answers.
+        runtime
+            .handle_sse_event(
+                "ses-1",
+                json!({
+                    "type": "question.asked",
+                    "properties": {
+                        "id": "q-ext",
+                        "sessionID": "ses-1",
+                        "questions": [
+                            { "header": "Scope", "question": "Which scope?", "options": [] },
+                            { "header": "Target", "question": "Which target?", "options": [] }
+                        ]
+                    }
+                }),
+            )
+            .await;
+        let _asked4 = runtime.next_event().await.expect("asked4");
+        runtime
+            .handle_sse_event(
+                "ses-1",
+                json!({
+                    "type": "question.replied",
+                    "properties": {
+                        "requestID": "q-ext",
+                        "sessionID": "ses-1",
+                        "answers": [["Workspace"], ["macOS", "Linux"]]
+                    }
+                }),
+            )
+            .await;
+        let resolved_ext = runtime.next_event().await.expect("resolved external");
+        assert_eq!(resolved_ext.payload["disposition"], json!("answered"));
+        assert_eq!(
+            resolved_ext.payload["answers"],
+            json!({ "Scope": ["Workspace"], "Target": ["macOS", "Linux"] })
+        );
 
         server.abort();
     }
