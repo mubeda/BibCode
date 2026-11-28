@@ -108,7 +108,7 @@ pub(crate) fn build_user_input_resolved_payload(
     Value::Object(payload)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct RequestScope(uuid::Uuid);
 
 impl RequestScope {

@@ -319,6 +319,10 @@ async fn the_handshake_speaks_protocol_one_and_never_authenticates() {
         initialize["params"]["clientCapabilities"]["terminal"],
         false
     );
+    assert_eq!(
+        initialize["params"]["clientCapabilities"]["elicitation"],
+        json!({ "form": {} })
+    );
     peer.reply(
         &initialize,
         initialize_result("1.5.13", 1, all_capabilities()),
@@ -3592,4 +3596,692 @@ async fn prompt_quota_error_after_update_publishes_warning_and_pre_update_classi
         assert_eq!(events[0].1["resetsAt"], "2026-11-27T18:45:00Z");
         assert_eq!(events[1].1["state"], "cancelled");
     }
+}
+
+#[tokio::test]
+async fn elicitation_form_mode_normalizes_schema_maps_dispositions_and_enforces_guards() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+    let turn_id = receipt.turn_id.clone();
+
+    // 1. Multi-field form: titled single-select oneOf, multi-select items.anyOf, boolean, integer, freeform string.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-1",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Configure deployment",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "title": "Target",
+                        "description": "Where should this deploy?",
+                        "oneOf": [
+                            { "const": "staging_eu", "title": "Staging (Recommended)", "description": "Safe pre-prod" },
+                            { "const": "prod_us", "title": "Production", "description": "Live traffic" }
+                        ]
+                    },
+                    "checks": {
+                        "type": "array",
+                        "title": "Checks",
+                        "description": "Which checks should run?",
+                        "items": {
+                            "anyOf": [
+                                { "const": "lint", "title": "Lint" },
+                                { "const": "e2e", "title": "End-to-end" }
+                            ]
+                        }
+                    },
+                    "dryRun": {
+                        "type": "boolean",
+                        "title": "Dry run",
+                        "description": "Preview without applying?"
+                    },
+                    "retries": {
+                        "type": "integer",
+                        "title": "Retries",
+                        "description": "How many retries?"
+                    },
+                    "notes": {
+                        "type": "string",
+                        "title": "Notes",
+                        "description": "Optional release note"
+                    }
+                },
+                "required": ["target"]
+            }
+        }
+    }))
+    .await;
+
+    let requested = loop {
+        let event = next_event(&runtime).await;
+        if event.event_type == "user-input.requested" {
+            break event;
+        }
+    };
+    assert_eq!(requested.event_type, "user-input.requested");
+    let request_id = requested
+        .request_id
+        .clone()
+        .expect("elicitation request id");
+    let questions = requested.payload["questions"]
+        .as_array()
+        .expect("questions array");
+    assert_eq!(questions.len(), 5);
+    let target_q = questions.iter().find(|q| q["id"] == "target").unwrap();
+    assert_eq!(target_q["question"], "Where should this deploy?");
+    assert_eq!(target_q["multiSelect"], false);
+    assert_eq!(target_q["options"][0]["label"], "Staging (Recommended)");
+    let checks_q = questions.iter().find(|q| q["id"] == "checks").unwrap();
+    assert_eq!(checks_q["multiSelect"], true);
+    assert_eq!(checks_q["options"].as_array().unwrap().len(), 2);
+    let dry_run_q = questions.iter().find(|q| q["id"] == "dryRun").unwrap();
+    assert_eq!(dry_run_q["options"][0]["label"], "Yes");
+    assert_eq!(dry_run_q["options"][0]["description"], "True");
+    assert_eq!(dry_run_q["options"][1]["label"], "No");
+    assert_eq!(dry_run_q["options"][1]["description"], "False");
+
+    // Partial Skipped missing required field `target` is rejected and keeps the elicitation open.
+    let missing_required = runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "notes": "Only optional field" }),
+            crate::provider::UserInputResponseDisposition::Skipped,
+        )
+        .await
+        .expect_err("partial skip without required field must fail validation");
+    assert_eq!(missing_required.reason(), "invalid_user_input_answer");
+
+    // Out-of-schema custom text on a constrained enum field is rejected and keeps the form open.
+    let invalid_enum = runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "target": "not-an-option" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect_err("out-of-schema enum choice must fail validation");
+    assert_eq!(invalid_enum.reason(), "invalid_user_input_answer");
+
+    // Permission endpoint must not cross-wire onto a pending elicitation.
+    let wrong_kind = runtime
+        .respond_to_request(&request_id, "accept")
+        .await
+        .expect_err("respond_to_request must reject elicitation id");
+    assert!(matches!(
+        wrong_kind,
+        AntigravityRuntimeError::PendingRequestNotFound { .. }
+    ));
+
+    // Duplicate wire_id is refused with -32600 while the first elicitation stays pending.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-1",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Duplicate",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "x": { "type": "string" } }
+            }
+        }
+    }))
+    .await;
+    let dup_reply = peer.next().await;
+    assert_eq!(dup_reply["id"], "elicit-1");
+    assert_eq!(dup_reply["error"]["code"], -32600);
+
+    // Non-numeric integer input returns validation error and keeps the elicitation retryable.
+    let bad_int = runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "retries": "not-a-number" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect_err("invalid integer must fail validation");
+    assert_eq!(bad_int.reason(), "invalid_user_input_answer");
+
+    // Valid answer coerces labels back to const values and primitive types.
+    runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({
+                "target": "Staging (Recommended)",
+                "checks": ["Lint", "End-to-end"],
+                "dryRun": "Yes",
+                "retries": "3",
+                "notes": "Ship tonight"
+            }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("accept elicitation");
+    let wire_accept = peer.next().await;
+    assert_eq!(wire_accept["id"], "elicit-1");
+    assert_eq!(wire_accept["result"]["action"], "accept");
+    assert_eq!(
+        wire_accept["result"]["content"],
+        json!({
+            "target": "staging_eu",
+            "checks": ["lint", "e2e"],
+            "dryRun": true,
+            "retries": 3,
+            "notes": "Ship tonight"
+        })
+    );
+    let resolved = next_event(&runtime).await;
+    assert_eq!(resolved.event_type, "user-input.resolved");
+    assert_eq!(resolved.payload["disposition"], "answered");
+    assert_eq!(
+        resolved.payload["questions"].as_array().map(Vec::len),
+        Some(5)
+    );
+
+    // 2. Skip-all sends action "decline" and emits disposition "skipped".
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-2",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Pick a color",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "color": { "type": "string", "enum": ["red", "blue"] }
+                }
+            }
+        }
+    }))
+    .await;
+    let req2 = next_event(&runtime).await;
+    let req2_id = req2.request_id.expect("req2 id");
+    assert_eq!(req2.payload["questions"][0]["question"], "Pick a color");
+    runtime
+        .respond_to_user_input_with_disposition(
+            &req2_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Skipped,
+        )
+        .await
+        .expect("skip elicitation");
+    let wire_decline = peer.next().await;
+    assert_eq!(wire_decline["id"], "elicit-2");
+    assert_eq!(wire_decline["result"], json!({ "action": "decline" }));
+    let res2 = next_event(&runtime).await;
+    assert_eq!(res2.event_type, "user-input.resolved");
+    assert_eq!(res2.payload["disposition"], "skipped");
+
+    // 3. Cancel sends action "cancel" and emits disposition "cancelled".
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-3",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Confirm branch",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "branch": { "type": "string" }
+                }
+            }
+        }
+    }))
+    .await;
+    let req3 = next_event(&runtime).await;
+    let req3_id = req3.request_id.expect("req3 id");
+    runtime
+        .respond_to_user_input_with_disposition(
+            &req3_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Cancelled,
+        )
+        .await
+        .expect("cancel elicitation");
+    let wire_cancel = peer.next().await;
+    assert_eq!(wire_cancel["id"], "elicit-3");
+    assert_eq!(wire_cancel["result"], json!({ "action": "cancel" }));
+    let res3 = next_event(&runtime).await;
+    assert_eq!(res3.event_type, "user-input.resolved");
+    assert_eq!(res3.payload["disposition"], "cancelled");
+
+    // 4. Unsupported/missing/malformed modes ("url", omitted, null, numeric) are rejected with -32602.
+    for (bad_id, bad_params) in [
+        (
+            "elicit-url",
+            json!({
+                "sessionId": SESSION,
+                "mode": "url",
+                "message": "Open browser",
+                "url": "https://example.test/auth"
+            }),
+        ),
+        (
+            "elicit-missing-mode",
+            json!({
+                "sessionId": SESSION,
+                "message": "Missing mode",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": { "x": { "type": "string" } }
+                }
+            }),
+        ),
+        (
+            "elicit-numeric-mode",
+            json!({
+                "sessionId": SESSION,
+                "mode": 42,
+                "message": "Numeric mode",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": { "x": { "type": "string" } }
+                }
+            }),
+        ),
+    ] {
+        peer.send(json!({
+            "jsonrpc": "2.0",
+            "id": bad_id,
+            "method": "elicitation/create",
+            "params": bad_params
+        }))
+        .await;
+        let mode_err = peer.next().await;
+        assert_eq!(mode_err["id"], bad_id);
+        assert_eq!(mode_err["error"]["code"], -32602);
+    }
+
+    // 5. Secret/password field is auto-declined with runtime.warning.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-secret",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Enter token",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "apiKey": { "type": "string", "format": "password" }
+                }
+            }
+        }
+    }))
+    .await;
+    let secret_reply = peer.next().await;
+    assert_eq!(secret_reply["id"], "elicit-secret");
+    assert_eq!(secret_reply["result"], json!({ "action": "decline" }));
+    let warning = next_event(&runtime).await;
+    assert_eq!(warning.event_type, "runtime.warning");
+
+    // 6. Interrupting the turn while an elicitation is pending answers "cancel" and emits user-input.expired.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-open",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Pending during cancel",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "choice": { "type": "string" } }
+            }
+        }
+    }))
+    .await;
+    let req_open = next_event(&runtime).await;
+    let req_open_id = req_open.request_id.expect("open id");
+    runtime
+        .interrupt_turn(Some(&turn_id))
+        .await
+        .expect("interrupt");
+    let cancel_msg = peer.next().await;
+    assert_eq!(cancel_msg["id"], "elicit-open");
+    assert_eq!(cancel_msg["result"], json!({ "action": "cancel" }));
+    let _ = peer.expect("session/cancel").await;
+    let expired = next_event(&runtime).await;
+    assert_eq!(expired.event_type, "user-input.expired");
+    assert_eq!(expired.request_id.as_deref(), Some(req_open_id.as_str()));
+
+    peer.reply(&prompt, json!({ "stopReason": "cancelled" }))
+        .await;
+    let _ = receipt.completion.await;
+}
+
+#[tokio::test]
+async fn elicitation_form_auto_declines_during_autonomous_code_review() {
+    let mut opts = options("full-access");
+    opts.code_review = true;
+    let (runtime, mut peer) = started_with(opts, "auto").await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-review",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Should I skip tests?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "skip": { "type": "boolean" } }
+            }
+        }
+    }))
+    .await;
+    let reply = peer.next().await;
+    assert_eq!(reply["id"], "elicit-review");
+    assert_eq!(reply["result"], json!({ "action": "decline" }));
+    assert!(runtime.pending_request_ids().await.is_empty());
+
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    receipt.completion.await.expect("receipt").expect("turn ok");
+}
+
+#[tokio::test]
+async fn elicitation_disambiguates_duplicate_titles_enforces_bounds_and_cancels_on_turn_end() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+    // Duplicate `oneOf` display titles must disambiguate so choosing the second sends `production`.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-dup-titles",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Choose target",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "env": {
+                        "type": "string",
+                        "title": "Environment",
+                        "oneOf": [
+                            { "const": "staging", "title": "Deploy", "description": "Pre-prod" },
+                            { "const": "production", "title": "Deploy", "description": "Live" }
+                        ]
+                    },
+                    "count": {
+                        "type": "integer",
+                        "title": "Count",
+                        "minimum": 1,
+                        "maximum": 5
+                    }
+                },
+                "required": ["env", "count"]
+            }
+        }
+    }))
+    .await;
+    let requested = loop {
+        let event = next_event(&runtime).await;
+        if event.event_type == "user-input.requested" {
+            break event;
+        }
+    };
+    let request_id = requested.request_id.expect("request id");
+    let questions = requested.payload["questions"].as_array().unwrap();
+    let env_q = questions.iter().find(|q| q["id"] == "env").unwrap();
+    let second_label = env_q["options"][1]["label"].as_str().unwrap().to_owned();
+    assert_ne!(
+        env_q["options"][0]["label"], env_q["options"][1]["label"],
+        "duplicate display titles must be disambiguated"
+    );
+
+    // Out-of-bounds integer fails validation and keeps the elicitation pending.
+    let out_of_bounds = runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "env": second_label, "count": "9" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect_err("count above maximum must fail validation");
+    assert_eq!(out_of_bounds.reason(), "invalid_user_input_answer");
+
+    // Valid answer sends `production` (second choice) and `3`.
+    runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "env": second_label, "count": "3" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("valid answer succeeds");
+    let accept = peer.next().await;
+    assert_eq!(accept["id"], "elicit-dup-titles");
+    assert_eq!(
+        accept["result"],
+        json!({ "action": "accept", "content": { "env": "production", "count": 3 } })
+    );
+    let _ = next_event(&runtime).await;
+
+    // Prompt completion on a live connection sends `action: "cancel"` for any outstanding form.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-end-turn",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Still open when turn ends",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        }
+    }))
+    .await;
+    let open = next_event(&runtime).await;
+    assert_eq!(open.event_type, "user-input.requested");
+    let open_id = open.request_id.expect("open id");
+
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    let cancel_on_end = peer.next().await;
+    assert_eq!(cancel_on_end["id"], "elicit-end-turn");
+    assert_eq!(cancel_on_end["result"], json!({ "action": "cancel" }));
+
+    let expired = next_event(&runtime).await;
+    assert_eq!(expired.event_type, "user-input.expired");
+    assert_eq!(expired.request_id.as_deref(), Some(open_id.as_str()));
+    receipt.completion.await.expect("receipt").expect("turn ok");
+}
+
+#[tokio::test]
+async fn elicitation_folds_companion_other_fields_and_routes_custom_answers() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+    // Exact wire shape emitted by live `agy 1.5.18` for `ask_question`.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-agy-live",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "toolCallId": "call_123",
+            "mode": "form",
+            "message": "The agent has 2 questions.",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "q1": {
+                        "type": "string",
+                        "title": "Which coffee style would you like?",
+                        "oneOf": [
+                            { "const": "1", "title": "(Recommended) Espresso" },
+                            { "const": "2", "title": "Latte" }
+                        ]
+                    },
+                    "q1_other": {
+                        "type": "string",
+                        "title": "Other",
+                        "description": "Optional free-form answer to: Which coffee style would you like?"
+                    },
+                    "q2": {
+                        "type": "array",
+                        "title": "Which toppings would you like?",
+                        "items": {
+                            "anyOf": [
+                                { "const": "1", "title": "Cinnamon" },
+                                { "const": "2", "title": "Cocoa" }
+                            ]
+                        }
+                    },
+                    "q2_other": {
+                        "type": "string",
+                        "title": "Other",
+                        "description": "Optional free-form answer to: Which toppings would you like?"
+                    }
+                }
+            }
+        }
+    }))
+    .await;
+
+    let requested = loop {
+        let event = next_event(&runtime).await;
+        if event.event_type == "user-input.requested" {
+            break event;
+        }
+    };
+    let request_id = requested.request_id.expect("request id");
+    let questions = requested.payload["questions"].as_array().unwrap();
+    assert_eq!(questions.len(), 2, "companion _other fields must be folded");
+    assert_eq!(questions[0]["id"], "q1");
+    assert_eq!(questions[0]["header"], "Question 1");
+    assert_eq!(
+        questions[0]["question"],
+        "Which coffee style would you like?"
+    );
+    assert_eq!(questions[1]["id"], "q2");
+    assert_eq!(questions[1]["multiSelect"], true);
+
+    runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({
+                "q1": "Cold brew with oat milk",
+                "q2": ["Cinnamon", "Cardamom"]
+            }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("custom answers route to companion _other keys");
+
+    let wire = peer.next().await;
+    assert_eq!(wire["id"], "elicit-agy-live");
+    assert_eq!(
+        wire["result"],
+        json!({
+            "action": "accept",
+            "content": {
+                "q1_other": "Cold brew with oat milk",
+                "q2": ["1"],
+                "q2_other": "Cardamom"
+            }
+        })
+    );
+    let resolved = next_event(&runtime).await;
+    assert_eq!(resolved.event_type, "user-input.resolved");
+    assert_eq!(resolved.payload["disposition"], "answered");
+
+    // Password-marked array items are declined as secrets without opening a card.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-secret-array",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Enter tokens",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "tokens": {
+                        "type": "array",
+                        "items": { "type": "string", "format": "password" }
+                    }
+                }
+            }
+        }
+    }))
+    .await;
+    let secret_reply = peer.next().await;
+    assert_eq!(secret_reply["id"], "elicit-secret-array");
+    assert_eq!(secret_reply["result"], json!({ "action": "decline" }));
+    let warning = next_event(&runtime).await;
+    assert_eq!(warning.event_type, "runtime.warning");
+
+    // 64-bit integer maximum bound keeps exact i64 precision beyond 2^53.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-big-int",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Big number",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "big": {
+                        "type": "integer",
+                        "maximum": 9007199254740992_i64
+                    }
+                },
+                "required": ["big"]
+            }
+        }
+    }))
+    .await;
+    let big_req = next_event(&runtime).await;
+    let big_req_id = big_req.request_id.expect("big req id");
+    let too_big = runtime
+        .respond_to_user_input_with_disposition(
+            &big_req_id,
+            json!({ "big": "9007199254740993" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect_err("9007199254740993 exceeds 9007199254740992");
+    assert_eq!(too_big.reason(), "invalid_user_input_answer");
+    runtime
+        .respond_to_user_input_with_disposition(
+            &big_req_id,
+            json!({ "big": "9007199254740992" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("exact max i64 passes");
+    let big_wire = peer.next().await;
+    assert_eq!(big_wire["id"], "elicit-big-int");
+    assert_eq!(
+        big_wire["result"],
+        json!({ "action": "accept", "content": { "big": 9007199254740992_i64 } })
+    );
+    let _ = next_event(&runtime).await;
+
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    receipt.completion.await.expect("receipt").expect("turn ok");
 }

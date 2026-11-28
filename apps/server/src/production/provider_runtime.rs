@@ -8492,6 +8492,100 @@ async fn run_supervisor(
                     }
                     continue;
                 }
+                if let OrchestrationCommand::ThreadUserInputRespond { thread_id, .. } =
+                    command.as_ref()
+                    && let Some(entry) = sessions.get(thread_id)
+                {
+                    let driver = entry.driver.clone();
+                    let provider = entry.launch.provider.clone();
+                    let OrchestrationCommand::ThreadUserInputRespond {
+                        thread_id,
+                        request_id,
+                        answers,
+                        disposition,
+                        ..
+                    } = *command
+                    else {
+                        unreachable!();
+                    };
+                    let engine = engine.clone();
+                    let disposition = disposition.unwrap_or_default();
+                    let answers = if disposition
+                        == crate::provider::UserInputResponseDisposition::Cancelled
+                    {
+                        json!({})
+                    } else {
+                        answers
+                    };
+                    // Run user-input answers off the shared supervisor loop so a slow or wedged
+                    // provider RPC cannot stall other threads. For post-turn Codex async answers
+                    // that may start a follow-up turn, wait for checkpoint capture and acquire
+                    // checkout admission first.
+                    tokio::spawn(async move {
+                        let result = if provider == "codex" && !disposition.is_skip_or_cancel() {
+                            match engine
+                                .repositories()
+                                .get_thread_session(thread_id.clone())
+                                .await
+                            {
+                                Ok(Some(session))
+                                    if matches!(
+                                        session.status.as_str(),
+                                        "running" | "starting"
+                                    ) =>
+                                {
+                                    driver.answer(request_id, answers, disposition).await
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        %thread_id,
+                                        "failed to inspect Codex session state before answering async question"
+                                    );
+                                    Err(ProviderRuntimeError::Persistence(error.to_string()))
+                                }
+                                Ok(_) => {
+                                    let _reservation =
+                                        engine.reserve_thread_turns(&thread_id).await;
+                                    let deadline = tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(10);
+                                    while engine.turns_held_for_checkpoint(&thread_id)
+                                        && tokio::time::Instant::now() < deadline
+                                    {
+                                        tokio::time::sleep(std::time::Duration::from_millis(50))
+                                            .await;
+                                    }
+                                    if engine.turns_held_for_checkpoint(&thread_id) {
+                                        tracing::warn!(
+                                            %thread_id,
+                                            "checkpoint capture did not settle before post-turn Codex async answer"
+                                        );
+                                    }
+                                    let Some(_admission) =
+                                        crate::production::orchestration_effects::admit_thread_turn(
+                                            &engine, &thread_id,
+                                        )
+                                        .await
+                                    else {
+                                        return {
+                                            let _ = response.send(Err(
+                                                ProviderRuntimeError::Provider {
+                                                    provider: "codex".to_owned(),
+                                                    detail: "A workspace restore is in progress. Try submitting your answer again once it finishes.".to_owned(),
+                                                },
+                                            ));
+                                        };
+                                    };
+                                    driver.answer(request_id, answers, disposition).await
+                                }
+                            }
+                        } else {
+                            driver.answer(request_id, answers, disposition).await
+                        };
+                        let _ = response.send(result);
+                    });
+                    continue;
+                }
                 let result = handle_command(
                     &engine,
                     &factory,
@@ -14742,6 +14836,18 @@ async fn project_provider_event(
     {
         return Ok(());
     }
+    // Avoid duplicate durable `user-input.expired` rows when an earlier Stop/interrupt or
+    // settlement already closed the request before the provider adapter's expiry event arrived.
+    if event.event_type == "user-input.expired"
+        && let Some(request_id) = event.request_id.as_ref()
+        && !engine
+            .repositories()
+            .user_input_request_is_open(launch.thread_id.clone(), request_id.clone())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+    {
+        return Ok(());
+    }
     // A notice about the session itself, such as Cursor keeping its current options, shows on
     // the session whatever its state, until its next update.
     if event.event_type == "session.notice" {
@@ -15482,6 +15588,7 @@ fn event_activity_summary(event_type: &str, payload: &Value, provider_label: &st
             Some("cancelled") => "Input cancelled",
             _ => "Input received",
         },
+        "user-input.expired" => "Input expired",
         "mcp.status.updated" => "Tool connections updated",
         "runtime.warning" => {
             if payload.get("usageLimit").and_then(Value::as_bool) == Some(true) {
@@ -15506,6 +15613,7 @@ fn event_activity_shape(event_type: &str) -> (&'static str, &'static str) {
         "request.resolved" => ("approval", "approval.resolved"),
         "user-input.requested" => ("approval", "user-input.requested"),
         "user-input.resolved" => ("approval", "user-input.resolved"),
+        "user-input.expired" => ("approval", "user-input.expired"),
         event if event.contains("error") || event.contains("failed") => ("error", "provider.error"),
         // Provider stderr and upstream retries arrive as `runtime.warning`.
         // Without this arm they fell through to the catch-all and were filed as
@@ -17767,6 +17875,11 @@ impl ProviderDriver for CodexDriver {
                 .map_err(provider_error("codex"))
         })
     }
+    fn holds_unsettled_work(&self) -> BoxRuntimeFuture<'_, bool> {
+        // Keep the live Codex runtime alive while it owns an open async/pending request so idle
+        // suspension cannot strand a visible clarifying-questions card.
+        Box::pin(async move { self.runtime.has_pending_requests().await })
+    }
     fn set_mode(&self, _mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         unsupported("codex", "post-start runtime mode changes")
     }
@@ -18585,17 +18698,37 @@ impl ProviderDriver for AntigravityDriver {
             self.runtime
                 .respond_to_request(&request_id, &decision)
                 .await
-                .map_err(antigravity_error)
+                .map_err(|error| match error {
+                    AntigravityRuntimeError::PendingRequestNotFound { request_id } => {
+                        ProviderRuntimeError::Provider {
+                            provider: "antigravity".to_owned(),
+                            detail: format!("Unknown pending approval request: {request_id}"),
+                        }
+                    }
+                    other => antigravity_error(other),
+                })
         })
     }
     fn answer(
         &self,
-        _: String,
-        _: Value,
-        _: crate::provider::UserInputResponseDisposition,
+        request_id: String,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
-        // The client advertises no elicitation, so no question is ever pending (D-A7).
-        unsupported("antigravity", "user input answers")
+        Box::pin(async move {
+            self.runtime
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
+                .await
+                .map_err(|error| match error {
+                    AntigravityRuntimeError::PendingRequestNotFound { request_id } => {
+                        ProviderRuntimeError::Provider {
+                            provider: "antigravity".to_owned(),
+                            detail: format!("Unknown pending user-input request: {request_id}"),
+                        }
+                    }
+                    other => antigravity_error(other),
+                })
+        })
     }
     fn set_mode(&self, mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {

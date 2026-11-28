@@ -205,6 +205,7 @@ describe("ComposerContextStrip", () => {
 
     const strip = container.querySelector('[data-testid="composer-context-strip"]');
     expect(strip).not.toBeNull();
+    expect(strip?.className).toContain("max-w-3xl");
     expect(strip?.className).toContain("text-xs");
     expect(strip?.className).toContain("text-muted-foreground");
     expect(strip?.className).not.toMatch(/text-muted-foreground\//);

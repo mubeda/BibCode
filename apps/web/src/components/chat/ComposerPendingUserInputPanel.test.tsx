@@ -163,6 +163,41 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
     expect(onAdvance).toHaveBeenCalledTimes(1);
   });
 
+  it("does not auto-submit the last single-select question when requireExplicitSubmit is true", async () => {
+    const onToggleOption = vi.fn();
+    const onAdvance = vi.fn();
+    await mount(
+      renderPanel({
+        onToggleOption,
+        onAdvance,
+        requireExplicitSubmit: true,
+      }),
+    );
+
+    await click(optionButton("Beta"));
+    expect(onToggleOption).toHaveBeenCalledWith("q1", "Beta");
+    await act(async () => vi.advanceTimersByTime(500));
+    expect(onAdvance).not.toHaveBeenCalled();
+  });
+
+  it("shows Optional follow-up copy for non-blocking cards when the turn is no longer running", async () => {
+    await mount(
+      renderPanel({
+        isTurnRunning: false,
+        pendingUserInputs: [
+          {
+            ...prompt(question("q1", [{ label: "Alpha" }])),
+            isBlocking: false,
+          },
+        ],
+      }),
+    );
+
+    expect(document.body.textContent).toContain("Follow-up question: 1 question");
+    expect(document.body.textContent).toContain("Optional");
+    expect(document.body.textContent).not.toContain("Agent is still working");
+  });
+
   it("replaces a pending single-select timer and uses the latest advance callback", async () => {
     const firstAdvance = vi.fn();
     const latestAdvance = vi.fn();
@@ -491,5 +526,40 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
     });
     expect(onHostToggleOption).not.toHaveBeenCalled();
     expect(onHostAdvance).not.toHaveBeenCalled();
+  });
+
+  it("renders non-blocking cue in expanded and collapsed states without blocking controls (#442)", async () => {
+    const q = question("q1", [
+      { label: "Fast", description: "Skip deep checks" },
+      { label: "Thorough", description: "Run full checks" },
+    ]);
+    const nonBlockingPrompt: PendingUserInput = {
+      ...prompt(q),
+      isBlocking: false,
+    };
+
+    const mounted = await mount(
+      renderPanel({
+        pendingUserInputs: [nonBlockingPrompt],
+        collapsed: false,
+        onToggleCollapsed: vi.fn(),
+      }),
+    );
+
+    expect(document.body.textContent).toContain("Question while working: 1 question");
+    expect(document.body.textContent).toContain("Agent is still working");
+    expect(document.querySelector('[data-pending-user-input-non-blocking="true"]')).not.toBeNull();
+    expect(textSizesBelowTextXs(document.body.innerHTML)).toEqual([]);
+
+    await act(async () => {
+      mounted.root.render(
+        renderPanel({
+          pendingUserInputs: [nonBlockingPrompt],
+          collapsed: true,
+          onToggleCollapsed: vi.fn(),
+        }),
+      );
+    });
+    expect(document.body.textContent).toContain("Question while working: 1 question");
   });
 });

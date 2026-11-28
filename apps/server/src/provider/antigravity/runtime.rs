@@ -130,6 +130,9 @@ pub enum AntigravityRuntimeError {
         message: String,
         resets_at: Option<String>,
     },
+    /// The supplied answer could not be converted into the elicitation schema's required type.
+    #[error("{detail}")]
+    InvalidUserInputAnswer { detail: String },
 }
 
 impl AntigravityRuntimeError {
@@ -150,6 +153,7 @@ impl AntigravityRuntimeError {
             | Self::MalformedConfigAcknowledgement => "runtime_error",
             Self::SteerUnavailable { .. } => "steer_unavailable",
             Self::UsageLimitReached { .. } => "provider_error",
+            Self::InvalidUserInputAnswer { .. } => "validation_error",
         }
     }
 
@@ -170,6 +174,7 @@ impl AntigravityRuntimeError {
             Self::MalformedConfigAcknowledgement => "malformed_config_acknowledgement",
             Self::SteerUnavailable { .. } => "steer_unavailable",
             Self::UsageLimitReached { .. } => "usage_limit",
+            Self::InvalidUserInputAnswer { .. } => "invalid_user_input_answer",
         }
     }
 
@@ -468,14 +473,63 @@ impl Gate {
     }
 }
 
+#[derive(Clone)]
+struct CompanionOtherFieldSpec {
+    id: String,
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+}
+
+enum ElicitationFieldKind {
+    String {
+        value_by_label: Vec<(String, Value)>,
+        enum_restricted: bool,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+        other_field: Option<CompanionOtherFieldSpec>,
+    },
+    MultiSelect {
+        value_by_label: Vec<(String, Value)>,
+        enum_restricted: bool,
+        min_items: Option<usize>,
+        max_items: Option<usize>,
+        other_field: Option<CompanionOtherFieldSpec>,
+    },
+    Boolean,
+    Integer {
+        minimum: Option<i64>,
+        maximum: Option<i64>,
+    },
+    Number {
+        minimum: Option<f64>,
+        maximum: Option<f64>,
+    },
+}
+
+struct ElicitationFieldSpec {
+    id: String,
+    required: bool,
+    kind: ElicitationFieldKind,
+}
+
+enum PendingRequestKind {
+    Permission {
+        request_type: &'static str,
+        allow_once: Option<String>,
+        allow_always: Option<String>,
+        reject_once: Option<String>,
+    },
+    Elicitation {
+        fields: Vec<ElicitationFieldSpec>,
+        question_summaries: Vec<Value>,
+    },
+}
+
 struct PendingRequest {
     /// The id exactly as the CLI sent it: numeric 1 and string "1" are different requests.
     wire_id: Value,
     turn_id: String,
-    request_type: &'static str,
-    allow_once: Option<String>,
-    allow_always: Option<String>,
-    reject_once: Option<String>,
+    kind: PendingRequestKind,
 }
 
 impl AntigravitySessionRuntime {
@@ -605,7 +659,11 @@ impl AntigravitySessionRuntime {
                 "initialize",
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
-                    "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false }, "terminal": false },
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false,
+                        "elicitation": { "form": {} },
+                    },
                     // This server, at its own version.
                     "clientInfo": { "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") },
                 }),
@@ -614,9 +672,10 @@ impl AntigravitySessionRuntime {
         {
             Ok(initialized) => initialized,
             // No working `agy acp`: the command is unknown, or the child exited before answering.
-            Err(AntigravityRuntimeError::Protocol(
-                AcpProtocolError::RemoteRequest { code: -32601, .. },
-            )) => return Err(AntigravityRuntimeError::UnsupportedVersion { version: None }),
+            Err(AntigravityRuntimeError::Protocol(AcpProtocolError::RemoteRequest {
+                code: -32601,
+                ..
+            })) => return Err(AntigravityRuntimeError::UnsupportedVersion { version: None }),
             Err(AntigravityRuntimeError::Protocol(
                 AcpProtocolError::Closed { .. }
                 | AcpProtocolError::WriteFailure { .. }
@@ -1291,7 +1350,7 @@ impl AntigravitySessionRuntime {
                 delivery_accepted,
                 prev_result,
             } => {
-                self.cancel_pending_requests(pending);
+                self.cancel_pending_requests(pending).await;
                 let _ = self
                     .emit_prompt_completion(
                         turn_id.to_owned(),
@@ -1334,7 +1393,7 @@ impl AntigravitySessionRuntime {
             gate.resolve_pending_accept_for(prompt_seq, Err(error.clone()));
             gate.clear_active_turn(turn_id).pending
         };
-        self.cancel_pending_requests(pending);
+        self.cancel_pending_requests(pending).await;
         self.emit(
             "turn.completed",
             Some(turn_id.to_owned()),
@@ -1350,14 +1409,34 @@ impl AntigravitySessionRuntime {
         error
     }
 
-    fn cancel_pending_requests(&self, pending: Vec<(String, PendingRequest)>) {
+    async fn cancel_pending_requests(&self, pending: Vec<(String, PendingRequest)>) {
+        let live_connection = !self.inner.connection.is_closed();
         for (request_id, pending) in pending {
-            self.emit(
-                "request.resolved",
-                Some(pending.turn_id),
-                Some(request_id),
-                json!({ "requestType": pending.request_type, "decision": "cancel" }),
-            );
+            match pending.kind {
+                PendingRequestKind::Permission { request_type, .. } => {
+                    self.emit(
+                        "request.resolved",
+                        Some(pending.turn_id),
+                        Some(request_id),
+                        json!({ "requestType": request_type, "decision": "cancel" }),
+                    );
+                }
+                PendingRequestKind::Elicitation { .. } => {
+                    if live_connection {
+                        let _ = self
+                            .inner
+                            .connection
+                            .respond(pending.wire_id, json!({ "action": "cancel" }))
+                            .await;
+                    }
+                    self.emit(
+                        "user-input.expired",
+                        Some(pending.turn_id),
+                        Some(request_id),
+                        json!({ "reason": "turn_completed" }),
+                    );
+                }
+            }
         }
     }
 
@@ -1652,7 +1731,7 @@ impl AntigravitySessionRuntime {
                     delivery_accepted,
                     prev_result,
                 } => {
-                    runtime.cancel_pending_requests(pending);
+                    runtime.cancel_pending_requests(pending).await;
                     let _ = runtime
                         .emit_prompt_completion(
                             turn_id,
@@ -1673,7 +1752,7 @@ impl AntigravitySessionRuntime {
                     delivery_accepted,
                     result,
                 } => {
-                    runtime.cancel_pending_requests(pending);
+                    runtime.cancel_pending_requests(pending).await;
                     runtime
                         .emit_prompt_completion(
                             turn_id,
@@ -1711,20 +1790,37 @@ impl AntigravitySessionRuntime {
             // From here no request of this turn is answered with anything but `cancelled`.
             gate.cancelled_turn = Some(turn_id.clone());
             for (request_id, pending) in gate.take_pending(&turn_id) {
-                let _ = self
-                    .inner
-                    .connection
-                    .respond(
-                        pending.wire_id,
-                        json!({ "outcome": { "outcome": "cancelled" } }),
-                    )
-                    .await;
-                self.emit(
-                    "request.resolved",
-                    Some(pending.turn_id),
-                    Some(request_id),
-                    json!({ "requestType": pending.request_type, "decision": "cancel" }),
-                );
+                match pending.kind {
+                    PendingRequestKind::Permission { request_type, .. } => {
+                        let _ = self
+                            .inner
+                            .connection
+                            .respond(
+                                pending.wire_id,
+                                json!({ "outcome": { "outcome": "cancelled" } }),
+                            )
+                            .await;
+                        self.emit(
+                            "request.resolved",
+                            Some(pending.turn_id),
+                            Some(request_id),
+                            json!({ "requestType": request_type, "decision": "cancel" }),
+                        );
+                    }
+                    PendingRequestKind::Elicitation { .. } => {
+                        let _ = self
+                            .inner
+                            .connection
+                            .respond(pending.wire_id, json!({ "action": "cancel" }))
+                            .await;
+                        self.emit(
+                            "user-input.expired",
+                            Some(pending.turn_id),
+                            Some(request_id),
+                            json!({ "reason": "turn_cancelled" }),
+                        );
+                    }
+                }
             }
             let session_id = gate
                 .session_id
@@ -1802,15 +1898,28 @@ impl AntigravitySessionRuntime {
         decision: &str,
     ) -> Result<(), AntigravityRuntimeError> {
         let mut gate = self.inner.gate.lock().await;
-        let pending = gate.pending.remove(request_id).ok_or_else(|| {
-            AntigravityRuntimeError::PendingRequestNotFound {
+        if !matches!(
+            gate.pending.get(request_id).map(|entry| &entry.kind),
+            Some(PendingRequestKind::Permission { .. })
+        ) {
+            return Err(AntigravityRuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
-            }
-        })?;
+            });
+        }
+        let pending = gate.pending.remove(request_id).expect("checked above");
+        let PendingRequestKind::Permission {
+            request_type,
+            allow_once,
+            allow_always,
+            reject_once,
+        } = pending.kind
+        else {
+            unreachable!("checked above");
+        };
         let selected = match decision {
-            "acceptForSession" => pending.allow_always.or(pending.allow_once),
-            "accept" => pending.allow_once,
-            "decline" => pending.reject_once,
+            "acceptForSession" => allow_always.or(allow_once),
+            "accept" => allow_once,
+            "decline" => reject_once,
             _ => None,
         };
         let outcome = selected.map_or_else(
@@ -1827,7 +1936,70 @@ impl AntigravitySessionRuntime {
             "request.resolved",
             Some(pending.turn_id),
             Some(request_id.to_owned()),
-            json!({ "requestType": pending.request_type, "decision": decision }),
+            json!({ "requestType": request_type, "decision": decision }),
+        );
+        Ok(())
+    }
+
+    pub async fn respond_to_user_input_with_disposition(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+    ) -> Result<(), AntigravityRuntimeError> {
+        let mut gate = self.inner.gate.lock().await;
+        let (wire_response, resolved_answers, resolved_disposition) = {
+            let Some(PendingRequest {
+                kind: PendingRequestKind::Elicitation { fields, .. },
+                ..
+            }) = gate.pending.get(request_id)
+            else {
+                return Err(AntigravityRuntimeError::PendingRequestNotFound {
+                    request_id: request_id.to_owned(),
+                });
+            };
+            match disposition {
+                crate::provider::UserInputResponseDisposition::Cancelled => {
+                    (json!({ "action": "cancel" }), json!({}), "cancelled")
+                }
+                crate::provider::UserInputResponseDisposition::Skipped
+                    if !crate::provider::has_non_empty_user_input_answer(&answers) =>
+                {
+                    (json!({ "action": "decline" }), json!({}), "skipped")
+                }
+                crate::provider::UserInputResponseDisposition::Answered
+                | crate::provider::UserInputResponseDisposition::Skipped => {
+                    let content = build_elicitation_content(fields, &answers)?;
+                    (
+                        json!({ "action": "accept", "content": Value::Object(content) }),
+                        answers,
+                        disposition.as_str(),
+                    )
+                }
+            }
+        };
+        let pending = gate.pending.remove(request_id).expect("checked above");
+        let PendingRequestKind::Elicitation {
+            question_summaries, ..
+        } = pending.kind
+        else {
+            unreachable!("checked above");
+        };
+        self.inner
+            .connection
+            .respond(pending.wire_id, wire_response)
+            .await
+            .map_err(classify)?;
+        drop(gate);
+        self.emit(
+            "user-input.resolved",
+            Some(pending.turn_id),
+            Some(request_id.to_owned()),
+            json!({
+                "answers": resolved_answers,
+                "disposition": resolved_disposition,
+                "questions": question_summaries,
+            }),
         );
         Ok(())
     }
@@ -2123,8 +2295,7 @@ impl AntigravitySessionRuntime {
         params: Value,
     ) -> Result<(), AntigravityRuntimeError> {
         let connection = &self.inner.connection;
-        if method != "session/request_permission" {
-            // No elicitation or other client method is offered (D-A7).
+        if method != "session/request_permission" && method != "elicitation/create" {
             tracing::debug!(provider = PROVIDER, "answered an unknown ACP request");
             connection
                 .respond_error(
@@ -2151,7 +2322,8 @@ impl AntigravitySessionRuntime {
             // outstanding request, which stays bound to its own operation.
             tracing::warn!(
                 provider = PROVIDER,
-                "refused a permission request reusing an outstanding id"
+                method = request_label(method),
+                "refused an ACP request reusing an outstanding id"
             );
             connection
                 .respond_error(
@@ -2174,11 +2346,103 @@ impl AntigravitySessionRuntime {
         let Some(turn_id) = turn_id.filter(|_| open_session) else {
             // Not this session's running turn: during the open, between turns, after a cancel,
             // or another session. Refused, never approved and never shown.
-            connection
-                .respond(wire_id, json!({ "outcome": { "outcome": "cancelled" } }))
-                .await?;
+            let cancel_reply = if method == "elicitation/create" {
+                json!({ "action": "cancel" })
+            } else {
+                json!({ "outcome": { "outcome": "cancelled" } })
+            };
+            drop(gate);
+            connection.respond(wire_id, cancel_reply).await?;
             return Ok(());
         };
+        if method == "elicitation/create" {
+            let mode = params.get("mode").and_then(Value::as_str);
+            if mode != Some("form") {
+                drop(gate);
+                connection
+                    .respond_error(
+                        wire_id,
+                        JsonRpcErrorShape {
+                            code: -32602,
+                            message: "Unsupported elicitation mode: only form mode is supported"
+                                .to_owned(),
+                            data: None,
+                        },
+                    )
+                    .await?;
+                return Ok(());
+            }
+            if gate.code_review && mode_for(&gate.runtime_mode, &gate.interaction_mode) == "auto" {
+                drop(gate);
+                connection
+                    .respond(wire_id, json!({ "action": "decline" }))
+                    .await?;
+                return Ok(());
+            }
+            let parsed = match parse_elicitation_form(&params) {
+                Ok(parsed) => parsed,
+                Err(ElicitationParseError::SecretRequested) => {
+                    drop(gate);
+                    connection
+                        .respond(wire_id, json!({ "action": "decline" }))
+                        .await?;
+                    self.emit(
+                        "runtime.warning",
+                        Some(turn_id),
+                        None,
+                        json!({
+                            "message": "Antigravity requested a secret input, which BiBCode declined to avoid storing secrets in thread history.",
+                        }),
+                    );
+                    return Ok(());
+                }
+                Err(ElicitationParseError::InvalidSchema(message)) => {
+                    drop(gate);
+                    connection
+                        .respond_error(
+                            wire_id,
+                            JsonRpcErrorShape {
+                                code: -32602,
+                                message,
+                                data: None,
+                            },
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let request_id = format!("elicitation:{}", Uuid::new_v4());
+            let question_summaries =
+                crate::provider::compact_user_input_question_summaries(&parsed.questions);
+            gate.pending.insert(
+                request_id.clone(),
+                PendingRequest {
+                    wire_id,
+                    turn_id: turn_id.clone(),
+                    kind: PendingRequestKind::Elicitation {
+                        fields: parsed.fields,
+                        question_summaries,
+                    },
+                },
+            );
+            if gate
+                .previous_prompt
+                .as_ref()
+                .is_none_or(|prev| prev.wire_ended || prev.settled.is_some())
+            {
+                gate.previous_prompt = None;
+                gate.active_turn_has_update = true;
+                gate.resolve_pending_accept(Ok(()));
+            }
+            // Emitted under the gate, so a cancel cannot resolve the request before it opens.
+            self.emit(
+                "user-input.requested",
+                Some(turn_id),
+                Some(request_id),
+                json!({ "questions": parsed.questions }),
+            );
+            return Ok(());
+        }
         if gate.code_review && mode_for(&gate.runtime_mode, &gate.interaction_mode) == "auto" {
             drop(gate);
             connection
@@ -2212,10 +2476,12 @@ impl AntigravitySessionRuntime {
             PendingRequest {
                 wire_id,
                 turn_id: turn_id.clone(),
-                request_type,
-                allow_once,
-                allow_always: find_option_id(&options, "allow_always"),
-                reject_once: find_option_id(&options, "reject_once"),
+                kind: PendingRequestKind::Permission {
+                    request_type,
+                    allow_once,
+                    allow_always: find_option_id(&options, "allow_always"),
+                    reject_once: find_option_id(&options, "reject_once"),
+                },
             },
         );
         // The CLI proved it accepted the prompt by opening an approval for it —
@@ -2814,11 +3080,800 @@ fn current_mode(options: &[Value]) -> Option<&str> {
 
 /// A fixed name for a request method from the CLI, safe to log.
 fn request_label(method: &str) -> &'static str {
-    if method == "session/request_permission" {
-        "session/request_permission"
-    } else {
-        "unknown"
+    match method {
+        "session/request_permission" => "session/request_permission",
+        "elicitation/create" => "elicitation/create",
+        _ => "unknown",
     }
+}
+
+struct ParsedElicitationForm {
+    questions: Vec<Value>,
+    fields: Vec<ElicitationFieldSpec>,
+}
+
+enum ElicitationParseError {
+    SecretRequested,
+    InvalidSchema(String),
+}
+
+fn non_empty_trimmed(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+fn value_as_display_label(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }
+        Value::Number(num) => Some(num.to_string()),
+        Value::Bool(flag) => Some(if *flag { "Yes" } else { "No" }.to_owned()),
+        _ => None,
+    }
+}
+
+fn disambiguate_option_labels(
+    raw_entries: Vec<(String, String, Value)>,
+) -> (Vec<Value>, Vec<(String, Value)>) {
+    let mut counts = HashMap::<String, usize>::new();
+    for (label, _, _) in &raw_entries {
+        *counts.entry(label.clone()).or_insert(0) += 1;
+    }
+    let mut used = HashSet::<String>::new();
+    let mut options = Vec::with_capacity(raw_entries.len());
+    let mut value_by_label = Vec::with_capacity(raw_entries.len());
+    for (index, (base_label, raw_description, const_val)) in raw_entries.into_iter().enumerate() {
+        let mut label = if counts.get(&base_label).copied().unwrap_or(0) > 1 {
+            if let Some(const_display) = value_as_display_label(&const_val)
+                && const_display != base_label
+            {
+                format!("{base_label} ({const_display})")
+            } else {
+                format!("{base_label} ({})", index + 1)
+            }
+        } else {
+            base_label.clone()
+        };
+        if !used.insert(label.clone()) {
+            let mut suffix = index + 1;
+            loop {
+                let candidate = format!("{base_label} ({suffix})");
+                if used.insert(candidate.clone()) {
+                    label = candidate;
+                    break;
+                }
+                suffix += 1;
+            }
+        }
+        let description = if raw_description.is_empty() {
+            label.clone()
+        } else {
+            raw_description
+        };
+        options.push(json!({
+            "label": label,
+            "description": description,
+        }));
+        value_by_label.push((label, const_val));
+    }
+    (options, value_by_label)
+}
+
+fn extract_titled_options(entries: &[Value]) -> (Vec<Value>, Vec<(String, Value)>) {
+    let mut raw = Vec::new();
+    for entry in entries {
+        let Some(const_val) = entry.get("const") else {
+            continue;
+        };
+        let Some(label) =
+            non_empty_trimmed(entry.get("title")).or_else(|| value_as_display_label(const_val))
+        else {
+            continue;
+        };
+        let description = non_empty_trimmed(entry.get("description")).unwrap_or_default();
+        raw.push((label, description, const_val.clone()));
+    }
+    disambiguate_option_labels(raw)
+}
+
+fn extract_enum_options(
+    enum_values: &[Value],
+    enum_names: Option<&[Value]>,
+) -> (Vec<Value>, Vec<(String, Value)>) {
+    let mut raw = Vec::new();
+    for (index, val) in enum_values.iter().enumerate() {
+        let Some(label) = enum_names
+            .and_then(|names| names.get(index))
+            .and_then(|name| non_empty_trimmed(Some(name)))
+            .or_else(|| value_as_display_label(val))
+        else {
+            continue;
+        };
+        raw.push((label, String::new(), val.clone()));
+    }
+    disambiguate_option_labels(raw)
+}
+
+fn property_has_selectable_options(prop_obj: &serde_json::Map<String, Value>) -> bool {
+    match prop_obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string")
+    {
+        "array" => prop_obj
+            .get("items")
+            .and_then(Value::as_object)
+            .is_some_and(|items| {
+                items
+                    .get("anyOf")
+                    .or_else(|| items.get("oneOf"))
+                    .or_else(|| items.get("enum"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| !arr.is_empty())
+            }),
+        "string" => prop_obj
+            .get("oneOf")
+            .or_else(|| prop_obj.get("anyOf"))
+            .or_else(|| prop_obj.get("enum"))
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty()),
+        _ => false,
+    }
+}
+
+fn is_companion_other_property(
+    field_key: &str,
+    prop_obj: &serde_json::Map<String, Value>,
+    properties: &serde_json::Map<String, Value>,
+    required_fields: &HashSet<String>,
+) -> Option<(String, CompanionOtherFieldSpec)> {
+    let base_key = field_key.strip_suffix("_other")?;
+    if base_key.is_empty() || required_fields.contains(field_key) {
+        return None;
+    }
+    let base_obj = properties.get(base_key)?.as_object()?;
+    if !property_has_selectable_options(base_obj) {
+        return None;
+    }
+    let prop_type = prop_obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string");
+    if prop_type != "string"
+        || prop_obj.get("format").and_then(Value::as_str) == Some("password")
+        || prop_obj.get("writeOnly").and_then(Value::as_bool) == Some(true)
+        || prop_obj.get("oneOf").is_some()
+        || prop_obj.get("anyOf").is_some()
+        || prop_obj.get("enum").is_some()
+    {
+        return None;
+    }
+    let title_is_other =
+        non_empty_trimmed(prop_obj.get("title")).is_some_and(|t| t.eq_ignore_ascii_case("other"));
+    let desc_mentions_other = non_empty_trimmed(prop_obj.get("description")).is_some_and(|d| {
+        let lower = d.to_ascii_lowercase();
+        lower.contains("free-form") || lower.contains("other")
+    });
+    if !title_is_other && !desc_mentions_other {
+        return None;
+    }
+    Some((
+        base_key.to_owned(),
+        CompanionOtherFieldSpec {
+            id: field_key.to_owned(),
+            min_length: prop_obj
+                .get("minLength")
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok()),
+            max_length: prop_obj
+                .get("maxLength")
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok()),
+        },
+    ))
+}
+
+fn parse_elicitation_form(params: &Value) -> Result<ParsedElicitationForm, ElicitationParseError> {
+    let Some(schema) = params.get("requestedSchema").and_then(Value::as_object) else {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: expected an object".to_owned(),
+        ));
+    };
+    if let Some(schema_type) = schema.get("type").and_then(Value::as_str)
+        && schema_type != "object"
+    {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: root type must be object".to_owned(),
+        ));
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: missing properties".to_owned(),
+        ));
+    };
+    if properties.is_empty() {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: properties must not be empty".to_owned(),
+        ));
+    }
+
+    let required_fields: HashSet<String> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    // Antigravity's `ask_question` emits companion `<field>_other` optional free-form string
+    // properties alongside `oneOf`/`anyOf` choice fields. Fold those into the parent choice
+    // question so BiBCode's built-in custom-answer input routes cleanly without duplicate pages.
+    let mut companion_others: HashMap<String, CompanionOtherFieldSpec> = HashMap::new();
+    let mut skipped_companion_keys: HashSet<String> = HashSet::new();
+    for (field_key, property) in properties {
+        let Some(prop_obj) = property.as_object() else {
+            continue;
+        };
+        if let Some((base_key, spec)) =
+            is_companion_other_property(field_key.trim(), prop_obj, properties, &required_fields)
+        {
+            skipped_companion_keys.insert(field_key.clone());
+            companion_others.insert(base_key, spec);
+        }
+    }
+
+    let prompt_message = non_empty_trimmed(params.get("message"));
+    let total_fields = properties
+        .keys()
+        .filter(|key| !key.trim().is_empty() && !skipped_companion_keys.contains(*key))
+        .count();
+    let mut questions = Vec::with_capacity(total_fields);
+    let mut fields = Vec::with_capacity(total_fields);
+
+    for (field_key, property) in properties {
+        if skipped_companion_keys.contains(field_key) {
+            continue;
+        }
+        let field_id = field_key.trim();
+        if field_id.is_empty() {
+            continue;
+        }
+        let Some(prop_obj) = property.as_object() else {
+            return Err(ElicitationParseError::InvalidSchema(format!(
+                "Invalid elicitation property schema for '{field_id}'"
+            )));
+        };
+        if prop_obj.get("format").and_then(Value::as_str) == Some("password")
+            || prop_obj.get("writeOnly").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(ElicitationParseError::SecretRequested);
+        }
+
+        let prop_type = prop_obj
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("string");
+        let title = non_empty_trimmed(prop_obj.get("title"));
+        let description = non_empty_trimmed(prop_obj.get("description"));
+        let question_index = questions.len() + 1;
+
+        let (header, question_text) = match (title, description) {
+            (Some(title), Some(description)) => (title, description),
+            (Some(title), None) => {
+                let title_is_prompt = title.ends_with('?') || title.chars().count() > 28;
+                if title_is_prompt {
+                    let header = if total_fields == 1 {
+                        "Question".to_owned()
+                    } else {
+                        format!("Question {question_index}")
+                    };
+                    (header, title)
+                } else if total_fields == 1 {
+                    let question = prompt_message.clone().unwrap_or_else(|| title.clone());
+                    (title, question)
+                } else {
+                    (title.clone(), title)
+                }
+            }
+            (None, Some(description)) => (field_id.to_owned(), description),
+            (None, None) => {
+                let question = if total_fields == 1 {
+                    prompt_message
+                        .clone()
+                        .unwrap_or_else(|| field_id.to_owned())
+                } else {
+                    field_id.to_owned()
+                };
+                (field_id.to_owned(), question)
+            }
+        };
+
+        let other_field = companion_others.remove(field_id);
+        let (options, multi_select, field_kind) = match prop_type {
+            "array" => {
+                let items = prop_obj.get("items").and_then(Value::as_object);
+                if let Some(items_obj) = items {
+                    if items_obj.get("format").and_then(Value::as_str) == Some("password")
+                        || items_obj.get("writeOnly").and_then(Value::as_bool) == Some(true)
+                    {
+                        return Err(ElicitationParseError::SecretRequested);
+                    }
+                    if matches!(
+                        items_obj.get("type").and_then(Value::as_str),
+                        Some("object" | "array")
+                    ) {
+                        return Err(ElicitationParseError::InvalidSchema(format!(
+                            "Invalid elicitation array items type for '{field_id}'"
+                        )));
+                    }
+                }
+                let (options, value_by_label, enum_restricted) = if let Some(titled) = items
+                    .and_then(|obj| obj.get("anyOf").or_else(|| obj.get("oneOf")))
+                    .and_then(Value::as_array)
+                {
+                    let (opts, map) = extract_titled_options(titled);
+                    (opts, map, true)
+                } else if let Some(enum_values) = items
+                    .and_then(|obj| obj.get("enum"))
+                    .and_then(Value::as_array)
+                {
+                    let enum_names = items
+                        .and_then(|obj| obj.get("enumNames"))
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice);
+                    let (opts, map) = extract_enum_options(enum_values, enum_names);
+                    (opts, map, true)
+                } else {
+                    (Vec::new(), Vec::new(), false)
+                };
+                let min_items = prop_obj
+                    .get("minItems")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok());
+                let max_items = prop_obj
+                    .get("maxItems")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok());
+                (
+                    options,
+                    true,
+                    ElicitationFieldKind::MultiSelect {
+                        value_by_label,
+                        enum_restricted,
+                        min_items,
+                        max_items,
+                        other_field,
+                    },
+                )
+            }
+            "boolean" => (
+                vec![
+                    json!({ "label": "Yes", "description": "True" }),
+                    json!({ "label": "No", "description": "False" }),
+                ],
+                false,
+                ElicitationFieldKind::Boolean,
+            ),
+            "integer" => (
+                Vec::new(),
+                false,
+                ElicitationFieldKind::Integer {
+                    minimum: parse_integer_min_bound(prop_obj.get("minimum")),
+                    maximum: parse_integer_max_bound(prop_obj.get("maximum")),
+                },
+            ),
+            "number" => (
+                Vec::new(),
+                false,
+                ElicitationFieldKind::Number {
+                    minimum: prop_obj.get("minimum").and_then(Value::as_f64),
+                    maximum: prop_obj.get("maximum").and_then(Value::as_f64),
+                },
+            ),
+            _ => {
+                let (options, value_by_label, enum_restricted) = if let Some(titled) = prop_obj
+                    .get("oneOf")
+                    .or_else(|| prop_obj.get("anyOf"))
+                    .and_then(Value::as_array)
+                {
+                    let (opts, map) = extract_titled_options(titled);
+                    (opts, map, true)
+                } else if let Some(enum_values) = prop_obj.get("enum").and_then(Value::as_array) {
+                    let enum_names = prop_obj
+                        .get("enumNames")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice);
+                    let (opts, map) = extract_enum_options(enum_values, enum_names);
+                    (opts, map, true)
+                } else {
+                    (Vec::new(), Vec::new(), false)
+                };
+                let min_length = prop_obj
+                    .get("minLength")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok());
+                let max_length = prop_obj
+                    .get("maxLength")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok());
+                (
+                    options,
+                    false,
+                    ElicitationFieldKind::String {
+                        value_by_label,
+                        enum_restricted,
+                        min_length,
+                        max_length,
+                        other_field,
+                    },
+                )
+            }
+        };
+
+        questions.push(json!({
+            "id": field_id,
+            "header": header,
+            "question": question_text,
+            "options": options,
+            "multiSelect": multi_select,
+        }));
+        fields.push(ElicitationFieldSpec {
+            id: field_id.to_owned(),
+            required: required_fields.contains(field_id),
+            kind: field_kind,
+        });
+    }
+
+    if questions.is_empty() {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: no valid properties".to_owned(),
+        ));
+    }
+
+    Ok(ParsedElicitationForm { questions, fields })
+}
+
+fn parse_integer_min_bound(value: Option<&Value>) -> Option<i64> {
+    let num = value?.as_number()?;
+    if let Some(int) = num.as_i64() {
+        return Some(int);
+    }
+    if let Some(uint) = num.as_u64() {
+        return Some(i64::try_from(uint).unwrap_or(i64::MAX));
+    }
+    num.as_f64()
+        .filter(|v| v.is_finite())
+        .map(|v| v.ceil().clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+}
+
+fn parse_integer_max_bound(value: Option<&Value>) -> Option<i64> {
+    let num = value?.as_number()?;
+    if let Some(int) = num.as_i64() {
+        return Some(int);
+    }
+    if let Some(uint) = num.as_u64() {
+        return Some(i64::try_from(uint).unwrap_or(i64::MAX));
+    }
+    num.as_f64()
+        .filter(|v| v.is_finite())
+        .map(|v| v.floor().clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+}
+
+fn find_option_wire_value(
+    value_by_label: &[(String, Value)],
+    raw: &str,
+    match_raw_wire_value: bool,
+) -> Option<Value> {
+    if let Some((_, wire_val)) = value_by_label.iter().find(|(label, _)| label == raw) {
+        return Some(wire_val.clone());
+    }
+    if !match_raw_wire_value {
+        return None;
+    }
+    value_by_label
+        .iter()
+        .find(|(_, val)| val.as_str() == Some(raw))
+        .map(|(_, wire_val)| wire_val.clone())
+}
+
+fn validate_string_length(
+    field_id: &str,
+    value: &str,
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+) -> Result<(), AntigravityRuntimeError> {
+    let char_len = value.chars().count();
+    if let Some(min) = min_length
+        && char_len < min
+    {
+        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+            detail: format!("Answer for '{field_id}' must be at least {min} characters."),
+        });
+    }
+    if let Some(max) = max_length
+        && char_len > max
+    {
+        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+            detail: format!("Answer for '{field_id}' must be at most {max} characters."),
+        });
+    }
+    Ok(())
+}
+
+fn build_elicitation_content(
+    fields: &[ElicitationFieldSpec],
+    answers: &Value,
+) -> Result<serde_json::Map<String, Value>, AntigravityRuntimeError> {
+    let Some(answer_map) = answers.as_object() else {
+        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+            detail: "User input answers must be a JSON object.".to_owned(),
+        });
+    };
+    let mut content = serde_json::Map::new();
+    for field in fields {
+        let Some(raw) = answer_map.get(&field.id) else {
+            continue;
+        };
+        match &field.kind {
+            ElicitationFieldKind::String {
+                value_by_label,
+                enum_restricted,
+                min_length,
+                max_length,
+                other_field,
+            } => {
+                let text = match raw {
+                    Value::String(s) => s.trim(),
+                    Value::Array(arr) => arr
+                        .iter()
+                        .find_map(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default(),
+                    _ => "",
+                };
+                if !text.is_empty() {
+                    if let Some(matched) =
+                        find_option_wire_value(value_by_label, text, other_field.is_none())
+                    {
+                        if let Some(str_val) = matched.as_str() {
+                            validate_string_length(&field.id, str_val, *min_length, *max_length)?;
+                        }
+                        content.insert(field.id.clone(), matched);
+                    } else if let Some(other) = other_field {
+                        validate_string_length(
+                            &other.id,
+                            text,
+                            other.min_length,
+                            other.max_length,
+                        )?;
+                        content.insert(other.id.clone(), Value::String(text.to_owned()));
+                    } else if *enum_restricted {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Select one of the listed options for '{}'.", field.id),
+                        });
+                    } else {
+                        validate_string_length(&field.id, text, *min_length, *max_length)?;
+                        content.insert(field.id.clone(), Value::String(text.to_owned()));
+                    }
+                }
+            }
+            ElicitationFieldKind::MultiSelect {
+                value_by_label,
+                enum_restricted,
+                min_items,
+                max_items,
+                other_field,
+            } => {
+                let raw_items: Vec<&str> = match raw {
+                    Value::Array(arr) => arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .collect(),
+                    Value::String(s) if !s.trim().is_empty() => vec![s.trim()],
+                    _ => Vec::new(),
+                };
+                if !raw_items.is_empty() {
+                    let mut items = Vec::with_capacity(raw_items.len());
+                    let mut custom_items: Vec<&str> = Vec::new();
+                    for entry in raw_items {
+                        if let Some(matched) =
+                            find_option_wire_value(value_by_label, entry, other_field.is_none())
+                        {
+                            items.push(matched);
+                        } else if other_field.is_some() {
+                            custom_items.push(entry);
+                        } else if *enum_restricted {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!(
+                                    "Select one of the listed options for '{}'.",
+                                    field.id
+                                ),
+                            });
+                        } else {
+                            items.push(Value::String(entry.to_owned()));
+                        }
+                    }
+                    if !custom_items.is_empty()
+                        && let Some(other) = other_field
+                    {
+                        let joined = custom_items.join(", ");
+                        validate_string_length(
+                            &other.id,
+                            &joined,
+                            other.min_length,
+                            other.max_length,
+                        )?;
+                        content.insert(other.id.clone(), Value::String(joined));
+                    }
+                    if !items.is_empty() {
+                        if let Some(min) = min_items
+                            && items.len() < *min
+                        {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!(
+                                    "Select at least {min} option(s) for '{}'.",
+                                    field.id
+                                ),
+                            });
+                        }
+                        if let Some(max) = max_items
+                            && items.len() > *max
+                        {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!(
+                                    "Select at most {max} option(s) for '{}'.",
+                                    field.id
+                                ),
+                            });
+                        }
+                        content.insert(field.id.clone(), Value::Array(items));
+                    } else if field.required
+                        && let Some(min) = min_items
+                        && *min > 0
+                    {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Select at least {min} option(s) for '{}'.", field.id),
+                        });
+                    }
+                }
+            }
+            ElicitationFieldKind::Boolean => {
+                let parsed = match raw {
+                    Value::Bool(flag) => Some(*flag),
+                    Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                        "" => None,
+                        "yes" | "true" | "1" => Some(true),
+                        "no" | "false" | "0" => Some(false),
+                        _ => {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!("Answer for '{}' must be Yes or No.", field.id),
+                            });
+                        }
+                    },
+                    _ => {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Answer for '{}' must be Yes or No.", field.id),
+                        });
+                    }
+                };
+                if let Some(flag) = parsed {
+                    content.insert(field.id.clone(), Value::Bool(flag));
+                }
+            }
+            ElicitationFieldKind::Integer { minimum, maximum } => {
+                let parsed = match raw {
+                    Value::Number(num) => num.as_i64().ok_or_else(|| {
+                        AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Answer for '{}' must be a whole number.", field.id),
+                        }
+                    })?,
+                    Value::String(s) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        trimmed.parse::<i64>().map_err(|_| {
+                            AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!(
+                                    "Answer for '{}' must be a whole number.",
+                                    field.id
+                                ),
+                            }
+                        })?
+                    }
+                    _ => {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Answer for '{}' must be a whole number.", field.id),
+                        });
+                    }
+                };
+                if let Some(min) = minimum
+                    && parsed < *min
+                {
+                    return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                        detail: format!("Answer for '{}' must be at least {min}.", field.id),
+                    });
+                }
+                if let Some(max) = maximum
+                    && parsed > *max
+                {
+                    return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                        detail: format!("Answer for '{}' must be at most {max}.", field.id),
+                    });
+                }
+                content.insert(field.id.clone(), json!(parsed));
+            }
+            ElicitationFieldKind::Number { minimum, maximum } => {
+                let parsed = match raw {
+                    Value::Number(num) => {
+                        num.as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+                            AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!("Answer for '{}' must be a number.", field.id),
+                            }
+                        })?
+                    }
+                    Value::String(s) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let val = trimmed.parse::<f64>().map_err(|_| {
+                            AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!("Answer for '{}' must be a number.", field.id),
+                            }
+                        })?;
+                        if !val.is_finite() {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!("Answer for '{}' must be a number.", field.id),
+                            });
+                        }
+                        val
+                    }
+                    _ => {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Answer for '{}' must be a number.", field.id),
+                        });
+                    }
+                };
+                if let Some(min) = minimum
+                    && parsed < *min
+                {
+                    return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                        detail: format!("Answer for '{}' must be at least {min}.", field.id),
+                    });
+                }
+                if let Some(max) = maximum
+                    && parsed > *max
+                {
+                    return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                        detail: format!("Answer for '{}' must be at most {max}.", field.id),
+                    });
+                }
+                content.insert(field.id.clone(), json!(parsed));
+            }
+        }
+    }
+    for field in fields {
+        if field.required && !content.contains_key(&field.id) {
+            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                detail: format!(
+                    "Answer for required field '{}' is missing. Fill it in or cancel the form.",
+                    field.id
+                ),
+            });
+        }
+    }
+    Ok(content)
 }
 
 fn option_id(descriptor: &Value) -> &str {

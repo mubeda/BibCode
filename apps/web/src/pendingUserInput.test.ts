@@ -255,6 +255,31 @@ describe("pending user input question progress", () => {
       isComplete: true,
     });
   });
+
+  it("preserves both selected options and custom text for multi-select questions", () => {
+    const withOptions = togglePendingUserInputOptionSelection(
+      multiSelectQuestion,
+      undefined,
+      "Server",
+    );
+    const withCustom = setPendingUserInputCustomAnswer(withOptions, "CLI", {
+      multiSelect: true,
+    });
+    const withSecondOption = togglePendingUserInputOptionSelection(
+      multiSelectQuestion,
+      withCustom,
+      "Web",
+    );
+    expect(withSecondOption).toEqual({
+      customAnswer: "CLI",
+      selectedOptionLabels: ["Server", "Web"],
+    });
+    expect(resolvePendingUserInputAnswer(multiSelectQuestion, withSecondOption)).toEqual([
+      "Server",
+      "Web",
+      "CLI",
+    ]);
+  });
 });
 
 describe("pending user input Orca helpers and draft persistence (#430)", () => {
@@ -323,6 +348,7 @@ describe("pending user input Orca helpers and draft persistence (#430)", () => {
   });
 
   it("reports provider cancel capability accurately", () => {
+    expect(providerSupportsPendingUserInputCancel("antigravity")).toBe(true);
     expect(providerSupportsPendingUserInputCancel("cursor")).toBe(true);
     expect(providerSupportsPendingUserInputCancel("opencode")).toBe(true);
     expect(providerSupportsPendingUserInputCancel("claudeAgent")).toBe(false);

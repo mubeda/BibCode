@@ -242,6 +242,78 @@ describe("expired requests (#187)", () => {
     expect(derivePendingApprovals(activities).map((entry) => entry.requestId)).toEqual(["a-1"]);
     expect(derivePendingUserInputs(activities).map((entry) => entry.requestId)).toEqual(["q-1"]);
   });
+
+  it("preserves non-blocking isBlocking: false on pending user inputs until expired (#442)", () => {
+    const nonBlockingAsked = makeActivity({
+      id: "q-nb",
+      createdAt: "2026-10-27T00:00:01.000Z",
+      kind: "user-input.requested",
+      summary: "Question",
+      tone: "approval",
+      payload: { requestId: "q-nb-1", isBlocking: false, questions: [question] },
+    });
+    const blockingAskedLater = makeActivity({
+      id: "q-block-later",
+      createdAt: "2026-10-27T00:00:02.000Z",
+      kind: "user-input.requested",
+      summary: "Question",
+      tone: "approval",
+      payload: { requestId: "q-block-1", questions: [question] },
+    });
+    expect(derivePendingUserInputs([nonBlockingAsked])).toEqual([
+      expect.objectContaining({
+        requestId: "q-nb-1",
+        isBlocking: false,
+      }),
+    ]);
+    // Newer blocking question must sort ahead of an older optional non-blocking question.
+    expect(
+      derivePendingUserInputs([nonBlockingAsked, blockingAskedLater]).map(
+        (entry) => entry.requestId,
+      ),
+    ).toEqual(["q-block-1", "q-nb-1"]);
+    // Open non-blocking ask uses the non-blocking work-log label; expiry suppresses the ask row.
+    expect(deriveWorkLogEntries([nonBlockingAsked]).map((entry) => entry.label)).toEqual([
+      "Question while working: 1 question",
+    ]);
+    const expiredNb = expired(
+      "q-nb-exp",
+      "user-input.expired",
+      "q-nb-1",
+      "2026-10-27T00:00:03.000Z",
+    );
+    expect(derivePendingUserInputs([nonBlockingAsked, expiredNb])).toEqual([]);
+    const expiredLog = deriveWorkLogEntries([nonBlockingAsked, expiredNb]);
+    expect(expiredLog.map((entry) => entry.label)).toEqual(["Question expired"]);
+    expect(expiredLog[0]?.detail).toBe("Which?");
+  });
+
+  it("decodes Antigravity boolean and untitled enum questions against UserInputQuestion contract (#442)", async () => {
+    const { Schema } = await import("effect");
+    const { UserInputQuestion } = await import("@bibcode/contracts");
+    const booleanQuestion = {
+      id: "dryRun",
+      header: "Dry run",
+      question: "Preview without applying?",
+      options: [
+        { label: "Yes", description: "True" },
+        { label: "No", description: "False" },
+      ],
+      multiSelect: false,
+    };
+    const untitledEnumQuestion = {
+      id: "color",
+      header: "color",
+      question: "Pick a color",
+      options: [
+        { label: "red", description: "red" },
+        { label: "blue", description: "blue" },
+      ],
+      multiSelect: false,
+    };
+    expect(Schema.is(UserInputQuestion)(booleanQuestion)).toBe(true);
+    expect(Schema.is(UserInputQuestion)(untitledEnumQuestion)).toBe(true);
+  });
 });
 
 describe("derivePendingUserInputs", () => {

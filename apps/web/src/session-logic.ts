@@ -92,6 +92,7 @@ export interface PendingUserInput {
   requestId: ApprovalRequestId;
   createdAt: string;
   questions: ReadonlyArray<UserInputQuestion>;
+  isBlocking?: boolean;
 }
 
 export interface ActivePlanState {
@@ -485,10 +486,13 @@ export function derivePendingUserInputs(
       if (!questions) {
         continue;
       }
+      const isBlocking =
+        payload && typeof payload.isBlocking === "boolean" ? payload.isBlocking : undefined;
       openByRequestId.set(requestId, {
         requestId,
         createdAt: activity.createdAt,
         questions,
+        ...(isBlocking === false ? { isBlocking: false } : {}),
       });
       continue;
     }
@@ -510,9 +514,14 @@ export function derivePendingUserInputs(
     }
   }
 
-  return [...openByRequestId.values()].toSorted((left, right) =>
-    left.createdAt.localeCompare(right.createdAt),
-  );
+  return [...openByRequestId.values()].toSorted((left, right) => {
+    const leftBlockingRank = left.isBlocking === false ? 1 : 0;
+    const rightBlockingRank = right.isBlocking === false ? 1 : 0;
+    if (leftBlockingRank !== rightBlockingRank) {
+      return leftBlockingRank - rightBlockingRank;
+    }
+    return left.createdAt.localeCompare(right.createdAt);
+  });
 }
 
 export function deriveActivePlanState(
@@ -694,11 +703,31 @@ function buildUserInputWorkLogSummary(
     if (questions.length === 0) {
       return null;
     }
-    const label =
-      questions.length === 1
+    const isNonBlocking = payload?.isBlocking === false;
+    const label = isNonBlocking
+      ? questions.length === 1
+        ? "Question while working: 1 question"
+        : `Question while working: ${questions.length} questions`
+      : questions.length === 1
         ? "Awaiting user input: 1 question"
         : `Awaiting user input: ${questions.length} questions`;
     const detail = questions.map((question) => question.question).join("\n");
+    return { label, detail };
+  }
+  if (activity.kind === "user-input.expired") {
+    const requestId =
+      payload && typeof payload.requestId === "string" && payload.requestId.trim().length > 0
+        ? payload.requestId.trim()
+        : null;
+    const requestedQuestions = requestId ? (requestedByRequestId.get(requestId) ?? []) : [];
+    const detail =
+      requestedQuestions.length > 0
+        ? requestedQuestions.map((question) => question.question).join("\n")
+        : null;
+    const label =
+      requestedQuestions.length > 1
+        ? `Questions expired (${requestedQuestions.length})`
+        : "Question expired";
     return { label, detail };
   }
   if (activity.kind !== "user-input.resolved") {
@@ -823,7 +852,7 @@ export function deriveWorkLogEntries(
       if (parsed) {
         requestedByRequestId.set(requestId, parsed);
       }
-    } else if (activity.kind === "user-input.resolved") {
+    } else if (activity.kind === "user-input.resolved" || activity.kind === "user-input.expired") {
       resolvedRequestIds.add(requestId);
     }
   }
@@ -836,7 +865,11 @@ export function deriveWorkLogEntries(
     if (activity.kind === "context-window.updated") continue;
     if (activity.summary === "Checkpoint captured") continue;
     if (isPlanBoundaryToolActivity(activity)) continue;
-    if (activity.kind === "user-input.requested" || activity.kind === "user-input.resolved") {
+    if (
+      activity.kind === "user-input.requested" ||
+      activity.kind === "user-input.resolved" ||
+      activity.kind === "user-input.expired"
+    ) {
       const payload =
         activity.payload && typeof activity.payload === "object"
           ? (activity.payload as Record<string, unknown>)
@@ -845,9 +878,9 @@ export function deriveWorkLogEntries(
         payload && typeof payload.requestId === "string" && payload.requestId.trim().length > 0
           ? payload.requestId.trim()
           : null;
-      // Deduplicate: once resolved, only a single user-input.resolved receipt is rendered
-      // whether user-input.requested was in the initial window or loaded from an older page,
-      // and duplicate resolved rows for the same requestId coalesce into one.
+      // Deduplicate: once resolved or expired, suppress the open ask row whether
+      // user-input.requested was in the initial window or loaded from an older page,
+      // and coalesce duplicate terminal rows for the same requestId into one.
       if (
         activity.kind === "user-input.requested" &&
         requestId &&
@@ -855,7 +888,10 @@ export function deriveWorkLogEntries(
       ) {
         continue;
       }
-      if (activity.kind === "user-input.resolved" && requestId) {
+      if (
+        (activity.kind === "user-input.resolved" || activity.kind === "user-input.expired") &&
+        requestId
+      ) {
         if (emittedResolvedRequestIds.has(requestId)) {
           continue;
         }

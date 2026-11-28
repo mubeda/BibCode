@@ -2709,7 +2709,7 @@ function ChatViewContent(props: ChatViewProps) {
   const compactionFailedMessageId = compaction?.failedMessageId ?? null;
   const composerPhase = composerPhaseWhileCompacting(phase, compaction !== undefined);
   const hasPendingApproval = activePendingApproval !== null;
-  const hasPendingUserInput = activePendingUserInput !== null;
+  const hasPendingUserInput = pendingUserInputs.some((entry) => entry.isBlocking !== false);
   const queueSessionStatus = activeThread?.session?.status ?? null;
   const queuedStatuses = useMemo(() => {
     return queuedMessages.map((message, index) =>
@@ -6654,9 +6654,21 @@ function ChatViewContent(props: ChatViewProps) {
         });
         if (result._tag === "Failure") throw squashAtomCommandFailure(result);
       } catch (error) {
+        const rawDetail = error instanceof Error ? error.message : "The request failed.";
+        const wasDeterministicInvariant =
+          /^orchestration command (?:invariant|validation) failed \([^)]+\):\s*/i.test(rawDetail);
+        const cleanedDetail = rawDetail
+          .replace(/^orchestration command (?:invariant|validation) failed \([^)]+\):\s*/i, "")
+          .trim();
+        const detail = cleanedDetail.length > 0 ? cleanedDetail : "The request failed.";
+        const punctuatedDetail = /[.!?]$/.test(detail) ? detail : `${detail}.`;
+        const suffix =
+          wasDeterministicInvariant || /\btry again[.!?]?$/i.test(punctuatedDetail)
+            ? ""
+            : " Try again.";
         setQueuedMessageError(
           messageId,
-          `Could not ${action === "steer" ? "steer" : "send"} this message. ${error instanceof Error ? error.message : "The request failed."} Try again.`,
+          `Could not ${action === "steer" ? "steer" : "send"} this message. ${punctuatedDetail}${suffix}`,
         );
       } finally {
         queuedActionsInFlightRef.current.delete(messageId);
@@ -7781,9 +7793,14 @@ function ChatViewContent(props: ChatViewProps) {
       setPendingUserInputAnswersByRequestId((existing) => {
         const baseAnswers =
           existing[requestId] ?? loadPendingUserInputDraft(routeThreadKey, requestId) ?? {};
+        const targetPrompt =
+          pendingUserInputs.find((item) => item.requestId === requestId) ?? activePendingUserInput;
+        const targetQuestion = targetPrompt.questions.find((q) => q.id === questionId);
         const nextForRequest = {
           ...baseAnswers,
-          [questionId]: setPendingUserInputCustomAnswer(baseAnswers[questionId], value),
+          [questionId]: setPendingUserInputCustomAnswer(baseAnswers[questionId], value, {
+            multiSelect: targetQuestion?.multiSelect === true,
+          }),
         };
         savePendingUserInputDraft(
           routeThreadKey,
@@ -7801,6 +7818,7 @@ function ChatViewContent(props: ChatViewProps) {
       activePendingQuestionIndex,
       activePendingSecretQuestionIds,
       activePendingUserInput,
+      pendingUserInputs,
       routeThreadKey,
     ],
   );
@@ -8959,11 +8977,17 @@ function ChatViewContent(props: ChatViewProps) {
                     </div>
                     <div
                       className={cn(
-                        "chat-composer-horizontal-inset chat-composer-lower-chrome relative z-10",
+                        "chat-composer-horizontal-inset relative z-10",
                         "pb-[calc(env(safe-area-inset-bottom)+0.5rem)] sm:pb-[calc(env(safe-area-inset-bottom)+0.625rem)]",
                       )}
                     >
-                      <ComposerContextStrip {...composerContextStripState} />
+                      <div
+                        aria-hidden="true"
+                        className="chat-composer-lower-chrome pointer-events-none absolute inset-0"
+                      />
+                      <div className="relative z-10">
+                        <ComposerContextStrip {...composerContextStripState} />
+                      </div>
                     </div>
                   </div>
 

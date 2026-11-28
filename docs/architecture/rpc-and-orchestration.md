@@ -3316,20 +3316,30 @@ no temporary sort that would spill large payloads to a temporary file.
 The shell carries what the left panel's agent status reads (#187):
 
 - **`hasPendingApprovals`** comes from `projection_pending_approvals`.
-- **`hasPendingUserInput`** is the thread's count of open questions. A question
+- **`hasPendingUserInput`** is the thread's count of open blocking questions. A question
   is open while the newest record for its request is the ask itself, or a
-  refused answer that the provider did not call stale. That rule is one shared
-  SQL fragment, `open_user_input_requests_sql`, which the queue head also uses.
+  refused answer that the provider did not call stale. That rule is shared via
+  `open_user_input_requests_sql` (all open questions, used for expiry on stop,
+  session-end, and startup recovery) and `open_blocking_user_input_requests_sql`
+  (excluding non-blocking `isBlocking: false` asks such as Codex async
+  clarifying questions, used for `pending_user_input_count`, `hasPendingUserInput`,
+  and queued-turn promotion so a running turn with an optional question stays in
+  `Working` and remains steerable).
   The count is recomputed only when a request's state changes, not on every
   thread event. `thread.user-input.respond` carries an optional backward-compatible
   `disposition` (`"answered" | "skipped" | "cancelled"`, defaulting to `"answered"`
   for older answers-only callers such as MCP `answer_question`). Providers map
-  skip/cancel outcomes explicitly (Cursor `outcome: "skipped"`, OpenCode v1
-  `POST /question/{id}/reject` and v2 session-scoped `DELETE /api/session/{sid}/form/{id}`,
-  empty entries for Claude/Codex/Grok) and persist self-sufficient `user-input.resolved`
-  receipt metadata (`answers`, `disposition`, and compact `questions` summaries) so
-  windowed history reloads render receipts even when `user-input.requested` is on
-  an older unloaded page.
+  skip/cancel outcomes explicitly (Antigravity ACP `elicitation/create` form mode
+  maps answers to `action: "accept"` with schema-coerced `content`, empty skips to
+  `action: "decline"`, and cancels to `action: "cancel"`; Cursor `outcome: "skipped"`,
+  OpenCode v1 `POST /question/{id}/reject` and v2 session-scoped
+  `DELETE /api/session/{sid}/form/{id}`, empty entries for Claude/Codex/Grok) and
+  persist self-sufficient `user-input.resolved` receipt metadata (`answers`,
+  `disposition`, and compact `questions` summaries) so windowed history reloads
+  render receipts even when `user-input.requested` is on an older unloaded page.
+  Codex `serverRequest/resolved`, Codex `turn/completed`, and Antigravity turn
+  completion/cancellation emit `user-input.expired` for unsettled prompts so
+  non-blocking and interrupted questions clear cleanly.
 - **`lastActivityAt`** is the time of the thread's latest provider progress:
   either an event the engine attributes to the provider, or a session update to
   `starting` or `running`. Titles, modes, archiving and BiBCode's own

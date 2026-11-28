@@ -137,6 +137,7 @@ pub enum PendingRequestKind {
     CommandApproval,
     FileChangeApproval,
     UserInput,
+    AsyncQuestion,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -265,6 +266,7 @@ struct RuntimeInner {
     events_rx: Mutex<mpsc::UnboundedReceiver<RuntimeEvent>>,
     event_counter: Mutex<u64>,
     pending_requests: Mutex<HashMap<String, PendingRequest>>,
+    next_pending_instance_id: std::sync::atomic::AtomicU64,
     task: StdMutex<Option<JoinHandle<()>>>,
     reconciliation_hint_tx: mpsc::Sender<()>,
     reconciliation_pending_hint: StdMutex<Option<ReconciliationHint>>,
@@ -637,10 +639,29 @@ enum ReconciliationEmission {
 
 #[derive(Clone)]
 struct PendingRequest {
+    instance_id: u64,
     kind: PendingRequestKind,
+    scope: RequestScope,
     wire_id: Value,
     turn_id: Option<String>,
     questions: Vec<Value>,
+    auto_resolve_cancel: Option<CancellationToken>,
+}
+
+impl PendingRequest {
+    fn cancel_auto_resolve(&self) {
+        if let Some(cancel) = &self.auto_resolve_cancel {
+            cancel.cancel();
+        }
+    }
+}
+
+fn is_codex_steer_turn_ended_error(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Protocol(ProtocolError::RemoteRequest { method, .. })
+            if method == "turn/steer"
+    )
 }
 
 /// The model Codex runs for a request that names none: the one its configuration names, else
@@ -848,6 +869,7 @@ impl CodexSessionRuntime {
             events_rx: Mutex::new(events_rx),
             event_counter: Mutex::new(0),
             pending_requests: Mutex::new(HashMap::new()),
+            next_pending_instance_id: std::sync::atomic::AtomicU64::new(1),
             task: StdMutex::new(None),
             reconciliation_hint_tx,
             reconciliation_pending_hint: StdMutex::new(None),
@@ -1333,6 +1355,16 @@ impl CodexSessionRuntime {
         Ok(session)
     }
 
+    pub async fn has_pending_requests(&self) -> bool {
+        !self.inner.pending_requests.lock().await.is_empty()
+    }
+
+    fn next_pending_instance_id(&self) -> u64 {
+        self.inner
+            .next_pending_instance_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn send_turn(
         &self,
         input: Option<String>,
@@ -1340,6 +1372,36 @@ impl CodexSessionRuntime {
         interaction_mode: Option<String>,
         client_user_message_id: Option<String>,
     ) -> Result<TurnStartResult, RuntimeError> {
+        self.send_turn_inner(
+            input,
+            attachments,
+            interaction_mode,
+            client_user_message_id,
+            true,
+        )
+        .await
+    }
+
+    async fn send_turn_inner(
+        &self,
+        input: Option<String>,
+        attachments: Vec<Value>,
+        interaction_mode: Option<String>,
+        client_user_message_id: Option<String>,
+        expire_async_questions: bool,
+    ) -> Result<TurnStartResult, RuntimeError> {
+        let superseded_ids = if expire_async_questions {
+            self.inner
+                .pending_requests
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, entry)| entry.kind == PendingRequestKind::AsyncQuestion)
+                .map(|(request_id, entry)| (request_id.clone(), entry.instance_id))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let provider_thread_id = self.provider_thread_id().await?;
         let session = self.inner.session.lock().await.clone();
         let turn_options = self.inner.turn_options.lock().await.clone();
@@ -1371,6 +1433,34 @@ impl CodexSessionRuntime {
                 message: "turn/start response missing turn.id".to_owned(),
             })?
             .to_owned();
+        if !superseded_ids.is_empty() {
+            let superseded = {
+                let mut pending = self.inner.pending_requests.lock().await;
+                superseded_ids
+                    .into_iter()
+                    .filter_map(|(request_id, instance_id)| {
+                        let matches = pending
+                            .get(&request_id)
+                            .is_some_and(|entry| entry.instance_id == instance_id);
+                        if matches {
+                            pending.remove(&request_id).map(|entry| (request_id, entry))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (request_id, entry) in superseded {
+                entry.cancel_auto_resolve();
+                self.emit(
+                    "user-input.expired",
+                    entry.turn_id,
+                    Some(request_id),
+                    json!({ "reason": "superseded" }),
+                )
+                .await;
+            }
+        }
         let mut session = self.inner.session.lock().await;
         if session.status != "running" || session.active_turn_id.is_none() {
             session.active_turn_id = Some(turn_id.clone());
@@ -1695,6 +1785,7 @@ impl CodexSessionRuntime {
             .ok_or_else(|| RuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
             })?;
+        pending.cancel_auto_resolve();
         self.emit(
             "request.resolved",
             pending.turn_id.clone(),
@@ -1754,6 +1845,7 @@ impl CodexSessionRuntime {
             .ok_or_else(|| RuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
             })?;
+        pending.cancel_auto_resolve();
         let answers =
             if disposition == Some(crate::provider::UserInputResponseDisposition::Cancelled) {
                 json!({})
@@ -1763,6 +1855,102 @@ impl CodexSessionRuntime {
         let skip_all = disposition.is_some_and(|disp| {
             disp.is_skip_or_cancel() && !crate::provider::has_non_empty_user_input_answer(&answers)
         });
+        if pending.kind == PendingRequestKind::AsyncQuestion {
+            if !skip_all {
+                let steer_text = format_async_question_steer_prompt(&pending.questions, &answers);
+                if steer_text.is_empty() {
+                    self.inner
+                        .pending_requests
+                        .lock()
+                        .await
+                        .insert(request_id.to_owned(), pending);
+                    return Err(RuntimeError::InvalidPayload {
+                        message: "Answer did not match any pending question.".to_owned(),
+                    });
+                }
+                let answer_timeout = Duration::from_secs(15);
+                let active_turn_id = self.inner.session.lock().await.active_turn_id.clone();
+                let delivery_result = if let Some(expected_turn_id) = active_turn_id {
+                    match tokio::time::timeout(
+                        answer_timeout,
+                        self.steer_turn(
+                            Some(steer_text.clone()),
+                            Vec::new(),
+                            expected_turn_id,
+                            None,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(steer_error)) if is_codex_steer_turn_ended_error(&steer_error) => {
+                            // Codex confirmed the turn already ended on `turn/steer`; start a
+                            // follow-up turn with the answers instead of failing the card.
+                            match tokio::time::timeout(
+                                answer_timeout,
+                                self.send_turn_inner(
+                                    Some(steer_text),
+                                    Vec::new(),
+                                    None,
+                                    None,
+                                    false,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(res) => res.map(|_| ()),
+                                Err(_) => Err(RuntimeError::InvalidPayload {
+                                    message: "Codex timed out while starting a follow-up turn for your answer.".to_owned(),
+                                }),
+                            }
+                        }
+                        Ok(Err(steer_error)) => Err(steer_error),
+                        Err(_) => Err(RuntimeError::InvalidPayload {
+                            message: "Codex timed out while delivering your answer.".to_owned(),
+                        }),
+                    }
+                } else {
+                    match tokio::time::timeout(
+                        answer_timeout,
+                        self.send_turn_inner(Some(steer_text), Vec::new(), None, None, false),
+                    )
+                    .await
+                    {
+                        Ok(res) => res.map(|_| ()),
+                        Err(_) => Err(RuntimeError::InvalidPayload {
+                            message:
+                                "Codex timed out while starting a follow-up turn for your answer."
+                                    .to_owned(),
+                        }),
+                    }
+                };
+                if let Err(error) = delivery_result {
+                    self.inner
+                        .pending_requests
+                        .lock()
+                        .await
+                        .insert(request_id.to_owned(), pending);
+                    return Err(error);
+                }
+            }
+            let resolved_answers = if skip_all { json!({}) } else { answers };
+            let resolved_payload = match disposition {
+                Some(disp) => crate::provider::build_user_input_resolved_payload(
+                    resolved_answers,
+                    disp,
+                    &pending.questions,
+                ),
+                None => json!({ "answers": resolved_answers }),
+            };
+            self.emit(
+                "user-input.resolved",
+                pending.turn_id,
+                Some(request_id.to_owned()),
+                resolved_payload,
+            )
+            .await;
+            return Ok(());
+        }
         let mut wire_answers = serde_json::Map::new();
         if !skip_all {
             for (question_id, value) in answers.as_object().cloned().unwrap_or_default() {
@@ -1851,6 +2039,18 @@ impl CodexSessionRuntime {
         let runtime = self.clone();
         let request_scope = RequestScope::new();
         let task = tokio::spawn(async move {
+            // Retire any pending requests belonging to a previous connection scope so reused wire
+            // IDs across reconnects can never settle or collide with the new connection.
+            {
+                let mut pending = runtime.inner.pending_requests.lock().await;
+                pending.retain(|_, entry| {
+                    let keep = entry.scope == request_scope;
+                    if !keep {
+                        entry.cancel_auto_resolve();
+                    }
+                    keep
+                });
+            }
             while let Some(event) = incoming.recv().await {
                 runtime
                     .handle_incoming(connection.clone(), request_scope, event)
@@ -2590,7 +2790,7 @@ impl CodexSessionRuntime {
                 params,
                 emitted_at_ms,
             } => {
-                self.handle_notification(method, params, emitted_at_ms)
+                self.handle_notification_with_scope(request_scope, method, params, emitted_at_ms)
                     .await;
             }
             IncomingEvent::NotificationBarrier { processed } => {
@@ -2664,7 +2864,19 @@ impl CodexSessionRuntime {
         }
     }
 
+    #[cfg(test)]
     async fn handle_notification(&self, method: String, params: Value, emitted_at_ms: u64) {
+        self.handle_notification_with_scope(RequestScope::new(), method, params, emitted_at_ms)
+            .await;
+    }
+
+    async fn handle_notification_with_scope(
+        &self,
+        request_scope: RequestScope,
+        method: String,
+        params: Value,
+        emitted_at_ms: u64,
+    ) {
         if method == "mcpServer/startupStatus/updated" {
             let notification_root = match params.get("threadId") {
                 None | Some(Value::Null) => None,
@@ -2744,6 +2956,50 @@ impl CodexSessionRuntime {
         }
         if request_reconciliation {
             self.request_reconciliation(false).await;
+        }
+        // Settle `serverRequest/resolved` against the connection-scoped pending table BEFORE
+        // filtering child-thread notifications so resolved child requests are never stranded.
+        if method == "serverRequest/resolved" {
+            if let Some(wire_request_id) = params.get("requestId") {
+                let resolved = {
+                    let mut pending = self.inner.pending_requests.lock().await;
+                    let matched_key = pending
+                        .iter()
+                        .find(|(_, entry)| {
+                            entry.scope == request_scope
+                                && entry.kind != PendingRequestKind::AsyncQuestion
+                                && entry.wire_id == *wire_request_id
+                        })
+                        .map(|(request_id, _)| request_id.clone());
+                    matched_key.and_then(|request_id| {
+                        pending.remove(&request_id).map(|entry| (request_id, entry))
+                    })
+                };
+                if let Some((request_id, entry)) = resolved {
+                    entry.cancel_auto_resolve();
+                    if entry.kind == PendingRequestKind::UserInput {
+                        self.emit(
+                            "user-input.expired",
+                            entry.turn_id,
+                            Some(request_id),
+                            json!({ "reason": "server_request_resolved" }),
+                        )
+                        .await;
+                    } else {
+                        self.emit(
+                            "request.resolved",
+                            entry.turn_id,
+                            Some(request_id),
+                            json!({
+                                "requestType": request_type(entry.kind),
+                                "decision": "cancel",
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
+            return;
         }
         if is_verified_child {
             return;
@@ -2843,6 +3099,55 @@ impl CodexSessionRuntime {
                 session.status = if state == "failed" { "error" } else { "ready" }.to_owned();
                 session.active_turn_id = None;
                 drop(session);
+                // Expire any unanswered blocking requests (and non-blocking async questions if the
+                // turn was interrupted or failed). A normal `completed` turn keeps `AsyncQuestion`
+                // open because Codex finishes its turn right after `request_user_input_async` and
+                // waits for the user's card answers to arrive in the next turn.
+                let expired_pending = {
+                    let mut pending = self.inner.pending_requests.lock().await;
+                    let matching_ids = pending
+                        .iter()
+                        .filter(|(_, entry)| {
+                            (entry.turn_id.is_none() || entry.turn_id == turn_id)
+                                && !(state == "completed"
+                                    && entry.kind == PendingRequestKind::AsyncQuestion)
+                        })
+                        .map(|(request_id, _)| request_id.clone())
+                        .collect::<Vec<_>>();
+                    matching_ids
+                        .into_iter()
+                        .filter_map(|request_id| {
+                            pending.remove(&request_id).map(|entry| (request_id, entry))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (request_id, entry) in expired_pending {
+                    entry.cancel_auto_resolve();
+                    let resolved_turn_id = entry.turn_id.or_else(|| turn_id.clone());
+                    if matches!(
+                        entry.kind,
+                        PendingRequestKind::UserInput | PendingRequestKind::AsyncQuestion
+                    ) {
+                        self.emit(
+                            "user-input.expired",
+                            resolved_turn_id,
+                            Some(request_id),
+                            json!({ "reason": "turn_completed" }),
+                        )
+                        .await;
+                    } else {
+                        self.emit(
+                            "request.resolved",
+                            resolved_turn_id,
+                            Some(request_id),
+                            json!({
+                                "requestType": request_type(entry.kind),
+                                "decision": "cancel",
+                            }),
+                        )
+                        .await;
+                    }
+                }
                 let mut payload = json!({ "state": state });
                 if let Some(error) = error {
                     // Codex classifies its own failures in `codexErrorInfo`.
@@ -2985,12 +3290,46 @@ impl CodexSessionRuntime {
                 {
                     self.emit_with_item_id(
                         "message.assistant.completed",
-                        Some(turn_id),
-                        Some(item_id),
+                        Some(turn_id.clone()),
+                        Some(item_id.clone()),
                         None,
                         json!({}),
                     )
                     .await;
+                    if self.inner.options.runtime_mode != CodexRuntimeMode::CodeReview
+                        && params.pointer("/item/delivery").and_then(Value::as_str) == Some("async")
+                        && let Some(raw_questions) =
+                            params.pointer("/item/questions").and_then(Value::as_array)
+                    {
+                        let questions = normalize_async_agent_message_questions(raw_questions);
+                        if !questions.is_empty() {
+                            let request_id =
+                                request_scope.user_input_id(&format!("async:{item_id}"));
+                            let instance_id = self.next_pending_instance_id();
+                            self.inner.pending_requests.lock().await.insert(
+                                request_id.clone(),
+                                PendingRequest {
+                                    instance_id,
+                                    kind: PendingRequestKind::AsyncQuestion,
+                                    scope: request_scope,
+                                    wire_id: Value::Null,
+                                    turn_id: Some(turn_id.clone()),
+                                    questions: questions.clone(),
+                                    auto_resolve_cancel: None,
+                                },
+                            );
+                            self.emit(
+                                "user-input.requested",
+                                Some(turn_id),
+                                Some(request_id),
+                                json!({
+                                    "questions": questions,
+                                    "isBlocking": false,
+                                }),
+                            )
+                            .await;
+                        }
+                    }
                 } else if let Some((turn_id, item_id)) = context_compaction_item(&params) {
                     self.emit_with_item_id(
                         "item.completed",
@@ -3089,13 +3428,17 @@ impl CodexSessionRuntime {
                     .get("turnId")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let instance_id = self.next_pending_instance_id();
                 self.inner.pending_requests.lock().await.insert(
                     request_id.clone(),
                     PendingRequest {
+                        instance_id,
                         kind: PendingRequestKind::CommandApproval,
+                        scope: request_scope,
                         wire_id,
                         turn_id: turn_id.clone(),
                         questions: Vec::new(),
+                        auto_resolve_cancel: None,
                     },
                 );
                 let detail = params
@@ -3121,13 +3464,17 @@ impl CodexSessionRuntime {
                     .get("turnId")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let instance_id = self.next_pending_instance_id();
                 self.inner.pending_requests.lock().await.insert(
                     request_id.clone(),
                     PendingRequest {
+                        instance_id,
                         kind: PendingRequestKind::FileChangeApproval,
+                        scope: request_scope,
                         wire_id,
                         turn_id: turn_id.clone(),
                         questions: Vec::new(),
+                        auto_resolve_cancel: None,
                     },
                 );
                 let detail = params
@@ -3187,24 +3534,98 @@ impl CodexSessionRuntime {
                     .await;
                     return Ok(());
                 }
+                let is_blocking_flag = params
+                    .get("isBlocking")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let auto_resolution_ms = params
+                    .get("autoResolutionMs")
+                    .and_then(Value::as_u64)
+                    .filter(|ms| *ms > 0);
+                // Only treat an RPC `requestUserInput` as non-blocking when it carries a bounded
+                // `autoResolutionMs` timeout: without one, Codex's tool handler stays suspended
+                // awaiting a client JSON-RPC reply on `wire_id`, so the card must stay blocking.
+                let effective_non_blocking = !is_blocking_flag && auto_resolution_ms.is_some();
+                let instance_id = self.next_pending_instance_id();
+                let auto_resolve_cancel = effective_non_blocking.then(CancellationToken::new);
                 self.inner.pending_requests.lock().await.insert(
                     request_id.clone(),
                     PendingRequest {
+                        instance_id,
                         kind: PendingRequestKind::UserInput,
+                        scope: request_scope,
                         wire_id,
                         turn_id: turn_id.clone(),
                         questions: question_list,
+                        auto_resolve_cancel: auto_resolve_cancel.clone(),
                     },
                 );
+                let mut payload = json!({
+                    "questions": questions,
+                });
+                if effective_non_blocking {
+                    payload["isBlocking"] = json!(false);
+                }
                 self.emit(
                     "user-input.requested",
                     turn_id,
-                    Some(request_id),
-                    json!({
-                        "questions": questions,
-                    }),
+                    Some(request_id.clone()),
+                    payload,
                 )
                 .await;
+                if let (Some(ms), Some(cancel)) = (
+                    auto_resolution_ms.filter(|_| effective_non_blocking),
+                    auto_resolve_cancel,
+                ) {
+                    let runtime = self.clone();
+                    let connection = connection.clone();
+                    let req_id = request_id;
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => return,
+                            () = tokio::time::sleep(Duration::from_millis(ms)) => {}
+                        }
+                        let expired = {
+                            let mut pending = runtime.inner.pending_requests.lock().await;
+                            let matches_instance = pending
+                                .get(&req_id)
+                                .is_some_and(|entry| entry.instance_id == instance_id);
+                            if matches_instance {
+                                pending.remove(&req_id)
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(entry) = expired {
+                            let mut empty_answers = serde_json::Map::new();
+                            for question in &entry.questions {
+                                if let Some(question_id) = question
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                {
+                                    empty_answers
+                                        .insert(question_id.to_owned(), json!({ "answers": [] }));
+                                }
+                            }
+                            let _ = connection
+                                .respond(
+                                    entry.wire_id,
+                                    json!({ "answers": Value::Object(empty_answers) }),
+                                )
+                                .await;
+                            runtime
+                                .emit(
+                                    "user-input.expired",
+                                    entry.turn_id,
+                                    Some(req_id),
+                                    json!({ "reason": "auto_resolved" }),
+                                )
+                                .await;
+                        }
+                    });
+                }
                 Ok(())
             }
             _ => {
@@ -4228,7 +4649,79 @@ fn request_type(kind: PendingRequestKind) -> &'static str {
     match kind {
         PendingRequestKind::CommandApproval => "command_execution_approval",
         PendingRequestKind::FileChangeApproval => "file_change_approval",
-        PendingRequestKind::UserInput => "tool_user_input",
+        PendingRequestKind::UserInput | PendingRequestKind::AsyncQuestion => "tool_user_input",
+    }
+}
+
+fn normalize_async_agent_message_questions(raw_questions: &[Value]) -> Vec<Value> {
+    raw_questions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let title = entry
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let options: Vec<Value> = entry
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|opt| !opt.is_empty())
+                .map(|opt| json!({ "label": opt, "description": opt }))
+                .collect();
+            Some(json!({
+                "id": format!("async-q-{}", index + 1),
+                "header": format!("Question {}", index + 1),
+                "question": title,
+                "options": options,
+                "multiSelect": false,
+            }))
+        })
+        .collect()
+}
+
+fn format_async_question_steer_prompt(questions: &[Value], answers: &Value) -> String {
+    let Some(answer_map) = answers.as_object() else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for question in questions {
+        let Some(id) = question.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(raw) = answer_map.get(id) else {
+            continue;
+        };
+        let answer_text = match raw {
+            Value::String(s) if !s.trim().is_empty() => s.trim().to_owned(),
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => String::new(),
+        };
+        if answer_text.is_empty() {
+            continue;
+        }
+        let prompt = question
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(id);
+        lines.push(format!("- {prompt}: {answer_text}"));
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("Clarifying question answers:\n{}", lines.join("\n"))
     }
 }
 
@@ -9259,5 +9752,522 @@ mod tests {
             .expect("resolved2");
         assert_eq!(resolved2.payload["disposition"], json!("skipped"));
         assert_eq!(resolved2.payload["answers"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn non_blocking_user_input_propagates_flag_and_expires_on_server_resolved_or_turn_complete()
+     {
+        let (connection, incoming, mut server_write, server_read, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        let mut reader = BufReader::new(server_read);
+
+        // Register root thread id so thread-scoped notifications pass the root filter.
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "thread/started",
+                "params": { "thread": { "id": "codex-root-1" } }
+            }),
+        )
+        .await;
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "turn/started",
+                "params": { "threadId": "codex-root-1", "turn": { "id": "turn-async-1" } }
+            }),
+        )
+        .await;
+        let started = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("turn started timeout")
+            .expect("turn started");
+        assert_eq!(started.event_type, "turn.started");
+
+        // 1. Non-blocking RPC request WITHOUT `autoResolutionMs` stays blocking (Codex's tool
+        // handler still awaits a client JSON-RPC reply on `wire_id`).
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 801,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "threadId": "codex-root-1",
+                    "turnId": "turn-async-1",
+                    "itemId": "item-1",
+                    "isBlocking": false,
+                    "autoResolutionMs": null,
+                    "questions": [
+                        { "id": "q1", "header": "Style", "question": "Prefer tabs or spaces?", "options": [{ "label": "Spaces", "description": "2 spaces" }] }
+                    ]
+                }
+            }),
+        )
+        .await;
+        let requested = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("requested timeout")
+            .expect("requested");
+        assert_eq!(requested.event_type, "user-input.requested");
+        assert_eq!(requested.payload.get("isBlocking"), None);
+        let req_id_1 = requested.request_id.expect("request id 1");
+
+        runtime
+            .respond_to_user_input_with_disposition(
+                &req_id_1,
+                json!({ "q1": "Spaces" }),
+                crate::provider::UserInputResponseDisposition::Answered,
+            )
+            .await
+            .expect("answer succeeds");
+        // Drain any background reconciliation request (e.g. `thread/read`) before reading the reply.
+        let wire = loop {
+            let frame = read_runtime_test_json(&mut reader).await;
+            if frame.get("method").is_none() {
+                break frame;
+            }
+        };
+        assert_eq!(wire["id"], json!(801));
+        assert_eq!(
+            wire["result"]["answers"],
+            json!({ "q1": { "answers": ["Spaces"] } })
+        );
+        let resolved = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("resolved timeout")
+            .expect("resolved");
+        assert_eq!(resolved.event_type, "user-input.resolved");
+        assert_eq!(resolved.payload["disposition"], json!("answered"));
+
+        // 2. Non-blocking RPC request WITH `autoResolutionMs` emits `isBlocking: false` and
+        // expires on `serverRequest/resolved` when Codex settles it first.
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req-802",
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "threadId": "codex-root-1",
+                    "turnId": "turn-async-1",
+                    "itemId": "item-2",
+                    "isBlocking": false,
+                    "autoResolutionMs": 5000,
+                    "questions": [
+                        { "id": "q2", "header": "Hint", "question": "Any extra hint?", "options": [] }
+                    ]
+                }
+            }),
+        )
+        .await;
+        let requested_2 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("requested 2 timeout")
+            .expect("requested 2");
+        assert_eq!(requested_2.event_type, "user-input.requested");
+        assert_eq!(requested_2.payload["isBlocking"], json!(false));
+        let req_id_2 = requested_2.request_id.expect("request id 2");
+
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "serverRequest/resolved",
+                "params": {
+                    "threadId": "codex-root-1",
+                    "requestId": "req-802"
+                }
+            }),
+        )
+        .await;
+        let expired_2 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("expired 2 timeout")
+            .expect("expired 2");
+        assert_eq!(expired_2.event_type, "user-input.expired");
+        assert_eq!(expired_2.request_id.as_deref(), Some(req_id_2.as_str()));
+        assert_eq!(
+            expired_2.payload["reason"],
+            json!("server_request_resolved")
+        );
+
+        // Answering after serverRequest/resolved fails cleanly as not found.
+        let err = runtime
+            .respond_to_user_input_with_disposition(
+                &req_id_2,
+                json!({ "q2": "Too late" }),
+                crate::provider::UserInputResponseDisposition::Answered,
+            )
+            .await
+            .expect_err("stale request must fail");
+        assert!(matches!(err, RuntimeError::PendingRequestNotFound { .. }));
+
+        // 3. Bounded `autoResolutionMs` auto-releases Codex on the wire if left unanswered.
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 804,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "threadId": "codex-root-1",
+                    "turnId": "turn-async-1",
+                    "itemId": "item-auto",
+                    "isBlocking": false,
+                    "autoResolutionMs": 30,
+                    "questions": [
+                        { "id": "q4", "header": "Auto", "question": "Optional preference?", "options": [] }
+                    ]
+                }
+            }),
+        )
+        .await;
+        let requested_4 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("requested 4 timeout")
+            .expect("requested 4");
+        assert_eq!(requested_4.payload["isBlocking"], json!(false));
+        let req_id_4 = requested_4.request_id.expect("request id 4");
+        let auto_wire = loop {
+            let frame = read_runtime_test_json(&mut reader).await;
+            if frame.get("method").is_none() {
+                break frame;
+            }
+        };
+        assert_eq!(auto_wire["id"], json!(804));
+        assert_eq!(
+            auto_wire["result"]["answers"],
+            json!({ "q4": { "answers": [] } })
+        );
+        let expired_4 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("expired 4 timeout")
+            .expect("expired 4");
+        assert_eq!(expired_4.event_type, "user-input.expired");
+        assert_eq!(expired_4.request_id.as_deref(), Some(req_id_4.as_str()));
+        assert_eq!(expired_4.payload["reason"], json!("auto_resolved"));
+
+        // 4. Genuine async `agentMessage` (`delivery: "async"`, `questions`) opens a non-blocking
+        // card whose answer steers the active turn via `turn/steer`.
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": "codex-root-1",
+                    "turnId": "turn-async-1",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-async-1",
+                        "text": "Quick question while I work",
+                        "delivery": "async",
+                        "questions": [
+                            { "title": "Target branch?", "options": ["main", "develop"] }
+                        ]
+                    }
+                }
+            }),
+        )
+        .await;
+        let completed_msg = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("assistant completed timeout")
+            .expect("assistant completed");
+        assert_eq!(completed_msg.event_type, "message.assistant.completed");
+        let async_requested = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("async requested timeout")
+            .expect("async requested");
+        assert_eq!(async_requested.event_type, "user-input.requested");
+        assert_eq!(async_requested.payload["isBlocking"], json!(false));
+        assert_eq!(
+            async_requested.payload["questions"][0]["options"][0]["description"],
+            json!("main")
+        );
+        let async_req_id = async_requested.request_id.expect("async req id");
+
+        let runtime_for_answer = runtime.clone();
+        let async_req_id_clone = async_req_id.clone();
+        let answer_task = tokio::spawn(async move {
+            runtime_for_answer
+                .respond_to_user_input_with_disposition(
+                    &async_req_id_clone,
+                    json!({ "async-q-1": "main" }),
+                    crate::provider::UserInputResponseDisposition::Answered,
+                )
+                .await
+        });
+        let steer_frame = loop {
+            let frame = read_runtime_test_json(&mut reader).await;
+            if frame.get("method").and_then(Value::as_str) == Some("turn/steer") {
+                break frame;
+            }
+        };
+        assert_eq!(
+            steer_frame["params"]["expectedTurnId"],
+            json!("turn-async-1")
+        );
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": steer_frame["id"],
+                "result": { "turnId": "turn-async-1" }
+            }),
+        )
+        .await;
+        answer_task
+            .await
+            .expect("join")
+            .expect("answering async agentMessage steers active turn");
+        let async_resolved = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("async resolved timeout")
+            .expect("async resolved");
+        assert_eq!(async_resolved.event_type, "user-input.resolved");
+        assert_eq!(
+            async_resolved.request_id.as_deref(),
+            Some(async_req_id.as_str())
+        );
+
+        // 5. Unanswered non-blocking async question stays open across a normal `turn/completed`
+        // (Codex finishes its turn right after `request_user_input_async`), and answering it after
+        // completion starts a follow-up `turn/start` with the user's responses.
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": "codex-root-1",
+                    "turnId": "turn-async-1",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-async-2",
+                        "text": "One more optional question",
+                        "delivery": "async",
+                        "questions": [
+                            { "title": "Want docs too?", "options": ["Yes", "No"] }
+                        ]
+                    }
+                }
+            }),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("assistant completed 2");
+        let requested_3 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("requested 3 timeout")
+            .expect("requested 3");
+        let req_id_3 = requested_3.request_id.expect("request id 3");
+
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "codex-root-1",
+                    "turn": { "id": "turn-async-1", "status": "completed" }
+                }
+            }),
+        )
+        .await;
+        let completed = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("turn completed timeout")
+            .expect("turn completed");
+        assert_eq!(completed.event_type, "turn.completed");
+        assert_eq!(completed.payload["state"], json!("completed"));
+
+        // Answering the still-open async question after `turn/completed` sends `turn/start`.
+        let post_turn_answer_handle = tokio::spawn({
+            let runtime = runtime.clone();
+            let req_id_3 = req_id_3.clone();
+            async move {
+                runtime
+                    .respond_to_user_input_with_disposition(
+                        &req_id_3,
+                        json!({ "async-q-1": "Yes" }),
+                        crate::provider::UserInputResponseDisposition::Answered,
+                    )
+                    .await
+            }
+        });
+        let follow_up_start = tokio::time::timeout(Duration::from_secs(2), async {
+            read_runtime_test_json(&mut reader).await
+        })
+        .await
+        .expect("follow-up turn/start timeout");
+        assert_eq!(follow_up_start["method"], json!("turn/start"));
+        assert!(
+            follow_up_start["params"]["input"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Want docs too?") && text.contains("Yes"))
+        );
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": follow_up_start["id"],
+                "result": { "turn": { "id": "turn-async-2", "status": "inProgress" } }
+            }),
+        )
+        .await;
+        post_turn_answer_handle
+            .await
+            .expect("post-turn answer join")
+            .expect("answering async question after turn completion starts follow-up turn");
+        let resolved_3 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("resolved 3 timeout")
+            .expect("resolved 3");
+        assert_eq!(resolved_3.event_type, "user-input.resolved");
+        assert_eq!(resolved_3.request_id.as_deref(), Some(req_id_3.as_str()));
+
+        // 6. An unanswered async question expires when superseded by a new user turn (`send_turn`).
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": "codex-root-1",
+                    "turnId": "turn-async-2",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-async-3",
+                        "text": "Superseded question",
+                        "delivery": "async",
+                        "questions": [
+                            { "title": "Skip me?", "options": null }
+                        ]
+                    }
+                }
+            }),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("assistant completed 3");
+        let requested_4 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("requested 4 timeout")
+            .expect("requested 4");
+        let req_id_4 = requested_4.request_id.expect("request id 4");
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "codex-root-1",
+                    "turn": { "id": "turn-async-2", "status": "completed" }
+                }
+            }),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("turn completed 2");
+
+        let new_turn_handle = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .send_turn(Some("Fresh prompt".to_owned()), Vec::new(), None, None)
+                    .await
+            }
+        });
+        let fresh_start = tokio::time::timeout(Duration::from_secs(2), async {
+            read_runtime_test_json(&mut reader).await
+        })
+        .await
+        .expect("fresh turn/start timeout");
+        assert_eq!(fresh_start["method"], json!("turn/start"));
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": fresh_start["id"],
+                "result": { "turn": { "id": "turn-async-3", "status": "inProgress" } }
+            }),
+        )
+        .await;
+        new_turn_handle
+            .await
+            .expect("new turn join")
+            .expect("fresh turn ok");
+        let expired_4 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("expired 4 timeout")
+            .expect("expired 4");
+        assert_eq!(expired_4.event_type, "user-input.expired");
+        assert_eq!(expired_4.request_id.as_deref(), Some(req_id_4.as_str()));
+        assert_eq!(expired_4.payload["reason"], json!("superseded"));
+    }
+
+    #[tokio::test]
+    async fn server_request_resolved_is_scoped_to_current_connection_across_reconnect() {
+        let (connection_a, _protocol_a, _stdout_a, _stdin_a, _stderr_a) = runtime_test_connection();
+        let (sender_a, incoming_a) = mpsc::unbounded_channel();
+        let runtime =
+            CodexSessionRuntime::new(reconciliation_test_options(), connection_a, incoming_a);
+
+        // Open wire ID 1 on connection A.
+        sender_a
+            .send(IncomingEvent::Request {
+                correlation_id: "1".to_owned(),
+                wire_id: json!(1),
+                method: "item/tool/requestUserInput".to_owned(),
+                params: json!({
+                    "turnId": "turn-a",
+                    "questions": [{ "id": "q1", "header": "A", "question": "Old?", "options": [] }]
+                }),
+            })
+            .expect("send req A");
+        let first = runtime.next_event().await.expect("first ask");
+        assert_eq!(first.event_type, "user-input.requested");
+
+        // Reconnect with connection B and open wire ID 1 again.
+        let (connection_b, _protocol_b, _stdout_b, _stdin_b, _stderr_b) = runtime_test_connection();
+        let (sender_b, incoming_b) = mpsc::unbounded_channel();
+        if let Some(previous) = runtime.attach_incoming(connection_b, incoming_b) {
+            let _ = previous.await;
+        }
+        sender_b
+            .send(IncomingEvent::Request {
+                correlation_id: "1".to_owned(),
+                wire_id: json!(1),
+                method: "item/tool/requestUserInput".to_owned(),
+                params: json!({
+                    "turnId": "turn-b",
+                    "questions": [{ "id": "q1", "header": "B", "question": "New?", "options": [] }]
+                }),
+            })
+            .expect("send req B");
+        let second = runtime.next_event().await.expect("second ask");
+        assert_eq!(second.event_type, "user-input.requested");
+        let second_id = second.request_id.expect("second request id");
+        assert_ne!(first.request_id.as_deref(), Some(second_id.as_str()));
+
+        // `serverRequest/resolved` for wire ID 1 on connection B settles ONLY connection B's entry.
+        sender_b
+            .send(IncomingEvent::Notification {
+                method: "serverRequest/resolved".to_owned(),
+                params: json!({ "requestId": 1 }),
+                emitted_at_ms: 1,
+            })
+            .expect("send resolved B");
+        let expired = runtime.next_event().await.expect("expired B");
+        assert_eq!(expired.event_type, "user-input.expired");
+        assert_eq!(expired.request_id.as_deref(), Some(second_id.as_str()));
     }
 }

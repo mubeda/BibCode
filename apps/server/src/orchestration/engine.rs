@@ -3612,7 +3612,10 @@ impl OrchestrationEngine {
             .repositories()
             .database()
             .call(move |connection| {
-                // Only threads with something open are visited: the counts say which.
+                // Visit threads with blocking counts or any historical user-input ask (served by
+                // partial index `idx_projection_thread_activities_user_input_requested`, with
+                // per-thread open checks served by `idx_projection_thread_activities_user_input_thread`)
+                // so crash recovery expires unsettled non-blocking asks without scanning unrelated history.
                 let threads = connection
                     .prepare(
                         "SELECT thread.thread_id, COALESCE(session.provider_name, ''),
@@ -3621,8 +3624,14 @@ impl OrchestrationEngine {
                            LEFT JOIN projection_thread_sessions AS session
                              ON session.thread_id = thread.thread_id
                           WHERE thread.deleted_at IS NULL
-                            AND (thread.pending_approval_count > 0 OR thread.pending_user_input_count > 0)
-                            AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')",
+                            AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')
+                            AND (thread.pending_approval_count > 0
+                                 OR thread.pending_user_input_count > 0
+                                 OR thread.thread_id IN (
+                                     SELECT DISTINCT thread_id
+                                       FROM projection_thread_activities
+                                      WHERE kind = 'user-input.requested'
+                                 ))",
                     )?
                     .query_map([], |row| {
                         Ok((
@@ -3634,13 +3643,19 @@ impl OrchestrationEngine {
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
                     .filter(|(thread_id, provider, instance)| {
-                        !ownership.work_may_outlive_bibcode(thread_id, provider, instance.as_deref())
+                        !ownership.work_may_outlive_bibcode(
+                            thread_id,
+                            provider,
+                            instance.as_deref(),
+                        )
                     })
                     .map(|(thread_id, _, _)| thread_id)
                     .collect::<Vec<_>>();
                 let mut requests = Vec::new();
                 for thread_id in threads {
-                    for (kind, request_id, turn_id) in open_requests_of_thread(connection, &thread_id)? {
+                    for (kind, request_id, turn_id) in
+                        open_requests_of_thread(connection, &thread_id)?
+                    {
                         requests.push((thread_id.clone(), kind, request_id, turn_id));
                     }
                 }
@@ -5727,19 +5742,10 @@ async fn plan_command(
             }
             if row.provider_kind == "antigravity" {
                 let ask_thread_id = thread_id.clone();
-                let (open_ask, awaiting_first_update) = repositories
+                let open_ask = repositories
                     .database()
                     .call(move |connection| {
-                        let open_ask = crate::agent_messaging::store::has_open_ask(
-                            connection,
-                            &ask_thread_id,
-                        )?;
-                        let awaiting_first_update: bool = connection.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND mode = 'start' AND state IN ('pending', 'sending'))",
-                            params![ask_thread_id],
-                            |row| row.get(0),
-                        )?;
-                        Ok((open_ask, awaiting_first_update))
+                        crate::agent_messaging::store::has_open_ask(connection, &ask_thread_id)
                     })
                     .await
                     .map_err(wrap_persistence)?;
@@ -5747,12 +5753,6 @@ async fn plan_command(
                     return invariant(
                         command,
                         "Respond to the pending approval or question before steering.".to_owned(),
-                    );
-                }
-                if awaiting_first_update {
-                    return invariant(
-                        command,
-                        "Wait for the running turn to start responding before steering.".to_owned(),
                     );
                 }
             }
@@ -6746,17 +6746,10 @@ async fn persist_command(
                 }) else {
                     return Ok(Err(STALE_QUEUED_DELIVERY));
                 };
-                if head.provider_kind == "antigravity" {
-                    let awaiting_first_update: bool = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM provider_turn_outbox WHERE thread_id = ?1 AND mode = 'start' AND state IN ('pending', 'sending'))",
-                        params![thread_id],
-                        |row| row.get(0),
-                    )?;
-                    if awaiting_first_update
-                        || crate::agent_messaging::store::has_open_ask(&transaction, &thread_id)?
-                    {
-                        return Ok(Err(STALE_QUEUED_DELIVERY));
-                    }
+                if head.provider_kind == "antigravity"
+                    && crate::agent_messaging::store::has_open_ask(&transaction, &thread_id)?
+                {
+                    return Ok(Err(STALE_QUEUED_DELIVERY));
                 }
                 let updated = transaction.execute(
                     "UPDATE provider_turn_outbox SET state = 'pending', mode = 'steer', held = 0, last_error = NULL, updated_at = ?
@@ -6796,6 +6789,24 @@ async fn persist_command(
                 }
                 if projection_mode == ProjectionMode::UpdateExistingReasoning
                     && !streaming_reasoning_exists_tx(&transaction, &planned.payload)?
+                {
+                    continue;
+                }
+                if planned.event_type == "thread.activity-appended"
+                    && planned
+                        .payload
+                        .pointer("/activity/kind")
+                        .and_then(Value::as_str)
+                        == Some("user-input.expired")
+                    && let Some(request_id) = planned
+                        .payload
+                        .pointer("/activity/payload/requestId")
+                        .and_then(Value::as_str)
+                    && !crate::persistence::user_input_request_is_open_on(
+                        &transaction,
+                        &planned.aggregate_id,
+                        request_id,
+                    )?
                 {
                     continue;
                 }
@@ -7470,15 +7481,107 @@ async fn persist_turn_delivery_transition(
                     &saved.event.occurred_at,
                 )?;
             }
-            rebuild_thread_derived_fields_tx(&transaction, &saved.event.aggregate_id)?;
+            let mut announced = vec![saved];
+            // If an active `start` delivery failed before completing while a `pending/steer` row
+            // was waiting behind it (e.g. an early Antigravity steer), return the waiting steer
+            // to `queued/start` so it is never stranded behind the failed start with Cancel disabled.
+            if mode == "start" && transition.next_state == TurnDeliveryState::Failed {
+                let waiting_steers = transaction
+                    .prepare(
+                        "SELECT command_id, message_id, provider_kind, provider_instance_id, held, last_error
+                           FROM provider_turn_outbox
+                          WHERE thread_id = ? AND mode = 'steer' AND state = 'pending'
+                          ORDER BY created_at, command_id",
+                    )?
+                    .query_map([&thread_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, bool>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (
+                    steer_cmd_id,
+                    steer_msg_id,
+                    steer_provider,
+                    steer_instance_id,
+                    _steer_held,
+                    steer_detail,
+                ) in waiting_steers
+                {
+                    let requeued = transaction.execute(
+                        "UPDATE provider_turn_outbox
+                            SET state = 'queued', mode = 'start', held = 1, attempts = 0, updated_at = ?
+                          WHERE command_id = ? AND mode = 'steer' AND state = 'pending'",
+                        params![transition.updated_at, steer_cmd_id],
+                    )?;
+                    if requeued == 1 {
+                        let steer_planned = make_event(
+                            "thread.turn-delivery-updated",
+                            "thread",
+                            &thread_id,
+                            &transition.updated_at,
+                            &format!(
+                                "server:turn-delivery:{steer_cmd_id}:requeue:{}:{}",
+                                transition.command_id, transition.expected_attempt
+                            ),
+                            json!({}),
+                            json!({
+                                "threadId": thread_id,
+                                "messageId": steer_msg_id,
+                                "state": "queued",
+                                "provider": steer_provider,
+                                "mode": "start",
+                                "held": true,
+                                "detail": steer_detail,
+                                "delivery": delivery_value(
+                                    "queued",
+                                    &steer_provider,
+                                    &steer_instance_id,
+                                    "start",
+                                    true,
+                                    steer_detail.as_deref(),
+                                ),
+                                "updatedAt": transition.updated_at,
+                            }),
+                        );
+                        let steer_saved = append_event_tx(&transaction, steer_planned)?;
+                        for projector in PROJECTOR_NAMES {
+                            hooks
+                                .maybe_fail(projector, &steer_saved.event.event_type)
+                                .map_err(projector_failure_to_persistence)?;
+                            apply_projector_tx(
+                                &transaction,
+                                projector,
+                                &steer_saved,
+                                &mut ProjectionContext::default(),
+                            )?;
+                            upsert_projection_state_tx(
+                                &transaction,
+                                projector,
+                                steer_saved.sequence,
+                                &steer_saved.event.occurred_at,
+                            )?;
+                        }
+                        announced.push(steer_saved);
+                    }
+                }
+            }
+            rebuild_thread_derived_fields_tx(&transaction, &thread_id)?;
             transaction.commit()?;
-            Ok(DeliveryTransitionCommit::Announced(Box::new(saved)))
+            Ok(DeliveryTransitionCommit::Announced(announced))
         })
         .await
         .map_err(wrap_persistence)?;
     match committed {
-        DeliveryTransitionCommit::Announced(event) => {
-            let _ = events.send(*event);
+        DeliveryTransitionCommit::Announced(committed_events) => {
+            for event in committed_events {
+                let _ = events.send(event);
+            }
             Ok(true)
         }
         DeliveryTransitionCommit::Unannounced => Ok(true),
@@ -7491,7 +7594,7 @@ async fn persist_turn_delivery_transition(
 enum DeliveryTransitionCommit {
     Stale,
     Unannounced,
-    Announced(Box<OrchestrationEvent>),
+    Announced(Vec<OrchestrationEvent>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8253,7 +8356,7 @@ fn record_agent_status_evidence_tx(
     if event.event.event_type == "thread.reverted"
         || activity_kind.is_some_and(|kind| USER_INPUT_REQUEST_KINDS.contains(&kind))
     {
-        let open = crate::persistence::open_user_input_requests_sql("?1");
+        let open = crate::persistence::open_blocking_user_input_requests_sql("?1");
         transaction.execute(
             &format!(
                 "UPDATE projection_threads SET pending_user_input_count = (SELECT COUNT(*) FROM ({open})) WHERE thread_id = ?1"

@@ -24,6 +24,8 @@ export interface PendingUserInputPanelProps {
   respondingRequestIds: ApprovalRequestId[];
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;
+  isTurnRunning?: boolean | undefined;
+  requireExplicitSubmit?: boolean | undefined;
   collapsed?: boolean | undefined;
   canCancel?: boolean | undefined;
   canSkipAll?: boolean | undefined;
@@ -44,6 +46,8 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
   respondingRequestIds,
   answers,
   questionIndex,
+  isTurnRunning = true,
+  requireExplicitSubmit = false,
   collapsed = false,
   canCancel = false,
   canSkipAll = true,
@@ -67,6 +71,8 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
       key={activePrompt.requestId}
       prompt={activePrompt}
       isResponding={respondingRequestIds.includes(activePrompt.requestId)}
+      isTurnRunning={isTurnRunning}
+      requireExplicitSubmit={requireExplicitSubmit}
       answers={answers}
       questionIndex={questionIndex}
       collapsed={collapsed}
@@ -89,6 +95,8 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
 const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard({
   prompt,
   isResponding,
+  isTurnRunning,
+  requireExplicitSubmit,
   answers,
   questionIndex,
   collapsed,
@@ -107,6 +115,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
 }: {
   prompt: PendingUserInput;
   isResponding: boolean;
+  isTurnRunning: boolean;
+  requireExplicitSubmit: boolean;
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;
   collapsed: boolean;
@@ -129,6 +139,10 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   const autoAdvanceTimerRef = useRef<number | null>(null);
   const onAdvanceRef = useRef(onAdvance);
   const onToggleOptionRef = useRef(onToggleOption);
+  const suppressAutoSubmitRef = useRef(requireExplicitSubmit && progress.isLastQuestion);
+  const selectedSingleOptionRef = useRef(
+    !activeQuestion?.multiSelect ? (progress.selectedOptionLabels[0] ?? null) : null,
+  );
   const [optimisticSingleSelect, setOptimisticSingleSelect] = useState<{
     questionId: string;
     optionLabel: string;
@@ -137,7 +151,29 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   useEffect(() => {
     onAdvanceRef.current = onAdvance;
     onToggleOptionRef.current = onToggleOption;
-  }, [onAdvance, onToggleOption]);
+    suppressAutoSubmitRef.current = requireExplicitSubmit && progress.isLastQuestion;
+    selectedSingleOptionRef.current = !activeQuestion?.multiSelect
+      ? (progress.selectedOptionLabels[0] ?? null)
+      : null;
+  }, [
+    activeQuestion?.multiSelect,
+    onAdvance,
+    onToggleOption,
+    progress.isLastQuestion,
+    progress.selectedOptionLabels,
+    requireExplicitSubmit,
+  ]);
+
+  const lastQuestionIndexRef = useRef(progress.questionIndex);
+  useEffect(() => {
+    if (lastQuestionIndexRef.current !== progress.questionIndex) {
+      lastQuestionIndexRef.current = progress.questionIndex;
+      if (autoAdvanceTimerRef.current !== null) {
+        window.clearTimeout(autoAdvanceTimerRef.current);
+        autoAdvanceTimerRef.current = null;
+      }
+    }
+  }, [progress.questionIndex]);
 
   // Drop the optimistic pick once the question moves on or the draft answer confirms it.
   if (
@@ -174,9 +210,14 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
         onToggleOptionRef.current(question.id, optionLabel);
         return;
       }
-      setOptimisticSingleSelect({ questionId: question.id, optionLabel });
+      const isDeselecting =
+        suppressAutoSubmitRef.current && selectedSingleOptionRef.current === optionLabel;
+      setOptimisticSingleSelect(isDeselecting ? null : { questionId: question.id, optionLabel });
       onToggleOptionRef.current(question.id, optionLabel);
       clearAutoAdvance();
+      if (suppressAutoSubmitRef.current) {
+        return;
+      }
       autoAdvanceTimerRef.current = window.setTimeout(() => {
         autoAdvanceTimerRef.current = null;
         onAdvanceRef.current();
@@ -254,10 +295,19 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     return null;
   }
 
+  const isNonBlocking = prompt.isBlocking === false;
   const countHeading =
-    totalQuestions === 1
-      ? "Awaiting user input: 1 question"
-      : `Awaiting user input: ${totalQuestions} questions`;
+    isNonBlocking && isTurnRunning
+      ? totalQuestions === 1
+        ? "Question while working: 1 question"
+        : `Question while working: ${totalQuestions} questions`
+      : isNonBlocking
+        ? totalQuestions === 1
+          ? "Follow-up question: 1 question"
+          : `Follow-up questions: ${totalQuestions} questions`
+        : totalQuestions === 1
+          ? "Awaiting user input: 1 question"
+          : `Awaiting user input: ${totalQuestions} questions`;
   const customAnswerActive = progress.customAnswer.trim().length > 0;
   const submitBlockedReason = progress.isLastQuestion ? environmentUnavailableReason : null;
   const canSubmitOrNext =
@@ -369,6 +419,14 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
           <span className="truncate text-xs font-semibold text-amber-900 dark:text-amber-200">
             {countHeading}
           </span>
+          {isNonBlocking ? (
+            <span
+              data-pending-user-input-non-blocking="true"
+              className="hidden shrink-0 rounded border border-border/70 bg-background/70 px-1.5 py-0.5 text-xs font-medium text-muted-foreground sm:inline"
+            >
+              {isTurnRunning ? "Agent is still working" : "Optional"}
+            </span>
+          ) : null}
           {activeQuestion.header &&
           activeQuestion.header.trim().length > 0 &&
           activeQuestion.header !== activeQuestion.question ? (
@@ -450,7 +508,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
               optimisticSingleSelect.optionLabel === option.label;
             const isSelected =
               isOptimisticallySelected ||
-              (!customAnswerActive && progress.selectedOptionLabels.includes(option.label));
+              ((activeQuestion.multiSelect || !customAnswerActive) &&
+                progress.selectedOptionLabels.includes(option.label));
             const recommended = isRecommendedUserInputOption(option);
             const displayLabel = recommended ? formatUserInputOptionLabel(option) : option.label;
             const shortcutKey = index < 9 ? index + 1 : null;

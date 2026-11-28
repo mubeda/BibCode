@@ -240,18 +240,19 @@ describe("RightPanelTabs mounted interactions", () => {
     expect(document.querySelector('[aria-label="Add panel surface"]')).toBeNull();
     expect(document.body.textContent).toContain("Select a surface from the bar above.");
 
-    const icons = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("[data-right-panel-icon-bar] button"),
-    ).map((button) => button.getAttribute("aria-label"));
+    const latestBar = Array.from(document.querySelectorAll("[data-right-panel-icon-bar]")).at(-1);
+    const icons = Array.from(latestBar?.querySelectorAll<HTMLButtonElement>("button") ?? []).map(
+      (button) => button.getAttribute("aria-label"),
+    );
     expect(icons).toEqual([
-      "Browser",
-      "Terminal",
       "Files",
-      "Diff",
       "Source Control",
+      "Diff",
+      "Pull Request",
       "Git Manager",
       "Pipelines",
-      "Pull Request",
+      "Browser",
+      "Terminal",
     ]);
 
     await click(iconButton("Terminal"));
@@ -289,7 +290,7 @@ describe("RightPanelTabs mounted interactions", () => {
     expect(document.querySelector('[aria-label="Close Diff"]')).toBeNull();
   });
 
-  it("omits Device when off and shows Device as the 9th icon when enabled", async () => {
+  it("omits Device when off and places Device between Pipelines and Browser when enabled", async () => {
     await mount(<RightPanelTabs {...tabsProps({ surfaces: [], activeSurfaceId: null })} />);
     expect(document.querySelector('[aria-label="Device"]')).toBeNull();
 
@@ -303,6 +304,21 @@ describe("RightPanelTabs mounted interactions", () => {
         })}
       />,
     );
+    const latestBar = Array.from(document.querySelectorAll("[data-right-panel-icon-bar]")).at(-1);
+    const icons = Array.from(latestBar?.querySelectorAll<HTMLButtonElement>("button") ?? []).map(
+      (button) => button.getAttribute("aria-label"),
+    );
+    expect(icons).toEqual([
+      "Files",
+      "Source Control",
+      "Diff",
+      "Pull Request",
+      "Git Manager",
+      "Pipelines",
+      "Device",
+      "Browser",
+      "Terminal",
+    ]);
     const deviceIcon = iconButton("Device");
     expect(deviceIcon.getAttribute("data-active-icon")).toBe("true");
     await click(deviceIcon);
@@ -351,30 +367,30 @@ describe("RightPanelTabs mounted interactions", () => {
 
   it("supports keyboard arrow, Home, and End navigation across the fixed icon bar", async () => {
     await mount(<RightPanelTabs {...tabsProps({ surfaces: [], activeSurfaceId: null })} />);
-    const browserIcon = iconButton("Browser");
+    const filesIcon = iconButton("Files");
+    const sourceControlIcon = iconButton("Source Control");
     const terminalIcon = iconButton("Terminal");
-    const pullRequestIcon = iconButton("Pull Request");
-    browserIcon.focus();
+    filesIcon.focus();
 
     await act(async () => {
-      browserIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      filesIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    });
+    expect(document.activeElement).toBe(sourceControlIcon);
+
+    await act(async () => {
+      sourceControlIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
     });
     expect(document.activeElement).toBe(terminalIcon);
 
     await act(async () => {
-      terminalIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+      terminalIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
     });
-    expect(document.activeElement).toBe(pullRequestIcon);
+    expect(document.activeElement).toBe(filesIcon);
 
     await act(async () => {
-      pullRequestIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+      filesIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
     });
-    expect(document.activeElement).toBe(browserIcon);
-
-    await act(async () => {
-      browserIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
-    });
-    expect(document.activeElement).toBe(pullRequestIcon);
+    expect(document.activeElement).toBe(terminalIcon);
   });
 
   it("activates, closes, and middle-clicks dynamic file and multi-Browser tabs beside Files root", async () => {

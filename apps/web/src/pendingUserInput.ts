@@ -34,7 +34,13 @@ export function formatUserInputOptionLabel(option: UserInputQuestionOption): str
 export function providerSupportsPendingUserInputCancel(
   provider: string | null | undefined,
 ): boolean {
-  return provider === "cursor" || provider === "opencode";
+  return provider === "antigravity" || provider === "cursor" || provider === "opencode";
+}
+
+export function providerRequiresExplicitUserInputSubmit(
+  provider: string | null | undefined,
+): boolean {
+  return provider === "antigravity";
 }
 
 export function buildPartialPendingUserInputSubmission(
@@ -266,13 +272,17 @@ export function resolvePendingUserInputAnswer(
   draft: PendingUserInputDraftAnswer | undefined,
 ): string | string[] | null {
   const customAnswer = normalizeDraftAnswer(draft?.customAnswer);
-  if (customAnswer) {
-    return customAnswer;
+  const selectedOptionLabels = normalizeSelectedOptionLabels(draft?.selectedOptionLabels);
+
+  if (question.multiSelect) {
+    const combined = customAnswer
+      ? Array.from(new Set([...selectedOptionLabels, customAnswer]))
+      : selectedOptionLabels;
+    return combined.length > 0 ? combined : null;
   }
 
-  const selectedOptionLabels = normalizeSelectedOptionLabels(draft?.selectedOptionLabels);
-  if (question.multiSelect) {
-    return selectedOptionLabels.length > 0 ? selectedOptionLabels : null;
+  if (customAnswer) {
+    return customAnswer;
   }
 
   return selectedOptionLabels[0] ?? null;
@@ -281,11 +291,12 @@ export function resolvePendingUserInputAnswer(
 export function setPendingUserInputCustomAnswer(
   draft: PendingUserInputDraftAnswer | undefined,
   customAnswer: string,
+  options?: { readonly multiSelect?: boolean },
 ): PendingUserInputDraftAnswer {
-  const selectedOptionLabels =
-    customAnswer.trim().length > 0
-      ? undefined
-      : normalizeSelectedOptionLabels(draft?.selectedOptionLabels);
+  const preserveSelections = options?.multiSelect === true || customAnswer.trim().length === 0;
+  const selectedOptionLabels = preserveSelections
+    ? normalizeSelectedOptionLabels(draft?.selectedOptionLabels)
+    : undefined;
 
   return {
     customAnswer,
@@ -305,7 +316,7 @@ export function togglePendingUserInputOptionSelection(
       : [...selectedOptionLabels, optionLabel];
 
     return {
-      customAnswer: "",
+      customAnswer: draft?.customAnswer ?? "",
       ...(nextSelectedOptionLabels.length > 0
         ? { selectedOptionLabels: nextSelectedOptionLabels }
         : {}),

@@ -194,6 +194,7 @@ const ProviderRuntimeEventType = Schema.Literals([
   "request.resolved",
   "user-input.requested",
   "user-input.resolved",
+  "user-input.expired",
   "task.started",
   "task.progress",
   "task.completed",
@@ -245,6 +246,7 @@ const RequestOpenedType = Schema.Literal("request.opened");
 const RequestResolvedType = Schema.Literal("request.resolved");
 const UserInputRequestedType = Schema.Literal("user-input.requested");
 const UserInputResolvedType = Schema.Literal("user-input.resolved");
+const UserInputExpiredType = Schema.Literal("user-input.expired");
 const TaskStartedType = Schema.Literal("task.started");
 const TaskProgressType = Schema.Literal("task.progress");
 const TaskCompletedType = Schema.Literal("task.completed");
@@ -503,6 +505,7 @@ export type UserInputQuestion = typeof UserInputQuestion.Type;
 
 const UserInputRequestedPayload = Schema.Struct({
   questions: Schema.Array(UserInputQuestion),
+  isBlocking: Schema.optional(Schema.Boolean),
 });
 export type UserInputRequestedPayload = typeof UserInputRequestedPayload.Type;
 
@@ -522,6 +525,11 @@ const UserInputResolvedPayload = Schema.Struct({
   questions: Schema.optional(Schema.Array(UserInputResolvedQuestionSummary)),
 });
 export type UserInputResolvedPayload = typeof UserInputResolvedPayload.Type;
+
+const UserInputExpiredPayload = Schema.Struct({
+  reason: Schema.optional(TrimmedNonEmptyStringSchema),
+});
+export type UserInputExpiredPayload = typeof UserInputExpiredPayload.Type;
 
 const TaskStartedPayload = Schema.Struct({
   taskId: RuntimeTaskId,
@@ -911,6 +919,13 @@ const ProviderRuntimeUserInputResolvedEvent = Schema.Struct({
 export type ProviderRuntimeUserInputResolvedEvent =
   typeof ProviderRuntimeUserInputResolvedEvent.Type;
 
+const ProviderRuntimeUserInputExpiredEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: UserInputExpiredType,
+  payload: UserInputExpiredPayload,
+});
+export type ProviderRuntimeUserInputExpiredEvent = typeof ProviderRuntimeUserInputExpiredEvent.Type;
+
 const ProviderRuntimeTaskStartedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: TaskStartedType,
@@ -1084,6 +1099,7 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeRequestResolvedEvent,
   ProviderRuntimeUserInputRequestedEvent,
   ProviderRuntimeUserInputResolvedEvent,
+  ProviderRuntimeUserInputExpiredEvent,
   ProviderRuntimeTaskStartedEvent,
   ProviderRuntimeTaskProgressEvent,
   ProviderRuntimeTaskCompletedEvent,

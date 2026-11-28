@@ -191,24 +191,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     const activeKind = activeSurface?.kind ?? null;
     const items: FixedSurfaceIconItem[] = [
       {
-        key: "browser",
-        label: "Browser",
-        icon: Globe2,
-        active: activeKind === "preview",
-        available: props.browserAvailable,
-        disabledReason: SURFACE_DISABLED_REASONS.browser,
-        onSelect: props.onSelectBrowser,
-      },
-      {
-        key: "terminal",
-        label: "Terminal",
-        icon: TerminalSquare,
-        active: activeKind === "terminal",
-        available: terminalAvailable,
-        disabledReason: SURFACE_DISABLED_REASONS.terminal,
-        onSelect: props.onSelectTerminal,
-      },
-      {
         key: "files",
         label: "Files",
         icon: Files,
@@ -216,6 +198,15 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
         available: props.filesAvailable,
         disabledReason: SURFACE_DISABLED_REASONS.files,
         onSelect: props.onSelectFiles,
+      },
+      {
+        key: "sourceControl",
+        label: "Source Control",
+        icon: GitPullRequestArrow,
+        active: activeKind === "sourceControl",
+        available: props.sourceControlAvailable,
+        disabledReason: SURFACE_DISABLED_REASONS.sourceControl,
+        onSelect: props.onSelectSourceControl,
       },
       {
         key: "diff",
@@ -227,28 +218,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
         onSelect: props.onSelectDiff,
       },
       {
-        key: "sourceControl",
-        label: "Source Control",
-        icon: GitPullRequestArrow,
-        active: activeKind === "sourceControl",
-        available: props.sourceControlAvailable,
-        disabledReason: SURFACE_DISABLED_REASONS.sourceControl,
-        onSelect: props.onSelectSourceControl,
+        key: "pullRequest",
+        label: "Pull Request",
+        icon: GitPullRequest,
+        active: activeKind === "pullRequest",
+        available: pullRequestAvailable,
+        disabledReason: props.pullRequestDisabledReason ?? SURFACE_DISABLED_REASONS.pullRequest,
+        onSelect: props.onSelectPullRequest,
       },
-    ];
-    // Hidden, not disabled, while device previews are off: Settings is the way in.
-    if (props.onSelectDevice !== undefined) {
-      items.push({
-        key: "device",
-        label: "Device",
-        icon: Smartphone,
-        active: activeKind === "device",
-        available: true,
-        disabledReason: null,
-        onSelect: props.onSelectDevice,
-      });
-    }
-    items.push(
       {
         key: "gitManager",
         label: "Git Manager",
@@ -267,14 +244,37 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
         disabledReason: props.pipelinesDisabledReason ?? SURFACE_DISABLED_REASONS.pipelines,
         onSelect: props.onSelectPipelines,
       },
+    ];
+    // Hidden, not disabled, while device previews are off: Settings is the way in.
+    if (props.onSelectDevice !== undefined) {
+      items.push({
+        key: "device",
+        label: "Device",
+        icon: Smartphone,
+        active: activeKind === "device",
+        available: true,
+        disabledReason: null,
+        onSelect: props.onSelectDevice,
+      });
+    }
+    items.push(
       {
-        key: "pullRequest",
-        label: "Pull Request",
-        icon: GitPullRequest,
-        active: activeKind === "pullRequest",
-        available: pullRequestAvailable,
-        disabledReason: props.pullRequestDisabledReason ?? SURFACE_DISABLED_REASONS.pullRequest,
-        onSelect: props.onSelectPullRequest,
+        key: "browser",
+        label: "Browser",
+        icon: Globe2,
+        active: activeKind === "preview",
+        available: props.browserAvailable,
+        disabledReason: SURFACE_DISABLED_REASONS.browser,
+        onSelect: props.onSelectBrowser,
+      },
+      {
+        key: "terminal",
+        label: "Terminal",
+        icon: TerminalSquare,
+        active: activeKind === "terminal",
+        available: terminalAvailable,
+        disabledReason: SURFACE_DISABLED_REASONS.terminal,
+        onSelect: props.onSelectTerminal,
       },
     );
     return items;

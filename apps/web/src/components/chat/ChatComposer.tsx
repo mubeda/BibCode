@@ -86,6 +86,7 @@ import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions
 import { ComposerPrimaryActions, formatUnavailableActionLabel } from "./ComposerPrimaryActions";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
+import { providerRequiresExplicitUserInputSubmit } from "../../pendingUserInput";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
 import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";
 import {
@@ -2391,6 +2392,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 respondingRequestIds={respondingUserInputRequestIds ?? respondingRequestIds}
                 answers={activePendingDraftAnswers}
                 questionIndex={activePendingQuestionIndex}
+                isTurnRunning={phase === "running" || activeThread?.session?.status === "starting"}
+                requireExplicitSubmit={providerRequiresExplicitUserInputSubmit(
+                  activeThread?.session?.providerName ?? selectedProvider,
+                )}
                 collapsed={activePendingCollapsed}
                 canCancel={activePendingUserInputCanCancel}
                 canSkipAll={activePendingUserInputCanSkipAll}
@@ -2439,6 +2444,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 respondingRequestIds={respondingUserInputRequestIds ?? respondingRequestIds}
                 answers={activePendingDraftAnswers}
                 questionIndex={activePendingQuestionIndex}
+                isTurnRunning={phase === "running" || activeThread?.session?.status === "starting"}
+                requireExplicitSubmit={providerRequiresExplicitUserInputSubmit(
+                  activeThread?.session?.providerName ?? selectedProvider,
+                )}
                 collapsed={activePendingCollapsed}
                 canCancel={activePendingUserInputCanCancel}
                 canSkipAll={activePendingUserInputCanSkipAll}

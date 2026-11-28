@@ -678,6 +678,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(74, "ProjectionThreadCodeReview", migration_074),
     Migration::new(75, "SendRequests", migration_075),
     Migration::new(76, "AgentMessages", migration_076),
+    Migration::new(77, "UserInputActivityPartialIndex", migration_077),
 ];
 
 impl Migration {
@@ -3118,6 +3119,22 @@ fn migration_076(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_077(transaction: &Transaction<'_>) -> Result<()> {
+    // Partial indexes for user-input lifecycle activities so startup `SELECT DISTINCT thread_id`
+    // and per-thread open-question lookups avoid scanning ordinary activity history.
+    if table_exists(transaction, "projection_thread_activities")? {
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_projection_thread_activities_user_input_thread
+               ON projection_thread_activities (thread_id, sequence DESC, created_at DESC, activity_id DESC)
+              WHERE kind IN ('user-input.requested', 'user-input.resolved', 'user-input.expired', 'provider.user-input.respond.failed');
+             CREATE INDEX IF NOT EXISTS idx_projection_thread_activities_user_input_requested
+               ON projection_thread_activities (thread_id)
+              WHERE kind = 'user-input.requested';",
+        )?;
+    }
+    Ok(())
+}
+
 fn migration_075(transaction: &Transaction<'_>) -> Result<()> {
     // A person's request to an agent: one row per request id. It keeps the sizes of the note
     // and attachments, never their text, and only the target's answer text. Guarded like the
@@ -3437,7 +3454,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76
+                59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77
             ]
         );
         let (state, outcome) = connection.query_row(
@@ -3471,7 +3488,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]
+            [65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77]
         );
         let claimed: i64 = connection.query_row(
             "SELECT claimed_once FROM provider_turn_outbox WHERE command_id = 'retried'",
@@ -3508,7 +3525,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76
+                61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77
             ]
         );
         connection.execute(
@@ -3551,7 +3568,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]
+            [66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77]
         );
         let bearer: Option<String> = connection.query_row(
             "SELECT bearer_secret FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -3582,7 +3599,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [69, 70, 71, 72, 73, 74, 75, 76]
+            [69, 70, 71, 72, 73, 74, 75, 76, 77]
         );
         let index_sql: String = connection.query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_projection_thread_messages_queued'",
@@ -3627,7 +3644,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [70, 71, 72, 73, 74, 75, 76]
+            [70, 71, 72, 73, 74, 75, 76, 77]
         );
         let unnamed: (Option<String>, Option<String>) = connection.query_row(
             "SELECT (SELECT mcp_named_client_id FROM auth_pairing_links WHERE id = 'l'), (SELECT mcp_named_client_id FROM auth_sessions WHERE session_id = 's')",
@@ -3676,7 +3693,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [71, 72, 73, 74, 75, 76]
+            [71, 72, 73, 74, 75, 76, 77]
         );
         let taken_over: Option<String> = connection.query_row(
             "SELECT taken_over_at FROM mcp_named_clients WHERE client_id = 'nc_1'",
@@ -3704,7 +3721,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [73, 74, 75, 76]
+            [73, 74, 75, 76, 77]
         );
         let prompt: String = connection.query_row(
             "SELECT code_review_prompt FROM projection_projects WHERE project_id = 'p'",
@@ -3733,7 +3750,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [74, 75, 76]
+            [74, 75, 76, 77]
         );
         let code_review: i64 = connection.query_row(
             "SELECT code_review FROM projection_threads WHERE thread_id = 't'",
@@ -3763,7 +3780,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [75, 76]
+            [75, 76, 77]
         );
         let columns = connection
             .prepare("PRAGMA table_info(send_requests)")?
@@ -3830,6 +3847,32 @@ mod tests {
     }
 
     #[test]
+    fn migration_77_indexes_user_input_activities_for_startup_recovery() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(76))?;
+        let applied = run_migrations(&mut connection, None)?;
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [77]
+        );
+        let index_sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_projection_thread_activities_user_input_thread'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            index_sql.contains("user-input.requested")
+                && index_sql.contains("user-input.resolved")
+                && index_sql.contains("user-input.expired"),
+            "unexpected partial index sql: {index_sql}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn migration_76_creates_agent_messages_with_its_indexes() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(75))?;
@@ -3839,7 +3882,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [76]
+            [76, 77]
         );
         let columns = connection
             .prepare("PRAGMA table_info(agent_messages)")?
@@ -3957,7 +4000,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [72, 73, 74, 75, 76]
+            [72, 73, 74, 75, 76, 77]
         );
         let columns = connection
             .prepare("PRAGMA table_info(worktree_creation_records)")?
@@ -4015,7 +4058,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [68, 69, 70, 71, 72, 73, 74, 75, 76]
+            [68, 69, 70, 71, 72, 73, 74, 75, 76, 77]
         );
         let kinds: Option<String> = connection.query_row(
             "SELECT status_kinds_json FROM webhook_endpoints WHERE endpoint_id = 'w'",
@@ -4043,7 +4086,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [67, 68, 69, 70, 71, 72, 73, 74, 75, 76]
+            [67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77]
         );
         let side_chat: i64 = connection.query_row(
             "SELECT side_chat FROM projection_threads WHERE thread_id = 't'",
@@ -4069,7 +4112,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76]
+            [
+                62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77
+            ]
         );
         for table in [
             "mcp_oauth_clients",
@@ -4125,7 +4170,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76
+                60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77
             ]
         );
         for (table, column) in [
@@ -4173,7 +4218,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
-                76
+                76, 77
             ]
         );
         connection.execute(
@@ -4216,7 +4261,7 @@ mod tests {
 
         let applied = run_migrations(&mut connection, None)?;
 
-        assert_eq!(applied.last().map(|migration| migration.id), Some(76));
+        assert_eq!(applied.last().map(|migration| migration.id), Some(77));
         for table in [
             "projection_thread_messages",
             "projection_thread_activities",
@@ -4948,7 +4993,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=76).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=77).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -4965,6 +5010,7 @@ mod tests {
         assert_eq!(MIGRATIONS[42].name, "DurableWorktreeRemovalReceipts");
         assert_eq!(MIGRATIONS[43].name, "ProjectionThreadSessionErrorClass");
         assert_eq!(MIGRATIONS[75].name, "AgentMessages");
+        assert_eq!(MIGRATIONS[76].name, "UserInputActivityPartialIndex");
         assert_eq!(MIGRATIONS[44].name, "ProjectionThreadUnresolvedDelivery");
         assert_eq!(MIGRATIONS[47].name, "AuthAuthorityRevision");
         assert_eq!(MIGRATIONS[48].name, "AuthPairingDeliveryState");
@@ -5030,6 +5076,7 @@ mod tests {
                 (74, "ProjectionThreadCodeReview"),
                 (75, "SendRequests"),
                 (76, "AgentMessages"),
+                (77, "UserInputActivityPartialIndex"),
             ],
         );
         assert_eq!(
@@ -5180,7 +5227,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 60);
+        assert_eq!(second.len(), 61);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -5300,7 +5347,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-                61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76
+                61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77
             ]
         );
         let policy = connection.query_row(
@@ -5340,7 +5387,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
-                62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76
+                62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77
             ]
         );
         let pin = connection.query_row(
@@ -5371,7 +5418,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
-                63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76
+                63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77
             ]
         );
         let pin = connection.query_row(
@@ -5514,7 +5561,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-                69, 70, 71, 72, 73, 74, 75, 76
+                69, 70, 71, 72, 73, 74, 75, 76, 77
             ]
         );
         assert_eq!(
@@ -5544,7 +5591,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 43);
+        assert_eq!(applied.len(), 44);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -5672,6 +5719,28 @@ mod tests {
         assert!(columns.iter().any(|column| column == "scopes"));
         assert!(!columns.iter().any(|column| column == "role"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn migration_77_partial_index_serves_startup_user_input_query() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, None)?;
+
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT DISTINCT thread_id
+                   FROM projection_thread_activities
+                  WHERE kind = 'user-input.requested'",
+            )?
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .join("\n");
+        assert!(
+            plan.contains("idx_projection_thread_activities_user_input_requested"),
+            "expected startup query to use partial index, got plan:\n{plan}"
+        );
         Ok(())
     }
 }
