@@ -327,6 +327,18 @@ describe("exited shell replay", () => {
     expect(prepared?.slice(6, -6)).not.toContain("\x1b[201~");
     expect(prepared?.split("\x1b[201~")).toHaveLength(2);
 
+    const { pendingIdentityPastePayload } = await import("./ThreadTerminalPanel");
+    // The driver is still unknown and bracketed paste is off: a multiline paste stays one
+    // envelope instead of becoming a raw Enter on every line.
+    expect(pendingIdentityPastePayload("echo one\necho two", null, false)).toBe(
+      "\x1b[200~echo one\recho two\x1b[201~",
+    );
+    // A known other driver that has since enabled bracketed paste must strip an embedded
+    // end marker before wrapping, so the suffix is not submitted as a command.
+    const wrapped = pendingIdentityPastePayload("echo safe\x1b[201~\necho pwned", "codex", true);
+    expect(wrapped).toBe("\x1b[200~echo safe\recho pwned\x1b[201~");
+    expect(wrapped.split("\x1b[201~")).toHaveLength(2);
+
     // Xterm parser parity: C1 CSI (`\u009b?2004h`), colon subparam (`\x1b[?1:2;2004h`),
     // parameterized DECSTR (`\x1b[0!p`), and replay halfway through `\x1b[?2004l` + live `"04l"`.
     const parityCases: Array<{
