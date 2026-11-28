@@ -1980,7 +1980,11 @@ impl AntigravitySessionRuntime {
                     .as_ref()
                     .is_none_or(|prev| prev.wire_ended || prev.settled.is_some())
             {
-                gate.previous_prompt = None;
+                // Keep `previous_prompt` until the steer request itself settles. An update
+                // that arrives after Prompt 1's response — including the usage report that
+                // follows `end_turn` — accepts the steer, but dropping Prompt 1 here would
+                // discard its result. A later rejection of the steer would then fail the
+                // whole turn instead of settling the prompt that already finished.
                 gate.active_turn_has_update = true;
                 gate.resolve_pending_accept(Ok(()));
             }
@@ -2226,7 +2230,7 @@ impl AntigravitySessionRuntime {
             .as_ref()
             .is_none_or(|prev| prev.wire_ended || prev.settled.is_some())
         {
-            gate.previous_prompt = None;
+            // Same as a session update: accepting the steer must not drop Prompt 1.
             gate.active_turn_has_update = true;
             gate.resolve_pending_accept(Ok(()));
         }

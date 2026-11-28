@@ -4537,6 +4537,92 @@ mod workspace_loss_tests {
         f.shutdown().await;
     }
 
+    /// The web Stop (Dismiss) landing after a steer row is frozen and before `steer` is called.
+    /// The start path re-checks the row here; a steer must do the same, or the follow-up is
+    /// written after the user cancelled it.
+    #[tokio::test]
+    async fn a_dismiss_after_the_steer_freeze_before_the_send_sends_nothing() {
+        let gate = Arc::new(PublicationTestGate::default());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                before_send: Some(gate.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        f.project("running").await;
+        let command = turn("steer-dismissed", true);
+        let mut payload = serde_json::to_value(&command).unwrap();
+        payload[DELIVERY_ROUTE_FINGERPRINT_FIELD] =
+            Value::String(delivery_route_fingerprint(&f.launch).unwrap());
+        f.engine
+            .dispatch_with_admission(
+                command.clone(),
+                CommandAdmission {
+                    payload_digest: canonical_command_digest(&command).unwrap(),
+                    attachment_refs: Vec::new(),
+                    provider_turn: Some(NewProviderTurnDelivery {
+                        command_id: "steer-dismissed".into(),
+                        thread_id: "t1".into(),
+                        message_id: "steer-dismissed".into(),
+                        provider_instance_id: "codex".into(),
+                        provider_kind: "codex".into(),
+                        provider_session_id: None,
+                        delivery_key: "steer-dismissed-key".into(),
+                        payload,
+                        state: TurnDeliveryState::Queued,
+                        mode: TurnDeliveryMode::Start,
+                        created_at: BEFORE_LOSS.into(),
+                    }),
+                    agent_message: None,
+                },
+                || {},
+            )
+            .await
+            .unwrap();
+        f.engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.turn.steer","commandId":"steer-dismiss-admit","threadId":"t1",
+                    "messageId":"steer-dismissed","createdAt":BEFORE_LOSS,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let row = f
+            .engine
+            .repositories()
+            .claim_provider_turn("steer-dismissed".into(), BEFORE_LOSS.into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.mode, TurnDeliveryMode::Steer);
+        let delivery = f.deliver_frozen(command, row);
+        timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("the steer row is frozen and the send is next");
+        f.dismiss("steer-dismissed").await;
+        gate.release.notify_one();
+        let outcome = timeout(Duration::from_secs(5), delivery)
+            .await
+            .expect("the delivery ends")
+            .unwrap();
+        assert_eq!(outcome, ProviderDeliveryOutcome::StoppedUnsent);
+        assert_eq!(
+            f.driver.steers.load(Ordering::SeqCst),
+            0,
+            "nothing was steered"
+        );
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0, "nothing was sent");
+        assert_eq!(
+            f.delivery_state("steer-dismissed").await,
+            TurnDeliveryState::Dismissed
+        );
+        f.shutdown().await;
+    }
+
     /// Dismissing a stuck message A commits, wakes the worker, and only then sends its follow-up
     /// interrupt. The worker may claim the next message B and start B's launch in between; that
     /// interrupt must not stop B's launch, which would settle B as stopped although the user
@@ -9784,9 +9870,35 @@ async fn spawn_delivery(
                                 .to_owned(),
                         },
                         Ok(false) => {
-                            driver
-                                .steer(message.text, message.attachments, turn_id, delivery_key)
-                                .await
+                            // Same fence as a start: a Stop that dismisses this row after the
+                            // freeze, while the target and open-ask reads are in flight, must
+                            // exclude the write. The guarded update and Dismiss cannot both commit.
+                            #[cfg(test)]
+                            if let Some(gate) = accepted_publication_test_hook
+                                .as_ref()
+                                .and_then(|hook| hook.before_send.as_ref())
+                            {
+                                gate.pause().await;
+                            }
+                            let stopped = match frozen_session.as_ref() {
+                                Some((row, session)) => {
+                                    send_fence(&repositories, row, session).await
+                                }
+                                None => None,
+                            };
+                            match stopped {
+                                Some(stopped) => stopped,
+                                None => {
+                                    driver
+                                        .steer(
+                                            message.text,
+                                            message.attachments,
+                                            turn_id,
+                                            delivery_key,
+                                        )
+                                        .await
+                                }
+                            }
                         }
                         Err(error) => ProviderDeliveryOutcome::DefinitelyNotSent {
                             detail: delivery_detail(

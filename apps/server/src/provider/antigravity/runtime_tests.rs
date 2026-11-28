@@ -2698,6 +2698,65 @@ async fn rejected_steer_preserves_running_or_settled_prompt_one() {
         assert_eq!(types(&remaining), ["turn.completed"]);
         assert_eq!(remaining[0].1["state"], "completed");
     }
+
+    // Case C: Prompt 1's `end_turn` is followed by a handled session update (the usage report
+    // a finished prompt emits, or Prompt 2's first chunk) and only then by Prompt 2's rejection.
+    // The update accepts the steer, but Prompt 1's stored result must still settle the turn.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "working" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(
+                Some("steer rejected after a late update"),
+                Vec::new(),
+                &turn_id,
+            )
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+        peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "usage_update",
+                "used": 12,
+                "size": 100,
+            }),
+        )
+        .await;
+        peer.fail(&second_prompt, -32602, "steer rejected").await;
+        assert!(
+            steer_receipt.accepted().await.is_ok(),
+            "a handled update after Prompt 1 ends accepts the steer"
+        );
+        let remaining = events_until(&runtime, "turn.completed").await;
+        assert_eq!(
+            remaining
+                .last()
+                .map(|(_, payload)| payload["state"].as_str()),
+            Some(Some("completed")),
+            "Prompt 2's rejection must not fail the turn Prompt 1 already finished: {remaining:?}"
+        );
+        assert!(
+            remaining
+                .iter()
+                .all(|(_, payload)| payload["state"] != "failed"),
+            "{remaining:?}"
+        );
+    }
 }
 
 #[tokio::test]
