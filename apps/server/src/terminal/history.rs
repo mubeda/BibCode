@@ -858,8 +858,8 @@ fn byte_index_after_nth_newline(data: &str, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::{CLIENT_TRANSCRIPT_CUT_BYTES, LossyReplay};
-    use super::{HistoryCursor, TerminalHistory};
+    use super::LossyReplay;
+    use super::{CLIENT_TRANSCRIPT_CUT_BYTES, HistoryCursor, TerminalHistory};
 
     fn legacy_push(history: &mut String, data: &str, line_limit: usize) {
         history.push_str(data);

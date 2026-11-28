@@ -7262,6 +7262,51 @@ describe("TerminalViewport mounted lifecycle", () => {
       expect(sentData()).toBe("\x1b[200~first\rsecond\x1b[201~\r");
     });
 
+    it("releases pending metadata-paste reservations when cancelling an image upload so subsequent typing is not blocked", async () => {
+      withCapabilities({ terminalImagePaste: true });
+      testState.stageImagePasteCommand.mockImplementation(
+        (_input: unknown, options?: { signal?: AbortSignal }) =>
+          new Promise((resolve) => {
+            options?.signal?.addEventListener(
+              "abort",
+              () => resolve(AsyncResult.failure(Cause.interrupt())),
+              { once: true },
+            );
+          }),
+      );
+      const mounted = await mount(
+        <TerminalViewport {...viewportProps()} driverKind={null} driverKindPending />,
+      );
+      const terminal = xtermState.terminals[0]!;
+      terminal.modes.bracketedPasteMode = false;
+      const screen = mounted.container.querySelector(".xterm-screen")!;
+
+      // Paste an image followed by multiline text before live driverKind metadata arrives.
+      await act(async () => {
+        screen.dispatchEvent(pasteEvent("", [png()]));
+        screen.dispatchEvent(pasteEvent("first\nsecond", []));
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(sentData()).toBe("");
+
+      // Click the image upload banner's Cancel button.
+      const cancelButton = Array.from(mounted.container.querySelectorAll("button")).find(
+        (button) => button.textContent?.trim() === "Cancel",
+      );
+      expect(cancelButton).toBeDefined();
+      await act(async () => {
+        cancelButton!.click();
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+
+      // Subsequent typing must flow through immediately without being blocked by an unsettled reservation.
+      await act(async () => {
+        terminal.dataHandler?.("ls\r");
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      });
+      expect(sentData()).toBe("ls\r");
+    });
+
     it.each(["claudeCode", "codex", "opencode", "cursor", "grok", null] as const)(
       "does not inject bracketed-paste markers for %s terminals when bracketedPasteMode is off",
       async (driverKind) => {

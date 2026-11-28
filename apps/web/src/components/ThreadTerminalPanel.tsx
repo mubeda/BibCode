@@ -1291,14 +1291,19 @@ export function TerminalViewport({
     command === undefined && resolvedDriverKind === null && driverKindPending;
   const readDriverKind = useEffectEvent(() => resolvedDriverKind);
   const readDriverKindPending = useEffectEvent(() => resolvedDriverKindPending);
-  const pendingDriverKindPastesRef = useRef<Array<(driver: ProviderDriverKind | null) => void>>([]);
+  const pendingDriverKindPastesRef = useRef<
+    Array<{
+      readonly resolve: (driver: ProviderDriverKind | null) => void;
+      readonly cancel: () => void;
+    }>
+  >([]);
   useEffect(() => {
     if (resolvedDriverKindPending) return;
     const queued = pendingDriverKindPastesRef.current;
     if (queued.length === 0) return;
     pendingDriverKindPastesRef.current = [];
-    for (const resolve of queued) {
-      resolve(resolvedDriverKind);
+    for (const entry of queued) {
+      entry.resolve(resolvedDriverKind);
     }
   }, [resolvedDriverKind, resolvedDriverKindPending]);
   const hasAuthoritativeHostConfig = serverConfig !== null;
@@ -2584,9 +2589,11 @@ export function TerminalViewport({
     const pendingIdentityPasteTimers = new Set<number>();
     cancelImagePastesRef.current = () => {
       for (const abort of pasteAborts) abort.abort();
+      const pendingPastes = pendingDriverKindPastesRef.current;
+      pendingDriverKindPastesRef.current = [];
+      for (const entry of pendingPastes) entry.cancel();
       for (const timer of pendingIdentityPasteTimers) window.clearTimeout(timer);
       pendingIdentityPasteTimers.clear();
-      pendingDriverKindPastesRef.current = [];
     };
     const handlePaste = (event: ClipboardEvent) => {
       const data = event.clipboardData;
@@ -2654,9 +2661,16 @@ export function TerminalViewport({
             }
             fill(payload.length > 0 ? payload : null);
           };
+          const cancel = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            pendingIdentityPasteTimers.delete(timer);
+            fill(null);
+          };
           const timer = window.setTimeout(() => finish(readDriverKind()), 1500);
           pendingIdentityPasteTimers.add(timer);
-          pendingDriverKindPastesRef.current.push(finish);
+          pendingDriverKindPastesRef.current.push({ resolve: finish, cancel });
         }
         return;
       }
