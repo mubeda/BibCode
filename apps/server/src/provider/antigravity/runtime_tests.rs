@@ -2899,6 +2899,13 @@ fn quota_chunk_classifier_enforces_allowlist_length_boundary_warning_prefix_and_
         .is_none()
     );
     assert!(
+        classify_quota_chunk(
+            "⚠ agent executor error: You have exhausted your quota on this modeling exercise.",
+            now
+        )
+        .is_none()
+    );
+    assert!(
         classify_quota_chunk("⚠ agent executor error: Error 429, Too Many Requests", now).is_none()
     );
     assert!(
@@ -2999,21 +3006,24 @@ fn quota_prompt_error_classifier_matches_allowlist_and_rejects_bare_429_and_disk
         other => panic!("expected UsageLimitReached, got {other:?}"),
     }
 
-    // Structured `data.code: "EDQUOT"` must also be excluded as a filesystem quota error.
-    let structured_edquot = AcpProtocolError::RemoteRequest {
-        method: "session/prompt".to_owned(),
-        request_id: "req-edquot".to_owned(),
-        code: -32603,
-        message: "RESOURCE_EXHAUSTED".to_owned(),
-        data: Some(json!({ "code": "EDQUOT" })),
-    };
-    assert!(
-        !matches!(
-            classify_with_clock(structured_edquot, now),
-            AntigravityRuntimeError::UsageLimitReached { .. }
-        ),
-        "structured EDQUOT error must not classify as account UsageLimitReached"
-    );
+    // Structured `data.code: "EDQUOT"` must also be excluded even when `message` exceeds 8 KiB.
+    let large_message = format!("RESOURCE_EXHAUSTED {}", "x".repeat(9 * 1024));
+    for message in ["RESOURCE_EXHAUSTED".to_owned(), large_message] {
+        let structured_edquot = AcpProtocolError::RemoteRequest {
+            method: "session/prompt".to_owned(),
+            request_id: "req-edquot".to_owned(),
+            code: -32603,
+            message,
+            data: Some(json!({ "code": "EDQUOT" })),
+        };
+        assert!(
+            !matches!(
+                classify_with_clock(structured_edquot, now),
+                AntigravityRuntimeError::UsageLimitReached { .. }
+            ),
+            "structured EDQUOT error must not classify as account UsageLimitReached"
+        );
+    }
 
     // Bare HTTP 429 without an explicit quota phrase and filesystem quota errors (including
     // EDQUOT) must NOT match.
@@ -3475,6 +3485,102 @@ async fn prompt_quota_error_after_update_publishes_warning_and_pre_update_classi
         .await;
         // Wait for the reader task to process Prompt 1's quota chunk before the user presses Stop.
         let _ = runtime.inner.connection.barrier().await;
+        runtime
+            .interrupt_turn(Some(&turn_id))
+            .await
+            .expect("interrupt_turn");
+        let _ = peer.expect("session/cancel").await;
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["runtime.warning", "turn.completed"]);
+        assert_eq!(events[0].1["usageLimit"], true);
+        assert_eq!(events[0].1["resetsAt"], "2026-11-27T18:45:00Z");
+        assert_eq!(events[1].1["state"], "cancelled");
+    }
+
+    // Subcase D: Prompt 1 emits quota chunk and returns `cancelled`, then steer is rejected ->
+    // rejected-steer settlement still publishes the quota warning before turn.completed(cancelled).
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "initial reply" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("rejected steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 45m."
+                },
+            }),
+        )
+        .await;
+        peer.reply(&first_prompt, json!({ "stopReason": "cancelled" }))
+            .await;
+        let _ = runtime.inner.connection.barrier().await;
+        peer.fail(&second_prompt, -32602, "steer rejected").await;
+        assert!(steer_receipt.accepted().await.is_err());
+
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["runtime.warning", "turn.completed"]);
+        assert_eq!(events[0].1["usageLimit"], true);
+        assert_eq!(events[0].1["resetsAt"], "2026-11-27T18:45:00Z");
+        assert_eq!(events[1].1["state"], "cancelled");
+    }
+
+    // Subcase E: Accepted Prompt 1 fails with a prompt-only quota error (no chunk) while steer is
+    // pending, then cancel-grace expires -> settled quota error is published via runtime.warning.
+    {
+        let mut opts = options("full-access");
+        opts.cancel_grace = Duration::from_millis(30);
+        let (runtime, mut peer) = started_with(opts, "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "usage_update",
+                "used": 1_000,
+                "size": 100_000,
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "thread.token-usage.updated").await;
+        first_receipt
+            .accepted
+            .await
+            .expect("accepted channel")
+            .expect("first accepted");
+
+        let _steer_receipt = runtime
+            .steer_turn(Some("hanging steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let _second_prompt = peer.expect("session/prompt").await;
+
+        peer.fail(&first_prompt, -32603, "RESOURCE_EXHAUSTED: retry in 45m")
+            .await;
+        let _ = first_receipt.completion.await;
         runtime
             .interrupt_turn(Some(&turn_id))
             .await

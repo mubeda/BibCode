@@ -332,6 +332,22 @@ struct PreviousPrompt {
     quota_published: Option<QuotaLimitNotice>,
 }
 
+impl PreviousPrompt {
+    fn unpublished_quota_notice(&self) -> Option<QuotaLimitNotice> {
+        let settled_notice = match &self.settled {
+            Some(Err(AntigravityRuntimeError::UsageLimitReached { message, resets_at })) => {
+                Some(QuotaLimitNotice {
+                    message: message.clone(),
+                    resets_at: resets_at.clone(),
+                })
+            }
+            _ => None,
+        };
+        QuotaLimitNotice::merge(self.quota_notice.clone(), settled_notice)
+            .filter(|notice| self.quota_published.as_ref() != Some(notice))
+    }
+}
+
 struct Gate {
     /// `None` until the open call and every update queued before its answer are handled, so a
     /// replayed history is dropped and no request during the open is answered.
@@ -388,10 +404,10 @@ impl Gate {
                 self.active_prompt_wire_id = None;
                 self.active_turn_has_update = false;
                 self.steer_in_flight = None;
-                let prev_unpublished_notice = self.previous_prompt.take().and_then(|prev| {
-                    prev.quota_notice
-                        .filter(|notice| prev.quota_published.as_ref() != Some(notice))
-                });
+                let prev_unpublished_notice = self
+                    .previous_prompt
+                    .take()
+                    .and_then(|prev| prev.unpublished_quota_notice());
                 (
                     self.active_prompt_quota_notice.take(),
                     self.active_prompt_quota_published.take(),
@@ -1417,7 +1433,10 @@ impl AntigravitySessionRuntime {
                     .and_then(Value::as_str)
                     .unwrap_or("end_turn");
                 if stop_reason == "cancelled" {
-                    if !abandoned && let Some(notice) = cancelled_prev_notice {
+                    let cancelled_notice = chunk_quota_notice
+                        .filter(|notice| published_quota_notice.as_ref() != Some(notice))
+                        .or(cancelled_prev_notice);
+                    if !abandoned && let Some(notice) = cancelled_notice {
                         self.emit_usage_limit_warning(&turn_id, &notice);
                     }
                 } else if let Some(notice) = chunk_quota_notice {
@@ -1733,10 +1752,10 @@ impl AntigravitySessionRuntime {
                 gate.active_prompt_quota_notice = None;
                 gate.active_prompt_quota_published = None;
                 gate.steer_in_flight = None;
-                let unpublished_prev_notice = gate.previous_prompt.take().and_then(|prev| {
-                    prev.quota_notice
-                        .filter(|notice| prev.quota_published.as_ref() != Some(notice))
-                });
+                let unpublished_prev_notice = gate
+                    .previous_prompt
+                    .take()
+                    .and_then(|prev| prev.unpublished_quota_notice());
                 // An unacknowledged prompt whose cancel grace expired remains ambiguous.
                 gate.resolve_pending_accept(Err(AntigravityRuntimeError::Protocol(
                     AcpProtocolError::Closed {
@@ -2348,10 +2367,35 @@ fn is_filesystem_quota_text(lower: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
+fn contains_phrase_boundary(text: &str, phrase: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(phrase) {
+        let abs = start + pos;
+        let end = abs + phrase.len();
+        let prev_ok = abs == 0
+            || text[..abs]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        let next_ok = end == text.len()
+            || text[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        if prev_ok && next_ok {
+            return true;
+        }
+        // Advance past the current char boundary to continue searching.
+        let step = text[abs..].chars().next().map_or(1, char::len_utf8);
+        start = abs + step;
+    }
+    false
+}
+
 fn matches_prompt_quota_allowlist(lower: &str) -> bool {
     PROMPT_ERROR_QUOTA_PHRASES
         .iter()
-        .any(|phrase| lower.contains(phrase))
+        .any(|phrase| contains_phrase_boundary(lower, phrase))
 }
 
 fn starts_with_phrase_boundary(text: &str, phrase: &str) -> bool {
@@ -2417,19 +2461,23 @@ fn classify_quota_prompt_error(
     if method != "session/prompt" {
         return None;
     }
-    let mut candidate = String::new();
-    push_bounded(&mut candidate, message, QUOTA_ERROR_SCAN_MAX_BYTES);
+    let mut message_buf = String::new();
+    push_bounded(&mut message_buf, message, QUOTA_ERROR_SCAN_MAX_BYTES);
+    let mut data_buf = String::new();
     if let Some(data) = data {
-        collect_error_data_text(data, &mut candidate, QUOTA_ERROR_SCAN_MAX_BYTES, 0);
+        collect_error_data_text(data, &mut data_buf, QUOTA_ERROR_SCAN_MAX_BYTES, 0);
     }
-    let lower = candidate.to_ascii_lowercase();
-    if is_filesystem_quota_text(&lower) {
+    let message_lower = message_buf.to_ascii_lowercase();
+    let data_lower = data_buf.to_ascii_lowercase();
+    if is_filesystem_quota_text(&message_lower) || is_filesystem_quota_text(&data_lower) {
         return None;
     }
-    if !matches_prompt_quota_allowlist(&lower) {
+    if !matches_prompt_quota_allowlist(&message_lower)
+        && !matches_prompt_quota_allowlist(&data_lower)
+    {
         return None;
     }
-    let duration = parse_reset_duration(&candidate);
+    let duration = parse_reset_duration(&message_buf).or_else(|| parse_reset_duration(&data_buf));
     Some(format_usage_limit_notice(duration, now))
 }
 
