@@ -64,7 +64,11 @@ export const PullRequestsRow = memo(function PullRequestsRow({
               className="min-w-0 truncate text-left text-sm font-medium underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
               title={row.title}
               onClick={() =>
-                listNavigation.openRequest({ number: row.number, provider: context.provider })
+                listNavigation.openRequest({
+                  number: row.number,
+                  provider: context.provider,
+                  ...(scope?.cwd ? { cwd: scope.cwd } : {}),
+                })
               }
             >
               {row.title}

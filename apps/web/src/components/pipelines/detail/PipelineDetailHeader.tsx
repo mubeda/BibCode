@@ -10,6 +10,7 @@ import { GitBranchIcon, GitPullRequestIcon, TagIcon } from "lucide-react";
 import { memo, type ReactNode } from "react";
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsActor } from "../../pullRequests/shared/PullRequestsActor";
+import { useRepositoryModule } from "../../repositoryModule/RepositoryModule";
 import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
 import { PipelineActions } from "../actions/PipelineActions";
 import type { RepositoryPermission } from "../actions/pipelineActions.logic";
@@ -35,10 +36,12 @@ function PipelineRef({
   value,
   provider,
   projectRef,
+  cwd,
 }: {
   value: PipelinesRef;
   provider: PullRequestsProviderKind;
   projectRef: ScopedProjectRef;
+  cwd: string;
 }) {
   const embeddedNavigation = useEmbeddedPipelinesNavigation();
   if (value.kind === "merge_request" && value.number !== null) {
@@ -52,7 +55,7 @@ function PipelineRef({
             title={value.name}
             className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
             onClick={() =>
-              embeddedNavigation.openMergeRequest!({ number: value.number!, provider })
+              embeddedNavigation.openMergeRequest!({ number: value.number!, provider, cwd })
             }
           >
             {label}
@@ -101,6 +104,9 @@ export const PipelineDetailHeader = memo(function PipelineDetailHeader({
   /** Controls the page adds beside the actions, such as GitHub's Attempt select. */
   children?: ReactNode;
 }) {
+  const {
+    state: { scope },
+  } = useRepositoryModule();
   const { pipeline, commit } = detail;
   const shownStatus = PipelineActions.useShownStatus(pipeline);
   const status = pipelineStatusText(shownStatus, pipeline.warnings, pipeline.reason);
@@ -200,7 +206,12 @@ export const PipelineDetailHeader = memo(function PipelineDetailHeader({
         <div className="flex min-w-0 items-center">
           <dt className="sr-only">Ref</dt>
           <dd className="min-w-0">
-            <PipelineRef value={pipeline.ref} provider={provider} projectRef={projectRef} />
+            <PipelineRef
+              value={pipeline.ref}
+              provider={provider}
+              projectRef={projectRef}
+              cwd={scope.cwd}
+            />
           </dd>
         </div>
         {jobs !== null ? (

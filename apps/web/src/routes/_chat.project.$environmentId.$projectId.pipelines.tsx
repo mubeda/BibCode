@@ -4,8 +4,13 @@ import { createFileRoute, Outlet, useChildMatches, useNavigate } from "@tanstack
 import { useEffect, useMemo } from "react";
 
 import { PipelinesPanel } from "../components/pipelines/PipelinesPanel";
-import { validatePipelinesSearch } from "../components/pipelines/list/pipelinesList.logic";
+import {
+  sameFilters,
+  shownFilters,
+  validatePipelinesSearch,
+} from "../components/pipelines/list/pipelinesList.logic";
 import { selectHostThreadForProjectSurface } from "../components/pullRequests/openBesideThread.logic";
+import { usePipelinesStore } from "../pipelinesStore";
 import { useRightPanelStore } from "../rightPanelStore";
 import { useProject, useThreadShellsForProjectRefs } from "../state/entities";
 import { useEnvironmentQuery } from "../state/query";
@@ -51,13 +56,19 @@ function PipelinesListRouteView() {
 
   useEffect(() => {
     if (!isRootList || !projectExists || hostThreadRef === null) return;
+    const pipelinesStore = usePipelinesStore.getState();
+    const currentFilters = pipelinesStore.selectViewState(projectRef).filters;
+    const nextFilters = shownFilters(search, currentFilters);
+    if (!sameFilters(currentFilters, nextFilters)) {
+      pipelinesStore.setFilters(projectRef, nextFilters);
+    }
     useRightPanelStore.getState().open(hostThreadRef, "pipelines");
     void navigate({
       to: "/$environmentId/$threadId",
       params: buildThreadRouteParams(hostThreadRef),
       replace: true,
     });
-  }, [hostThreadRef, isRootList, navigate, projectExists]);
+  }, [hostThreadRef, isRootList, navigate, projectExists, projectRef, search]);
 
   if (!isRootList) return <Outlet />;
   if (!projectExists || hostThreadRef !== null) return null;

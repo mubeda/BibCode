@@ -417,7 +417,8 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     >
       <div
         className={cn(
-          "workspace-topbar gap-1 pl-2",
+          "@container/right-panel-bar workspace-topbar flex-wrap gap-x-1 gap-y-0.5 pl-2",
+          dynamicSurfaces.length > 0 && "h-auto min-h-10 py-1",
           props.mode === "inline" ? "pr-28" : "pr-3",
           props.mode === "inline" && props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
         )}
@@ -471,14 +472,21 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
         ) : null}
 
         {showIconBar && dynamicSurfaces.length > 0 ? (
-          <div aria-hidden="true" className="mx-1 h-4 w-px shrink-0 bg-panel-separator" />
+          <div
+            aria-hidden="true"
+            className="mx-1 hidden h-4 w-px shrink-0 bg-panel-separator @min-[520px]/right-panel-bar:block"
+          />
         ) : null}
 
         <ScrollArea
           ref={tabListRef}
           hideScrollbars
           scrollFade
-          className="min-w-0 flex-1 rounded-none"
+          className={cn(
+            "min-w-0 flex-1 rounded-none",
+            dynamicSurfaces.length > 0 &&
+              "basis-full @min-[520px]/right-panel-bar:basis-auto @min-[520px]/right-panel-bar:min-w-28",
+          )}
           data-right-panel-tab-list
         >
           <div className="flex h-full w-max min-w-full items-center gap-1">

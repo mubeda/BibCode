@@ -3703,8 +3703,8 @@ export default function ThreadTerminalPanel({
     onSplitTerminalVertical();
   }, [hasReachedSplitLimit, onSplitTerminalVertical, workspaceUnavailable]);
   const onNewTerminalAction = useCallback(() => {
-    if (!workspaceUnavailable) onNewTerminal?.();
-  }, [onNewTerminal, workspaceUnavailable]);
+    if (!workspaceUnavailable && !hasReachedSplitLimit) onNewTerminal?.();
+  }, [hasReachedSplitLimit, onNewTerminal, workspaceUnavailable]);
 
   if (normalizedTerminalIds.length === 0) {
     return (
@@ -3791,10 +3791,19 @@ export default function ThreadTerminalPanel({
             ) : null}
             {onNewTerminal ? (
               <TerminalActionButton
-                className="p-1 text-foreground/90 transition-colors hover:bg-accent"
+                className={`p-1 text-foreground/90 transition-colors ${
+                  hasReachedSplitLimit
+                    ? "cursor-not-allowed opacity-45 hover:bg-transparent"
+                    : "hover:bg-accent"
+                }`}
                 onClick={onNewTerminalAction}
                 label={newTerminalActionLabel}
-                disabledReason={workspaceUnavailable}
+                disabledReason={
+                  workspaceUnavailable ??
+                  (hasReachedSplitLimit
+                    ? `Maximum ${MAX_TERMINALS_PER_GROUP} terminal panes open.`
+                    : null)
+                }
               >
                 <Plus className="size-3.25" />
               </TerminalActionButton>
@@ -3961,14 +3970,23 @@ export default function ThreadTerminalPanel({
                     ) : null}
                     {onNewTerminal ? (
                       <TerminalActionButton
-                        className={`inline-flex h-full items-center px-1 text-foreground/90 transition-colors hover:bg-accent/70 ${
+                        className={`inline-flex h-full items-center px-1 text-foreground/90 transition-colors ${
                           onSplitTerminal || onSplitTerminalVertical
                             ? "border-l border-border/70"
                             : ""
+                        } ${
+                          hasReachedSplitLimit
+                            ? "cursor-not-allowed opacity-45 hover:bg-transparent"
+                            : "hover:bg-accent/70"
                         }`}
                         onClick={onNewTerminalAction}
                         label={newTerminalActionLabel}
-                        disabledReason={workspaceUnavailable}
+                        disabledReason={
+                          workspaceUnavailable ??
+                          (hasReachedSplitLimit
+                            ? `Maximum ${MAX_TERMINALS_PER_GROUP} terminal panes open.`
+                            : null)
+                        }
                       >
                         <Plus className="size-3.25" />
                       </TerminalActionButton>

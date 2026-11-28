@@ -3374,19 +3374,20 @@ never count a sandbox-denied listener test as passed or skipped.
    refusal after access is revoked or the request changes within that window.
 9. Right-panel requests: with a thread on a branch that has an open request,
    choose **Open MR in panel** (**Open PR in panel** on GitHub) from the
-   Source Control menu; it opens one right-panel tab labelled `!N`/`#N` beside
-   the thread, against the thread's checkout. For a Bitbucket or Azure DevOps
-   repository, or with **Pull requests** off in Settings, the item is absent
-   and Done opens no tab. In the tab, switch tabs, follow a conversation file
-   link (it must select Changes and scroll to the file), reload and confirm the
-   tab and its selected section persist, then use **Open full page** and
-   confirm the `?tab=` URL. On a disposable request, a revert must open the
-   revert request as a second tab and a delete must close only its tab. From
+   Source Control menu; it selects the right panel's singleton **Pull Request**
+   surface on that request against the thread's checkout. For a Bitbucket or
+   Azure DevOps repository, or with **Pull requests** off in Settings, the item
+   is absent and Done opens no request. Inside the surface, switch tabs, follow
+   a conversation file link (it must select Changes and scroll to the file),
+   reload and confirm the selected request and section persist, then use **Open
+   full page** and confirm the `?tab=` URL. On a disposable request, a revert
+   must switch the Pull Request surface to the revert request and a delete must
+   return the surface to the embedded Pull Requests list. From
    the full page, **Open beside a thread…** must list the project's threads
    with those on the request's branch first ("On this branch"), open the
    request in the chosen thread and navigate to it; with no thread it is
-   disabled with its reason. Remove the thread's worktree and confirm the tab
-   shows the unavailable reason instead of an error.
+   disabled with its reason. Remove the thread's worktree and confirm the
+   surface shows the unavailable reason instead of an error.
 10. Verify Commits copy the full SHA and open the host commit. Checks/Pipelines
     group rows with state, duration and links and distinguish the host's empty
     state. Refresh reloads detail plus the active tab (including timeline in

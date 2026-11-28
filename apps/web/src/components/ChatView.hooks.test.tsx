@@ -3862,12 +3862,14 @@ describe("ChatView right panel handlers", () => {
     );
   });
 
-  it("closes single, other, right-of, and all surfaces including terminal cleanup", () => {
+  it("closes single terminal surfaces and restricts bulk tab close to dynamic surfaces", () => {
     const props = openedPanelProps((ref) => {
       useRightPanelStore.getState().open(ref, "plan");
       useRightPanelStore.getState().openTerminal(ref, "terminal-1");
       useRightPanelStore.getState().open(ref, "sourceControl");
       useRightPanelStore.getState().open(ref, "files");
+      useRightPanelStore.getState().openFile(ref, "src/a.ts");
+      useRightPanelStore.getState().openFile(ref, "src/b.ts");
     });
     const surfaces = useRightPanelStore.getState().byThreadKey[threadKey]!.surfaces;
     const terminalSurface = surfaces.find((surface) => surface.kind === "terminal")!;
@@ -3889,7 +3891,9 @@ describe("ChatView right panel handlers", () => {
     onCloseOtherSurfaces(planSurface);
     onCloseAllSurfaces();
 
-    expect(useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).toHaveLength(0);
+    expect(
+      (useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).map((s) => s.id),
+    ).toEqual(["sourceControl", "files"]);
   });
 
   it("falls back to terminal exit when right-panel session close fails", async () => {

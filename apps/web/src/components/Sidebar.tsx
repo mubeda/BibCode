@@ -3786,6 +3786,12 @@ function useOpenRepositoryModule(
         ? scopeThreadRef(params.environmentId as EnvironmentId, params.threadId as ThreadId)
         : null,
   });
+  const groupThreadsRef = useRef(groupThreads);
+  const routeThreadRefRef = useRef(routeThreadRef);
+  useLayoutEffect(() => {
+    groupThreadsRef.current = groupThreads;
+    routeThreadRefRef.current = routeThreadRef;
+  }, [groupThreads, routeThreadRef]);
   return useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
       event.preventDefault();
@@ -3797,13 +3803,15 @@ function useOpenRepositoryModule(
         (member) => {
           if (!member) return;
           if (isMobile) setOpenMobile(false);
-          const memberThreads = groupThreads.filter(
+          const latestThreads = groupThreadsRef.current;
+          const latestRouteThreadRef = routeThreadRefRef.current;
+          const memberThreads = latestThreads.filter(
             (thread) =>
               thread.environmentId === member.environmentId && thread.projectId === member.id,
           );
           const hostThreadRef = selectHostThreadForProjectSurface({
             threads: memberThreads,
-            currentThreadRef: routeThreadRef,
+            currentThreadRef: latestRouteThreadRef,
             preferredBranch: null,
           });
           if (hostThreadRef !== null) {
@@ -3811,9 +3819,9 @@ function useOpenRepositoryModule(
               to === "/project/$environmentId/$projectId/pipelines" ? "pipelines" : "pullRequest";
             useRightPanelStore.getState().open(hostThreadRef, surfaceKind);
             if (
-              routeThreadRef === null ||
-              routeThreadRef.environmentId !== hostThreadRef.environmentId ||
-              routeThreadRef.threadId !== hostThreadRef.threadId
+              latestRouteThreadRef === null ||
+              latestRouteThreadRef.environmentId !== hostThreadRef.environmentId ||
+              latestRouteThreadRef.threadId !== hostThreadRef.threadId
             ) {
               void navigate({
                 to: "/$environmentId/$threadId",
@@ -3829,16 +3837,7 @@ function useOpenRepositoryModule(
         },
       );
     },
-    [
-      environments,
-      group.cards,
-      groupThreads,
-      isMobile,
-      navigate,
-      routeThreadRef,
-      setOpenMobile,
-      to,
-    ],
+    [environments, group.cards, isMobile, navigate, setOpenMobile, to],
   );
 }
 

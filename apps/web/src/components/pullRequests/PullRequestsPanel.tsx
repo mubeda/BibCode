@@ -36,6 +36,7 @@ export interface PullRequestsPanelProps {
   onSelectRequest?: (target: {
     readonly number: number;
     readonly provider: SourceControlProviderKind;
+    readonly cwd?: string;
   }) => void;
 }
 
@@ -77,8 +78,17 @@ function AvailablePullRequests({
     [context.host, context.provider, context.webUrl],
   );
   const listNavigation = useMemo<PullRequestsListNavigation | null>(
-    () => (mode === "embedded" && onSelectRequest ? { openRequest: onSelectRequest } : null),
-    [mode, onSelectRequest],
+    () =>
+      mode === "embedded" && onSelectRequest
+        ? {
+            openRequest: (target) =>
+              onSelectRequest({
+                ...target,
+                cwd: target.cwd ?? scope.cwd,
+              }),
+          }
+        : null,
+    [mode, onSelectRequest, scope.cwd],
   );
   const listView = (
     <PullRequestsListView

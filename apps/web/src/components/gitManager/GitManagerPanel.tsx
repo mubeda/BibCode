@@ -10,6 +10,7 @@ import type {
   GitManagerRefsSnapshot,
   GitManagerStashEntry,
   ScopedProjectRef,
+  SourceControlProviderKind,
   VcsWorktreeDescriptor,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
@@ -152,6 +153,13 @@ function createMultiCommitState(
 
 export interface GitManagerPanelProps {
   readonly projectRef: ScopedProjectRef;
+  readonly onOpenPullRequest?:
+    | ((target: {
+        readonly number: number;
+        readonly provider: SourceControlProviderKind;
+        readonly cwd: string;
+      }) => void)
+    | undefined;
 }
 
 interface GitManagerUnavailableStateProps {
@@ -221,6 +229,13 @@ interface GitManagerRepositorySurfacesProps {
   readonly activeTab: GitManagerTab;
   readonly tabTransitionBaselineRef: RefObject<GitManagerTabTransitionBaseline | null>;
   readonly onTabChange: (value: string | number | null) => void;
+  readonly onOpenPullRequest?:
+    | ((target: {
+        readonly number: number;
+        readonly provider: SourceControlProviderKind;
+        readonly cwd: string;
+      }) => void)
+    | undefined;
 }
 
 const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces({
@@ -239,6 +254,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   activeTab,
   tabTransitionBaselineRef,
   onTabChange,
+  onOpenPullRequest,
 }: GitManagerRepositorySurfacesProps) {
   const registry = useContext(RegistryContext);
   const { environmentId, cwd } = scope;
@@ -1126,6 +1142,7 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
             disabledReason={pullRequestsDisabledReason}
             scope={scope}
             onRefresh={refreshRefs}
+            onOpenPullRequest={onOpenPullRequest}
           />
         </div>
       ) : null}
@@ -1315,7 +1332,10 @@ const GitManagerRepositorySurfaces = memo(function GitManagerRepositorySurfaces(
   );
 });
 
-export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: GitManagerPanelProps) {
+export const GitManagerPanel = memo(function GitManagerPanel({
+  projectRef,
+  onOpenPullRequest,
+}: GitManagerPanelProps) {
   // Reconnecting unmounts the surfaces, not the route: keep their transition memory here
   // so only a real panel opening or checkout change starts a fresh baseline.
   const tabTransitionBaselineRef = useRef<GitManagerTabTransitionBaseline | null>(null);
@@ -1478,6 +1498,7 @@ export const GitManagerPanel = memo(function GitManagerPanel({ projectRef }: Git
           tagDisabledReason={effectiveDisabledReasons.tag}
           tabTransitionBaselineRef={tabTransitionBaselineRef}
           onTabChange={handleTabChange}
+          onOpenPullRequest={onOpenPullRequest}
         />
       </div>
     </GitManagerImageDiffModeProvider>

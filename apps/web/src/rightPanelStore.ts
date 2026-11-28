@@ -73,6 +73,14 @@ export interface PullRequestSelection {
   readonly number: number;
   readonly provider: SourceControlProviderKind;
   readonly tab: PullRequestsDetailTab;
+  readonly cwd?: string;
+}
+
+export interface EmbeddedPipelineViewState {
+  readonly pipelineId: number;
+  readonly attempt: number | null;
+  readonly jobId: number | null;
+  readonly jobLogOffset?: number | null;
 }
 
 export type PullRequestRightPanelSurface = {
@@ -145,11 +153,22 @@ interface RightPanelStoreState {
   recentActiveSurfaceIdsByThreadKey: Record<string, string[]>;
   /**
    * Legacy v11 terminal session ids dropped during v11 -> v12 singleton merge (>4 panes).
-   * Consumed by `ChatView` so orphaned server terminal sessions are retired cleanly. Never persisted.
+   * Persisted until `ChatView` confirms each orphaned server terminal session has been retired.
    */
   migratedOverflowTerminalIdsByThreadKey: Record<string, string[]>;
+  /** Transient per-thread embedded Pipelines view state so switching to MR and back restores it. */
+  embeddedPipelineByThreadKey: Record<string, EmbeddedPipelineViewState | null>;
+  /** Transient return surface when an embedded MR was opened from another right-panel surface. */
+  pullRequestReturnSurfaceByThreadKey: Record<string, "pipelines">;
   /** Returns and clears any v11 -> v12 overflow terminal ids queued for cleanup on `ref`. */
   consumeMigratedOverflowTerminalIds: (ref: ScopedThreadRef) => string[];
+  /** Acknowledges retired v11 -> v12 overflow terminal ids after cleanup succeeds. */
+  acknowledgeMigratedOverflowTerminalIds: (
+    ref: ScopedThreadRef,
+    terminalIds: readonly string[],
+  ) => void;
+  setEmbeddedPipeline: (ref: ScopedThreadRef, next: EmbeddedPipelineViewState | null) => void;
+  consumePullRequestReturnSurface: (ref: ScopedThreadRef) => "pipelines" | null;
   /** Opens (or reopens) the Files tab and asks its tree to select `relativePath`. */
   revealInFiles: (ref: ScopedThreadRef, relativePath: string) => void;
   /** Drops the request once handled; a newer request for the same thread is kept. */
@@ -161,10 +180,14 @@ interface RightPanelStoreState {
   openFile: (ref: ScopedThreadRef, relativePath: string, line?: number) => void;
   openPullRequest: (
     ref: ScopedThreadRef,
-    request: { number: number; provider: SourceControlProviderKind },
+    request: { number: number; provider: SourceControlProviderKind; cwd?: string },
     tab?: PullRequestsDetailTab,
+    options?: { readonly returnTo?: "pipelines" },
   ) => void;
-  clearPullRequestSelection: (ref: ScopedThreadRef) => void;
+  clearPullRequestSelection: (
+    ref: ScopedThreadRef,
+    options?: { readonly preserveFocus?: boolean },
+  ) => void;
   setPullRequestTab: (ref: ScopedThreadRef, number: number, tab: PullRequestsDetailTab) => void;
   /** Remembers the image the thread's Device pane shows; a thread without one keeps nothing. */
   setDeviceImage: (ref: ScopedThreadRef, image: DeviceSurfaceImage) => void;
@@ -179,17 +202,30 @@ interface RightPanelStoreState {
   closeTerminal: (ref: ScopedThreadRef, surfaceId: string, terminalId: string) => void;
   activateSurface: (ref: ScopedThreadRef, surfaceId: string) => void;
   closeSurface: (ref: ScopedThreadRef, surfaceId: string, options?: CloseSurfaceOptions) => void;
+  closeSurfaces: (
+    ref: ScopedThreadRef,
+    surfaceIds: readonly string[],
+    options?: CloseSurfaceOptions,
+  ) => void;
   closeOtherSurfaces: (ref: ScopedThreadRef, surfaceId: string) => void;
   closeSurfacesToRight: (ref: ScopedThreadRef, surfaceId: string) => void;
   closeAllSurfaces: (ref: ScopedThreadRef) => void;
-  reconcileBrowserSurfaces: (ref: ScopedThreadRef, tabIds: readonly string[]) => void;
+  reconcileBrowserSurfaces: (
+    ref: ScopedThreadRef,
+    tabIds: readonly string[],
+    options?: CloseSurfaceOptions,
+  ) => void;
   reconcileFileSurfaces: (ref: ScopedThreadRef, workspaceAvailable: boolean) => void;
   remapFileSurfaces: (
     ref: ScopedThreadRef,
     oldRelativePath: string,
     newRelativePath: string,
   ) => void;
-  closeFileSurfacesUnder: (ref: ScopedThreadRef, relativePath: string) => void;
+  closeFileSurfacesUnder: (
+    ref: ScopedThreadRef,
+    relativePath: string,
+    options?: CloseSurfaceOptions,
+  ) => void;
   show: (ref: ScopedThreadRef) => void;
   close: (ref: ScopedThreadRef) => void;
   toggleVisibility: (ref: ScopedThreadRef) => void;
@@ -257,6 +293,10 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
+export function isDynamicRightPanelSurface(surface: RightPanelSurface): boolean {
+  return surface.kind === "preview" || surface.kind === "file" || surface.kind === "plan";
+}
+
 function isDynamicSurface(surface: RightPanelSurface): boolean {
   return surface.kind === "preview" || surface.kind === "file";
 }
@@ -318,13 +358,14 @@ export function pullRequestSurfaceId(_number?: number): "pullRequest" {
 
 function normalizePullRequestSelection(value: unknown): PullRequestSelection | null {
   if (!isRecord(value)) return null;
-  const { number, provider, tab } = value;
+  const { number, provider, tab, cwd } = value;
   if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) return null;
   if (!isSourceControlProviderKind(provider)) return null;
   return {
     number,
     provider,
     tab: isPullRequestDetailTab(tab) ? tab : "conversation",
+    ...(isNonEmptyString(cwd) ? { cwd } : {}),
   };
 }
 
@@ -765,6 +806,8 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       filesReveal: {},
       recentActiveSurfaceIdsByThreadKey: {},
       migratedOverflowTerminalIdsByThreadKey: {},
+      embeddedPipelineByThreadKey: {},
+      pullRequestReturnSurfaceByThreadKey: {},
       consumeMigratedOverflowTerminalIds: (ref) => {
         const key = scopedThreadKey(ref);
         const ids = get().migratedOverflowTerminalIdsByThreadKey[key];
@@ -775,6 +818,53 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
           return { migratedOverflowTerminalIdsByThreadKey: rest };
         });
         return ids;
+      },
+      acknowledgeMigratedOverflowTerminalIds: (ref, terminalIds) => {
+        if (terminalIds.length === 0) return;
+        const key = scopedThreadKey(ref);
+        const acked = new Set(terminalIds);
+        set((state) => {
+          const existing = state.migratedOverflowTerminalIdsByThreadKey[key];
+          if (!existing || existing.length === 0) return state;
+          const remaining = existing.filter((id) => !acked.has(id));
+          if (remaining.length === existing.length) return state;
+          if (remaining.length === 0) {
+            const { [key]: _removed, ...rest } = state.migratedOverflowTerminalIdsByThreadKey;
+            return { migratedOverflowTerminalIdsByThreadKey: rest };
+          }
+          return {
+            migratedOverflowTerminalIdsByThreadKey: {
+              ...state.migratedOverflowTerminalIdsByThreadKey,
+              [key]: remaining,
+            },
+          };
+        });
+      },
+      setEmbeddedPipeline: (ref, next) =>
+        set((state) => {
+          const key = scopedThreadKey(ref);
+          if (next === null) {
+            if (!(key in state.embeddedPipelineByThreadKey)) return state;
+            const { [key]: _removed, ...rest } = state.embeddedPipelineByThreadKey;
+            return { embeddedPipelineByThreadKey: rest };
+          }
+          return {
+            embeddedPipelineByThreadKey: {
+              ...state.embeddedPipelineByThreadKey,
+              [key]: next,
+            },
+          };
+        }),
+      consumePullRequestReturnSurface: (ref) => {
+        const key = scopedThreadKey(ref);
+        const target = get().pullRequestReturnSurfaceByThreadKey[key] ?? null;
+        if (target === null) return null;
+        set((state) => {
+          if (!(key in state.pullRequestReturnSurfaceByThreadKey)) return state;
+          const { [key]: _removed, ...rest } = state.pullRequestReturnSurfaceByThreadKey;
+          return { pullRequestReturnSurfaceByThreadKey: rest };
+        });
+        return target;
       },
       revealInFiles: (ref, relativePath) =>
         set((state) => {
@@ -828,9 +918,10 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             return upsertSurface({ ...current, surfaces: withoutPlaceholder }, surface);
           }),
         ),
-      openPullRequest: (ref, request, tab) =>
-        set((state) =>
-          updateThreadWithHistory(state, scopedThreadKey(ref), (current) => {
+      openPullRequest: (ref, request, tab, options) =>
+        set((state) => {
+          const key = scopedThreadKey(ref);
+          const updated = updateThreadWithHistory(state, key, (current) => {
             const existing = current.surfaces.find(
               (surface): surface is PullRequestRightPanelSurface => surface.kind === "pullRequest",
             );
@@ -839,6 +930,9 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               (existing?.selection?.number === request.number
                 ? existing.selection.tab
                 : "conversation");
+            const nextCwd =
+              request.cwd ??
+              (existing?.selection?.number === request.number ? existing.selection.cwd : undefined);
             const nextSurface: PullRequestRightPanelSurface = {
               id: "pullRequest",
               kind: "pullRequest",
@@ -846,25 +940,56 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
                 number: request.number,
                 provider: request.provider,
                 tab: nextTab,
+                ...(nextCwd ? { cwd: nextCwd } : {}),
               },
             };
             return replaceSurface(current, nextSurface);
-          }),
-        ),
-      clearPullRequestSelection: (ref) =>
-        set((state) =>
-          updateThreadWithHistory(state, scopedThreadKey(ref), (current) => {
+          });
+          if (options?.returnTo !== undefined) {
+            return {
+              ...updated,
+              pullRequestReturnSurfaceByThreadKey: {
+                ...state.pullRequestReturnSurfaceByThreadKey,
+                [key]: options.returnTo,
+              },
+            };
+          }
+          if (key in state.pullRequestReturnSurfaceByThreadKey) {
+            const { [key]: _removed, ...rest } = state.pullRequestReturnSurfaceByThreadKey;
+            return { ...updated, pullRequestReturnSurfaceByThreadKey: rest };
+          }
+          return updated;
+        }),
+      clearPullRequestSelection: (ref, options) =>
+        set((state) => {
+          const key = scopedThreadKey(ref);
+          const updated = updateThreadWithHistory(state, key, (current) => {
             const existing = current.surfaces.find(
               (surface): surface is PullRequestRightPanelSurface => surface.kind === "pullRequest",
             );
-            if (!existing || existing.selection === undefined) {
-              return existing
-                ? { ...current, isOpen: true, activeSurfaceId: "pullRequest" }
-                : current;
+            if (!existing) return current;
+            if (options?.preserveFocus) {
+              if (existing.selection === undefined) return current;
+              return {
+                ...current,
+                surfaces: current.surfaces.map((surface) =>
+                  surface.kind === "pullRequest"
+                    ? ({ id: "pullRequest", kind: "pullRequest" } as PullRequestRightPanelSurface)
+                    : surface,
+                ),
+              };
+            }
+            if (existing.selection === undefined) {
+              return { ...current, isOpen: true, activeSurfaceId: "pullRequest" };
             }
             return replaceSurface(current, { id: "pullRequest", kind: "pullRequest" });
-          }),
-        ),
+          });
+          if (key in state.pullRequestReturnSurfaceByThreadKey) {
+            const { [key]: _removed, ...rest } = state.pullRequestReturnSurfaceByThreadKey;
+            return { ...updated, pullRequestReturnSurfaceByThreadKey: rest };
+          }
+          return updated;
+        }),
       setPullRequestTab: (ref, number, tab) =>
         set((state) =>
           updateThreadWithHistory(state, scopedThreadKey(ref), (current) => {
@@ -1099,6 +1224,57 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             };
           }),
         ),
+      closeSurfaces: (ref, surfaceIds, options) =>
+        set((state) =>
+          updateThreadWithHistory(state, scopedThreadKey(ref), (current, recentIds) => {
+            if (surfaceIds.length === 0) return current;
+            const idSet = new Set(surfaceIds);
+            const removed = current.surfaces.filter((surface) => idSet.has(surface.id));
+            if (removed.length === 0) return current;
+            const activeIndex = current.surfaces.findIndex(
+              (surface) => surface.id === current.activeSurfaceId,
+            );
+            const surfaces = current.surfaces.filter((surface) => !idSet.has(surface.id));
+            const activeStillExists =
+              current.activeSurfaceId !== null &&
+              surfaces.some((surface) => surface.id === current.activeSurfaceId);
+            if (activeStillExists) {
+              return { ...current, surfaces };
+            }
+            const fallbackId = pickRemainingFallbackSurfaceId(
+              surfaces,
+              Math.max(0, activeIndex),
+              recentIds,
+            );
+            if (fallbackId !== null) {
+              return {
+                ...current,
+                isOpen: current.isOpen,
+                surfaces,
+                activeSurfaceId: fallbackId,
+              };
+            }
+            if (current.isOpen && removed.some(isDynamicSurface)) {
+              const fallbackSingleton = resolveNonTerminalFallbackSingleton(
+                options?.availableSingletons,
+              );
+              if (fallbackSingleton !== null) {
+                const surface = singletonSurface(fallbackSingleton);
+                return {
+                  isOpen: true,
+                  surfaces: [surface],
+                  activeSurfaceId: surface.id,
+                };
+              }
+            }
+            return {
+              ...current,
+              isOpen: false,
+              surfaces,
+              activeSurfaceId: null,
+            };
+          }),
+        ),
       closeOtherSurfaces: (ref, surfaceId) =>
         set((state) =>
           updateThreadWithHistory(state, scopedThreadKey(ref), (current) => {
@@ -1136,7 +1312,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               : { ...current, isOpen: false, surfaces: [], activeSurfaceId: null },
           ),
         ),
-      reconcileBrowserSurfaces: (ref, tabIds) =>
+      reconcileBrowserSurfaces: (ref, tabIds, options) =>
         set((state) =>
           updateThreadWithHistory(state, scopedThreadKey(ref), (current, recentIds) => {
             const validIds = new Set(tabIds.map((tabId) => `browser:${tabId}`));
@@ -1155,13 +1331,34 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             const activeStillExists = surfaces.some(
               (surface) => surface.id === current.activeSurfaceId,
             );
-            const fallbackBrowser = surfaces.find((surface) => surface.kind === "preview");
+            if (activeStillExists) {
+              return { ...current, surfaces };
+            }
+            const mruFallback = pickRemainingFallbackSurfaceId(surfaces, 0, recentIds);
+            if (mruFallback !== null) {
+              return { ...current, surfaces, activeSurfaceId: mruFallback };
+            }
+            if (
+              current.isOpen &&
+              current.activeSurfaceId !== null &&
+              options?.availableSingletons !== undefined
+            ) {
+              const fallbackSingleton = resolveNonTerminalFallbackSingleton(
+                options.availableSingletons,
+              );
+              if (fallbackSingleton !== null) {
+                const surface = singletonSurface(fallbackSingleton);
+                return {
+                  isOpen: true,
+                  surfaces: [surface],
+                  activeSurfaceId: surface.id,
+                };
+              }
+            }
             return {
               ...current,
               surfaces,
-              activeSurfaceId: activeStillExists
-                ? current.activeSurfaceId
-                : (fallbackBrowser?.id ?? pickRemainingFallbackSurfaceId(surfaces, 0, recentIds)),
+              activeSurfaceId: null,
             };
           }),
         ),
@@ -1191,26 +1388,38 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       // each surface's reveal state and the active-surface selection. A `file:${old}` prefix WITHOUT
       // the trailing "/" boundary is deliberately NOT matched (so renaming "src" leaves "srcfoo/x").
       remapFileSurfaces: (ref, oldRelativePath, newRelativePath) =>
-        set((state) =>
-          updateThreadWithHistory(state, scopedThreadKey(ref), (current) => {
-            const oldId = `file:${oldRelativePath}`;
-            const childPrefix = `${oldId}/`;
-            const idRemap = new Map<string, string>();
-            for (const surface of current.surfaces) {
-              if (surface.kind !== "file") continue;
-              if (surface.id === oldId) {
-                idRemap.set(surface.id, `file:${newRelativePath}`);
-              } else if (surface.id.startsWith(childPrefix)) {
-                idRemap.set(
-                  surface.id,
-                  `file:${newRelativePath}/${surface.id.slice(childPrefix.length)}`,
-                );
-              }
+        set((state) => {
+          const threadKey = scopedThreadKey(ref);
+          const current = state.byThreadKey[threadKey] ?? EMPTY_THREAD_STATE;
+          const oldId = `file:${oldRelativePath}`;
+          const childPrefix = `${oldId}/`;
+          const idRemap = new Map<string, string>();
+          for (const surface of current.surfaces) {
+            if (surface.kind !== "file") continue;
+            if (surface.id === oldId) {
+              idRemap.set(surface.id, `file:${newRelativePath}`);
+            } else if (surface.id.startsWith(childPrefix)) {
+              idRemap.set(
+                surface.id,
+                `file:${newRelativePath}/${surface.id.slice(childPrefix.length)}`,
+              );
             }
-            if (idRemap.size === 0) return current;
+          }
+          if (idRemap.size === 0) return state;
+          const remappedRecent = (state.recentActiveSurfaceIdsByThreadKey[threadKey] ?? []).map(
+            (id) => idRemap.get(id) ?? id,
+          );
+          const preRemappedState = {
+            ...state,
+            recentActiveSurfaceIdsByThreadKey: {
+              ...state.recentActiveSurfaceIdsByThreadKey,
+              [threadKey]: remappedRecent,
+            },
+          };
+          return updateThreadWithHistory(preRemappedState, threadKey, (entry) => {
             const seen = new Set<string>();
             const surfaces: RightPanelSurface[] = [];
-            for (const surface of current.surfaces) {
+            for (const surface of entry.surfaces) {
               const nextId = surface.kind === "file" ? idRemap.get(surface.id) : undefined;
               const next: RightPanelSurface =
                 nextId !== undefined && surface.kind === "file"
@@ -1225,16 +1434,16 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               surfaces.push(next);
             }
             const activeSurfaceId =
-              current.activeSurfaceId !== null
-                ? (idRemap.get(current.activeSurfaceId) ?? current.activeSurfaceId)
+              entry.activeSurfaceId !== null
+                ? (idRemap.get(entry.activeSurfaceId) ?? entry.activeSurfaceId)
                 : null;
-            return { ...current, surfaces, activeSurfaceId };
-          }),
-        ),
+            return { ...entry, surfaces, activeSurfaceId };
+          });
+        }),
       // Close the file surface at `relativePath` and, for a deleted directory, every descendant under
-      // it (same trailing-slash boundary as remap). Falls the active selection back to a neighbor the
-      // way closeSurface does, and closes the panel when nothing is left.
-      closeFileSurfacesUnder: (ref, relativePath) =>
+      // it (same trailing-slash boundary as remap). Falls the active selection back to MRU/neighbor
+      // or an available singleton when open, and closes the panel when nothing is left.
+      closeFileSurfacesUnder: (ref, relativePath, options) =>
         set((state) =>
           updateThreadWithHistory(state, scopedThreadKey(ref), (current, recentIds) => {
             const targetId = `file:${relativePath}`;
@@ -1253,6 +1462,19 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             const fallbackId = activeRemoved
               ? pickRemainingFallbackSurfaceId(surfaces, activeIndex, recentIds)
               : null;
+            if (surfaces.length === 0 && current.isOpen && options?.availableSingletons) {
+              const fallbackSingleton = resolveNonTerminalFallbackSingleton(
+                options.availableSingletons,
+              );
+              if (fallbackSingleton !== null) {
+                const surface = singletonSurface(fallbackSingleton);
+                return {
+                  isOpen: true,
+                  surfaces: [surface],
+                  activeSurfaceId: surface.id,
+                };
+              }
+            }
             return {
               ...current,
               isOpen: surfaces.length > 0 && current.isOpen,
@@ -1307,11 +1529,17 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             state.recentActiveSurfaceIdsByThreadKey;
           const { [threadKey]: _removedOverflow, ...restOverflow } =
             state.migratedOverflowTerminalIdsByThreadKey;
+          const { [threadKey]: _removedPipeline, ...restPipeline } =
+            state.embeddedPipelineByThreadKey;
+          const { [threadKey]: _removedReturn, ...restReturn } =
+            state.pullRequestReturnSurfaceByThreadKey;
           // A host's Diff on this (chat panel) thread goes back to the host's own diff.
           let changed =
             threadKey in state.byThreadKey ||
             threadKey in state.recentActiveSurfaceIdsByThreadKey ||
-            threadKey in state.migratedOverflowTerminalIdsByThreadKey;
+            threadKey in state.migratedOverflowTerminalIdsByThreadKey ||
+            threadKey in state.embeddedPipelineByThreadKey ||
+            threadKey in state.pullRequestReturnSurfaceByThreadKey;
           for (const [key, thread] of Object.entries(rest)) {
             if (parseScopedThreadKey(key)?.environmentId !== ref.environmentId) continue;
             if (!thread.surfaces.some((s) => s.kind === "diff" && s.threadId === ref.threadId)) {
@@ -1330,6 +1558,8 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
                 byThreadKey: rest,
                 recentActiveSurfaceIdsByThreadKey: restRecent,
                 migratedOverflowTerminalIdsByThreadKey: restOverflow,
+                embeddedPipelineByThreadKey: restPipeline,
+                pullRequestReturnSurfaceByThreadKey: restReturn,
               }
             : state;
         }),
@@ -1340,20 +1570,17 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       storage: createJSONStorage(() =>
         resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
       ),
-      partialize: (state) => ({ byThreadKey: state.byThreadKey }),
+      partialize: (state) => ({
+        byThreadKey: state.byThreadKey,
+        ...(Object.keys(state.migratedOverflowTerminalIdsByThreadKey).length > 0
+          ? {
+              migratedOverflowTerminalIdsByThreadKey: state.migratedOverflowTerminalIdsByThreadKey,
+            }
+          : {}),
+      }),
       migrate: (persistedState) => {
         const migrated = migratePersistedRightPanelStateWithOverflow(persistedState);
-        return {
-          byThreadKey: migrated.byThreadKey,
-          migratedOverflowTerminalIdsByThreadKey: migrated.overflowTerminalIdsByThreadKey,
-        };
-      },
-      merge: (persistedState, currentState) => {
-        if (persistedState === undefined) return currentState;
-        const sanitized = migratePersistedRightPanelStateWithOverflow(persistedState);
-        const migratedOverflow: Record<string, string[]> = {
-          ...sanitized.overflowTerminalIdsByThreadKey,
-        };
+        const overflow = { ...migrated.overflowTerminalIdsByThreadKey };
         if (
           isRecord(persistedState) &&
           isRecord(persistedState.migratedOverflowTerminalIdsByThreadKey)
@@ -1364,10 +1591,33 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             if (!Array.isArray(rawIds)) continue;
             const validIds = rawIds.filter((id): id is string => isNonEmptyString(id));
             if (validIds.length === 0) continue;
+            overflow[threadKey] = [...new Set([...(overflow[threadKey] ?? []), ...validIds])];
+          }
+        }
+        return {
+          byThreadKey: migrated.byThreadKey,
+          migratedOverflowTerminalIdsByThreadKey: overflow,
+        };
+      },
+      merge: (persistedState, currentState) => {
+        if (persistedState === undefined) return currentState;
+        const sanitized = migratePersistedRightPanelStateWithOverflow(persistedState);
+        const migratedOverflow: Record<string, string[]> = {};
+        const mergeOverflowRecord = (record: unknown) => {
+          if (!isRecord(record)) return;
+          for (const [threadKey, rawIds] of Object.entries(record)) {
+            if (!Array.isArray(rawIds)) continue;
+            const validIds = rawIds.filter((id): id is string => isNonEmptyString(id));
+            if (validIds.length === 0) continue;
             migratedOverflow[threadKey] = [
               ...new Set([...(migratedOverflow[threadKey] ?? []), ...validIds]),
             ];
           }
+        };
+        mergeOverflowRecord(currentState.migratedOverflowTerminalIdsByThreadKey);
+        mergeOverflowRecord(sanitized.overflowTerminalIdsByThreadKey);
+        if (isRecord(persistedState)) {
+          mergeOverflowRecord(persistedState.migratedOverflowTerminalIdsByThreadKey);
         }
         return {
           ...currentState,

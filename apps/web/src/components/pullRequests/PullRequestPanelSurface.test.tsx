@@ -216,6 +216,34 @@ describe("PullRequestPanelSurface", () => {
     expect(h.navigate).not.toHaveBeenCalled();
   });
 
+  it("carries the selected checkout cwd from list/pipeline into detail and returns to Pipelines on Back when opened from Pipelines", async () => {
+    useRightPanelStore.getState().open(threadRef, "pipelines");
+    useRightPanelStore
+      .getState()
+      .openPullRequest(
+        threadRef,
+        { number: 89, provider: "gitlab", cwd: "/repo/main-checkout" },
+        "conversation",
+        { returnTo: "pipelines" },
+      );
+    const active = panelState().surfaces.find(
+      (entry): entry is PullRequestRightPanelSurface => entry.kind === "pullRequest",
+    )!;
+    await render({ surface: active, gitCwd: "/repo/linked-worktree" });
+    expect(h.detailProps).toMatchObject({
+      scope: { environmentId: "env", cwd: "/repo/main-checkout" },
+      number: 89,
+    });
+    const navigation = h.navigation as PullRequestsNavigation;
+    await act(async () => navigation.back!());
+    expect(panelState().activeSurfaceId).toBe("pipelines");
+    expect(panelState().surfaces.find((entry) => entry.kind === "pullRequest")).toEqual({
+      id: "pullRequest",
+      kind: "pullRequest",
+    });
+    expect(h.navigate).not.toHaveBeenCalled();
+  });
+
   it("renders the request in the thread's checkout on the surface's tab", async () => {
     await render();
     expect(h.detailProps).toMatchObject({
@@ -244,7 +272,7 @@ describe("PullRequestPanelSurface", () => {
       {
         id: "pullRequest",
         kind: "pullRequest",
-        selection: { number: 90, provider: "gitlab", tab: "conversation" },
+        selection: { number: 90, provider: "gitlab", tab: "conversation", cwd: "/repo/worktree" },
       },
     ]);
     expect(state.activeSurfaceId).toBe("pullRequest");

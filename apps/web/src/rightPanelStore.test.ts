@@ -1711,4 +1711,80 @@ describe("rightPanelStore v12 fixed icon bar surface model (#426)", () => {
     expect(secondHydrated.byThreadKey).toEqual(firstPass.byThreadKey);
     expect(secondHydrated.overflow).toEqual({});
   });
+
+  it("preserves overflow terminal cleanup across double hydration, renames MRU entries, reconciles browser/file removals with D6 fallback, and preserves focus on late PR deletion", async () => {
+    const legacyV11 = {
+      byThreadKey: {
+        "env-1:thread-A": {
+          isOpen: true,
+          activeSurfaceId: "terminal:term-5",
+          surfaces: [
+            { id: "terminal:term-1", kind: "terminal", resourceId: "term-1" },
+            { id: "terminal:term-2", kind: "terminal", resourceId: "term-2" },
+            { id: "terminal:term-3", kind: "terminal", resourceId: "term-3" },
+            { id: "terminal:term-4", kind: "terminal", resourceId: "term-4" },
+            { id: "terminal:term-5", kind: "terminal", resourceId: "term-5" },
+          ],
+        },
+      },
+    };
+    const firstHydrated = await hydrate({ state: legacyV11, version: 11 });
+    expect(firstHydrated.overflow["env-1:thread-A"]).toEqual(["term-4"]);
+    // Re-hydrating before acknowledgment must preserve pending overflow IDs.
+    const secondHydrated = await hydrate({
+      state: {
+        byThreadKey: firstHydrated.byThreadKey,
+        migratedOverflowTerminalIdsByThreadKey: firstHydrated.overflow,
+      },
+      version: 12,
+    });
+    expect(secondHydrated.overflow["env-1:thread-A"]).toEqual(["term-4"]);
+    useRightPanelStore.getState().acknowledgeMigratedOverflowTerminalIds(refA, ["term-4"]);
+    expect(
+      useRightPanelStore.getState().migratedOverflowTerminalIdsByThreadKey["env-1:thread-A"],
+    ).toBeUndefined();
+
+    // Renaming a background file preserves its MRU position.
+    useRightPanelStore.setState({ byThreadKey: {}, recentActiveSurfaceIdsByThreadKey: {} });
+    useRightPanelStore.getState().open(refA, "files");
+    useRightPanelStore.getState().openFile(refA, "src/a.ts");
+    useRightPanelStore.getState().openFile(refA, "src/c.ts");
+    useRightPanelStore.getState().remapFileSurfaces(refA, "src/a.ts", "src/b.ts");
+    useRightPanelStore.getState().closeSurface(refA, "file:src/c.ts");
+    expect(useRightPanelStore.getState().byThreadKey["env-1:thread-A"]?.activeSurfaceId).toBe(
+      "file:src/b.ts",
+    );
+
+    // Reconciling the last Browser session falls back to an available singleton instead of null.
+    useRightPanelStore.setState({ byThreadKey: {}, recentActiveSurfaceIdsByThreadKey: {} });
+    useRightPanelStore.getState().openBrowser(refA, "tab-1");
+    useRightPanelStore.getState().reconcileBrowserSurfaces(refA, [], {
+      availableSingletons: new Set(["files"]),
+    });
+    expect(useRightPanelStore.getState().byThreadKey["env-1:thread-A"]).toEqual({
+      isOpen: true,
+      activeSurfaceId: "files",
+      surfaces: [{ id: "files", kind: "files" }],
+    });
+
+    // Late PR deletion with preserveFocus clears selection without stealing focus or reopening.
+    useRightPanelStore.setState({ byThreadKey: {}, recentActiveSurfaceIdsByThreadKey: {} });
+    useRightPanelStore.getState().openPullRequest(refA, {
+      number: 77,
+      provider: "gitlab",
+      cwd: "/repo/worktree-a",
+    });
+    useRightPanelStore.getState().openTerminal(refA, "term-live");
+    useRightPanelStore.getState().close(refA);
+    useRightPanelStore.getState().clearPullRequestSelection(refA, { preserveFocus: true });
+    expect(useRightPanelStore.getState().byThreadKey["env-1:thread-A"]?.isOpen).toBe(false);
+    expect(useRightPanelStore.getState().byThreadKey["env-1:thread-A"]?.activeSurfaceId).toBe(
+      "terminal",
+    );
+    expect(
+      useRightPanelStore
+        .getState()
+        .byThreadKey["env-1:thread-A"]?.surfaces.find((s) => s.kind === "pullRequest"),
+    ).toEqual({ id: "pullRequest", kind: "pullRequest" });
+  });
 });

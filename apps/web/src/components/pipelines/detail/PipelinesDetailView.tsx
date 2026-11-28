@@ -366,9 +366,17 @@ export function PipelinesDetailView({
   // the run's latest. Anything else re-reads this page.
   const navigate = useNavigate();
   const embeddedNavigation = useEmbeddedPipelinesNavigation();
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const { environmentId: routeEnvironmentId, projectId } = projectRef;
   const onActionSettled = useCallback(
     ({ request, result }: PipelineActionOutcome) => {
+      if (!mountedRef.current) return;
       const destination =
         result === null
           ? null

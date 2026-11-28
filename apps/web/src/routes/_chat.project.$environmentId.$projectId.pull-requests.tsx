@@ -51,7 +51,9 @@ function PullRequestsListRouteView() {
 
   useEffect(() => {
     if (!isRootList || !projectExists || hostThreadRef === null) return;
-    useRightPanelStore.getState().open(hostThreadRef, "pullRequest");
+    const store = useRightPanelStore.getState();
+    store.open(hostThreadRef, "pullRequest");
+    store.clearPullRequestSelection(hostThreadRef);
     void navigate({
       to: "/$environmentId/$threadId",
       params: buildThreadRouteParams(hostThreadRef),

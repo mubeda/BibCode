@@ -72,22 +72,27 @@ function PullRequestPanelSurfaceContent({
   const enabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
   const availability = resolvePullRequestsAvailability(connection.data, serverConfig, enabled);
   const selection = surface.selection;
+  const effectiveCwd = selection?.cwd ?? gitCwd;
   // ChatView derives gitCwd from the loaded project, so a cwd means the project is known.
   const usable =
     availability.kind === "ready" &&
-    gitCwd !== null &&
+    effectiveCwd !== null &&
     workspaceUnavailable === null &&
     selection !== undefined;
   const { query, storedContext, rescan, recover } = usePullRequestsContextQuery({
     environmentId,
-    cwd: gitCwd,
+    cwd: effectiveCwd,
     enabled: usable,
   });
   const [fileAnchor, setFileAnchor] = useState<string | null>(null);
   const selectedNumber = selection?.number ?? null;
   const selectedProvider = selection?.provider ?? null;
   const handleSelectRequest = useCallback(
-    (target: { readonly number: number; readonly provider: SourceControlProviderKind }) => {
+    (target: {
+      readonly number: number;
+      readonly provider: SourceControlProviderKind;
+      readonly cwd?: string;
+    }) => {
       setFileAnchor(null);
       useRightPanelStore.getState().openPullRequest(threadRef, target);
     },
@@ -97,6 +102,16 @@ function PullRequestPanelSurfaceContent({
     const store = () => useRightPanelStore.getState();
     const clearSelection = () => {
       setFileAnchor(null);
+      store().clearPullRequestSelection(threadRef);
+    };
+    const goBack = () => {
+      setFileAnchor(null);
+      const returnSurface = store().consumePullRequestReturnSurface(threadRef);
+      if (returnSurface === "pipelines") {
+        store().clearPullRequestSelection(threadRef, { preserveFocus: true });
+        store().open(threadRef, "pipelines");
+        return;
+      }
       store().clearPullRequestSelection(threadRef);
     };
     return {
@@ -113,7 +128,11 @@ function PullRequestPanelSurfaceContent({
       openRequest: (target) => {
         if (selectedProvider === null) return;
         setFileAnchor(null);
-        store().openPullRequest(threadRef, { number: target, provider: selectedProvider });
+        store().openPullRequest(threadRef, {
+          number: target,
+          provider: selectedProvider,
+          ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+        });
       },
       requestGone: clearSelection,
       discardDeleted: () => {
@@ -122,13 +141,17 @@ function PullRequestPanelSurfaceContent({
           (entry): entry is PullRequestRightPanelSurface => entry.kind === "pullRequest",
         );
         if (current?.selection?.number === selectedNumber) {
-          clearSelection();
+          setFileAnchor(null);
+          store().clearPullRequestSelection(threadRef, { preserveFocus: true });
         }
       },
-      back: clearSelection,
+      back: goBack,
     };
-  }, [selectedNumber, selectedProvider, threadRef]);
-  const scope = useMemo(() => ({ environmentId, cwd: gitCwd ?? "" }), [environmentId, gitCwd]);
+  }, [effectiveCwd, selectedNumber, selectedProvider, threadRef]);
+  const scope = useMemo(
+    () => ({ environmentId, cwd: effectiveCwd ?? "" }),
+    [effectiveCwd, environmentId],
+  );
 
   if (availability.kind !== "ready") {
     return (
@@ -147,7 +170,7 @@ function PullRequestPanelSurfaceContent({
   if (workspaceUnavailable !== null) {
     return <PullRequestsUnavailableState reason={workspaceUnavailable} />;
   }
-  if (stableProjectRef === null || gitCwd === null) {
+  if (stableProjectRef === null || effectiveCwd === null) {
     return <PullRequestsUnavailableState reason="Waiting for project data." />;
   }
   if (selection === undefined) {
@@ -184,10 +207,10 @@ function PullRequestPanelSurfaceContent({
     );
   }
   const openFullPage = () => {
-    // The full page reads its checkout from the project's saved choice. Carry the thread's,
+    // The full page reads its checkout from the project's saved choice. Carry the active one,
     // so the page shows the same request against the same checkout; its Worktree picker
     // shows the switch and changes it back in one step, like Git Manager's link.
-    usePullRequestsStore.getState().setCheckoutCwd(stableProjectRef, gitCwd);
+    usePullRequestsStore.getState().setCheckoutCwd(stableProjectRef, effectiveCwd);
     void navigate({
       to: "/project/$environmentId/$projectId/pull-requests/$number",
       params: { ...stableProjectRef, number: String(number) },
@@ -208,7 +231,7 @@ function PullRequestPanelSurfaceContent({
             // A different repository or account at the same checkout path remounts the
             // detail, as on the full page: its queries are keyed by checkout and number.
             key={JSON.stringify([
-              gitCwd,
+              effectiveCwd,
               number,
               query.data.provider,
               query.data.host,

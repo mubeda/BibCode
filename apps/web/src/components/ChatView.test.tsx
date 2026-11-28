@@ -9884,6 +9884,9 @@ describe("ChatView composer model picker provider scope (#347)", () => {
       publishSeededStoreState(useRightPanelStore);
 
       await mount(serverRoute);
+      await act(async () => {
+        await Promise.resolve();
+      });
       const closedIds = h.commandCalls
         .filter((call) => call.key === "terminal.close")
         .map((call) => (call.input as { input: { terminalId: string } }).input.terminalId);
@@ -9891,6 +9894,57 @@ describe("ChatView composer model picker provider scope (#347)", () => {
       expect(useRightPanelStore.getState().consumeMigratedOverflowTerminalIds(threadRef)).toEqual(
         [],
       );
+    });
+
+    it("never retires a background Terminal when bulk-closing dynamic file tabs, and preserves child Diff on Diff icon click", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      const childThreadId = ThreadId.make("child-thread-1");
+      useRightPanelStore.getState().openFile(threadRef, "src/a.ts");
+      useRightPanelStore.getState().openTerminal(threadRef, "term-keep-alive");
+      useRightPanelStore.getState().openDiff(threadRef, childThreadId);
+      useRightPanelStore.getState().openFile(threadRef, "src/b.ts");
+      publishSeededStoreState(useRightPanelStore);
+
+      await mount(serverRoute);
+      const rightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      const onCloseToRight = rightPanel["onCloseSurfacesToRight"] as (surface: {
+        id: string;
+        kind: "file";
+        relativePath: string;
+        revealLine: null;
+        revealRequestId: number;
+      }) => void;
+      await act(async () => {
+        onCloseToRight({
+          id: "file:src/a.ts",
+          kind: "file",
+          relativePath: "src/a.ts",
+          revealLine: null,
+          revealRequestId: 0,
+        });
+        publishSeededStoreState(useRightPanelStore);
+      });
+
+      expect(h.commandCalls.filter((call) => call.key === "terminal.close")).toHaveLength(0);
+      const surfacesAfter =
+        useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces ?? [];
+      expect(surfacesAfter.some((surface) => surface.kind === "terminal")).toBe(true);
+      expect(surfacesAfter.some((surface) => surface.id === "file:src/b.ts")).toBe(false);
+
+      const onSelectDiff = rightPanel["onSelectDiff"] as () => void;
+      await act(async () => {
+        onSelectDiff();
+        publishSeededStoreState(useRightPanelStore);
+      });
+      const diffSurface = useRightPanelStore
+        .getState()
+        .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
+          (surface) => surface.kind === "diff",
+        );
+      expect(diffSurface).toEqual({ id: "diff", kind: "diff", threadId: childThreadId });
     });
   });
 });

@@ -164,4 +164,21 @@ describe("project surface root routes", () => {
     expect(container.querySelector('[data-testid="route-outlet"]')).not.toBeNull();
     expect(h.navigate).not.toHaveBeenCalled();
   });
+
+  it("clears any previously selected PR when redirecting from the Pull Requests list route", async () => {
+    const hostRef = { environmentId: "env-1" as never, threadId: "live" as never };
+    h.threads = [makeThread("live", "2026-10-10T00:00:00.000Z")];
+    useRightPanelStore
+      .getState()
+      .openPullRequest(hostRef, { number: 42, provider: "github", cwd: "/repo" });
+    const PullRequestsComponent = PullRequestsRoute.options.component as ComponentType;
+    await act(async () => root.render(<PullRequestsComponent />));
+
+    const panel = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, hostRef);
+    expect(panel.activeSurfaceId).toBe("pullRequest");
+    expect(panel.surfaces.find((s) => s.kind === "pullRequest")).toEqual({
+      id: "pullRequest",
+      kind: "pullRequest",
+    });
+  });
 });

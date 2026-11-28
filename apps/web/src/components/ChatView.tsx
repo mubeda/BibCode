@@ -16,6 +16,7 @@ import {
   ProviderInstanceId,
   type PullRequestsProviderKind,
   type ServerProvider,
+  type SourceControlProviderKind,
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
   type SendRequest,
@@ -201,10 +202,12 @@ import {
   RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
 } from "../rightPanelLayout";
 import {
+  isDynamicRightPanelSurface,
   resolveFallbackSingletonKind,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
   selectThreadRightPanelState,
+  type EmbeddedPipelineViewState,
   type FallbackSingletonKind,
   type RightPanelSurface,
   useRightPanelStore,
@@ -1828,13 +1831,6 @@ function ChatViewContent(props: ChatViewProps) {
   const rightPanelMaximized =
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
 
-  useEffect(() => {
-    if (!activeThreadRef) return;
-    useRightPanelStore
-      .getState()
-      .reconcileBrowserSurfaces(activeThreadRef, Object.keys(activePreviewState.sessions));
-  }, [activePreviewState.sessions, activeThreadRef]);
-
   const planSidebarOpen = activeRightPanelKind === "plan";
 
   const activeLatestTurn = activeThread?.latestTurn ?? null;
@@ -3109,14 +3105,23 @@ function ChatViewContent(props: ChatViewProps) {
   const terminalRightPanelAvailable = activeProject !== null && workspaceUnavailable === null;
   const pipelinesSettingEnabled = settings.pipelinesEnabled !== false;
   const pullRequestsSettingEnabled = settings.pullRequestsEnabled !== false;
-  const pipelinesRightPanelAvailable = gitRightPanelAvailable && pipelinesSettingEnabled;
-  const pullRequestRightPanelAvailable = gitRightPanelAvailable && pullRequestsSettingEnabled;
+  const serverCapabilities = serverConfig?.environment.capabilities ?? null;
+  const pipelinesSupportedByServer = serverCapabilities?.pipelinesReads !== false;
+  const pullRequestsSupportedByServer = serverCapabilities?.pullRequestsReads !== false;
+  const pipelinesRightPanelAvailable =
+    gitRightPanelAvailable && pipelinesSettingEnabled && pipelinesSupportedByServer;
+  const pullRequestRightPanelAvailable =
+    gitRightPanelAvailable && pullRequestsSettingEnabled && pullRequestsSupportedByServer;
   const pipelinesRightPanelDisabledReason = !pipelinesSettingEnabled
     ? "Pipelines are turned off in Settings → Source Control."
-    : undefined;
+    : !pipelinesSupportedByServer
+      ? "Update this environment's server to use Pipelines."
+      : undefined;
   const pullRequestRightPanelDisabledReason = !pullRequestsSettingEnabled
     ? "Pull requests are turned off in Settings → Source Control."
-    : undefined;
+    : !pullRequestsSupportedByServer
+      ? "This environment does not support Pull Requests."
+      : undefined;
   const composerContextEnvironmentLabel =
     activeEnvironment?.label ??
     environmentById.get(environmentId)?.label ??
@@ -3473,7 +3478,16 @@ function ChatViewContent(props: ChatViewProps) {
   }, [activeThreadRef, openPreview]);
   const addDiffSurface = useCallback(() => {
     if (!activeThreadRef || !gitRightPanelAvailable) return;
-    useRightPanelStore.getState().open(activeThreadRef, "diff");
+    const store = useRightPanelStore.getState();
+    const existingDiff = selectThreadRightPanelState(
+      store.byThreadKey,
+      activeThreadRef,
+    ).surfaces.find((surface) => surface.kind === "diff");
+    if (existingDiff) {
+      store.activateSurface(activeThreadRef, existingDiff.id);
+    } else {
+      store.open(activeThreadRef, "diff");
+    }
     onDiffPanelOpen?.();
   }, [activeThreadRef, gitRightPanelAvailable, onDiffPanelOpen]);
   const addSourceControlSurface = useCallback(() => {
@@ -3497,9 +3511,38 @@ function ChatViewContent(props: ChatViewProps) {
     useRightPanelStore.getState().open(activeThreadRef, "pullRequest");
   }, [activeThreadRef, pullRequestRightPanelAvailable]);
   const openEmbeddedMergeRequest = useCallback(
-    (target: { readonly number: number; readonly provider: PullRequestsProviderKind }) => {
+    (target: {
+      readonly number: number;
+      readonly provider: PullRequestsProviderKind;
+      readonly cwd?: string;
+    }) => {
+      if (!activeThreadRef) return;
+      useRightPanelStore
+        .getState()
+        .openPullRequest(activeThreadRef, target, undefined, { returnTo: "pipelines" });
+    },
+    [activeThreadRef],
+  );
+  const openEmbeddedGitManagerPullRequest = useCallback(
+    (target: {
+      readonly number: number;
+      readonly provider: SourceControlProviderKind;
+      readonly cwd: string;
+    }) => {
       if (!activeThreadRef) return;
       useRightPanelStore.getState().openPullRequest(activeThreadRef, target);
+    },
+    [activeThreadRef],
+  );
+  const embeddedPipelineState = useRightPanelStore((state) =>
+    activeThreadRef
+      ? (state.embeddedPipelineByThreadKey[scopedThreadKey(activeThreadRef)] ?? null)
+      : null,
+  );
+  const handleEmbeddedPipelineStateChange = useCallback(
+    (next: EmbeddedPipelineViewState | null) => {
+      if (!activeThreadRef) return;
+      useRightPanelStore.getState().setEmbeddedPipeline(activeThreadRef, next);
     },
     [activeThreadRef],
   );
@@ -3531,6 +3574,14 @@ function ChatViewContent(props: ChatViewProps) {
     pullRequestRightPanelAvailable,
     terminalRightPanelAvailable,
   ]);
+  useEffect(() => {
+    if (!activeThreadRef) return;
+    useRightPanelStore
+      .getState()
+      .reconcileBrowserSurfaces(activeThreadRef, Object.keys(activePreviewState.sessions), {
+        availableSingletons: availableFallbackSingletons,
+      });
+  }, [activePreviewState.sessions, activeThreadRef, availableFallbackSingletons]);
   const openFileSurface = useCallback(
     (relativePath: string) => {
       if (!activeThreadRef || !activeProject) return;
@@ -3654,19 +3705,40 @@ function ChatViewContent(props: ChatViewProps) {
     }
     addTerminalSurface();
   }, [activeProject, activeThreadId, activeThreadRef, addTerminalSurface, workspaceUnavailable]);
+  const pendingMigratedOverflowTerminalIds = useRightPanelStore((state) =>
+    activeThreadRef
+      ? (state.migratedOverflowTerminalIdsByThreadKey[scopedThreadKey(activeThreadRef)] ?? null)
+      : null,
+  );
+  const retiringOverflowTerminalKeysRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (!activeThreadRef) return;
-    const overflowTerminalIds = useRightPanelStore
-      .getState()
-      .consumeMigratedOverflowTerminalIds(activeThreadRef);
-    for (const terminalId of overflowTerminalIds) {
+    if (
+      !activeThreadRef ||
+      !pendingMigratedOverflowTerminalIds ||
+      pendingMigratedOverflowTerminalIds.length === 0
+    ) {
+      return;
+    }
+    const threadKey = scopedThreadKey(activeThreadRef);
+    for (const terminalId of pendingMigratedOverflowTerminalIds) {
+      const retireKey = `${threadKey}:${terminalId}`;
+      if (retiringOverflowTerminalKeysRef.current.has(retireKey)) continue;
+      retiringOverflowTerminalKeysRef.current.add(retireKey);
       void retireTerminalResource({
         environmentId: activeThreadRef.environmentId,
         threadId: activeThreadRef.threadId,
         terminalId,
-      });
+      })
+        .then(() => {
+          useRightPanelStore
+            .getState()
+            .acknowledgeMigratedOverflowTerminalIds(activeThreadRef, [terminalId]);
+        })
+        .finally(() => {
+          retiringOverflowTerminalKeysRef.current.delete(retireKey);
+        });
     }
-  }, [activeThreadRef, retireTerminalResource]);
+  }, [activeThreadRef, pendingMigratedOverflowTerminalIds, retireTerminalResource]);
   const splitPanelTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
       if (
@@ -3854,13 +3926,21 @@ function ChatViewContent(props: ChatViewProps) {
   const closeOtherRightPanelSurfaces = useCallback(
     (surface: RightPanelSurface) => {
       if (!activeThreadRef) return;
-      const surfaces = rightPanelState.surfaces.filter((entry) => entry.id !== surface.id);
-      cleanupRightPanelSurfaces(surfaces);
-      useRightPanelStore.getState().closeOtherSurfaces(activeThreadRef, surface.id);
+      const dynamicToClose = rightPanelState.surfaces.filter(
+        (entry) => isDynamicRightPanelSurface(entry) && entry.id !== surface.id,
+      );
+      if (dynamicToClose.length === 0) return;
+      cleanupRightPanelSurfaces(dynamicToClose);
+      useRightPanelStore.getState().closeSurfaces(
+        activeThreadRef,
+        dynamicToClose.map((entry) => entry.id),
+        { availableSingletons: availableFallbackSingletons },
+      );
       syncActivePreviewSurface();
     },
     [
       activeThreadRef,
+      availableFallbackSingletons,
       cleanupRightPanelSurfaces,
       rightPanelState.surfaces,
       syncActivePreviewSurface,
@@ -3869,15 +3949,22 @@ function ChatViewContent(props: ChatViewProps) {
   const closeRightPanelSurfacesToRight = useCallback(
     (surface: RightPanelSurface) => {
       if (!activeThreadRef) return;
-      const surfaceIndex = rightPanelState.surfaces.findIndex((entry) => entry.id === surface.id);
+      const dynamicSurfaces = rightPanelState.surfaces.filter(isDynamicRightPanelSurface);
+      const surfaceIndex = dynamicSurfaces.findIndex((entry) => entry.id === surface.id);
       if (surfaceIndex < 0) return;
-      const surfaces = rightPanelState.surfaces.slice(surfaceIndex + 1);
-      cleanupRightPanelSurfaces(surfaces);
-      useRightPanelStore.getState().closeSurfacesToRight(activeThreadRef, surface.id);
+      const dynamicToClose = dynamicSurfaces.slice(surfaceIndex + 1);
+      if (dynamicToClose.length === 0) return;
+      cleanupRightPanelSurfaces(dynamicToClose);
+      useRightPanelStore.getState().closeSurfaces(
+        activeThreadRef,
+        dynamicToClose.map((entry) => entry.id),
+        { availableSingletons: availableFallbackSingletons },
+      );
       syncActivePreviewSurface();
     },
     [
       activeThreadRef,
+      availableFallbackSingletons,
       cleanupRightPanelSurfaces,
       rightPanelState.surfaces,
       syncActivePreviewSurface,
@@ -3885,9 +3972,22 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const closeAllRightPanelSurfaces = useCallback(() => {
     if (!activeThreadRef) return;
-    cleanupRightPanelSurfaces(rightPanelState.surfaces);
-    useRightPanelStore.getState().closeAllSurfaces(activeThreadRef);
-  }, [activeThreadRef, cleanupRightPanelSurfaces, rightPanelState.surfaces]);
+    const dynamicToClose = rightPanelState.surfaces.filter(isDynamicRightPanelSurface);
+    if (dynamicToClose.length === 0) return;
+    cleanupRightPanelSurfaces(dynamicToClose);
+    useRightPanelStore.getState().closeSurfaces(
+      activeThreadRef,
+      dynamicToClose.map((entry) => entry.id),
+      { availableSingletons: availableFallbackSingletons },
+    );
+    syncActivePreviewSurface();
+  }, [
+    activeThreadRef,
+    availableFallbackSingletons,
+    cleanupRightPanelSurfaces,
+    rightPanelState.surfaces,
+    syncActivePreviewSurface,
+  ]);
   // Only the host renders the right panel; a panel chat never shows one.
   const closeDisplayedRightPanelSurface = closeRightPanelSurface;
   const closeOtherDisplayedRightPanelSurfaces = closeOtherRightPanelSurfaces;
@@ -8275,13 +8375,18 @@ function ChatViewContent(props: ChatViewProps) {
       </Suspense>
     ) : activeRightPanelSurface?.kind === "gitManager" && activeProjectRef ? (
       <Suspense fallback={null}>
-        <GitManagerPanel projectRef={activeProjectRef} />
+        <GitManagerPanel
+          projectRef={activeProjectRef}
+          onOpenPullRequest={openEmbeddedGitManagerPullRequest}
+        />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "pipelines" && activeProjectRef ? (
       <Suspense fallback={null}>
         <PipelinesPanel
           projectRef={activeProjectRef}
           mode="embedded"
+          embeddedState={embeddedPipelineState}
+          onEmbeddedStateChange={handleEmbeddedPipelineStateChange}
           onOpenMergeRequest={openEmbeddedMergeRequest}
         />
       </Suspense>

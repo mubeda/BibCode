@@ -554,7 +554,11 @@ it("keeps PullRequestsRow selection inside embedded mode without router navigati
   const embeddedRowButton = button("Fix embedded PR row");
   expect(embeddedRowButton.tagName).toBe("BUTTON");
   await act(async () => embeddedRowButton.click());
-  expect(onSelectRequest).toHaveBeenCalledWith({ number: 42, provider: "github" });
+  expect(onSelectRequest).toHaveBeenCalledWith({
+    number: 42,
+    provider: "github",
+    cwd: "Z:\\opaque\\main",
+  });
   expect(h.navigate).not.toHaveBeenCalled();
 
   await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));

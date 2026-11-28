@@ -13,6 +13,7 @@ import { JobLog } from "../log/JobLog";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { pipelineStatusText } from "../shared/pipelineStatus.logic";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
+import { useEmbeddedPipelinesNavigation } from "./PipelineLinks";
 
 /** Fields and open pickers (a Select trigger, a menu) that own focus until the reader leaves. */
 const INTERACTIVE_FIELD =
@@ -41,6 +42,7 @@ export function PipelineJobLogPanel({
     meta: { projectRef },
   } = useRepositoryModule();
   const navigate = useNavigate();
+  const embeddedNavigation = useEmbeddedPipelinesNavigation();
   const isGitlab = context.provider === "gitlab";
   const hostName = HOST_NAMES[context.provider];
   const jobTarget = useMemo(
@@ -65,9 +67,14 @@ export function PipelineJobLogPanel({
     pipelineId,
     jobId,
   });
-  // A line link opens the job's own page at that line: its address is the permalink.
+  // A line link opens the job's own page at that line on full-page routes, or records the
+  // offset locally in embedded mode without leaving the chat.
   const onLineLink = useCallback(
-    (offset: number) =>
+    (offset: number) => {
+      if (embeddedNavigation !== null) {
+        embeddedNavigation.setJobLogOffset?.(offset);
+        return;
+      }
       void navigate(
         pipelineJobLink({
           environmentId: projectRef.environmentId,
@@ -76,8 +83,16 @@ export function PipelineJobLogPanel({
           jobId,
           at: offset,
         }),
-      ),
-    [jobId, navigate, pipelineId, projectRef.environmentId, projectRef.projectId],
+      );
+    },
+    [
+      embeddedNavigation,
+      jobId,
+      navigate,
+      pipelineId,
+      projectRef.environmentId,
+      projectRef.projectId,
+    ],
   );
   const headingRef = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
@@ -144,7 +159,7 @@ export function PipelineJobLogPanel({
         <JobLog.Provider
           source={source}
           scope={scope}
-          initialOffset={null}
+          initialOffset={embeddedNavigation?.jobLogOffset ?? null}
           rawLogUrl={jobDetail?.rawLogUrl ?? null}
           hostName={hostName}
           onLineLink={onLineLink}

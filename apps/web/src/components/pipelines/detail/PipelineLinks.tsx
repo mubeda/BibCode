@@ -10,12 +10,22 @@ import { pipelineJobLink } from "../job/pipelineJobRoute";
 export interface EmbeddedPipelinesNavigation {
   readonly openPipeline: (
     pipelineId: number,
-    options?: { readonly attempt?: number | null; readonly jobId?: number | null },
+    options?: {
+      readonly attempt?: number | null;
+      readonly jobId?: number | null;
+      readonly jobLogOffset?: number | null;
+    },
   ) => void;
   readonly backToList: () => void;
   readonly selectAttempt: (attempt: number | null) => void;
+  readonly jobLogOffset?: number | null;
+  readonly setJobLogOffset?: (offset: number | null) => void;
   readonly openMergeRequest?:
-    | ((target: { readonly number: number; readonly provider: PullRequestsProviderKind }) => void)
+    | ((target: {
+        readonly number: number;
+        readonly provider: PullRequestsProviderKind;
+        readonly cwd?: string;
+      }) => void)
     | undefined;
 }
 

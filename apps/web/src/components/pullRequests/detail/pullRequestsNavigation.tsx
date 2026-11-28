@@ -12,6 +12,7 @@ export interface PullRequestsListNavigation {
   openRequest(target: {
     readonly number: number;
     readonly provider: SourceControlProviderKind;
+    readonly cwd?: string;
   }): void;
 }
 

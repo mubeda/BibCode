@@ -2005,15 +2005,20 @@ the Pull Requests page or the Git Manager. Nothing opens in the panel while
 **Settings → Source Control → Pull requests** is off, or for a Bitbucket or
 Azure DevOps repository, which Pull Requests does not support.
 
-Each request is its own tab, labelled `!N` (`#N` on GitHub); opening one that is
-already open selects its tab. The tab and its selected section survive a reload.
-**Open full page** shows the request on the Pull Requests page for the thread's
-checkout, and switches that page's **Worktree** picker to it. Deleting the request closes its tab, and a revert request opens in a
-new one. A tab whose Pull Requests setting is off, environment is
-disconnected, workspace was removed or host is unsupported explains what to do
-instead of showing an error, and recovers when the workspace returns. The detail
-switches to its narrow layout, with the request's details above the merge box,
-when the panel is narrow, not only when the window is.
+Each thread has one **Pull Request** surface in its fixed top icon bar showing
+either the embedded Pull Requests list or a selected request; opening a request
+replaces the current selection inside that surface, and Back returns to the
+list (or to Pipelines when opened from a pipeline's merge request link). The
+selected request and section survive a reload. **Open full page** shows the
+request on the Pull Requests page for the selected checkout, and switches that
+page's **Worktree** picker to it. Deleting the selected request returns the
+surface to the embedded list, and a revert request switches the surface to the
+revert request. When the Pull Requests setting is off, the environment is
+disconnected, the workspace was removed, or the host is unsupported, the
+surface explains what to do instead of showing an error, and recovers when the
+workspace returns. The detail switches to its narrow layout, with the request's
+details above the merge box, when the panel is narrow, not only when the window
+is.
 
 ### Opening links
 

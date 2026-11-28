@@ -381,9 +381,11 @@ describe("packaged Pierre diff and editor interactions", () => {
       return button !== null;
     }, desktopUiFixture.projectName);
     expect(pullRequestsOpened).toBe(true);
-    await browser.waitUntil(async () => (await browser.getUrl()).includes("/pull-requests"), {
-      timeoutMsg: "The packaged Pull Requests route did not open.",
-    });
+    await browser
+      .$('[data-right-panel-icon-bar] button[aria-label="Pull Request"][data-active-icon="true"]')
+      .waitForDisplayed({
+        timeoutMsg: "The packaged Pull Requests surface did not open in the right panel.",
+      });
     await saveEvidence("pierre-pull-requests-route");
 
     const gitManagerOpened = await browser.execute((label: string) => {
@@ -394,9 +396,11 @@ describe("packaged Pierre diff and editor interactions", () => {
       return button !== null;
     }, desktopUiFixture.projectName);
     expect(gitManagerOpened).toBe(true);
-    await browser.waitUntil(async () => (await browser.getUrl()).includes("/git"), {
-      timeoutMsg: "The packaged Git Manager route did not open.",
-    });
+    await browser
+      .$('[data-right-panel-icon-bar] button[aria-label="Git Manager"][data-active-icon="true"]')
+      .waitForDisplayed({
+        timeoutMsg: "The packaged Git Manager surface did not open in the right panel.",
+      });
     const changesTab = browser.$('//button[@role="tab" and normalize-space()="Changes"]');
     await changesTab.waitForDisplayed();
     await changesTab.click();
