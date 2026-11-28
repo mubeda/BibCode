@@ -963,7 +963,15 @@ screenshots:
    becomes an error and the held head shows **Waiting for you**; **Send now**
    must start it. Report unavailable attachment restoration after reload or
    from another client without losing text.
-8. Hold a pending approval or question and verify no automatic sending. After
+8. On Antigravity, confirm **Show Antigravity usage** is absent from
+   **Settings -> Status bar**, the status bar shows no Antigravity usage meter
+   (Claude and Codex meters remain unchanged), and provider usage refreshes
+   never spawn `agy -p "/usage"` or a usage-only `agy --version` probe. When
+   `agy acp` emits a single-line `⚠` quota notice or a quota `session/prompt`
+   error, verify exactly one in-chat **Usage limit reached** notice with the
+   formatted reset time (when present) and one failed turn transition appear
+   while ACP `usage_update` continues reporting context-window tokens.
+9. Hold a pending approval or question and verify no automatic sending. After
    interrupt and error settles, verify **Waiting for you**, persistent holds
    through ready, and explicit **Send now** starting only the head.
    End the provider child mid-turn and verify the next composer send or

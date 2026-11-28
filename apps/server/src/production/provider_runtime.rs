@@ -15075,7 +15075,11 @@ async fn project_provider_event(
             let (tone, kind) = if event.event_type == "turn.completed"
                 && event.payload.get("state").and_then(Value::as_str) == Some("failed")
             {
-                ("error", "provider.error")
+                if event.payload.get("errorReason").and_then(Value::as_str) == Some("usage_limit") {
+                    ("warning", "provider.warning")
+                } else {
+                    ("error", "provider.error")
+                }
             } else {
                 event_activity_shape(&event.event_type)
             };
@@ -15124,6 +15128,16 @@ async fn project_provider_event(
                             |detail| format!("{message}\n{detail}"),
                         );
                     object.insert("detail".to_owned(), Value::String(detail));
+                }
+                if event.event_type == "turn.completed"
+                    && object.get("errorReason").and_then(Value::as_str) == Some("usage_limit")
+                    && !object.contains_key("detail")
+                    && let Some(message) = object
+                        .get("errorMessage")
+                        .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                {
+                    object.insert("detail".to_owned(), Value::String(message.to_owned()));
                 }
                 object.insert("eventType".to_owned(), Value::String(event.event_type));
             } else {
@@ -15428,6 +15442,11 @@ fn event_activity_summary(event_type: &str, payload: &Value, provider_label: &st
         "thread.started" => "Conversation started",
         "turn.started" => "Turn started",
         "turn.completed" => match payload.get("state").and_then(Value::as_str) {
+            Some("failed")
+                if payload.get("errorReason").and_then(Value::as_str) == Some("usage_limit") =>
+            {
+                "Usage limit reached"
+            }
             Some("failed") => "Turn failed",
             Some("interrupted") => "Turn interrupted",
             Some("cancelled") => "Turn cancelled",
@@ -18457,6 +18476,7 @@ impl ProviderDriver for AntigravityDriver {
                 Err(
                     error @ (AntigravityRuntimeError::SignInRequired
                     | AntigravityRuntimeError::AccountDisabled { .. }
+                    | AntigravityRuntimeError::UsageLimitReached { .. }
                     | AntigravityRuntimeError::Protocol(
                         crate::provider::antigravity::acp::AcpProtocolError::RemoteRequest {
                             ..
@@ -18513,6 +18533,7 @@ impl ProviderDriver for AntigravityDriver {
                 Err(
                     error @ (AntigravityRuntimeError::SignInRequired
                     | AntigravityRuntimeError::AccountDisabled { .. }
+                    | AntigravityRuntimeError::UsageLimitReached { .. }
                     | AntigravityRuntimeError::Protocol(
                         crate::provider::antigravity::acp::AcpProtocolError::RemoteRequest {
                             ..

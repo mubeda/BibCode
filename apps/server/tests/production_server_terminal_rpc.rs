@@ -1080,16 +1080,19 @@ async fn provider_usage_refresh_rpc_forces_a_fetch_only_when_requested() {
     }
 }
 
-/// A fake `agy` (Unix shell) whose answer carries a marker in every free-text field.
+/// A fake `agy` (Unix shell) that records any invocation to `invocations`.
 #[cfg(unix)]
-fn fake_antigravity_cli(directory: &std::path::Path) -> std::path::PathBuf {
+fn fake_antigravity_cli(
+    directory: &std::path::Path,
+    invocations: &std::path::Path,
+) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let usage = r#"{"status":"SUCCESS","num_turns":0,"response":"PRIVATE-PLAN-MARKER","command":{"name":"usage","data":{"description":"PRIVATE-PLAN-MARKER","groups":[{"name":"PRIVATE-PLAN-MARKER","buckets":[{"id":"gemini-5h","name":"PRIVATE-PLAN-MARKER","window":"5h","remaining_fraction":0.25,"reset_time":"2026-11-22T02:28:19Z"},{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.5,"reset_time":"2026-11-28T21:28:19Z"}]}]}}}"#;
     let path = directory.join("agy");
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 1.5.14; exit 0; fi\nprintf '%s' '{usage}'\necho PRIVATE-PLAN-MARKER >&2\n"
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nprintf 1.5.14\n",
+            invocations.display()
         ),
     )
     .expect("fake agy");
@@ -1097,13 +1100,15 @@ fn fake_antigravity_cli(directory: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
-/// Antigravity is answered only when a request names it, on the read and on the refresh, and
-/// its wire shape carries the groups and no free text from the CLI.
+/// Antigravity quota polling (`agy -p "/usage"` / `--version`) is removed (#429): omitting it
+/// returns Claude and Codex only, and explicitly naming `antigravity` (even forced) returns an
+/// unavailable snapshot without ever spawning the configured `agy` binary.
 #[cfg(unix)]
 #[tokio::test]
 async fn provider_usage_rpcs_answer_antigravity_only_when_named() {
     let temp = TempDir::new().expect("temporary directory");
-    let agy = fake_antigravity_cli(temp.path());
+    let invocations = temp.path().join("agy-invocations.log");
+    let agy = fake_antigravity_cli(temp.path(), &invocations);
     let settings_root = temp.path().join("settings");
     std::fs::create_dir_all(&settings_root).expect("settings root");
     std::fs::write(
@@ -1118,7 +1123,6 @@ async fn provider_usage_rpcs_answer_antigravity_only_when_named() {
         .to_string(),
     )
     .expect("settings");
-    // Only the Antigravity fetcher is real; Claude and Codex never touch the host account here.
     let antigravity = provider_usage::production_fetchers(
         bibcode_server::server_settings::ProviderSettingsStore::new(&settings_root),
         None,
@@ -1126,7 +1130,10 @@ async fn provider_usage_rpcs_answer_antigravity_only_when_named() {
     .into_iter()
     .filter(|fetcher| fetcher.provider == provider_usage::ProviderUsageProvider::Antigravity)
     .collect::<Vec<_>>();
-    assert_eq!(antigravity.len(), 1);
+    assert!(
+        antigravity.is_empty(),
+        "production_fetchers must not register an Antigravity CLI usage fetcher"
+    );
     let usage = provider_usage::ProviderUsageService::new(
         antigravity,
         Arc::new(time::OffsetDateTime::now_utc),
@@ -1163,17 +1170,12 @@ async fn provider_usage_rpcs_answer_antigravity_only_when_named() {
         );
         assert_eq!(names(&named), ["claude", "codex", "antigravity"]);
         let antigravity = &named["providers"][2];
-        assert_eq!(antigravity["status"], "ok", "{antigravity}");
-        assert_eq!(antigravity["windowGroups"][0]["id"], "gemini");
-        assert_eq!(antigravity["windowGroups"][0]["label"], "Gemini models");
-        assert_eq!(antigravity["windowGroups"][0]["session"]["usedPercent"], 75);
-        assert_eq!(
-            antigravity["windowGroups"][0]["weekly"]["windowMinutes"],
-            10_080
+        assert_eq!(antigravity["status"], "unavailable", "{antigravity}");
+        assert!(
+            !invocations.exists(),
+            "forced Antigravity usage refresh must never spawn agy"
         );
-        assert!(!named.to_string().contains("PRIVATE-PLAN-MARKER"));
 
-        // Cached now, it still stays out of an answer that does not name it.
         let read_omitted =
             success_value(request(socket, "3", "server.getProviderUsage", json!({})).await);
         assert_eq!(names(&read_omitted), legacy);
@@ -1187,8 +1189,7 @@ async fn provider_usage_rpcs_answer_antigravity_only_when_named() {
             .await,
         );
         assert_eq!(names(&read_named), ["claude", "codex", "antigravity"]);
-        assert_eq!(read_named["providers"][2]["status"], "ok");
-        assert!(!read_named.to_string().contains("PRIVATE-PLAN-MARKER"));
+        assert_eq!(read_named["providers"][2]["status"], "unavailable");
         let refresh_omitted = success_value(
             request(
                 socket,
@@ -1199,6 +1200,7 @@ async fn provider_usage_rpcs_answer_antigravity_only_when_named() {
             .await,
         );
         assert_eq!(names(&refresh_omitted), legacy);
+        assert!(!invocations.exists());
     })
     .catch_unwind()
     .await;

@@ -90,4 +90,27 @@ describe("clientPersistenceStorage", () => {
     expect(settings).not.toHaveProperty("chatWordWrap");
     expect(settings).not.toHaveProperty("diffWordWrap");
   });
+
+  it("ignores legacy showAntigravityUsage: true without dropping sibling non-default preferences (#429)", async () => {
+    const testWindow = getTestWindow();
+    testWindow.localStorage.setItem(
+      "bibcode:client-settings:v1",
+      JSON.stringify({
+        showAntigravityUsage: true,
+        timestampFormat: "24-hour",
+        wordWrap: false,
+      }),
+    );
+    const { readBrowserClientSettings } = await import("./clientPersistenceStorage");
+    const settings = readBrowserClientSettings();
+
+    expect(settings).not.toBeNull();
+    expect(settings).toEqual(
+      expect.objectContaining({
+        timestampFormat: "24-hour",
+        wordWrap: false,
+      }),
+    );
+    expect(settings).not.toHaveProperty("showAntigravityUsage");
+  });
 });

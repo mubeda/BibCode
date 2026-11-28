@@ -587,17 +587,17 @@ describe("ClientSettings usage status bar", () => {
     });
   });
 
-  it("keeps Antigravity usage its own boolean, on by default, preserving opt-out with the item list untouched", () => {
-    expect(decodeClientSettings({}).showAntigravityUsage).toBe(true);
-    expect(DEFAULT_CLIENT_SETTINGS.showAntigravityUsage).toBe(true);
-    expect(decodeClientSettings({ showAntigravityUsage: false }).showAntigravityUsage).toBe(false);
+  it("ignores legacy showAntigravityUsage while preserving sibling non-default preferences (#429)", () => {
+    expect("showAntigravityUsage" in DEFAULT_CLIENT_SETTINGS).toBe(false);
     const settings = decodeClientSettings({
-      showAntigravityUsage: false,
+      showAntigravityUsage: true,
+      wordWrap: false,
       statusBarItems: ["claude"],
     });
-    expect(settings.showAntigravityUsage).toBe(false);
+    expect("showAntigravityUsage" in settings).toBe(false);
+    expect(settings.wordWrap).toBe(false);
     expect(settings.statusBarItems).toEqual(["claude"]);
-    // An unknown item literal resets the list (the downgrade hazard the separate flag avoids).
+    // An unknown item literal still recovers the status bar list safely.
     expect(
       decodeClientSettings({ statusBarItems: ["claude", "antigravity"] }).statusBarItems,
     ).toEqual(["claude", "codex", "resource-usage"]);

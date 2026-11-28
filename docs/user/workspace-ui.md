@@ -4,11 +4,13 @@ BiBCode is split into left, center, and right work areas. The left panel
 navigates agents and project/worktree threads, the center panel runs chats and
 terminals, and the right panel hosts project tools.
 
-The bottom status bar shows Claude, Codex, and Antigravity usage for the
-environment selected in the left rail (all three are on by default; toggle any
-of them in status bar settings, see [Antigravity](../providers/antigravity.md)). Selecting a remote server changes both the displayed account
-usage and the target of refresh or usage-reset actions. A server that has not
-returned usage does not borrow the local server's values.
+The bottom status bar shows Claude and Codex usage for the environment selected
+in the left rail (both are on by default; toggle either in status bar settings;
+Antigravity quota limits appear in chat instead, see
+[Antigravity](../providers/antigravity.md)). Selecting a remote server changes
+both the displayed account usage and the target of refresh or usage-reset
+actions. A server that has not returned usage does not borrow the local server's
+values.
 
 When a request has waited more than 15 seconds for a response, the status bar
 shows a warning such as **2 slow requests**. Click it to see each request's name,

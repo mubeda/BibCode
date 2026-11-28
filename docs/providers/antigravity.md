@@ -86,15 +86,15 @@ The first run of the CLI in a workspace asks a few questions in the terminal.
 Answer them there; BiBCode does not answer them for you. It is simplest to open
 an Antigravity Terminal once before the first chat.
 
-## Usage in the status bar
+## Quota and usage-limit notices
 
-**Show Antigravity usage** is on by default in **Settings → Status bar** to show
-the five-hour and weekly limits the CLI reports, for each model group, with
-their reset times (unset buckets omit a placeholder epoch reset time). BiBCode
-reads them with `agy -p "/usage"`, which sends no prompt, at most every five
-minutes; the refresh button reads at once. It needs CLI version 1.1.11 or
-later and an account sign-in: with an API key there is no account quota to show.
-BiBCode reads only the built-in Antigravity instance.
+Antigravity does not show a status-bar usage meter and BiBCode never spawns
+`agy -p "/usage"` or a usage-only `agy --version` probe. Instead, when the
+active `agy acp` chat session reports a quota or capacity limit (either as a
+single-line `⚠` quota notice or as a `session/prompt` quota error), BiBCode
+classifies it into an in-chat usage-limit notice showing the parsed reset time
+when present. ACP `usage_update` notifications continue to report the
+conversation's context-window tokens only.
 
 ## Skills and slash commands
 
@@ -116,9 +116,7 @@ hand, and otherwise at most every five minutes.
 ## Known limits
 
 - A session that cannot be resumed starts fresh.
-- BiBCode trusts the configured `agy` binary. It checks the version before it
-  reads usage, but it cannot tell if the file is replaced between that check and
-  the next run.
+- BiBCode trusts the configured `agy` binary.
 - A second Antigravity instance cannot be added from Settings yet; the add
   button is hidden for every provider.
 - A very large single file write can exceed the transport's line limit and end

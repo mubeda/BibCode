@@ -124,6 +124,12 @@ pub enum AntigravityRuntimeError {
     /// pending approval/question, or no turn update yet); the message returns to the queue.
     #[error("{detail}")]
     SteerUnavailable { detail: String },
+    /// Antigravity reported an account or model quota/usage limit during the turn (#429).
+    #[error("{message}")]
+    UsageLimitReached {
+        message: String,
+        resets_at: Option<String>,
+    },
 }
 
 impl AntigravityRuntimeError {
@@ -143,6 +149,7 @@ impl AntigravityRuntimeError {
             | Self::PendingRequestNotFound { .. }
             | Self::MalformedConfigAcknowledgement => "runtime_error",
             Self::SteerUnavailable { .. } => "steer_unavailable",
+            Self::UsageLimitReached { .. } => "provider_error",
         }
     }
 
@@ -162,6 +169,7 @@ impl AntigravityRuntimeError {
             Self::PendingRequestNotFound { .. } => "pending_request_not_found",
             Self::MalformedConfigAcknowledgement => "malformed_config_acknowledgement",
             Self::SteerUnavailable { .. } => "steer_unavailable",
+            Self::UsageLimitReached { .. } => "usage_limit",
         }
     }
 
@@ -284,6 +292,32 @@ struct RuntimeInner {
     events_tx: mpsc::UnboundedSender<AntigravityRuntimeEvent>,
     events_rx: Mutex<mpsc::UnboundedReceiver<AntigravityRuntimeEvent>>,
     abandon: Notify,
+    clock: std::sync::Mutex<Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuotaLimitNotice {
+    message: String,
+    resets_at: Option<String>,
+}
+
+impl QuotaLimitNotice {
+    fn merge(first: Option<Self>, second: Option<Self>) -> Option<Self> {
+        match (first, second) {
+            (Some(a), Some(b)) => {
+                if a.resets_at.is_some() {
+                    Some(a)
+                } else if b.resets_at.is_some() {
+                    Some(b)
+                } else {
+                    Some(a)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
 }
 
 struct PreviousPrompt {
@@ -307,6 +341,8 @@ struct Gate {
     next_prompt_seq: u64,
     /// True once the currently running prompt has produced at least one turn update.
     active_turn_has_update: bool,
+    /// Classified quota notice intercepted from an `agent_message_chunk` on the active turn (#429).
+    active_turn_quota_notice: Option<QuotaLimitNotice>,
     /// Non-none while a concurrent steer prompt is being written to the CLI.
     steer_in_flight: Option<u64>,
     /// Superseded prompt retained until the steered prompt's disposition is known, so a rejected
@@ -333,16 +369,22 @@ impl Gate {
         self.next_prompt_seq
     }
 
-    fn clear_active_turn(&mut self, turn_id: &str) -> Vec<(String, PendingRequest)> {
-        if self.active_turn.as_deref() == Some(turn_id) {
+    fn clear_active_turn(
+        &mut self,
+        turn_id: &str,
+    ) -> (Vec<(String, PendingRequest)>, Option<QuotaLimitNotice>) {
+        let quota_notice = if self.active_turn.as_deref() == Some(turn_id) {
             self.active_turn = None;
             self.active_prompt_seq = 0;
             self.active_prompt_wire_id = None;
             self.active_turn_has_update = false;
             self.steer_in_flight = None;
             self.previous_prompt = None;
-        }
-        self.take_pending(turn_id)
+            self.active_turn_quota_notice.take()
+        } else {
+            None
+        };
+        (self.take_pending(turn_id), quota_notice)
     }
 
     fn resolve_pending_accept(&mut self, outcome: Result<(), AntigravityRuntimeError>) {
@@ -414,6 +456,7 @@ impl AntigravitySessionRuntime {
             active_prompt_wire_id: None,
             next_prompt_seq: 0,
             active_turn_has_update: false,
+            active_turn_quota_notice: None,
             steer_in_flight: None,
             previous_prompt: None,
             pending_accept: None,
@@ -440,6 +483,7 @@ impl AntigravitySessionRuntime {
                 events_tx,
                 events_rx: Mutex::new(events_rx),
                 abandon: Notify::new(),
+                clock: std::sync::Mutex::new(Arc::new(time::OffsetDateTime::now_utc)),
             }),
         };
         let reader = runtime.clone();
@@ -944,6 +988,7 @@ impl AntigravitySessionRuntime {
                     gate.active_prompt_seq = seq;
                     gate.active_prompt_wire_id = None;
                     gate.active_turn_has_update = false;
+                    gate.active_turn_quota_notice = None;
                     gate.steer_in_flight = None;
                     gate.previous_prompt = None;
                     gate.pending_accept = Some((seq, accepted_tx));
@@ -1144,8 +1189,8 @@ impl AntigravitySessionRuntime {
                         settled: Some(prev_result),
                         ..
                     }) if seq == prev_seq => {
-                        let pending = gate.clear_active_turn(turn_id);
-                        Some((pending, prev_result))
+                        let (pending, quota_notice) = gate.clear_active_turn(turn_id);
+                        Some((pending, quota_notice, prev_result))
                     }
                     other => {
                         gate.active_prompt_seq = prev_seq;
@@ -1158,10 +1203,10 @@ impl AntigravitySessionRuntime {
                 None
             }
         };
-        if let Some((pending, prev_result)) = settled_previous {
+        if let Some((pending, quota_notice, prev_result)) = settled_previous {
             self.cancel_pending_requests(pending);
             let _ = self
-                .emit_prompt_completion(turn_id.to_owned(), prev_result)
+                .emit_prompt_completion(turn_id.to_owned(), prev_result, quota_notice)
                 .await;
         }
     }
@@ -1180,7 +1225,7 @@ impl AntigravitySessionRuntime {
         prompt_seq: u64,
         error: AcpProtocolError,
     ) -> AntigravityRuntimeError {
-        let error = classify(error);
+        let error = self.classify(error);
         let error_class = error.class();
         let error_reason = error.reason();
         tracing::warn!(
@@ -1189,7 +1234,7 @@ impl AntigravitySessionRuntime {
             error_reason,
             "antigravity turn failed before prompt delivery"
         );
-        let pending = {
+        let (pending, _) = {
             let mut gate = self.inner.gate.lock().await;
             gate.resolve_pending_accept_for(prompt_seq, Err(error.clone()));
             gate.clear_active_turn(turn_id)
@@ -1221,14 +1266,59 @@ impl AntigravitySessionRuntime {
         }
     }
 
+    fn now_utc(&self) -> time::OffsetDateTime {
+        let clock = self
+            .inner
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        clock()
+    }
+
+    fn classify(&self, error: AcpProtocolError) -> AntigravityRuntimeError {
+        classify_with_clock(error, self.now_utc())
+    }
+
     async fn emit_prompt_completion(
         &self,
         turn_id: String,
         result: Result<Value, AcpProtocolError>,
+        chunk_quota_notice: Option<QuotaLimitNotice>,
     ) -> Result<(), AntigravityRuntimeError> {
         let abandoned = self.inner.abandoned_turns.lock().await.remove(&turn_id);
+        let emit_quota = |notice: QuotaLimitNotice| {
+            let error = AntigravityRuntimeError::UsageLimitReached {
+                message: notice.message.clone(),
+                resets_at: notice.resets_at.clone(),
+            };
+            if !abandoned {
+                tracing::warn!(
+                    provider = PROVIDER,
+                    error_class = error.class(),
+                    error_reason = error.reason(),
+                    has_reset_time = notice.resets_at.is_some(),
+                    "antigravity turn hit usage limit"
+                );
+                let mut payload = json!({
+                    "state": "failed",
+                    "stopReason": "usage_limit",
+                    "errorMessage": notice.message,
+                    "errorClass": error.class(),
+                    "errorReason": error.reason(),
+                });
+                if let Some(resets_at) = notice.resets_at {
+                    payload["resetsAt"] = json!(resets_at);
+                }
+                self.emit("turn.completed", Some(turn_id.clone()), None, payload);
+            }
+            Err(error)
+        };
         match result {
             Ok(response) => {
+                if let Some(notice) = chunk_quota_notice {
+                    return emit_quota(notice);
+                }
                 let stop_reason = response
                     .get("stopReason")
                     .and_then(Value::as_str)
@@ -1244,7 +1334,21 @@ impl AntigravitySessionRuntime {
                 Ok(())
             }
             Err(error) => {
-                let error = classify(error);
+                let error = self.classify(error);
+                let prompt_quota_notice = match &error {
+                    AntigravityRuntimeError::UsageLimitReached { message, resets_at } => {
+                        Some(QuotaLimitNotice {
+                            message: message.clone(),
+                            resets_at: resets_at.clone(),
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(notice) =
+                    QuotaLimitNotice::merge(chunk_quota_notice, prompt_quota_notice)
+                {
+                    return emit_quota(notice);
+                }
                 let error_class = error.class();
                 let error_reason = error.reason();
                 if !abandoned {
@@ -1288,10 +1392,12 @@ impl AntigravitySessionRuntime {
             SteerRejectedSettlePrevious {
                 steer_error: AntigravityRuntimeError,
                 pending: Vec<(String, PendingRequest)>,
+                quota_notice: Option<QuotaLimitNotice>,
                 prev_result: Result<Value, AcpProtocolError>,
             },
             CompleteTurn {
                 pending: Vec<(String, PendingRequest)>,
+                quota_notice: Option<QuotaLimitNotice>,
                 result: Result<Value, AcpProtocolError>,
             },
         }
@@ -1313,7 +1419,7 @@ impl AntigravitySessionRuntime {
                 {
                     let outcome = match &result {
                         Ok(_) => Ok(()),
-                        Err(error) => Err(classify(error.clone())),
+                        Err(error) => Err(runtime.classify(error.clone())),
                     };
                     prev.settled = Some(result);
                     Resolution::Superseded(outcome)
@@ -1321,13 +1427,19 @@ impl AntigravitySessionRuntime {
                     && gate.active_prompt_seq == prompt_seq
                 {
                     let steer_rejection = is_steer
-                        .then(|| result.as_ref().err().map(|error| classify(error.clone())))
+                        .then(|| {
+                            result
+                                .as_ref()
+                                .err()
+                                .map(|error| runtime.classify(error.clone()))
+                        })
                         .flatten()
                         .filter(|error| {
                             matches!(
                                 error,
                                 AntigravityRuntimeError::SignInRequired
                                     | AntigravityRuntimeError::AccountDisabled { .. }
+                                    | AntigravityRuntimeError::UsageLimitReached { .. }
                                     | AntigravityRuntimeError::Protocol(
                                         AcpProtocolError::RemoteRequest { .. }
                                     )
@@ -1338,10 +1450,11 @@ impl AntigravitySessionRuntime {
                     {
                         gate.resolve_pending_accept_for(prompt_seq, Err(steer_error.clone()));
                         if let Some(prev_result) = prev.settled {
-                            let pending = gate.clear_active_turn(&turn_id);
+                            let (pending, quota_notice) = gate.clear_active_turn(&turn_id);
                             Resolution::SteerRejectedSettlePrevious {
                                 steer_error,
                                 pending,
+                                quota_notice,
                                 prev_result,
                             }
                         } else {
@@ -1354,16 +1467,20 @@ impl AntigravitySessionRuntime {
                     } else {
                         let accept_outcome = match &result {
                             Ok(_) => Ok(()),
-                            Err(error) => Err(classify(error.clone())),
+                            Err(error) => Err(runtime.classify(error.clone())),
                         };
                         gate.resolve_pending_accept_for(prompt_seq, accept_outcome);
-                        let pending = gate.clear_active_turn(&turn_id);
-                        Resolution::CompleteTurn { pending, result }
+                        let (pending, quota_notice) = gate.clear_active_turn(&turn_id);
+                        Resolution::CompleteTurn {
+                            pending,
+                            quota_notice,
+                            result,
+                        }
                     }
                 } else {
                     let outcome = match result {
                         Ok(_) => Ok(()),
-                        Err(error) => Err(classify(error)),
+                        Err(error) => Err(runtime.classify(error)),
                     };
                     Resolution::Superseded(outcome)
                 }
@@ -1374,15 +1491,24 @@ impl AntigravitySessionRuntime {
                 Resolution::SteerRejectedSettlePrevious {
                     steer_error,
                     pending,
+                    quota_notice,
                     prev_result,
                 } => {
                     runtime.cancel_pending_requests(pending);
-                    let _ = runtime.emit_prompt_completion(turn_id, prev_result).await;
+                    let _ = runtime
+                        .emit_prompt_completion(turn_id, prev_result, quota_notice)
+                        .await;
                     Err(steer_error)
                 }
-                Resolution::CompleteTurn { pending, result } => {
+                Resolution::CompleteTurn {
+                    pending,
+                    quota_notice,
+                    result,
+                } => {
                     runtime.cancel_pending_requests(pending);
-                    runtime.emit_prompt_completion(turn_id, result).await
+                    runtime
+                        .emit_prompt_completion(turn_id, result, quota_notice)
+                        .await
                 }
             };
             let _ = completion_tx.send(outcome);
@@ -1448,6 +1574,7 @@ impl AntigravitySessionRuntime {
                 gate.active_turn = None;
                 gate.active_prompt_seq = 0;
                 gate.active_turn_has_update = false;
+                gate.active_turn_quota_notice = None;
                 gate.steer_in_flight = None;
                 gate.previous_prompt = None;
                 // An unacknowledged prompt whose cancel grace expired remains ambiguous.
@@ -1541,6 +1668,18 @@ impl AntigravitySessionRuntime {
     #[cfg(test)]
     pub(crate) async fn set_agent_version_for_test(&self, version: Option<(u64, u64, u64)>) {
         self.inner.gate.lock().await.agent_version = version;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_clock_for_test(
+        &self,
+        clock: impl Fn() -> time::OffsetDateTime + Send + Sync + 'static,
+    ) {
+        *self
+            .inner
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(clock);
     }
 
     async fn handle_incoming(&self, event: IncomingEvent) {
@@ -1677,6 +1816,18 @@ impl AntigravitySessionRuntime {
                     .and_then(|content| content.get("text"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if let Some(active_turn_id) = turn_id.as_deref()
+                    && let Some(notice) = classify_quota_chunk(delta, self.now_utc())
+                {
+                    let mut gate = self.inner.gate.lock().await;
+                    if gate.active_turn.as_deref() == Some(active_turn_id) {
+                        gate.active_turn_quota_notice = QuotaLimitNotice::merge(
+                            gate.active_turn_quota_notice.take(),
+                            Some(notice),
+                        );
+                    }
+                    return;
+                }
                 self.emit(
                     "content.delta",
                     turn_id,
@@ -1939,9 +2090,16 @@ fn account_disabled_notice(message: &str) -> Option<String> {
 }
 
 /// One classifier for every request: `-32000` "Authentication required" is the sign-in error,
-/// and Google's notice that the account is disabled is its own error, whatever its code; any
-/// other error passes through.
+/// Google's notice that the account is disabled is its own error, and quota-limit prompt errors
+/// classify into `UsageLimitReached`; any other error passes through.
 fn classify(error: AcpProtocolError) -> AntigravityRuntimeError {
+    classify_with_clock(error, time::OffsetDateTime::now_utc())
+}
+
+fn classify_with_clock(
+    error: AcpProtocolError,
+    now: time::OffsetDateTime,
+) -> AntigravityRuntimeError {
     if let AcpProtocolError::RemoteRequest { message, .. } = &error
         && let Some(google_message) = account_disabled_notice(message)
     {
@@ -1956,9 +2114,342 @@ fn classify(error: AcpProtocolError) -> AntigravityRuntimeError {
             .to_ascii_lowercase()
             .contains("authentication required") =>
         {
-            AntigravityRuntimeError::SignInRequired
+            return AntigravityRuntimeError::SignInRequired;
         }
-        _ => AntigravityRuntimeError::Protocol(error),
+        _ => {}
+    }
+    if let Some(notice) = classify_quota_prompt_error(&error, now) {
+        return AntigravityRuntimeError::UsageLimitReached {
+            message: notice.message,
+            resets_at: notice.resets_at,
+        };
+    }
+    AntigravityRuntimeError::Protocol(error)
+}
+
+const QUOTA_CHUNK_MAX_CHARS: usize = 2_048;
+const QUOTA_ERROR_SCAN_MAX_BYTES: usize = 8 * 1024;
+const MAX_RESET_DURATION_SECS: u64 = 365 * 24 * 3600;
+
+/// Classifies a single short ACP `agent_message_chunk` starting with `⚠` (`U+26A0`) against the
+/// tight quota notice allowlist (#429). Ordinary prose, multi-line chunks, >2,048-char chunks,
+/// chunks without leading `⚠`, and disk-quota strings never match.
+fn classify_quota_chunk(text: &str, now: time::OffsetDateTime) -> Option<QuotaLimitNotice> {
+    if text.contains('\n') || text.contains('\r') {
+        return None;
+    }
+    if text.chars().count() > QUOTA_CHUNK_MAX_CHARS {
+        return None;
+    }
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('\u{26A0}') {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("disk quota") {
+        return None;
+    }
+    let matches_allowlist = lower.contains("individual quota reached")
+        || lower.contains("you have exhausted your quota on this model")
+        || lower.contains("you have exhausted your capacity on this model");
+    if !matches_allowlist {
+        return None;
+    }
+    let duration = parse_reset_duration(trimmed);
+    Some(format_usage_limit_notice(duration, now))
+}
+
+/// Classifies a `session/prompt` JSON-RPC error against the tight quota error allowlist (#429).
+/// Bare HTTP 429 errors without an explicit quota phrase and filesystem/disk quota errors never
+/// match.
+fn classify_quota_prompt_error(
+    error: &AcpProtocolError,
+    now: time::OffsetDateTime,
+) -> Option<QuotaLimitNotice> {
+    let AcpProtocolError::RemoteRequest { message, data, .. } = error else {
+        return None;
+    };
+    let mut candidate = String::new();
+    push_bounded(&mut candidate, message, QUOTA_ERROR_SCAN_MAX_BYTES);
+    if let Some(data) = data {
+        collect_error_data_text(data, &mut candidate, QUOTA_ERROR_SCAN_MAX_BYTES, 0);
+    }
+    let lower = candidate.to_ascii_lowercase();
+    if lower.contains("disk quota") {
+        return None;
+    }
+    const PROMPT_ERROR_PHRASES: &[&str] = &[
+        "individual quota reached",
+        "exhausted your quota on this model",
+        "exhausted your capacity on this model",
+        "resource_exhausted",
+        "exceeded your current quota",
+        "quota exceeded for",
+        "usage limit reached",
+    ];
+    if !PROMPT_ERROR_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+    {
+        return None;
+    }
+    let duration = parse_reset_duration(&candidate);
+    Some(format_usage_limit_notice(duration, now))
+}
+
+fn push_bounded(out: &mut String, part: &str, max_bytes: usize) {
+    if part.is_empty() || out.len() >= max_bytes {
+        return;
+    }
+    if !out.is_empty() && out.len() < max_bytes {
+        out.push(' ');
+    }
+    let remaining = max_bytes.saturating_sub(out.len());
+    if part.len() <= remaining {
+        out.push_str(part);
+    } else {
+        let mut end = remaining;
+        while end > 0 && !part.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&part[..end]);
+    }
+}
+
+fn collect_error_data_text(value: &Value, out: &mut String, max_bytes: usize, depth: usize) {
+    if depth >= 4 || out.len() >= max_bytes {
+        return;
+    }
+    match value {
+        Value::String(text) => push_bounded(out, text, max_bytes),
+        Value::Array(items) => {
+            for item in items {
+                collect_error_data_text(item, out, max_bytes, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            for (key, entry) in map {
+                if matches!(
+                    key.as_str(),
+                    "message" | "detail" | "details" | "error" | "reason" | "status"
+                ) {
+                    collect_error_data_text(entry, out, max_bytes, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parses a relative reset duration following `Resets in`, `reset after`, or `retry in` in either
+/// Go duration syntax (`2h30m0s`, `45m`) or unit words (`4 hours, 5 minutes`).
+fn parse_reset_duration(text: &str) -> Option<Duration> {
+    const INTRODUCERS: &[&str] = &["resets in", "reset after", "retry in"];
+    let lower = text.to_ascii_lowercase();
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    for introducer in INTRODUCERS {
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(introducer) {
+            let abs = start + pos;
+            let after = abs + introducer.len();
+            // Ensure the introducer is not glued inside a longer word.
+            let prev_ok = abs == 0 || !lower.as_bytes()[abs - 1].is_ascii_alphabetic();
+            let next_ok = after == lower.len() || !lower.as_bytes()[after].is_ascii_alphabetic();
+            if prev_ok && next_ok {
+                matches.push((abs, after));
+            }
+            start = after;
+        }
+    }
+    matches.sort_unstable_by_key(|(pos, _)| *pos);
+    for (_, after) in matches {
+        if let Some(duration) = parse_duration_expression(&lower[after..]) {
+            return Some(duration);
+        }
+    }
+    None
+}
+
+fn parse_duration_expression(input: &str) -> Option<Duration> {
+    let mut rest =
+        input.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ':' || c == '~');
+    for filler in ["approximately ", "about "] {
+        if let Some(stripped) = rest.strip_prefix(filler) {
+            rest = stripped.trim_start();
+            break;
+        }
+    }
+
+    let mut total_millis: u128 = 0;
+    let mut components = 0usize;
+
+    loop {
+        if components > 0 {
+            let trimmed = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+            let trimmed = if let Some(after_and) = trimmed.strip_prefix("and")
+                && after_and.starts_with(|c: char| c.is_ascii_whitespace())
+            {
+                after_and.trim_start()
+            } else {
+                trimmed
+            };
+            rest = trimmed;
+        }
+
+        let num_end = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_digit() || *b == b'.')
+            .count();
+        if num_end == 0 {
+            break;
+        }
+        let num_str = &rest[..num_end];
+        if !num_str.bytes().any(|b| b.is_ascii_digit()) {
+            break;
+        }
+        let Ok(value) = num_str.parse::<f64>() else {
+            break;
+        };
+        if !value.is_finite() || value < 0.0 {
+            break;
+        }
+        let after_num = rest[num_end..].trim_start_matches([' ', '\t']);
+        let Some((unit_millis, unit_len)) = parse_duration_unit(after_num) else {
+            break;
+        };
+        let added = (value * unit_millis).round();
+        if !added.is_finite() || added < 0.0 {
+            break;
+        }
+        total_millis = total_millis.saturating_add(added as u128);
+        components += 1;
+        rest = &after_num[unit_len..];
+    }
+
+    if components == 0 || total_millis == 0 {
+        return None;
+    }
+    let secs = if total_millis < 1_000 {
+        1
+    } else {
+        u64::try_from(total_millis / 1_000)
+            .unwrap_or(MAX_RESET_DURATION_SECS)
+            .min(MAX_RESET_DURATION_SECS)
+    };
+    Some(Duration::from_secs(secs))
+}
+
+fn parse_duration_unit(text: &str) -> Option<(f64, usize)> {
+    // Longest units first so `ms`/`milliseconds` match before `m`, and `minutes` before `min`/`m`.
+    const UNITS: &[(&str, f64)] = &[
+        ("milliseconds", 1.0),
+        ("millisecond", 1.0),
+        ("msecs", 1.0),
+        ("msec", 1.0),
+        ("ms", 1.0),
+        ("seconds", 1_000.0),
+        ("second", 1_000.0),
+        ("secs", 1_000.0),
+        ("sec", 1_000.0),
+        ("minutes", 60_000.0),
+        ("minute", 60_000.0),
+        ("mins", 60_000.0),
+        ("min", 60_000.0),
+        ("hours", 3_600_000.0),
+        ("hour", 3_600_000.0),
+        ("hrs", 3_600_000.0),
+        ("hr", 3_600_000.0),
+        ("days", 86_400_000.0),
+        ("day", 86_400_000.0),
+        ("s", 1_000.0),
+        ("m", 60_000.0),
+        ("h", 3_600_000.0),
+        ("d", 86_400_000.0),
+    ];
+    for &(token, millis) in UNITS {
+        if let Some(after) = text.strip_prefix(token) {
+            let boundary_ok = after
+                .as_bytes()
+                .first()
+                .is_none_or(|b| !b.is_ascii_alphabetic());
+            if boundary_ok {
+                return Some((millis, token.len()));
+            }
+        }
+    }
+    None
+}
+
+fn format_relative_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!("{seconds}s"));
+    }
+    parts.join(" ")
+}
+
+fn format_usage_limit_notice(
+    duration: Option<Duration>,
+    now: time::OffsetDateTime,
+) -> QuotaLimitNotice {
+    let Some(duration) = duration else {
+        return QuotaLimitNotice {
+            message: "Antigravity usage limit reached. Try again later or switch models."
+                .to_owned(),
+            resets_at: None,
+        };
+    };
+    let resets_at_dt =
+        (now + time::Duration::seconds(duration.as_secs() as i64)).to_offset(time::UtcOffset::UTC);
+    let resets_at_iso = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        resets_at_dt.year(),
+        u8::from(resets_at_dt.month()),
+        resets_at_dt.day(),
+        resets_at_dt.hour(),
+        resets_at_dt.minute(),
+        resets_at_dt.second(),
+    );
+    let absolute_display = if resets_at_dt.second() == 0 {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+            resets_at_dt.year(),
+            u8::from(resets_at_dt.month()),
+            resets_at_dt.day(),
+            resets_at_dt.hour(),
+            resets_at_dt.minute(),
+        )
+    } else {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            resets_at_dt.year(),
+            u8::from(resets_at_dt.month()),
+            resets_at_dt.day(),
+            resets_at_dt.hour(),
+            resets_at_dt.minute(),
+            resets_at_dt.second(),
+        )
+    };
+    let relative = format_relative_duration(duration);
+    QuotaLimitNotice {
+        message: format!(
+            "Antigravity usage limit reached. Resets at {absolute_display} (in {relative})."
+        ),
+        resets_at: Some(resets_at_iso),
     }
 }
 

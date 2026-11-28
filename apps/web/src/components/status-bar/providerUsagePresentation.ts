@@ -246,32 +246,6 @@ export function buildProviderUsageViewModel(
   };
 }
 
-export type AntigravityPlaceholder = "loading" | "failed" | "unsupported";
-
-const ANTIGRAVITY_PLACEHOLDER_ERROR: Readonly<Record<AntigravityPlaceholder, string | null>> = {
-  loading: null,
-  failed: "Could not load Antigravity usage. Use the refresh button to try again.",
-  unsupported: "This BiBCode server is too old to show Antigravity usage.",
-};
-
-/** The Antigravity item before it has a snapshot, after a failed read, or on an old server. */
-export function antigravityPlaceholderViewModel(
-  placeholder: AntigravityPlaceholder,
-): ProviderUsageViewModel {
-  return {
-    provider: "antigravity",
-    status: placeholder === "loading" ? "fetching" : "unavailable",
-    windows: [],
-    detailedWindows: [],
-    compactWindows: [],
-    groups: [],
-    plan: null,
-    credits: null,
-    updatedAt: null,
-    error: ANTIGRAVITY_PLACEHOLDER_ERROR[placeholder],
-  };
-}
-
 export function buildProviderUsageViewModels(
   snapshots: ReadonlyArray<ServerProviderUsageSnapshot>,
   options: ProviderUsagePresentationOptions = {},

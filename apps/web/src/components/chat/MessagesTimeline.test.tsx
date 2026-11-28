@@ -1926,6 +1926,23 @@ describe("MessagesTimeline work entry rows", () => {
     expect(markup).not.toContain('aria-label="Tool call failed"');
   });
 
+  it("renders an Antigravity in-chat usage-limit notice with formatted reset time (#429)", async () => {
+    const markup = await renderWorkEntry({
+      label: "Usage limit reached",
+      detail: "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m).",
+      tone: "warning",
+      sourceActivityKind: "provider.warning",
+    });
+
+    expect(markup).toContain("Usage limit reached");
+    expect(markup).toContain(
+      "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m).",
+    );
+    expect(markup).toContain("lucide-circle-alert");
+    expect(markup).toContain("text-warning-foreground");
+    expect(markup).not.toContain('aria-label="Tool call failed"');
+  });
+
   it("renders runtime errors with destructive chrome", async () => {
     const markup = await renderWorkEntry({
       label: "Crashed",
