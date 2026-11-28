@@ -8522,7 +8522,9 @@ async fn run_supervisor(
                     // that may start a follow-up turn, wait for checkpoint capture and acquire
                     // checkout admission first.
                     tokio::spawn(async move {
-                        let result = if provider == "codex" && !disposition.is_skip_or_cancel() {
+                        let result = if provider == "codex"
+                            && !disposition.is_effective_skip_or_cancel(&answers)
+                        {
                             match engine
                                 .repositories()
                                 .get_thread_session(thread_id.clone())

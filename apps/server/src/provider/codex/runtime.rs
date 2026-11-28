@@ -1852,9 +1852,7 @@ impl CodexSessionRuntime {
             } else {
                 answers
             };
-        let skip_all = disposition.is_some_and(|disp| {
-            disp.is_skip_or_cancel() && !crate::provider::has_non_empty_user_input_answer(&answers)
-        });
+        let skip_all = disposition.is_some_and(|disp| disp.is_effective_skip_or_cancel(&answers));
         if pending.kind == PendingRequestKind::AsyncQuestion {
             if !skip_all {
                 let steer_text = format_async_question_steer_prompt(&pending.questions, &answers);

@@ -38,6 +38,14 @@ impl UserInputResponseDisposition {
     pub const fn is_skip_or_cancel(self) -> bool {
         matches!(self, Self::Skipped | Self::Cancelled)
     }
+
+    /// True when the response suppresses answer delivery: either `Cancelled` (whose answers are
+    /// discarded) or `Skipped` with no non-empty answers. A partial `Skipped` response carrying
+    /// non-empty answers still submits those answers and may start a follow-up turn.
+    pub(crate) fn is_effective_skip_or_cancel(self, answers: &Value) -> bool {
+        matches!(self, Self::Cancelled)
+            || (matches!(self, Self::Skipped) && !has_non_empty_user_input_answer(answers))
+    }
 }
 
 /// Returns true when the answer object carries at least one non-empty string answer.
@@ -127,7 +135,8 @@ impl RequestScope {
 
 #[cfg(test)]
 mod request_scope_tests {
-    use super::RequestScope;
+    use super::{RequestScope, UserInputResponseDisposition};
+    use serde_json::json;
 
     #[test]
     fn one_wire_id_is_stable_within_a_connection_and_distinct_across_connections() {
@@ -136,6 +145,24 @@ mod request_scope_tests {
         assert_eq!(first.approval_id("1"), first.approval_id("1"));
         assert_ne!(first.approval_id("1"), second.approval_id("1"));
         assert_ne!(first.approval_id("1"), first.user_input_id("1"));
+    }
+
+    #[test]
+    fn effective_skip_or_cancel_treats_partial_skipped_answers_as_deliverable() {
+        assert!(
+            UserInputResponseDisposition::Cancelled
+                .is_effective_skip_or_cancel(&json!({"q1": "yes"}))
+        );
+        assert!(UserInputResponseDisposition::Skipped.is_effective_skip_or_cancel(&json!({})));
+        assert!(
+            UserInputResponseDisposition::Skipped
+                .is_effective_skip_or_cancel(&json!({"q1": "   "}))
+        );
+        assert!(
+            !UserInputResponseDisposition::Skipped
+                .is_effective_skip_or_cancel(&json!({"q1": "Espresso"}))
+        );
+        assert!(!UserInputResponseDisposition::Answered.is_effective_skip_or_cancel(&json!({})));
     }
 }
 
