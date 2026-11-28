@@ -1,10 +1,18 @@
 import { resolveChangeRequestPresentationForKind } from "@bibcode/shared/sourceControl";
-import type { ScopedProjectRef, ScopedThreadRef } from "@bibcode/contracts";
+import type {
+  ScopedProjectRef,
+  ScopedThreadRef,
+  SourceControlProviderKind,
+} from "@bibcode/contracts";
 import { useNavigate } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { usePrimarySettings } from "../../hooks/useSettings";
 import { usePullRequestsStore } from "../../pullRequestsStore";
-import { type PullRequestRightPanelSurface, useRightPanelStore } from "../../rightPanelStore";
+import {
+  type PullRequestRightPanelSurface,
+  selectThreadRightPanelState,
+  useRightPanelStore,
+} from "../../rightPanelStore";
 import { useServerConfigs } from "../../state/entities";
 import { useEnvironmentConnectionState } from "../../state/environments";
 import { Button } from "../ui/button";
@@ -21,6 +29,7 @@ import {
   resolvePullRequestsMutationsDisabledReason,
 } from "./pullRequestsAvailability";
 import { PullRequestsContextRefresh } from "./pullRequestsContextRefresh";
+import { PullRequestsPanel } from "./PullRequestsPanel";
 import { PullRequestsUnavailableState } from "./PullRequestsUnavailableState";
 import { usePullRequestsContextQuery } from "./usePullRequestsContextQuery";
 
@@ -32,7 +41,7 @@ export interface PullRequestPanelSurfaceProps {
   surface: PullRequestRightPanelSurface;
 }
 
-/** A request's detail as a thread's right-panel tab, against the thread's checkout. */
+/** Pull Requests inside a thread's right panel: list view or one selected request. */
 export function PullRequestPanelSurface(props: PullRequestPanelSurfaceProps) {
   // A definite width: the detail view lays out by its container's inline size.
   return (
@@ -62,30 +71,63 @@ function PullRequestPanelSurfaceContent({
   const serverConfig = useServerConfigs().get(environmentId) ?? null;
   const enabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
   const availability = resolvePullRequestsAvailability(connection.data, serverConfig, enabled);
+  const selection = surface.selection;
   // ChatView derives gitCwd from the loaded project, so a cwd means the project is known.
-  const usable = availability.kind === "ready" && gitCwd !== null && workspaceUnavailable === null;
+  const usable =
+    availability.kind === "ready" &&
+    gitCwd !== null &&
+    workspaceUnavailable === null &&
+    selection !== undefined;
   const { query, storedContext, rescan, recover } = usePullRequestsContextQuery({
     environmentId,
     cwd: gitCwd,
     enabled: usable,
   });
   const [fileAnchor, setFileAnchor] = useState<string | null>(null);
-  const { id, number, provider } = surface;
+  const selectedNumber = selection?.number ?? null;
+  const selectedProvider = selection?.provider ?? null;
+  const handleSelectRequest = useCallback(
+    (target: { readonly number: number; readonly provider: SourceControlProviderKind }) => {
+      setFileAnchor(null);
+      useRightPanelStore.getState().openPullRequest(threadRef, target);
+    },
+    [threadRef],
+  );
   const navigation = useMemo<PullRequestsNavigation>(() => {
     const store = () => useRightPanelStore.getState();
+    const clearSelection = () => {
+      setFileAnchor(null);
+      store().clearPullRequestSelection(threadRef);
+    };
     return {
-      selectTab: (tab) => store().setPullRequestTab(threadRef, number, tab),
+      selectTab: (tab) => {
+        if (selectedNumber === null) return;
+        store().setPullRequestTab(threadRef, selectedNumber, tab);
+      },
       showFile: (path) => {
+        if (selectedNumber === null) return;
         setFileAnchor(path);
-        store().setPullRequestTab(threadRef, number, "files");
+        store().setPullRequestTab(threadRef, selectedNumber, "files");
       },
       setFileAnchor,
-      openRequest: (target) => store().openPullRequest(threadRef, { number: target, provider }),
-      requestGone: () => store().closeSurface(threadRef, id),
-      discardDeleted: () => store().closeSurface(threadRef, id),
-      back: null,
+      openRequest: (target) => {
+        if (selectedProvider === null) return;
+        setFileAnchor(null);
+        store().openPullRequest(threadRef, { number: target, provider: selectedProvider });
+      },
+      requestGone: clearSelection,
+      discardDeleted: () => {
+        if (selectedNumber === null) return;
+        const current = selectThreadRightPanelState(store().byThreadKey, threadRef).surfaces.find(
+          (entry): entry is PullRequestRightPanelSurface => entry.kind === "pullRequest",
+        );
+        if (current?.selection?.number === selectedNumber) {
+          clearSelection();
+        }
+      },
+      back: clearSelection,
     };
-  }, [id, number, provider, threadRef]);
+  }, [selectedNumber, selectedProvider, threadRef]);
   const scope = useMemo(() => ({ environmentId, cwd: gitCwd ?? "" }), [environmentId, gitCwd]);
 
   if (availability.kind !== "ready") {
@@ -108,6 +150,16 @@ function PullRequestPanelSurfaceContent({
   if (stableProjectRef === null || gitCwd === null) {
     return <PullRequestsUnavailableState reason="Waiting for project data." />;
   }
+  if (selection === undefined) {
+    return (
+      <PullRequestsPanel
+        projectRef={stableProjectRef}
+        mode="embedded"
+        onSelectRequest={handleSelectRequest}
+      />
+    );
+  }
+  const { number, provider, tab } = selection;
   if ((query.error !== null && !storedContext) || query.data?.status === "unavailable") {
     const unavailable = query.data?.status === "unavailable" ? query.data : null;
     return (
@@ -139,7 +191,7 @@ function PullRequestPanelSurfaceContent({
     void navigate({
       to: "/project/$environmentId/$projectId/pull-requests/$number",
       params: { ...stableProjectRef, number: String(number) },
-      search: { tab: surface.tab },
+      search: { tab },
     });
   };
   // An element, not a component: the detail view calls headerActions while rendering.
@@ -167,7 +219,7 @@ function PullRequestPanelSurfaceContent({
             projectRef={stableProjectRef}
             context={query.data}
             number={number}
-            tab={surface.tab}
+            tab={tab}
             mutationsDisabledReason={resolvePullRequestsMutationsDisabledReason(serverConfig)}
             headerActions={() => openFullPageButton}
           />

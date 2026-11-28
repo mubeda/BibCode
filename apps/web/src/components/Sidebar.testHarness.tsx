@@ -14,6 +14,7 @@ import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { createModelSelection } from "@bibcode/shared/model";
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import { createEnvironmentPresentationPolicy } from "../connection/environmentPresentationPolicy";
+import { useRightPanelStore } from "../rightPanelStore";
 import type {
   EnvironmentProject,
   EnvironmentThreadShell,
@@ -1186,6 +1187,7 @@ beforeEach(() => {
   h.uiStore.reset();
   h.selectionStore.reset();
   h.metaStore.reset();
+  useRightPanelStore.setState({ byThreadKey: {} });
   h.state.captures.length = 0;
   h.state.projects = [];
   h.state.threads = [];

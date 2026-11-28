@@ -3269,19 +3269,16 @@ describe("ChatView keydown shortcuts", () => {
   );
 
   it.each([
-    ["terminal.new", "new"],
+    ["terminal.new", "horizontal"],
     ["terminal.split", "horizontal"],
     ["terminal.splitVertical", "vertical"],
-  ] as const)("preserves right-panel %s routing", async (command, expectedAction) => {
+  ] as const)("preserves right-panel %s routing", async (command, expectedDirection) => {
     seedConnectedServerThread();
     useRightPanelStore.getState().openTerminal(threadRef, "terminal-77");
     publishSeededStoreState(useRightPanelStore);
     h.terminalFocusOwner = "right-panel";
     const rightStore = useRightPanelStore.getState();
-    const action =
-      expectedAction === "new"
-        ? vi.spyOn(rightStore, "openTerminal")
-        : vi.spyOn(rightStore, "splitTerminal");
+    const action = vi.spyOn(rightStore, "splitTerminal");
     renderServerRoute();
     installComposerHandle();
     runEffects();
@@ -3291,16 +3288,12 @@ describe("ChatView keydown shortcuts", () => {
     handler(makeKeyEvent({ key: "F1" }));
     await flushTerminalAction();
 
-    if (expectedAction === "new") {
-      expect(action).toHaveBeenCalled();
-    } else {
-      expect(action).toHaveBeenCalledWith(
-        threadRef,
-        expect.any(String),
-        expect.any(String),
-        expectedAction,
-      );
-    }
+    expect(action).toHaveBeenCalledWith(
+      threadRef,
+      "terminal",
+      expect.any(String),
+      expectedDirection,
+    );
     expect(commandCallsFor("terminal.open")).toHaveLength(1);
   });
 
@@ -3516,8 +3509,8 @@ describe("ChatView keydown shortcuts", () => {
     h.commandResults["terminal.open"] = () => AsyncResult.success(undefined);
     const store = useRightPanelStore.getState();
     store.openTerminal(threadRef, "right-seed");
-    store.splitTerminal(threadRef, "terminal:right-seed", "right-2");
-    store.splitTerminal(threadRef, "terminal:right-seed", "right-3");
+    store.splitTerminal(threadRef, "terminal", "right-2");
+    store.splitTerminal(threadRef, "terminal", "right-3");
     publishSeededStoreState(useRightPanelStore);
     h.terminalFocusOwner = "right-panel";
     const { handler } = renderWithKeydown();
@@ -3530,7 +3523,7 @@ describe("ChatView keydown shortcuts", () => {
     const terminalSurface = useRightPanelStore
       .getState()
       .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
-        (surface) => surface.id === "terminal:right-seed" && surface.kind === "terminal",
+        (surface) => surface.id === "terminal" && surface.kind === "terminal",
       );
     expect(terminalSurface).toMatchObject({
       terminalIds: expect.arrayContaining(["right-seed", "right-2", "right-3"]),
@@ -3557,7 +3550,7 @@ describe("ChatView keydown shortcuts", () => {
 
     finishOpen[0]?.(AsyncResult.failure(Cause.fail(new Error("open rejected"))));
     await flushTerminalAction();
-    useRightPanelStore.getState().closeSurface(threadRef, `terminal:${rejectedId}`);
+    useRightPanelStore.getState().closeTerminal(threadRef, "terminal", rejectedId!);
     handler(makeKeyEvent({ key: "F1" }));
 
     expect(openedTerminalIds()[2]).toBe(rejectedId);
@@ -3927,23 +3920,36 @@ describe("ChatView right panel handlers", () => {
     expect(useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).toEqual([]);
   });
 
-  it("adds browser/terminal/diff/source-control/files surfaces on demand", () => {
+  it("adds browser/terminal/diff/source-control/files/project surfaces on demand", () => {
     const props = openedPanelProps((ref) => {
       useRightPanelStore.getState().open(ref, "plan");
     });
 
-    (props["onAddBrowser"] as () => void)();
-    (props["onAddTerminal"] as () => void)();
-    (props["onAddDiff"] as () => void)();
-    (props["onAddSourceControl"] as () => void)();
-    (props["onAddFiles"] as () => void)();
+    (props["onSelectBrowser"] as () => void)();
+    (props["onSelectTerminal"] as () => void)();
+    (props["onSelectDiff"] as () => void)();
+    (props["onSelectSourceControl"] as () => void)();
+    (props["onSelectFiles"] as () => void)();
+    (props["onSelectGitManager"] as () => void)();
+    (props["onSelectPipelines"] as () => void)();
+    (props["onSelectPullRequest"] as () => void)();
 
     expect(h.addBrowserSurfaceCalls).toHaveLength(1);
     expect(commandCallsFor("terminal.open")).toHaveLength(1);
     const kinds = (useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).map(
       (surface) => surface.kind,
     );
-    expect(kinds).toEqual(expect.arrayContaining(["terminal", "diff", "sourceControl", "files"]));
+    expect(kinds).toEqual(
+      expect.arrayContaining([
+        "terminal",
+        "diff",
+        "sourceControl",
+        "files",
+        "gitManager",
+        "pipelines",
+        "pullRequest",
+      ]),
+    );
   });
 
   it("copies file paths via the clipboard with success and failure toasts", async () => {

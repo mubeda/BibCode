@@ -670,7 +670,7 @@ pgrep -fl <udid>                          # no process BiBCode started
 ```
 
 1. **Setting.** Turn on **Settings → Mobile emulators → Device previews**. With a
-   thread open, open **Device** from the right panel's `+` menu or run **Open
+   thread open, select **Device** in the right panel's top icon bar or run **Open
    device preview** from the command palette; neither is offered without an
    active thread. The picker lists the simulator
    under **iOS**, named like `iPhone 17 Pro · iOS 26.5`; a simulator already

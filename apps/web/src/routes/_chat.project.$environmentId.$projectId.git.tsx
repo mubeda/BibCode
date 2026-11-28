@@ -4,9 +4,12 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo } from "react";
 
 import { GitManagerPanel } from "../components/gitManager/GitManagerPanel";
-import { useProject } from "../state/entities";
+import { selectHostThreadForProjectSurface } from "../components/pullRequests/openBesideThread.logic";
+import { useRightPanelStore } from "../rightPanelStore";
+import { useProject, useThreadShellsForProjectRefs } from "../state/entities";
 import { useEnvironmentQuery } from "../state/query";
 import { environmentShell } from "../state/shell";
+import { buildThreadRouteParams } from "../threadRoutes";
 import { ChatRouteInset } from "./-ChatRouteInset";
 
 const MISSING_PROJECT_REDIRECT_DELAY_MS = 1_000;
@@ -19,10 +22,17 @@ function GitManagerRouteView() {
     () => scopeProjectRef(environmentId as EnvironmentId, projectId as ProjectId),
     [environmentId, projectId],
   );
+  const projectRefs = useMemo(() => [projectRef], [projectRef]);
   const project = useProject(projectRef);
+  const threads = useThreadShellsForProjectRefs(projectRefs);
   const shell = useEnvironmentQuery(environmentShell.stateAtom(projectRef.environmentId));
   const shellStatus = shell.data?.status ?? null;
   const projectExists = project !== null;
+  const hostThreadRef = useMemo(
+    () =>
+      projectExists ? selectHostThreadForProjectSurface({ threads, preferredBranch: null }) : null,
+    [projectExists, threads],
+  );
 
   useEffect(() => {
     if (projectExists || shellStatus !== "live") return;
@@ -32,7 +42,17 @@ function GitManagerRouteView() {
     return () => window.clearTimeout(timeoutId);
   }, [navigate, projectExists, shellStatus]);
 
-  if (!projectExists) return null;
+  useEffect(() => {
+    if (!projectExists || hostThreadRef === null) return;
+    useRightPanelStore.getState().open(hostThreadRef, "gitManager");
+    void navigate({
+      to: "/$environmentId/$threadId",
+      params: buildThreadRouteParams(hostThreadRef),
+      replace: true,
+    });
+  }, [hostThreadRef, navigate, projectExists]);
+
+  if (!projectExists || hostThreadRef !== null) return null;
   return (
     <ChatRouteInset>
       <GitManagerPanel projectRef={projectRef} />

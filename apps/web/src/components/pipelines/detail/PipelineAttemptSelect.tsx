@@ -1,5 +1,6 @@
 import { useNavigate } from "@tanstack/react-router";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../../ui/select";
+import { useEmbeddedPipelinesNavigation } from "./PipelineLinks";
 import type { PipelineAttemptOptions } from "./pipelineDetail.logic";
 
 /**
@@ -16,6 +17,7 @@ export function PipelineAttemptSelect({
   pipelineId: number;
 }) {
   const navigate = useNavigate();
+  const embeddedNavigation = useEmbeddedPipelinesNavigation();
   return (
     <div className="w-44">
       <Select
@@ -24,6 +26,10 @@ export function PipelineAttemptSelect({
         value={options.value}
         onValueChange={(next) => {
           if (next === null || next === options.value) return;
+          if (embeddedNavigation !== null) {
+            embeddedNavigation.selectAttempt(next === "latest" ? null : Number(next));
+            return;
+          }
           void navigate({
             to: "/project/$environmentId/$projectId/pipelines/$pipelineId",
             params: {

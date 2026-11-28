@@ -8,7 +8,11 @@ import { act, useContext, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { usePullRequestsStore } from "../../pullRequestsStore";
-import { selectThreadRightPanelState, useRightPanelStore } from "../../rightPanelStore";
+import {
+  type PullRequestRightPanelSurface,
+  selectThreadRightPanelState,
+  useRightPanelStore,
+} from "../../rightPanelStore";
 import type { PullRequestsNavigation } from "./detail/pullRequestsNavigation";
 import { context as availableContext } from "./testFixtures";
 
@@ -19,6 +23,7 @@ const h = vi.hoisted(() => ({
   contextError: null as string | null,
   detailProps: null as Record<string, unknown> | null,
   detailMounts: 0,
+  panelProps: null as Record<string, unknown> | null,
   navigation: null as unknown,
   fileAnchor: null as string | null,
   navigate: vi.fn(),
@@ -70,6 +75,21 @@ vi.mock("../../state/query", () => ({
     requiresRetry: false,
   }),
 }));
+vi.mock("./PullRequestsPanel", () => ({
+  PullRequestsPanel: (props: Record<string, unknown>) => {
+    h.panelProps = props;
+    const onSelectRequest = props.onSelectRequest as
+      | ((target: { number: number; provider: "gitlab" }) => void)
+      | undefined;
+    return (
+      <div data-testid="embedded-pr-list">
+        <button type="button" onClick={() => onSelectRequest?.({ number: 89, provider: "gitlab" })}>
+          Open PR !89
+        </button>
+      </div>
+    );
+  },
+}));
 vi.mock("./detail/PullRequestsDetailView", async () => {
   const { PullRequestsFileAnchorContext, PullRequestsNavigationContext } =
     await import("./detail/pullRequestsNavigation");
@@ -94,13 +114,19 @@ import { PullRequestPanelSurface } from "./PullRequestPanelSurface";
 
 const threadRef = scopeThreadRef("env" as never, "thread-1" as never);
 const projectRef = { environmentId: "env", projectId: "project" } as never;
-const surface = {
-  id: "pullRequest:89",
+const selectedSurface: PullRequestRightPanelSurface = {
+  id: "pullRequest",
   kind: "pullRequest",
-  number: 89,
-  provider: "gitlab",
-  tab: "commits",
-} as const;
+  selection: {
+    number: 89,
+    provider: "gitlab",
+    tab: "commits",
+  },
+};
+const listSurface: PullRequestRightPanelSurface = {
+  id: "pullRequest",
+  kind: "pullRequest",
+};
 let root: Root;
 let container: HTMLDivElement;
 
@@ -112,7 +138,7 @@ async function render(overrides: Partial<Parameters<typeof PullRequestPanelSurfa
         projectRef={projectRef}
         gitCwd="/repo/worktree"
         workspaceUnavailable={null}
-        surface={surface}
+        surface={selectedSurface}
         {...overrides}
       />,
     ),
@@ -134,6 +160,7 @@ beforeEach(() => {
     .getState()
     .openPullRequest(threadRef, { number: 89, provider: "gitlab" }, "commits");
   h.detailProps = null;
+  h.panelProps = null;
   h.navigation = null;
   h.fileAnchor = null;
   h.navigate.mockReset();
@@ -155,6 +182,40 @@ afterEach(async () => {
 });
 
 describe("PullRequestPanelSurface", () => {
+  it("supports embedded list -> row click -> detail tabs/files -> Back with zero route navigations", async () => {
+    useRightPanelStore.getState().clearPullRequestSelection(threadRef);
+    await render({ surface: listSurface });
+    expect(container.querySelector('[data-testid="embedded-pr-list"]')).not.toBeNull();
+    expect(h.panelProps).toMatchObject({ projectRef, mode: "embedded" });
+    expect(h.getContext).not.toHaveBeenCalled();
+
+    // Clicking a row selects it in the singleton pullRequest surface without router navigation.
+    await act(async () => container.querySelector("button")!.click());
+    const selected = panelState().surfaces.find(
+      (entry): entry is PullRequestRightPanelSurface => entry.kind === "pullRequest",
+    );
+    expect(selected).toEqual({
+      id: "pullRequest",
+      kind: "pullRequest",
+      selection: { number: 89, provider: "gitlab", tab: "conversation" },
+    });
+
+    await render({ surface: selected! });
+    const navigation = h.navigation as PullRequestsNavigation;
+    await act(async () => navigation.showFile("src/a.ts"));
+    expect(h.fileAnchor).toBe("src/a.ts");
+    expect(panelState().surfaces[0]).toMatchObject({
+      id: "pullRequest",
+      selection: { number: 89, tab: "files" },
+    });
+
+    // Back returns to the embedded list inside the singleton panel.
+    expect(navigation.back).not.toBeNull();
+    await act(async () => navigation.back!());
+    expect(panelState().surfaces).toEqual([{ id: "pullRequest", kind: "pullRequest" }]);
+    expect(h.navigate).not.toHaveBeenCalled();
+  });
+
   it("renders the request in the thread's checkout on the surface's tab", async () => {
     await render();
     expect(h.detailProps).toMatchObject({
@@ -162,30 +223,51 @@ describe("PullRequestPanelSurface", () => {
       number: 89,
       tab: "commits",
     });
-    expect((h.navigation as PullRequestsNavigation).back).toBeNull();
+    expect((h.navigation as PullRequestsNavigation).back).not.toBeNull();
   });
 
-  it("keeps tab changes, revert requests and deletes inside the thread's panel", async () => {
+  it("keeps tab changes, revert requests, and deletes inside the single pullRequest surface", async () => {
     await render();
     const navigation = h.navigation as PullRequestsNavigation;
     await act(async () => navigation.selectTab("files"));
+    expect(panelState().surfaces).toEqual([
+      {
+        id: "pullRequest",
+        kind: "pullRequest",
+        selection: { number: 89, provider: "gitlab", tab: "files" },
+      },
+    ]);
+
     await act(async () => navigation.openRequest(90));
     let state = panelState();
-    expect(state.surfaces.map((entry) => entry.id)).toEqual(["pullRequest:89", "pullRequest:90"]);
-    expect(state.surfaces[0]).toMatchObject({ tab: "files" });
-    expect(state.activeSurfaceId).toBe("pullRequest:90");
+    expect(state.surfaces).toEqual([
+      {
+        id: "pullRequest",
+        kind: "pullRequest",
+        selection: { number: 90, provider: "gitlab", tab: "conversation" },
+      },
+    ]);
+    expect(state.activeSurfaceId).toBe("pullRequest");
+
     await act(async () => navigation.requestGone());
     state = panelState();
-    expect(state.surfaces.map((entry) => entry.id)).toEqual(["pullRequest:90"]);
+    expect(state.surfaces).toEqual([{ id: "pullRequest", kind: "pullRequest" }]);
   });
 
-  it("closes a deleted request's tab even after the panel moved to another tab", async () => {
+  it("clears only a deleted request's selection and leaves a newer selection alone", async () => {
     await render();
     const discardDeleted = (h.navigation as PullRequestsNavigation).discardDeleted!;
     useRightPanelStore.getState().openPullRequest(threadRef, { number: 90, provider: "gitlab" });
     await act(async () => root.render(null));
     discardDeleted();
-    expect(panelState().surfaces.map((entry) => entry.id)).toEqual(["pullRequest:90"]);
+    // Request #90 is now selected, so discarding #89 must not clobber #90.
+    expect(panelState().surfaces).toEqual([
+      {
+        id: "pullRequest",
+        kind: "pullRequest",
+        selection: { number: 90, provider: "gitlab", tab: "conversation" },
+      },
+    ]);
   });
 
   it("shows a conversation file link on the Changes tab at that file", async () => {
@@ -195,7 +277,9 @@ describe("PullRequestPanelSurface", () => {
     expect(h.fileAnchor).toBe("src/a.ts");
     // The anchor travels in its own context: the navigation object keeps its identity.
     expect(h.navigation).toBe(navigation);
-    expect(panelState().surfaces[0]).toMatchObject({ tab: "files" });
+    expect(panelState().surfaces[0]).toMatchObject({
+      selection: { tab: "files" },
+    });
   });
 
   it("explains instead of loading when the workspace is unavailable, and recovers", async () => {

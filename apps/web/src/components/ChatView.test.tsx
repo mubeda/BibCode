@@ -4675,18 +4675,34 @@ describe("ChatView", () => {
       expect(rightPanel["diffAvailable"]).toBe(true);
       expect(rightPanel["sourceControlAvailable"]).toBe(true);
       expect(rightPanel["filesAvailable"]).toBe(true);
+      expect(rightPanel["gitManagerAvailable"]).toBe(true);
+      expect(rightPanel["pipelinesAvailable"]).toBe(true);
+      expect(rightPanel["pullRequestAvailable"]).toBe(true);
 
-      (rightPanel["onAddTerminal"] as () => void)();
-      (rightPanel["onAddDiff"] as () => void)();
-      (rightPanel["onAddSourceControl"] as () => void)();
-      (rightPanel["onAddFiles"] as () => void)();
+      (rightPanel["onSelectTerminal"] as () => void)();
+      (rightPanel["onSelectDiff"] as () => void)();
+      (rightPanel["onSelectSourceControl"] as () => void)();
+      (rightPanel["onSelectFiles"] as () => void)();
+      (rightPanel["onSelectGitManager"] as () => void)();
+      (rightPanel["onSelectPipelines"] as () => void)();
+      (rightPanel["onSelectPullRequest"] as () => void)();
 
       expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(1);
       expect(
         (useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces ?? []).map(
           (surface) => surface.kind,
         ),
-      ).toEqual(expect.arrayContaining(["terminal", "diff", "sourceControl", "files"]));
+      ).toEqual(
+        expect.arrayContaining([
+          "terminal",
+          "diff",
+          "sourceControl",
+          "files",
+          "gitManager",
+          "pipelines",
+          "pullRequest",
+        ]),
+      );
     });
   });
 
@@ -5093,7 +5109,7 @@ describe("ChatView", () => {
         { id: "browser:tab-a", kind: "preview", resourceId: "tab-a" },
         { id: "browser:tab-b", kind: "preview", resourceId: "tab-b" },
         {
-          id: "terminal:term-active",
+          id: "terminal",
           kind: "terminal",
           resourceId: "term-active",
           terminalIds: ["term-active"],
@@ -9744,5 +9760,137 @@ describe("ChatView composer model picker provider scope (#347)", () => {
       }
     }
     h.settings = prevSettings;
+  });
+
+  describe("right-panel fixed icon bar lazy mounting, terminal capacity, D6 fallback, and v11 overflow cleanup (#426)", () => {
+    it("mounts zero inactive surface bodies and opens zero terminal or preview sessions when opened empty", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useRightPanelStore.getState().toggleVisibility(threadRef);
+      publishSeededStoreState(useRightPanelStore);
+
+      const markup = renderServerRoute();
+
+      expect(markup).toContain('data-mock="right-panel-tabs"');
+      expect(markup).not.toContain('data-mock="thread-terminal-panel"');
+      expect(markup).not.toContain('data-mock="diff-panel"');
+      expect(markup).not.toContain('data-mock="source-control-panel"');
+      expect(markup).not.toContain('data-mock="file-preview-panel"');
+      expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(0);
+      expect(h.commandCalls.filter((call) => call.key === "preview.open")).toHaveLength(0);
+      const rightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      expect(rightPanel["activeSurfaceId"]).toBeNull();
+      expect(rightPanel["surfaces"]).toEqual([]);
+    });
+
+    it("reuses the singleton terminal on repeated Terminal icon clicks and enforces the 4-pane cap on New terminal", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useRightPanelStore.getState().toggleVisibility(threadRef);
+      publishSeededStoreState(useRightPanelStore);
+
+      renderServerRoute();
+      const rightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      const onSelectTerminal = rightPanel["onSelectTerminal"] as () => void;
+
+      // First click opens one shell; repeated icon clicks never open extra shells.
+      onSelectTerminal();
+      onSelectTerminal();
+      onSelectTerminal();
+      expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(1);
+      const terminalSurfaces = (
+        useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces ?? []
+      ).filter((surface) => surface.kind === "terminal");
+      expect(terminalSurfaces).toHaveLength(1);
+      expect(terminalSurfaces[0]?.id).toBe("terminal");
+
+      // Re-render with terminal active to capture onNewTerminal from PersistentThreadTerminalPanel.
+      publishSeededStoreState(useRightPanelStore);
+      renderServerRoute();
+      const terminalProps = capturedProps<Record<string, unknown>>("threadTerminalPanel");
+      const onNewTerminal = terminalProps["onNewTerminal"] as () => void;
+
+      // Split up to 4 panes, then verify a 5th call never opens an extra server session.
+      onNewTerminal();
+      onNewTerminal();
+      onNewTerminal();
+      onNewTerminal();
+      onNewTerminal();
+      expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(4);
+      const afterCap = useRightPanelStore
+        .getState()
+        .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
+          (surface) => surface.kind === "terminal",
+        );
+      expect(afterCap?.kind === "terminal" ? afterCap.terminalIds : []).toHaveLength(4);
+    });
+
+    it("falls back to an available singleton with active id and body when closing the last Browser tab (D6)", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      h.previewState = {
+        ...h.previewState,
+        activeTabId: "tab-only",
+        sessions: {
+          "tab-only": {
+            threadId,
+            tabId: "tab-only",
+            navStatus: { _tag: "Success", url: "https://example.test/", title: "Preview" },
+            canGoBack: false,
+            canGoForward: false,
+            updatedAt: "2026-11-27T18:00:00.000Z",
+          },
+        },
+      };
+      useRightPanelStore.getState().openBrowser(threadRef, "tab-only");
+      publishSeededStoreState(useRightPanelStore);
+
+      await mount(serverRoute);
+      const rightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      const onCloseSurface = rightPanel["onCloseSurface"] as (surface: {
+        id: string;
+        kind: "preview";
+        resourceId: string;
+      }) => void;
+      await act(async () => {
+        onCloseSurface({ id: "browser:tab-only", kind: "preview", resourceId: "tab-only" });
+        publishSeededStoreState(useRightPanelStore);
+      });
+
+      const nextState = useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)];
+      expect(nextState?.isOpen).toBe(true);
+      expect(nextState?.activeSurfaceId).toBe("files");
+      const nextRightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      expect(nextRightPanel["activeSurfaceId"]).toBe("files");
+      expect(nextRightPanel["children"]).not.toBeNull();
+    });
+
+    it("retires v11 migrated overflow terminal IDs on mount", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useRightPanelStore.setState({
+        migratedOverflowTerminalIdsByThreadKey: {
+          [scopedThreadKey(threadRef)]: ["term-overflow-1", "term-overflow-2"],
+        },
+      });
+      publishSeededStoreState(useRightPanelStore);
+
+      await mount(serverRoute);
+      const closedIds = h.commandCalls
+        .filter((call) => call.key === "terminal.close")
+        .map((call) => (call.input as { input: { terminalId: string } }).input.terminalId);
+      expect(closedIds).toEqual(expect.arrayContaining(["term-overflow-1", "term-overflow-2"]));
+      expect(useRightPanelStore.getState().consumeMigratedOverflowTerminalIds(threadRef)).toEqual(
+        [],
+      );
+    });
   });
 });

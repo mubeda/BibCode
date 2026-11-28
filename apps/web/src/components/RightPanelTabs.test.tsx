@@ -33,21 +33,6 @@ vi.mock("~/components/ui/tooltip", () => ({
   ),
 }));
 
-vi.mock("~/components/ui/menu", () => ({
-  Menu: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
-  MenuTrigger: ({ children, ...props }: React.ComponentProps<"button">) => (
-    <button type="button" {...props}>
-      {children}
-    </button>
-  ),
-  MenuPopup: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
-  MenuItem: ({ children, ...props }: React.ComponentProps<"button">) => (
-    <button type="button" {...props}>
-      {children}
-    </button>
-  ),
-}));
-
 vi.mock("~/components/ui/scroll-area", () => ({
   ScrollArea: ({
     children,
@@ -112,6 +97,14 @@ function buttonWithText(text: string): HTMLButtonElement {
   return button!;
 }
 
+function iconButton(label: string): HTMLButtonElement {
+  const button = document.querySelector<HTMLButtonElement>(
+    `[data-right-panel-icon-bar] button[aria-label="${label}"]`,
+  );
+  expect(button).not.toBeNull();
+  return button!;
+}
+
 function snapshot(navStatus: PreviewSessionSnapshot["navStatus"]): PreviewSessionSnapshot {
   return {
     threadId: "thread-1",
@@ -135,6 +128,11 @@ const previewSurface: RightPanelSurface = {
   kind: "preview",
   resourceId: "preview-1",
 };
+const secondPreviewSurface: RightPanelSurface = {
+  id: "browser:2",
+  kind: "preview",
+  resourceId: "preview-2",
+};
 
 function tabsProps(overrides: Partial<TabsProps> = {}): TabsProps {
   return {
@@ -157,15 +155,22 @@ function tabsProps(overrides: Partial<TabsProps> = {}): TabsProps {
     onCloseSurfacesToRight: vi.fn(),
     onCloseAllSurfaces: vi.fn(),
     onCopyFilePath: vi.fn(),
-    onAddBrowser: vi.fn(),
-    onAddTerminal: vi.fn(),
-    onAddDiff: vi.fn(),
-    onAddFiles: vi.fn(),
-    onAddSourceControl: vi.fn(),
+    onSelectBrowser: vi.fn(),
+    onSelectTerminal: vi.fn(),
+    onSelectFiles: vi.fn(),
+    onSelectDiff: vi.fn(),
+    onSelectSourceControl: vi.fn(),
+    onSelectGitManager: vi.fn(),
+    onSelectPipelines: vi.fn(),
+    onSelectPullRequest: vi.fn(),
     browserAvailable: true,
+    terminalAvailable: true,
     diffAvailable: true,
     filesAvailable: true,
     sourceControlAvailable: true,
+    gitManagerAvailable: true,
+    pipelinesAvailable: true,
+    pullRequestAvailable: true,
     children: <div>active content</div>,
     ...overrides,
   };
@@ -213,13 +218,206 @@ afterAll(() => {
 });
 
 describe("RightPanelTabs mounted interactions", () => {
-  it("activates, closes, and middle-clicks rendered tabs", async () => {
+  it("always shows the fixed top outline-icon bar with zero empty-state card grid or + menu", async () => {
+    const onSelectTerminal = vi.fn();
+    const onSelectGitManager = vi.fn();
+    const onSelectPipelines = vi.fn();
+    const onSelectPullRequest = vi.fn();
+    await mount(
+      <RightPanelTabs
+        {...tabsProps({
+          surfaces: [],
+          activeSurfaceId: null,
+          onSelectTerminal,
+          onSelectGitManager,
+          onSelectPipelines,
+          onSelectPullRequest,
+        })}
+      />,
+    );
+
+    expect(document.body.textContent).not.toContain("Open a surface");
+    expect(document.querySelector('[aria-label="Add panel surface"]')).toBeNull();
+    expect(document.body.textContent).toContain("Select a surface from the bar above.");
+
+    const icons = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("[data-right-panel-icon-bar] button"),
+    ).map((button) => button.getAttribute("aria-label"));
+    expect(icons).toEqual([
+      "Browser",
+      "Terminal",
+      "Files",
+      "Diff",
+      "Source Control",
+      "Git Manager",
+      "Pipelines",
+      "Pull Request",
+    ]);
+
+    await click(iconButton("Terminal"));
+    await click(iconButton("Git Manager"));
+    await click(iconButton("Pipelines"));
+    await click(iconButton("Pull Request"));
+    expect(onSelectTerminal).toHaveBeenCalledOnce();
+    expect(onSelectGitManager).toHaveBeenCalledOnce();
+    expect(onSelectPipelines).toHaveBeenCalledOnce();
+    expect(onSelectPullRequest).toHaveBeenCalledOnce();
+  });
+
+  it("underlines the active singleton icon and keeps it selected on re-click (D6)", async () => {
+    const onSelectDiff = vi.fn();
+    await mount(
+      <RightPanelTabs
+        {...tabsProps({
+          surfaces: [{ id: "diff", kind: "diff" }],
+          activeSurfaceId: "diff",
+          onSelectDiff,
+        })}
+      />,
+    );
+
+    const diffIcon = iconButton("Diff");
+    expect(diffIcon.getAttribute("data-active-icon")).toBe("true");
+    expect(diffIcon.getAttribute("aria-pressed")).toBe("true");
+    expect(diffIcon.className).toContain("after:bg-foreground");
+
+    // Re-clicking calls onSelectDiff (which keeps diff active, never toggling it off).
+    await click(diffIcon);
+    expect(onSelectDiff).toHaveBeenCalledOnce();
+    expect(diffIcon.getAttribute("data-active-icon")).toBe("true");
+    // Singleton surfaces do not appear as closable tabs beside the icon bar.
+    expect(document.querySelector('[aria-label="Close Diff"]')).toBeNull();
+  });
+
+  it("omits Device when off and shows Device as the 9th icon when enabled", async () => {
+    await mount(<RightPanelTabs {...tabsProps({ surfaces: [], activeSurfaceId: null })} />);
+    expect(document.querySelector('[aria-label="Device"]')).toBeNull();
+
+    const onSelectDevice = vi.fn();
+    await mount(
+      <RightPanelTabs
+        {...tabsProps({
+          surfaces: [{ id: "device", kind: "device" }],
+          activeSurfaceId: "device",
+          onSelectDevice,
+        })}
+      />,
+    );
+    const deviceIcon = iconButton("Device");
+    expect(deviceIcon.getAttribute("data-active-icon")).toBe("true");
+    await click(deviceIcon);
+    expect(onSelectDevice).toHaveBeenCalledOnce();
+  });
+
+  it("keeps unavailable icons visible with aria-disabled and explanatory tooltips", async () => {
+    const onSelectBrowser = vi.fn();
+    const onSelectDiff = vi.fn();
+    const onSelectPipelines = vi.fn();
+    await mount(
+      <RightPanelTabs
+        {...tabsProps({
+          surfaces: [],
+          activeSurfaceId: null,
+          browserAvailable: false,
+          diffAvailable: false,
+          filesAvailable: false,
+          sourceControlAvailable: false,
+          gitManagerAvailable: false,
+          pipelinesAvailable: false,
+          pullRequestAvailable: false,
+          pipelinesDisabledReason: "Pipelines are turned off in Settings → Source Control.",
+          onSelectBrowser,
+          onSelectDiff,
+          onSelectPipelines,
+        })}
+      />,
+    );
+
+    expect(
+      document.querySelectorAll('[data-right-panel-icon-bar] [aria-disabled="true"]'),
+    ).toHaveLength(7);
+    await click(iconButton("Browser"));
+    await click(iconButton("Diff"));
+    await click(iconButton("Pipelines"));
+    expect(onSelectBrowser).not.toHaveBeenCalled();
+    expect(onSelectDiff).not.toHaveBeenCalled();
+    expect(onSelectPipelines).not.toHaveBeenCalled();
+    const tooltips = Array.from(document.querySelectorAll('[data-testid="tooltip"]')).map(
+      (node) => node.textContent,
+    );
+    expect(tooltips).toContain("Browser previews are only available in the BiBCode desktop app.");
+    expect(tooltips).toContain("Pipelines are turned off in Settings → Source Control.");
+  });
+
+  it("supports keyboard arrow, Home, and End navigation across the fixed icon bar", async () => {
+    await mount(<RightPanelTabs {...tabsProps({ surfaces: [], activeSurfaceId: null })} />);
+    const browserIcon = iconButton("Browser");
+    const terminalIcon = iconButton("Terminal");
+    const pullRequestIcon = iconButton("Pull Request");
+    browserIcon.focus();
+
+    await act(async () => {
+      browserIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    });
+    expect(document.activeElement).toBe(terminalIcon);
+
+    await act(async () => {
+      terminalIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+    });
+    expect(document.activeElement).toBe(pullRequestIcon);
+
+    await act(async () => {
+      pullRequestIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+    });
+    expect(document.activeElement).toBe(browserIcon);
+
+    await act(async () => {
+      browserIcon.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
+    });
+    expect(document.activeElement).toBe(pullRequestIcon);
+  });
+
+  it("activates, closes, and middle-clicks dynamic file and multi-Browser tabs beside Files root", async () => {
     const onActivate = vi.fn();
     const onCloseSurface = vi.fn();
-    await mount(<RightPanelTabs {...tabsProps({ onActivate, onCloseSurface })} />);
+    const onSelectFiles = vi.fn();
+    await mount(
+      <RightPanelTabs
+        {...tabsProps({
+          surfaces: [
+            { id: "files", kind: "files" },
+            fileSurface,
+            previewSurface,
+            secondPreviewSurface,
+          ],
+          activeSurfaceId: fileSurface.id,
+          previewSessions: {
+            "preview-1": snapshot({
+              _tag: "Success",
+              url: "https://example.test/docs",
+              title: "Project docs",
+            }),
+            "preview-2": snapshot({
+              _tag: "Success",
+              url: "https://example.test/app",
+              title: "Preview app",
+            }),
+          },
+          onActivate,
+          onCloseSurface,
+          onSelectFiles,
+        })}
+      />,
+    );
 
     expect(document.body.textContent).toContain("main.ts");
     expect(document.body.textContent).toContain("Project docs");
+    expect(document.body.textContent).toContain("Preview app");
+    // Files singleton is in the icon bar, not repeated as a closable tab.
+    expect(document.querySelector('[aria-label="Close Files"]')).toBeNull();
+    await click(iconButton("Files"));
+    expect(onSelectFiles).toHaveBeenCalledOnce();
+
     await click(buttonWithText("Project docs"));
     expect(onActivate).toHaveBeenCalledWith(previewSurface);
 
@@ -263,123 +461,6 @@ describe("RightPanelTabs mounted interactions", () => {
     expect(onCopyFilePath).toHaveBeenCalledWith("src/main.ts");
   });
 
-  it("uses real empty-state buttons and respects unavailable surfaces", async () => {
-    const onAddTerminal = vi.fn();
-    const onAddBrowser = vi.fn();
-    await mount(
-      <RightPanelTabs
-        {...tabsProps({
-          surfaces: [],
-          activeSurfaceId: null,
-          browserAvailable: false,
-          onAddTerminal,
-          onAddBrowser,
-        })}
-      />,
-    );
-
-    await click(buttonWithText("TerminalStart a shell in this workspace."));
-    expect(onAddTerminal).toHaveBeenCalledOnce();
-
-    const browserButton = buttonWithText("BrowserOpen a local app or URL.");
-    expect(browserButton.getAttribute("aria-disabled")).toBe("true");
-    await click(browserButton);
-    expect(onAddBrowser).not.toHaveBeenCalled();
-    expect(document.body.textContent).not.toContain("Activity");
-  });
-
-  it("adds a surface from the rendered panel menu", async () => {
-    const onAddFiles = vi.fn();
-    await mount(<RightPanelTabs {...tabsProps({ onAddFiles })} />);
-
-    await click(document.querySelector<HTMLButtonElement>('[aria-label="Add panel surface"]')!);
-    await click(buttonWithText("Files"));
-    expect(onAddFiles).toHaveBeenCalledOnce();
-    expect(document.body.textContent).not.toContain("Activity");
-  });
-
-  it("hides the device surface until device previews are on", async () => {
-    await mount(<RightPanelTabs {...tabsProps({ surfaces: [], activeSurfaceId: null })} />);
-    expect(document.body.textContent).not.toContain("Device");
-  });
-
-  it("offers the device surface and titles its tab", async () => {
-    const onAddDevice = vi.fn();
-    await mount(
-      <RightPanelTabs
-        {...tabsProps({
-          surfaces: [{ id: "device", kind: "device" }],
-          activeSurfaceId: "device",
-          onAddDevice,
-        })}
-      />,
-    );
-    expect(document.querySelector('[aria-label="Close Device"]')).not.toBeNull();
-    await click(document.querySelector<HTMLButtonElement>('[aria-label="Add panel surface"]')!);
-    // The tab itself is also titled "Device"; the menu item comes after it.
-    const menuItem = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).findLast(
-      (candidate) => candidate.textContent?.trim() === "Device",
-    )!;
-    await click(menuItem);
-    expect(onAddDevice).toHaveBeenCalledOnce();
-  });
-
-  it("offers the device surface in the empty state", async () => {
-    const onAddDevice = vi.fn();
-    await mount(
-      <RightPanelTabs {...tabsProps({ surfaces: [], activeSurfaceId: null, onAddDevice })} />,
-    );
-    await click(buttonWithText("DeviceRun an Android emulator."));
-    expect(onAddDevice).toHaveBeenCalledOnce();
-  });
-
-  it("can suppress generic add-surface controls", async () => {
-    await mount(<RightPanelTabs {...tabsProps({ allowAddSurfaces: false })} />);
-
-    expect(document.querySelector('[aria-label="Add panel surface"]')).toBeNull();
-  });
-
-  it("renders every surface title, icon, preview fallback, and terminal label", async () => {
-    const surfaces = [
-      { id: "diff", kind: "diff" },
-      { id: "source", kind: "sourceControl" },
-      { id: "files", kind: "files" },
-      { id: "terminal:1", kind: "terminal", activeTerminalId: "term-1" },
-      { id: "terminal:2", kind: "terminal", activeTerminalId: "term-2" },
-      { id: "plan", kind: "plan" },
-      { id: "preview:idle", kind: "preview", resourceId: "idle" },
-      { id: "preview:host", kind: "preview", resourceId: "host" },
-      { id: "preview:invalid", kind: "preview", resourceId: "invalid" },
-      { id: "preview:missing", kind: "preview", resourceId: "missing" },
-    ] as RightPanelSurface[];
-    await mount(
-      <RightPanelTabs
-        {...tabsProps({
-          maximized: true,
-          surfaces,
-          activeSurfaceId: "diff",
-          pendingSurfaceIds: new Set(["diff"]),
-          terminalLabelsById: new Map([["term-1", "Build shell"]]),
-          previewSessions: {
-            idle: snapshot({ _tag: "Idle" }),
-            host: snapshot({ _tag: "Success", url: "https://docs.example.test/path", title: " " }),
-            invalid: snapshot({ _tag: "Success", url: "not a url", title: "" }),
-          },
-        })}
-      />,
-    );
-
-    expect(document.body.textContent).toContain("Diff");
-    expect(document.body.textContent).toContain("Source Control");
-    expect(document.body.textContent).toContain("Files");
-    expect(document.body.textContent).toContain("Build shell");
-    expect(document.body.textContent).toContain("Terminal 2");
-    expect(document.body.textContent).toContain("Plan");
-    expect(document.body.textContent).toContain("docs.example.test");
-    expect(document.body.textContent?.match(/Browser/g)?.length).toBeGreaterThanOrEqual(3);
-    expect(document.querySelector('[aria-label="Close Diff"] span')).not.toBeNull();
-  });
-
   it("marks a file tab whose edits conflict with the disk, even in the background", async () => {
     await mount(
       <RightPanelTabs
@@ -398,47 +479,11 @@ describe("RightPanelTabs mounted interactions", () => {
     ).toBeNull();
   });
 
-  it("titles pull request tabs by the host's number format with the request icon", async () => {
+  it("uses the live desktop title for preview tabs and renders local globe icon", async () => {
     await mount(
       <RightPanelTabs
         {...tabsProps({
-          surfaces: [
-            {
-              id: "pullRequest:12",
-              kind: "pullRequest",
-              number: 12,
-              provider: "github",
-              tab: "conversation",
-            },
-            {
-              id: "pullRequest:89",
-              kind: "pullRequest",
-              number: 89,
-              provider: "gitlab",
-              tab: "files",
-            },
-          ] as RightPanelSurface[],
-          activeSurfaceId: "pullRequest:12",
-        })}
-      />,
-    );
-    for (const title of ["#12", "!89"]) {
-      const tab = buttonWithText(title);
-      expect(tab.querySelector("svg.lucide-git-pull-request")).not.toBeNull();
-      expect(document.querySelector(`[aria-label="Close ${title}"]`)).not.toBeNull();
-    }
-  });
-
-  it("renders a local globe icon for preview tabs without a remote image", async () => {
-    await mount(<RightPanelTabs {...tabsProps()} />);
-    expect(buttonWithText("Project docs").querySelector("svg.lucide-earth")).not.toBeNull();
-    expect(document.querySelector("img")).toBeNull();
-  });
-
-  it("uses the live desktop title instead of a stale server title", async () => {
-    await mount(
-      <RightPanelTabs
-        {...tabsProps({
+          activeSurfaceId: previewSurface.id,
           previewDesktopByTabId: {
             "preview-1": {
               url: "https://example.test/current",
@@ -454,13 +499,14 @@ describe("RightPanelTabs mounted interactions", () => {
       />,
     );
 
-    expect(buttonWithText("Current page")).toBeDefined();
-    expect(
-      Array.from(document.querySelectorAll('[data-testid="tooltip"]')).find(
-        (tooltip) => tooltip.textContent === "Current page",
-      ),
-    ).toBeDefined();
-    expect(document.body.textContent).not.toContain("Project docs");
+    expect(buttonWithText("Current page").querySelector("svg.lucide-earth")).not.toBeNull();
+    expect(document.querySelector("img")).toBeNull();
+    expect(iconButton("Browser").getAttribute("data-active-icon")).toBe("true");
+  });
+
+  it("can suppress the icon bar when allowAddSurfaces is false", async () => {
+    await mount(<RightPanelTabs {...tabsProps({ allowAddSurfaces: false })} />);
+    expect(document.querySelector("[data-right-panel-icon-bar]")).toBeNull();
   });
 
   it("dispatches every native context-menu close action and ignores unavailable menus", async () => {
@@ -490,40 +536,11 @@ describe("RightPanelTabs mounted interactions", () => {
     expect(onCloseSurfacesToRight).toHaveBeenCalledWith(previewSurface);
     expect(onCloseAllSurfaces).toHaveBeenCalledOnce();
 
-    testState.contextMenuShow.mockResolvedValueOnce("copy-path");
-    await act(async () => {
-      previewTab.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
-    });
-
     testState.localApiAvailable = false;
     const callsBeforeUnavailable = testState.contextMenuShow.mock.calls.length;
     await act(async () => {
       previewTab.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
     });
     expect(testState.contextMenuShow).toHaveBeenCalledTimes(callsBeforeUnavailable);
-  });
-
-  it("ignores non-middle auxiliary clicks and exposes every disabled add action", async () => {
-    const onCloseSurface = vi.fn();
-    await mount(
-      <RightPanelTabs
-        {...tabsProps({
-          surfaces: [],
-          activeSurfaceId: null,
-          browserAvailable: false,
-          diffAvailable: false,
-          filesAvailable: false,
-          sourceControlAvailable: false,
-          onCloseSurface,
-        })}
-      />,
-    );
-    expect(document.querySelectorAll('[aria-disabled="true"]')).toHaveLength(4);
-
-    await act(async () => {
-      document.body.dispatchEvent(new MouseEvent("auxclick", { bubbles: true, button: 0 }));
-      document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
-    });
-    expect(onCloseSurface).not.toHaveBeenCalled();
   });
 });

@@ -261,29 +261,11 @@ async function openRightPanelSurface(label: "Diff" | "Files"): Promise<void> {
     await toggle.click();
     await rightPanel.waitForDisplayed();
   }
-
-  const existingTab = browser.$(
-    `//*[@data-right-panel-tab-list]//button[normalize-space()="${label}"]`,
+  const iconButton = browser.$(
+    `[data-right-panel-icon-bar] button[aria-label="${label}"]:not([aria-disabled="true"])`,
   );
-  if (await existingTab.isDisplayed()) {
-    await existingTab.click();
-    return;
-  }
-
-  const emptyStateAction = browser.$(
-    `//button[.//span[normalize-space()="${label}"] and not(@aria-disabled="true")]`,
-  );
-  if (await emptyStateAction.isDisplayed()) {
-    await emptyStateAction.click();
-    return;
-  }
-
-  const addSurface = browser.$('button[aria-label="Add panel surface"]');
-  await addSurface.waitForDisplayed();
-  await addSurface.click();
-  const menuItem = browser.$(`//*[@role="menuitem" and normalize-space()="${label}"]`);
-  await menuItem.waitForDisplayed();
-  await menuItem.click();
+  await iconButton.waitForDisplayed();
+  await iconButton.click();
 }
 
 async function closeRightPanel(): Promise<void> {
@@ -522,7 +504,7 @@ describe("packaged Pierre diff and editor interactions", () => {
     await browser.$('button[aria-label="Undo"]').waitForEnabled();
     await saveEvidence("pierre-edit-before-tab-switch");
 
-    const diffTab = browser.$('//*[@data-right-panel-tab-list]//button[normalize-space()="Diff"]');
+    const diffTab = browser.$('[data-right-panel-icon-bar] button[aria-label="Diff"]');
     await diffTab.click();
     await browser.$('button[aria-label^="Diff scope:"]').waitForDisplayed();
     const editFileTab = browser.$(

@@ -67,22 +67,52 @@ vi.mock("@tanstack/react-router", () => ({
 }));
 vi.mock("./list/PipelinesListView", async () => {
   const { useRepositoryModule } = await import("../repositoryModule/RepositoryModule");
+  const { useEmbeddedPipelinesNavigation } = await import("./detail/PipelineLinks");
   return {
     PipelinesListView: (props: Record<string, unknown>) => {
       h.listProps = props;
       h.freshPageKey = useRepositoryModule().state.freshPageKey;
-      return <div>Pipelines list</div>;
+      const embeddedNav = useEmbeddedPipelinesNavigation();
+      return (
+        <div>
+          <div>Pipelines list</div>
+          {embeddedNav ? (
+            <button type="button" onClick={() => embeddedNav.openPipeline(4821)}>
+              Open pipeline 4821
+            </button>
+          ) : null}
+        </div>
+      );
     },
   };
 });
 
 vi.mock("./detail/PipelinesDetailView", async () => {
-  const { usePipelineLinks } = await import("./detail/PipelineLinks");
+  const { useEmbeddedPipelinesNavigation, usePipelineLinks } =
+    await import("./detail/PipelineLinks");
   return {
     PipelinesDetailView: (props: Record<string, unknown>) => {
       h.detailProps = props;
       h.jobLink = usePipelineLinks().jobLink(998);
-      return <div>Pipeline detail</div>;
+      const embeddedNav = useEmbeddedPipelinesNavigation();
+      return (
+        <div>
+          <div>Pipeline detail</div>
+          {embeddedNav ? (
+            <>
+              <button type="button" onClick={() => embeddedNav.backToList()}>
+                Back to pipelines
+              </button>
+              <button
+                type="button"
+                onClick={() => embeddedNav.openMergeRequest?.({ number: 77, provider: "gitlab" })}
+              >
+                Open MR !77
+              </button>
+            </>
+          ) : null}
+        </div>
+      );
     },
   };
 });
@@ -285,5 +315,42 @@ describe("PipelinesPanel", () => {
       params: { environmentId: "env", projectId: "project", pipelineId: "4821", jobId: "998" },
       search: {},
     });
+  });
+
+  it("keeps embedded filter -> pipeline detail -> job log -> MR link -> Back inside the panel with zero route navigations", async () => {
+    const onOpenMergeRequest = vi.fn();
+    await act(async () =>
+      root.render(
+        <PipelinesPanel projectRef={ref} mode="embedded" onOpenMergeRequest={onOpenMergeRequest} />,
+      ),
+    );
+    expect(container.textContent).toContain("Pipelines list");
+    const onFiltersChange = h.listProps?.onFiltersChange as (filters: unknown) => void;
+    await act(async () => onFiltersChange({ ...DEFAULT_PIPELINES_FILTERS, ref: "release" }));
+    expect(usePipelinesStore.getState().selectViewState(ref).filters.ref).toBe("release");
+    expect(h.navigate).not.toHaveBeenCalled();
+
+    const openPipelineButton = [...container.querySelectorAll("button")].find(
+      (btn) => btn.textContent?.trim() === "Open pipeline 4821",
+    )!;
+    await act(async () => openPipelineButton.click());
+    expect(container.textContent).toContain("Pipeline detail");
+    expect(h.detailProps).toMatchObject({ pipelineId: 4821, attempt: null, jobId: null });
+
+    await act(async () => (h.detailProps!.onJobChange as (jobId: number | null) => void)(998));
+    expect(h.detailProps).toMatchObject({ pipelineId: 4821, jobId: 998 });
+
+    const mrButton = [...container.querySelectorAll("button")].find(
+      (btn) => btn.textContent?.trim() === "Open MR !77",
+    )!;
+    await act(async () => mrButton.click());
+    expect(onOpenMergeRequest).toHaveBeenCalledWith({ number: 77, provider: "gitlab" });
+
+    const backButton = [...container.querySelectorAll("button")].find(
+      (btn) => btn.textContent?.trim() === "Back to pipelines",
+    )!;
+    await act(async () => backButton.click());
+    expect(container.textContent).toContain("Pipelines list");
+    expect(h.navigate).not.toHaveBeenCalled();
   });
 });

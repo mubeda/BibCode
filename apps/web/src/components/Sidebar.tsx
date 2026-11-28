@@ -21,6 +21,8 @@ import {
   terminalStatusFromRunningIds,
 } from "./ThreadStatusIndicators";
 import { projectModuleRouteProjectKey } from "./pullRequests/shared/projectModuleRoute.logic";
+import { selectHostThreadForProjectSurface } from "./pullRequests/openBesideThread.logic";
+import { useRightPanelStore } from "../rightPanelStore";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { CreateWorktreeDialog } from "./CreateWorktreeDialog";
 import { useAtomValue } from "@effect/atom-react";
@@ -2717,15 +2719,54 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     [openProjectHeaderMenu],
   );
 
-  const openGitManagerForProjectMember = useCallback(
-    (member: SidebarProjectGroupMember) => {
+  const openProjectSurfaceForMember = useCallback(
+    (
+      member: SidebarProjectGroupMember,
+      kind: "gitManager" | "pipelines" | "pullRequest",
+      fallbackRoute:
+        | "/project/$environmentId/$projectId/git"
+        | "/project/$environmentId/$projectId/pipelines"
+        | "/project/$environmentId/$projectId/pull-requests",
+    ) => {
       if (isMobile) setOpenMobile(false);
+      const memberThreads = Array.from(sidebarThreadByKeyRef.current.values()).filter(
+        (thread) => thread.environmentId === member.environmentId && thread.projectId === member.id,
+      );
+      const currentThreadRef = activeRouteThreadKey
+        ? parseScopedThreadKey(activeRouteThreadKey)
+        : null;
+      const hostThreadRef = selectHostThreadForProjectSurface({
+        threads: memberThreads,
+        currentThreadRef,
+        preferredBranch: null,
+      });
+      if (hostThreadRef !== null) {
+        useRightPanelStore.getState().open(hostThreadRef, kind);
+        if (
+          currentThreadRef === null ||
+          currentThreadRef.environmentId !== hostThreadRef.environmentId ||
+          currentThreadRef.threadId !== hostThreadRef.threadId
+        ) {
+          void navigate({
+            to: "/$environmentId/$threadId",
+            params: buildThreadRouteParams(hostThreadRef),
+          });
+        }
+        return;
+      }
       void navigate({
-        to: "/project/$environmentId/$projectId/git",
+        to: fallbackRoute,
         params: { environmentId: member.environmentId, projectId: member.id },
       });
     },
-    [isMobile, navigate, setOpenMobile],
+    [activeRouteThreadKey, isMobile, navigate, setOpenMobile],
+  );
+
+  const openGitManagerForProjectMember = useCallback(
+    (member: SidebarProjectGroupMember) => {
+      openProjectSurfaceForMember(member, "gitManager", "/project/$environmentId/$projectId/git");
+    },
+    [openProjectSurfaceForMember],
   );
 
   const handleOpenGitManagerClick = useCallback(
@@ -2737,13 +2778,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 
   const openPullRequestsForProjectMember = useCallback(
     (member: SidebarProjectGroupMember) => {
-      if (isMobile) setOpenMobile(false);
-      void navigate({
-        to: "/project/$environmentId/$projectId/pull-requests",
-        params: { environmentId: member.environmentId, projectId: member.id },
-      });
+      openProjectSurfaceForMember(
+        member,
+        "pullRequest",
+        "/project/$environmentId/$projectId/pull-requests",
+      );
     },
-    [isMobile, navigate, setOpenMobile],
+    [openProjectSurfaceForMember],
   );
 
   const handleOpenPullRequestsClick = useCallback(
@@ -2755,13 +2796,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
 
   const openPipelinesForProjectMember = useCallback(
     (member: SidebarProjectGroupMember) => {
-      if (isMobile) setOpenMobile(false);
-      void navigate({
-        to: "/project/$environmentId/$projectId/pipelines",
-        params: { environmentId: member.environmentId, projectId: member.id },
-      });
+      openProjectSurfaceForMember(
+        member,
+        "pipelines",
+        "/project/$environmentId/$projectId/pipelines",
+      );
     },
-    [isMobile, navigate, setOpenMobile],
+    [openProjectSurfaceForMember],
   );
 
   const handleOpenPipelinesClick = useCallback(
@@ -3733,6 +3774,18 @@ function useOpenRepositoryModule(
 ) {
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
+  const memberProjectRefs = useMemo(
+    () => group.cards.flatMap((card) => card.memberProjectRefs),
+    [group.cards],
+  );
+  const groupThreads = useThreadShellsForProjectRefs(memberProjectRefs);
+  const routeThreadRef = useParams({
+    strict: false,
+    select: (params) =>
+      params.environmentId && params.threadId
+        ? scopeThreadRef(params.environmentId as EnvironmentId, params.threadId as ThreadId)
+        : null,
+  });
   return useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
       event.preventDefault();
@@ -3744,6 +3797,31 @@ function useOpenRepositoryModule(
         (member) => {
           if (!member) return;
           if (isMobile) setOpenMobile(false);
+          const memberThreads = groupThreads.filter(
+            (thread) =>
+              thread.environmentId === member.environmentId && thread.projectId === member.id,
+          );
+          const hostThreadRef = selectHostThreadForProjectSurface({
+            threads: memberThreads,
+            currentThreadRef: routeThreadRef,
+            preferredBranch: null,
+          });
+          if (hostThreadRef !== null) {
+            const surfaceKind =
+              to === "/project/$environmentId/$projectId/pipelines" ? "pipelines" : "pullRequest";
+            useRightPanelStore.getState().open(hostThreadRef, surfaceKind);
+            if (
+              routeThreadRef === null ||
+              routeThreadRef.environmentId !== hostThreadRef.environmentId ||
+              routeThreadRef.threadId !== hostThreadRef.threadId
+            ) {
+              void navigate({
+                to: "/$environmentId/$threadId",
+                params: buildThreadRouteParams(hostThreadRef),
+              });
+            }
+            return;
+          }
           void navigate({
             to,
             params: { environmentId: member.environmentId, projectId: member.id },
@@ -3751,7 +3829,16 @@ function useOpenRepositoryModule(
         },
       );
     },
-    [environments, group.cards, isMobile, navigate, setOpenMobile, to],
+    [
+      environments,
+      group.cards,
+      groupThreads,
+      isMobile,
+      navigate,
+      routeThreadRef,
+      setOpenMobile,
+      to,
+    ],
   );
 }
 

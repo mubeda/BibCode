@@ -16,6 +16,7 @@ import type { RepositoryPermission } from "../actions/pipelineActions.logic";
 import { pipelineRowActions } from "../list/pipelinesList.logic";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { formatPipelineDuration, pipelineStatusText } from "../shared/pipelineStatus.logic";
+import { useEmbeddedPipelinesNavigation } from "./PipelineLinks";
 import { pipelineJobCount } from "./pipelineDetail.logic";
 
 const HOST_NAMES: Record<PullRequestsProviderKind, string> = { github: "GitHub", gitlab: "GitLab" };
@@ -39,21 +40,37 @@ function PipelineRef({
   provider: PullRequestsProviderKind;
   projectRef: ScopedProjectRef;
 }) {
-  if (value.kind === "merge_request" && value.number !== null)
+  const embeddedNavigation = useEmbeddedPipelinesNavigation();
+  if (value.kind === "merge_request" && value.number !== null) {
+    const label = formatChangeRequestNumber(provider, value.number);
     return (
       <span className="inline-flex min-w-0 items-center gap-1">
         <GitPullRequestIcon aria-hidden="true" className="size-3.5 shrink-0" />
-        <Link
-          to="/project/$environmentId/$projectId/pull-requests/$number"
-          params={{ ...projectRef, number: String(value.number) }}
-          search={{ tab: "conversation" }}
-          title={value.name}
-          className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
-        >
-          {formatChangeRequestNumber(provider, value.number)}
-        </Link>
+        {embeddedNavigation?.openMergeRequest ? (
+          <button
+            type="button"
+            title={value.name}
+            className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
+            onClick={() =>
+              embeddedNavigation.openMergeRequest!({ number: value.number!, provider })
+            }
+          >
+            {label}
+          </button>
+        ) : (
+          <Link
+            to="/project/$environmentId/$projectId/pull-requests/$number"
+            params={{ ...projectRef, number: String(value.number) }}
+            search={{ tab: "conversation" }}
+            title={value.name}
+            className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
+          >
+            {label}
+          </Link>
+        )}
       </span>
     );
+  }
   const Icon = value.kind === "tag" ? TagIcon : value.kind === "branch" ? GitBranchIcon : null;
   return (
     <span className="inline-flex min-w-0 items-center gap-1" title={value.name}>

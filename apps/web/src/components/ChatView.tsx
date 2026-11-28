@@ -14,6 +14,7 @@ import {
   type ProjectId,
   type ProviderApprovalDecision,
   ProviderInstanceId,
+  type PullRequestsProviderKind,
   type ServerProvider,
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
@@ -200,9 +201,11 @@ import {
   RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
 } from "../rightPanelLayout";
 import {
+  resolveFallbackSingletonKind,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
   selectThreadRightPanelState,
+  type FallbackSingletonKind,
   type RightPanelSurface,
   useRightPanelStore,
 } from "../rightPanelStore";
@@ -509,6 +512,16 @@ const DevicePanel = lazy(() =>
 const PullRequestPanelSurface = lazy(() =>
   import("./pullRequests/PullRequestPanelSurface").then((module) => ({
     default: module.PullRequestPanelSurface,
+  })),
+);
+const GitManagerPanel = lazy(() =>
+  import("./gitManager/GitManagerPanel").then((module) => ({
+    default: module.GitManagerPanel,
+  })),
+);
+const PipelinesPanel = lazy(() =>
+  import("./pipelines/PipelinesPanel").then((module) => ({
+    default: module.PipelinesPanel,
   })),
 );
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
@@ -3093,6 +3106,17 @@ function ChatViewContent(props: ChatViewProps) {
   // Default true while loading to avoid toolbar flicker.
   const isGitRepo = gitStatusQuery.data?.isRepo ?? true;
   const gitRightPanelAvailable = activeProject !== null && isGitRepo;
+  const terminalRightPanelAvailable = activeProject !== null && workspaceUnavailable === null;
+  const pipelinesSettingEnabled = settings.pipelinesEnabled !== false;
+  const pullRequestsSettingEnabled = settings.pullRequestsEnabled !== false;
+  const pipelinesRightPanelAvailable = gitRightPanelAvailable && pipelinesSettingEnabled;
+  const pullRequestRightPanelAvailable = gitRightPanelAvailable && pullRequestsSettingEnabled;
+  const pipelinesRightPanelDisabledReason = !pipelinesSettingEnabled
+    ? "Pipelines are turned off in Settings → Source Control."
+    : undefined;
+  const pullRequestRightPanelDisabledReason = !pullRequestsSettingEnabled
+    ? "Pull requests are turned off in Settings → Source Control."
+    : undefined;
   const composerContextEnvironmentLabel =
     activeEnvironment?.label ??
     environmentById.get(environmentId)?.label ??
@@ -3460,6 +3484,25 @@ function ChatViewContent(props: ChatViewProps) {
     if (!activeThreadRef || !activeProject) return;
     useRightPanelStore.getState().open(activeThreadRef, "files");
   }, [activeProject, activeThreadRef]);
+  const addGitManagerSurface = useCallback(() => {
+    if (!activeThreadRef || !gitRightPanelAvailable) return;
+    useRightPanelStore.getState().open(activeThreadRef, "gitManager");
+  }, [activeThreadRef, gitRightPanelAvailable]);
+  const addPipelinesSurface = useCallback(() => {
+    if (!activeThreadRef || !pipelinesRightPanelAvailable) return;
+    useRightPanelStore.getState().open(activeThreadRef, "pipelines");
+  }, [activeThreadRef, pipelinesRightPanelAvailable]);
+  const addPullRequestSurface = useCallback(() => {
+    if (!activeThreadRef || !pullRequestRightPanelAvailable) return;
+    useRightPanelStore.getState().open(activeThreadRef, "pullRequest");
+  }, [activeThreadRef, pullRequestRightPanelAvailable]);
+  const openEmbeddedMergeRequest = useCallback(
+    (target: { readonly number: number; readonly provider: PullRequestsProviderKind }) => {
+      if (!activeThreadRef) return;
+      useRightPanelStore.getState().openPullRequest(activeThreadRef, target);
+    },
+    [activeThreadRef],
+  );
   const deviceAvailability = useDevicePreviewsAvailability(activeThreadRef?.environmentId ?? null);
   const addDeviceSurface = useCallback(() => {
     if (!activeThreadRef) return;
@@ -3467,6 +3510,27 @@ function ChatViewContent(props: ChatViewProps) {
   }, [activeThreadRef]);
   // Hidden, not disabled, while the setting is off: Settings is the way in.
   const onAddDevice = deviceAvailability.enabled ? addDeviceSurface : undefined;
+  const availableFallbackSingletons = useMemo<ReadonlySet<FallbackSingletonKind>>(() => {
+    const available = new Set<FallbackSingletonKind>();
+    if (activeProject !== null) available.add("files");
+    if (terminalRightPanelAvailable) available.add("terminal");
+    if (gitRightPanelAvailable) {
+      available.add("sourceControl");
+      available.add("diff");
+      available.add("gitManager");
+    }
+    if (pipelinesRightPanelAvailable) available.add("pipelines");
+    if (pullRequestRightPanelAvailable) available.add("pullRequest");
+    if (onAddDevice !== undefined) available.add("device");
+    return available;
+  }, [
+    activeProject,
+    gitRightPanelAvailable,
+    onAddDevice,
+    pipelinesRightPanelAvailable,
+    pullRequestRightPanelAvailable,
+    terminalRightPanelAvailable,
+  ]);
   const openFileSurface = useCallback(
     (relativePath: string) => {
       if (!activeThreadRef || !activeProject) return;
@@ -3537,11 +3601,34 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const addTerminalSurface = useCallback(() => {
     if (!activeThreadRef || !activeThreadId || !activeProject || workspaceUnavailable) return;
+    const store = useRightPanelStore.getState();
+    const existingTerminal = selectThreadRightPanelState(
+      store.byThreadKey,
+      activeThreadRef,
+    ).surfaces.find((surface) => surface.kind === "terminal");
+    if (existingTerminal && existingTerminal.terminalIds.length >= MAX_TERMINALS_PER_GROUP) {
+      store.activateSurface(activeThreadRef, existingTerminal.id);
+      setTerminalFocusRequestId((value) => value + 1);
+      return;
+    }
     const cwd = gitCwd ?? activeProject.workspaceRoot;
     const reservation = reserveActiveTerminalId();
     if (!reservation) return;
     const terminalId = reservation.terminalId;
-    useRightPanelStore.getState().openTerminal(activeThreadRef, terminalId);
+    if (existingTerminal) {
+      const didSplit = store.splitTerminal(
+        activeThreadRef,
+        existingTerminal.id,
+        terminalId,
+        "horizontal",
+      );
+      if (!didSplit) {
+        reservation.release();
+        return;
+      }
+    } else {
+      store.openTerminal(activeThreadRef, terminalId);
+    }
     setTerminalFocusRequestId((value) => value + 1);
     openReservedRightPanelTerminal(reservation, cwd);
   }, [
@@ -3553,6 +3640,33 @@ function ChatViewContent(props: ChatViewProps) {
     reserveActiveTerminalId,
     workspaceUnavailable,
   ]);
+  const selectTerminalSurface = useCallback(() => {
+    if (!activeThreadRef || !activeThreadId || !activeProject || workspaceUnavailable) return;
+    const store = useRightPanelStore.getState();
+    const existingTerminal = selectThreadRightPanelState(
+      store.byThreadKey,
+      activeThreadRef,
+    ).surfaces.find((surface) => surface.kind === "terminal");
+    if (existingTerminal) {
+      store.activateSurface(activeThreadRef, existingTerminal.id);
+      setTerminalFocusRequestId((value) => value + 1);
+      return;
+    }
+    addTerminalSurface();
+  }, [activeProject, activeThreadId, activeThreadRef, addTerminalSurface, workspaceUnavailable]);
+  useEffect(() => {
+    if (!activeThreadRef) return;
+    const overflowTerminalIds = useRightPanelStore
+      .getState()
+      .consumeMigratedOverflowTerminalIds(activeThreadRef);
+    for (const terminalId of overflowTerminalIds) {
+      void retireTerminalResource({
+        environmentId: activeThreadRef.environmentId,
+        threadId: activeThreadRef.threadId,
+        terminalId,
+      });
+    }
+  }, [activeThreadRef, retireTerminalResource]);
   const splitPanelTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
       if (
@@ -3701,6 +3815,18 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const syncActivePreviewSurface = useCallback(() => {
     if (!activeThreadRef) return;
+    const state = selectThreadRightPanelState(
+      useRightPanelStore.getState().byThreadKey,
+      activeThreadRef,
+    );
+    if (
+      state.isOpen &&
+      state.activeSurfaceId === null &&
+      resolveFallbackSingletonKind(availableFallbackSingletons) === "terminal"
+    ) {
+      selectTerminalSurface();
+      return;
+    }
     const nextActiveSurface = selectActiveRightPanelSurface(
       useRightPanelStore.getState().byThreadKey,
       activeThreadRef,
@@ -3708,15 +3834,22 @@ function ChatViewContent(props: ChatViewProps) {
     if (nextActiveSurface?.kind === "preview" && nextActiveSurface.resourceId) {
       setActivePreviewTab(activeThreadRef, nextActiveSurface.resourceId);
     }
-  }, [activeThreadRef]);
+  }, [activeThreadRef, availableFallbackSingletons, selectTerminalSurface]);
   const closeRightPanelSurface = useCallback(
     (surface: RightPanelSurface) => {
       if (!activeThreadRef) return;
       cleanupRightPanelSurfaces([surface]);
-      useRightPanelStore.getState().closeSurface(activeThreadRef, surface.id);
+      useRightPanelStore.getState().closeSurface(activeThreadRef, surface.id, {
+        availableSingletons: availableFallbackSingletons,
+      });
       syncActivePreviewSurface();
     },
-    [activeThreadRef, cleanupRightPanelSurfaces, syncActivePreviewSurface],
+    [
+      activeThreadRef,
+      availableFallbackSingletons,
+      cleanupRightPanelSurfaces,
+      syncActivePreviewSurface,
+    ],
   );
   const closeOtherRightPanelSurfaces = useCallback(
     (surface: RightPanelSurface) => {
@@ -8140,6 +8273,18 @@ function ChatViewContent(props: ChatViewProps) {
           rootThreadId={activeThread?.hostThreadId ?? activeThreadRef.threadId}
         />
       </Suspense>
+    ) : activeRightPanelSurface?.kind === "gitManager" && activeProjectRef ? (
+      <Suspense fallback={null}>
+        <GitManagerPanel projectRef={activeProjectRef} />
+      </Suspense>
+    ) : activeRightPanelSurface?.kind === "pipelines" && activeProjectRef ? (
+      <Suspense fallback={null}>
+        <PipelinesPanel
+          projectRef={activeProjectRef}
+          mode="embedded"
+          onOpenMergeRequest={openEmbeddedMergeRequest}
+        />
+      </Suspense>
     ) : activeRightPanelSurface?.kind === "pullRequest" ? (
       <Suspense fallback={null}>
         <PullRequestPanelSurface
@@ -8594,16 +8739,29 @@ function ChatViewContent(props: ChatViewProps) {
           onCloseSurfacesToRight={closeDisplayedRightPanelSurfacesToRight}
           onCloseAllSurfaces={closeAllDisplayedRightPanelSurfaces}
           onCopyFilePath={copyRightPanelFilePath}
-          onAddBrowser={createBrowserSurface}
-          onAddTerminal={addTerminalSurface}
-          onAddDiff={addDiffSurface}
-          onAddSourceControl={addSourceControlSurface}
-          onAddFiles={addFilesSurface}
-          onAddDevice={onAddDevice}
+          onSelectBrowser={createBrowserSurface}
+          onSelectTerminal={selectTerminalSurface}
+          onSelectDiff={addDiffSurface}
+          onSelectSourceControl={addSourceControlSurface}
+          onSelectFiles={addFilesSurface}
+          onSelectDevice={onAddDevice}
+          onSelectGitManager={addGitManagerSurface}
+          onSelectPipelines={addPipelinesSurface}
+          onSelectPullRequest={addPullRequestSurface}
           browserAvailable={isPreviewSupportedInRuntime()}
+          terminalAvailable={terminalRightPanelAvailable}
           diffAvailable={gitRightPanelAvailable}
           sourceControlAvailable={gitRightPanelAvailable}
           filesAvailable={activeProject !== null}
+          gitManagerAvailable={gitRightPanelAvailable}
+          pipelinesAvailable={pipelinesRightPanelAvailable}
+          pullRequestAvailable={pullRequestRightPanelAvailable}
+          {...(pipelinesRightPanelDisabledReason
+            ? { pipelinesDisabledReason: pipelinesRightPanelDisabledReason }
+            : {})}
+          {...(pullRequestRightPanelDisabledReason
+            ? { pullRequestDisabledReason: pullRequestRightPanelDisabledReason }
+            : {})}
         >
           {rightPanelContent}
         </RightPanelTabs>
@@ -8627,16 +8785,29 @@ function ChatViewContent(props: ChatViewProps) {
             onCloseSurfacesToRight={closeDisplayedRightPanelSurfacesToRight}
             onCloseAllSurfaces={closeAllDisplayedRightPanelSurfaces}
             onCopyFilePath={copyRightPanelFilePath}
-            onAddBrowser={createBrowserSurface}
-            onAddTerminal={addTerminalSurface}
-            onAddDiff={addDiffSurface}
-            onAddSourceControl={addSourceControlSurface}
-            onAddFiles={addFilesSurface}
-            onAddDevice={onAddDevice}
+            onSelectBrowser={createBrowserSurface}
+            onSelectTerminal={selectTerminalSurface}
+            onSelectDiff={addDiffSurface}
+            onSelectSourceControl={addSourceControlSurface}
+            onSelectFiles={addFilesSurface}
+            onSelectDevice={onAddDevice}
+            onSelectGitManager={addGitManagerSurface}
+            onSelectPipelines={addPipelinesSurface}
+            onSelectPullRequest={addPullRequestSurface}
             browserAvailable={isPreviewSupportedInRuntime()}
+            terminalAvailable={terminalRightPanelAvailable}
             diffAvailable={gitRightPanelAvailable}
             sourceControlAvailable={gitRightPanelAvailable}
             filesAvailable={activeProject !== null}
+            gitManagerAvailable={gitRightPanelAvailable}
+            pipelinesAvailable={pipelinesRightPanelAvailable}
+            pullRequestAvailable={pullRequestRightPanelAvailable}
+            {...(pipelinesRightPanelDisabledReason
+              ? { pipelinesDisabledReason: pipelinesRightPanelDisabledReason }
+              : {})}
+            {...(pullRequestRightPanelDisabledReason
+              ? { pullRequestDisabledReason: pullRequestRightPanelDisabledReason }
+              : {})}
           >
             {rightPanelContent}
           </RightPanelTabs>

@@ -1,5 +1,9 @@
 import { resolveChangeRequestPresentationForKind } from "@bibcode/shared/sourceControl";
-import type { PullRequestsDetail, ScopedProjectRef } from "@bibcode/contracts";
+import type {
+  PullRequestsDetail,
+  ScopedProjectRef,
+  SourceControlProviderKind,
+} from "@bibcode/contracts";
 import { RefreshCwIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useOpenPrLink } from "../../lib/openPullRequestLink";
@@ -18,12 +22,21 @@ import { pullRequestsHostAddress } from "./pullRequestsHost.logic";
 import { pullRequestsModule, usePullRequestsFirstPagePrefetch } from "./pullRequestsModule";
 import { OpenBesideThreadButton } from "./OpenBesideThreadButton";
 import { PullRequestsDetailView } from "./detail/PullRequestsDetailView";
-import { PullRequestsRouteNavigation } from "./detail/pullRequestsNavigation";
+import {
+  type PullRequestsListNavigation,
+  PullRequestsListNavigationContext,
+  PullRequestsRouteNavigation,
+} from "./detail/pullRequestsNavigation";
 
 export interface PullRequestsPanelProps {
   projectRef: ScopedProjectRef;
   number?: number;
   tab?: PullRequestsDetailTab;
+  mode?: "page" | "embedded";
+  onSelectRequest?: (target: {
+    readonly number: number;
+    readonly provider: SourceControlProviderKind;
+  }) => void;
 }
 
 // The shell remounts this boundary on a checkout change, so a dialog or old list
@@ -31,7 +44,9 @@ export interface PullRequestsPanelProps {
 function AvailablePullRequests({
   number,
   tab = "conversation",
-}: Pick<PullRequestsPanelProps, "number" | "tab">) {
+  mode = "page",
+  onSelectRequest,
+}: Pick<PullRequestsPanelProps, "number" | "tab" | "mode" | "onSelectRequest">) {
   const {
     context,
     state: { scope, contextQuery, freshPageKey },
@@ -60,6 +75,20 @@ function AvailablePullRequests({
       baseUrl: pullRequestsHostAddress({ webUrl: context.webUrl, host: context.host }),
     }),
     [context.host, context.provider, context.webUrl],
+  );
+  const listNavigation = useMemo<PullRequestsListNavigation | null>(
+    () => (mode === "embedded" && onSelectRequest ? { openRequest: onSelectRequest } : null),
+    [mode, onSelectRequest],
+  );
+  const listView = (
+    <PullRequestsListView
+      ref={listRef}
+      scope={scope}
+      projectRef={projectRef}
+      context={context}
+      freshPageKey={freshPageKey}
+      onFreshPageConsumed={consumeFreshPage}
+    />
   );
   return (
     <section
@@ -114,14 +143,13 @@ function AvailablePullRequests({
         ) : null}
       </RepositoryModule.Header>
       {number === undefined ? (
-        <PullRequestsListView
-          ref={listRef}
-          scope={scope}
-          projectRef={projectRef}
-          context={context}
-          freshPageKey={freshPageKey}
-          onFreshPageConsumed={consumeFreshPage}
-        />
+        listNavigation !== null ? (
+          <PullRequestsListNavigationContext value={listNavigation}>
+            {listView}
+          </PullRequestsListNavigationContext>
+        ) : (
+          listView
+        )
       ) : (
         <PullRequestsRouteNavigation projectRef={projectRef} number={number}>
           {/* The full page shares its checkout with Pipelines, so its jobs open there in-app.
@@ -153,7 +181,13 @@ function AvailablePullRequests({
   );
 }
 
-export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanelProps) {
+export function PullRequestsPanel({
+  projectRef,
+  number,
+  tab,
+  mode = "page",
+  onSelectRequest,
+}: PullRequestsPanelProps) {
   const { environmentId, projectId } = projectRef;
   useEffect(() => {
     usePullRequestsStore.getState().touchProject({ environmentId, projectId });
@@ -175,6 +209,8 @@ export function PullRequestsPanel({ projectRef, number, tab }: PullRequestsPanel
         <AvailablePullRequests
           {...(number === undefined ? {} : { number })}
           {...(tab === undefined ? {} : { tab })}
+          mode={mode}
+          {...(onSelectRequest === undefined ? {} : { onSelectRequest })}
         />
       </RepositoryModule.Gate>
     </RepositoryModule.Provider>

@@ -1,6 +1,31 @@
+import type { PullRequestsProviderKind } from "@bibcode/contracts";
 import type { ToOptions } from "@tanstack/react-router";
 import { createContext, use } from "react";
 import { pipelineJobLink } from "../job/pipelineJobRoute";
+
+/**
+ * Navigation owner for embedded Pipelines inside a thread's right panel.
+ * Null on standalone routes, where links and actions use the router.
+ */
+export interface EmbeddedPipelinesNavigation {
+  readonly openPipeline: (
+    pipelineId: number,
+    options?: { readonly attempt?: number | null; readonly jobId?: number | null },
+  ) => void;
+  readonly backToList: () => void;
+  readonly selectAttempt: (attempt: number | null) => void;
+  readonly openMergeRequest?:
+    | ((target: { readonly number: number; readonly provider: PullRequestsProviderKind }) => void)
+    | undefined;
+}
+
+const EmbeddedPipelinesNavigationContext = createContext<EmbeddedPipelinesNavigation | null>(null);
+
+export const EmbeddedPipelinesNavigationProvider = EmbeddedPipelinesNavigationContext;
+
+export function useEmbeddedPipelinesNavigation(): EmbeddedPipelinesNavigation | null {
+  return use(EmbeddedPipelinesNavigationContext);
+}
 
 /**
  * Where the stage views link a job. The stage components never ask where they are

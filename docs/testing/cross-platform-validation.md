@@ -4889,8 +4889,8 @@ with a pinned (E2EE) profile, and a browser on that machine opening
 `http://<server lan ip>:<port>` (not `localhost`, which is a secure context).
 Record each client's OS, app or browser version, and profile type.
 
-1. **Off by default.** Before turning anything on, the right panel's `+` menu
-   has no **Device** item and the command palette has no **Open device
+1. **Off by default.** Before turning anything on, the right panel's top icon bar
+   has no **Device** icon and the command palette has no **Open device
    preview**. Turn on **Settings → Mobile emulators → Device previews** for the
    environment; both appear.
 2. **Availability.** Open the Device panel: it lists the AVDs. On a host

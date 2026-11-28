@@ -47,7 +47,11 @@ import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
 import { PipelineAttemptSelect } from "./PipelineAttemptSelect";
 import { PipelineDetailHeader } from "./PipelineDetailHeader";
 import { PipelineJobLogPanel } from "./PipelineJobLogPanel";
-import { PipelineLinksProvider, usePipelineLinks } from "./PipelineLinks";
+import {
+  PipelineLinksProvider,
+  useEmbeddedPipelinesNavigation,
+  usePipelineLinks,
+} from "./PipelineLinks";
 import { PipelineStageColumns } from "./PipelineStageColumns";
 import {
   QUIET_AFTER_MS,
@@ -124,6 +128,18 @@ function BackToPipelines({
 }: {
   projectRef: { environmentId: string; projectId: string };
 }) {
+  const embeddedNavigation = useEmbeddedPipelinesNavigation();
+  if (embeddedNavigation !== null) {
+    return (
+      <button
+        type="button"
+        onClick={embeddedNavigation.backToList}
+        className="text-sm underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
+      >
+        Back to pipelines
+      </button>
+    );
+  }
   return (
     <Link
       to="/project/$environmentId/$projectId/pipelines"
@@ -349,6 +365,7 @@ export function PipelinesDetailView({
   // A GitLab job retry opens the new job; a GitHub re-run of an earlier attempt opens
   // the run's latest. Anything else re-reads this page.
   const navigate = useNavigate();
+  const embeddedNavigation = useEmbeddedPipelinesNavigation();
   const { environmentId: routeEnvironmentId, projectId } = projectRef;
   const onActionSettled = useCallback(
     ({ request, result }: PipelineActionOutcome) => {
@@ -362,6 +379,13 @@ export function PipelinesDetailView({
               shown: { pipelineId, attempt, jobId: null },
             });
       if (destination?.kind === "job") {
+        if (embeddedNavigation !== null) {
+          embeddedNavigation.openPipeline(destination.pipelineId, {
+            attempt: null,
+            jobId: destination.jobId,
+          });
+          return;
+        }
         void navigate(
           pipelineJobLink({
             environmentId: routeEnvironmentId,
@@ -373,6 +397,10 @@ export function PipelinesDetailView({
         return;
       }
       if (destination?.kind === "pipeline") {
+        if (embeddedNavigation !== null) {
+          embeddedNavigation.openPipeline(destination.pipelineId, { attempt: null, jobId: null });
+          return;
+        }
         void navigate({
           to: "/project/$environmentId/$projectId/pipelines/$pipelineId",
           params: {
@@ -385,7 +413,16 @@ export function PipelinesDetailView({
       }
       revalidateDetail();
     },
-    [attempt, navigate, pipelineId, projectId, provider, revalidateDetail, routeEnvironmentId],
+    [
+      attempt,
+      embeddedNavigation,
+      navigate,
+      pipelineId,
+      projectId,
+      provider,
+      revalidateDetail,
+      routeEnvironmentId,
+    ],
   );
 
   const statusText =
