@@ -695,6 +695,35 @@ export function prepareAntigravityTextPaste(
 }
 
 /**
+ * Bytes to write for a paste held until the terminal's driver is known.
+ *
+ * An unknown driver is protected the same way as Antigravity: a multiline paste
+ * is one bracketed envelope, so a summary that is still missing cannot submit
+ * each line. A known other driver wraps only while bracketed paste is on, and
+ * an embedded end marker is stripped first so the suffix is not typed as a command.
+ */
+export function pendingIdentityPastePayload(
+  text: string,
+  resolved: string | null,
+  bracketedPasteMode: boolean,
+): string {
+  if (resolved === "antigravity" || resolved === null) {
+    return (
+      prepareAntigravityTextPaste(text, bracketedPasteMode) ??
+      (bracketedPasteMode
+        ? `${BRACKETED_PASTE_START}${text.replace(/\r\n|\n/g, "\r")}${BRACKETED_PASTE_END}`
+        : text.replace(/\r\n|\n/g, "\r"))
+    );
+  }
+  const sanitized = text.includes(BRACKETED_PASTE_END) ? stripBracketedPasteEnd(text) : text;
+  if (sanitized.length === 0) return "";
+  const normalized = sanitized.replace(/\r\n|\n/g, "\r");
+  return bracketedPasteMode
+    ? `${BRACKETED_PASTE_START}${normalized}${BRACKETED_PASTE_END}`
+    : normalized;
+}
+
+/**
  * How long a mount must hold its size before an automatic size claim (layout, attach) is
  * sent. A panel opening, collapsing or being dragged passes through a few pixels on the way,
  * which would size the program to 2 columns; a small panel that holds still is claimed (#348).
@@ -2642,20 +2671,11 @@ export function TerminalViewport({
               fill(null);
               return;
             }
-            const bracketed = terminal.modes.bracketedPasteMode;
-            let payload: string;
-            if (resolved === "antigravity") {
-              payload =
-                prepareAntigravityTextPaste(text, bracketed) ??
-                (bracketed
-                  ? `${BRACKETED_PASTE_START}${text.replace(/\r\n|\n/g, "\r")}${BRACKETED_PASTE_END}`
-                  : text.replace(/\r\n|\n/g, "\r"));
-            } else {
-              const normalized = text.replace(/\r\n|\n/g, "\r");
-              payload = bracketed
-                ? `${BRACKETED_PASTE_START}${normalized}${BRACKETED_PASTE_END}`
-                : normalized;
-            }
+            const payload = pendingIdentityPastePayload(
+              text,
+              resolved,
+              terminal.modes.bracketedPasteMode,
+            );
             if (payload.length > 0) {
               fallback.remaining = payload.length;
             }
