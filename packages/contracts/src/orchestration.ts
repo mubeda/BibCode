@@ -6,7 +6,7 @@ import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Struct from "effect/Struct";
 import { ProviderOptionSelections } from "./model.ts";
 import { RepositoryIdentity } from "./environment.ts";
-import { RuntimeErrorClass } from "./providerRuntime.ts";
+import { RuntimeErrorClass, UserInputResponseDisposition } from "./providerRuntime.ts";
 import {
   ApprovalRequestId,
   CheckpointRef,
@@ -1250,6 +1250,7 @@ const ThreadUserInputRespondCommand = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
   answers: ProviderUserInputAnswers,
+  disposition: Schema.optionalKey(UserInputResponseDisposition),
   createdAt: IsoDateTime,
 });
 
@@ -1694,6 +1695,7 @@ const ThreadUserInputResponseRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
   answers: ProviderUserInputAnswers,
+  disposition: Schema.optionalKey(UserInputResponseDisposition),
   createdAt: IsoDateTime,
 });
 

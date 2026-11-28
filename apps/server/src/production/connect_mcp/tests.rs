@@ -2374,7 +2374,12 @@ impl crate::production::provider_runtime::ProviderDriver for EnvelopeDriver {
         Box::pin(async { Ok(()) })
     }
 
-    fn answer(&self, _request_id: String, _answers: Value) -> DriverResult<'_, ()> {
+    fn answer(
+        &self,
+        _request_id: String,
+        _answers: Value,
+        _disposition: crate::provider::UserInputResponseDisposition,
+    ) -> DriverResult<'_, ()> {
         Box::pin(async { Ok(()) })
     }
 

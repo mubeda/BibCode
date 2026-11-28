@@ -502,8 +502,20 @@ const UserInputRequestedPayload = Schema.Struct({
 });
 export type UserInputRequestedPayload = typeof UserInputRequestedPayload.Type;
 
+export const UserInputResponseDisposition = Schema.Literals(["answered", "skipped", "cancelled"]);
+export type UserInputResponseDisposition = typeof UserInputResponseDisposition.Type;
+
+export const UserInputResolvedQuestionSummary = Schema.Struct({
+  id: TrimmedNonEmptyStringSchema,
+  header: Schema.optional(TrimmedNonEmptyStringSchema),
+  question: TrimmedNonEmptyStringSchema,
+});
+export type UserInputResolvedQuestionSummary = typeof UserInputResolvedQuestionSummary.Type;
+
 const UserInputResolvedPayload = Schema.Struct({
   answers: UnknownRecordSchema,
+  disposition: Schema.optional(UserInputResponseDisposition),
+  questions: Schema.optional(Schema.Array(UserInputResolvedQuestionSummary)),
 });
 export type UserInputResolvedPayload = typeof UserInputResolvedPayload.Type;
 

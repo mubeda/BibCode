@@ -567,6 +567,10 @@ async fn serve(scenario: &'static str) -> (String, Arc<Replay>) {
                     if replay.stall_form_cancel.load(Ordering::SeqCst) {
                         std::future::pending::<()>().await;
                     }
+                    if replay.fail_next_reply.swap(false, Ordering::SeqCst) {
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                    replay.replied.notify_one();
                     StatusCode::NO_CONTENT
                 },
             ),
@@ -2328,5 +2332,94 @@ async fn a_keyless_rewind_record_is_continued_not_restarted() {
         "no further turns are dropped"
     );
     assert!(!runtime.has_unfinished_rewind().await);
+    runtime.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn v2_form_skip_and_cancel_use_session_scoped_delete_and_emit_receipt_metadata() {
+    let (endpoint, replay) = serve("question").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.start().await.expect("starts");
+    runtime
+        .send_turn(Some("ASK_QUESTION please"), Vec::new(), None)
+        .await
+        .expect("prompt is accepted");
+    let requested = wait_for(&runtime, "user-input.requested").await;
+    let form_id = requested.request_id.as_deref().unwrap();
+    runtime
+        .respond_to_user_input_with_disposition(
+            form_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Skipped,
+        )
+        .await
+        .expect("dismiss succeeds");
+    let mut events = until_turns_complete(&runtime, 1).await;
+    events.extend(drain(&runtime).await);
+    let resolved = of_type(&events, "user-input.resolved");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].payload["disposition"], json!("skipped"));
+    assert_eq!(resolved[0].payload["answers"], json!({}));
+    assert!(
+        resolved[0].payload["questions"]
+            .as_array()
+            .is_some_and(|q| !q.is_empty())
+    );
+    let expected_delete = format!("/api/session/{}/form/{form_id}", replay.root);
+    {
+        let requests = replay.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path, _)| method == "DELETE" && path.starts_with(&expected_delete)),
+            "expected session-scoped DELETE {expected_delete}, got {requests:?}"
+        );
+    }
+    runtime.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn v2_form_cancel_surfaces_http_500_before_settlement_and_remains_retryable() {
+    let (endpoint, replay) = serve("question").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.start().await.expect("starts");
+    runtime
+        .send_turn(Some("ASK_QUESTION please"), Vec::new(), None)
+        .await
+        .expect("prompt is accepted");
+    let requested = wait_for(&runtime, "user-input.requested").await;
+    let form_id = requested.request_id.as_deref().unwrap();
+
+    replay.fail_next_reply.store(true, Ordering::SeqCst);
+    let err = runtime
+        .respond_to_user_input_with_disposition(
+            form_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Cancelled,
+        )
+        .await
+        .expect_err("HTTP 500 before settlement must fail");
+    assert!(err.to_string().contains("500"), "unexpected error: {err}");
+
+    // Retry succeeds and emits the cancelled receipt once.
+    runtime
+        .respond_to_user_input_with_disposition(
+            form_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Cancelled,
+        )
+        .await
+        .expect("retry cancel succeeds");
+    let mut events = until_turns_complete(&runtime, 1).await;
+    events.extend(drain(&runtime).await);
+    let resolved = of_type(&events, "user-input.resolved");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].payload["disposition"], json!("cancelled"));
+    assert_eq!(resolved[0].payload["answers"], json!({}));
+    assert!(
+        resolved[0].payload["questions"]
+            .as_array()
+            .is_some_and(|q| !q.is_empty())
+    );
     runtime.stop().await.expect("stop");
 }

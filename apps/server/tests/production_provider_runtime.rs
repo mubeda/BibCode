@@ -471,6 +471,7 @@ impl ProviderDriver for FakeDriver {
         &self,
         request_id: String,
         answers: Value,
+        _disposition: bibcode_server::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.state
@@ -18084,7 +18085,13 @@ async fn native_opencode_driver_supports_session_turn_and_control_commands() {
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "opencode"
     ));
     assert!(matches!(
-        driver.answer("unknown".to_owned(), json!({})).await,
+        driver
+            .answer(
+                "unknown".to_owned(),
+                json!({}),
+                bibcode_server::provider::UserInputResponseDisposition::Answered,
+            )
+            .await,
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "opencode"
     ));
     let activity_event = timeout(Duration::from_secs(2), async {
@@ -18321,7 +18328,13 @@ done
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "codex"
     ));
     assert!(matches!(
-        driver.answer("unknown".to_owned(), json!({})).await,
+        driver
+            .answer(
+                "unknown".to_owned(),
+                json!({}),
+                bibcode_server::provider::UserInputResponseDisposition::Answered,
+            )
+            .await,
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "codex"
     ));
     match timeout_at(owner_deadline, driver.shutdown()).await {
@@ -19915,7 +19928,13 @@ done
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "cursor"
     ));
     assert!(matches!(
-        cursor.answer("unknown".to_owned(), json!({})).await,
+        cursor
+            .answer(
+                "unknown".to_owned(),
+                json!({}),
+                bibcode_server::provider::UserInputResponseDisposition::Answered,
+            )
+            .await,
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "cursor"
     ));
     cursor.shutdown().await.unwrap();
@@ -19955,7 +19974,12 @@ done
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "grok"
     ));
     assert!(matches!(
-        grok.answer("unknown".to_owned(), json!({})).await,
+        grok.answer(
+            "unknown".to_owned(),
+            json!({}),
+            bibcode_server::provider::UserInputResponseDisposition::Answered,
+        )
+        .await,
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "grok"
     ));
     grok.shutdown().await.unwrap();

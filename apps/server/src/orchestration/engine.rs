@@ -774,6 +774,8 @@ pub enum OrchestrationCommand {
         #[serde(rename = "requestId")]
         request_id: String,
         answers: Value,
+        #[serde(default)]
+        disposition: Option<crate::provider::UserInputResponseDisposition>,
         #[serde(rename = "createdAt")]
         created_at: String,
     },
@@ -5887,9 +5889,19 @@ async fn plan_command(
             thread_id,
             request_id,
             answers,
+            disposition,
             created_at,
         } => {
             require_thread(model, command, thread_id)?;
+            let mut payload = json!({
+                "threadId": thread_id,
+                "requestId": request_id,
+                "answers": answers,
+                "createdAt": created_at,
+            });
+            if let Some(disposition) = disposition {
+                payload["disposition"] = json!(disposition);
+            }
             Ok(vec![make_event(
                 "thread.user-input-response-requested",
                 "thread",
@@ -5897,7 +5909,7 @@ async fn plan_command(
                 created_at,
                 command_id,
                 json!({"requestId":request_id}),
-                json!({"threadId":thread_id,"requestId":request_id,"answers":answers,"createdAt":created_at}),
+                payload,
             )])
         }
         OrchestrationCommand::ThreadCheckpointRevert { thread_id, .. }
@@ -16305,5 +16317,58 @@ mod timestamp_tie_tests {
                 .as_deref(),
             Some("message-a-later")
         );
+    }
+
+    #[test]
+    fn thread_user_input_respond_command_accepts_legacy_and_explicit_dispositions() {
+        let legacy: OrchestrationCommand = serde_json::from_value(json!({
+            "type": "thread.user-input.respond",
+            "commandId": "cmd-legacy",
+            "threadId": "thread-1",
+            "requestId": "req-1",
+            "answers": { "q1": "Yes" },
+            "createdAt": "2026-11-28T00:00:00.000Z"
+        }))
+        .expect("legacy payload decodes");
+        assert!(matches!(
+            legacy,
+            OrchestrationCommand::ThreadUserInputRespond {
+                disposition: None,
+                ..
+            }
+        ));
+
+        for (wire, expected) in [
+            (
+                "answered",
+                crate::provider::UserInputResponseDisposition::Answered,
+            ),
+            (
+                "skipped",
+                crate::provider::UserInputResponseDisposition::Skipped,
+            ),
+            (
+                "cancelled",
+                crate::provider::UserInputResponseDisposition::Cancelled,
+            ),
+        ] {
+            let cmd: OrchestrationCommand = serde_json::from_value(json!({
+                "type": "thread.user-input.respond",
+                "commandId": format!("cmd-{wire}"),
+                "threadId": "thread-1",
+                "requestId": "req-1",
+                "answers": {},
+                "disposition": wire,
+                "createdAt": "2026-11-28T00:00:00.000Z"
+            }))
+            .expect("disposition payload decodes");
+            assert!(matches!(
+                cmd,
+                OrchestrationCommand::ThreadUserInputRespond {
+                    disposition: Some(actual),
+                    ..
+                } if actual == expected
+            ));
+        }
     }
 }

@@ -1902,12 +1902,41 @@ describe("MessagesTimeline work entry rows", () => {
 
   it("renders user-input requests with the message icon", async () => {
     const markup = await renderWorkEntry({
-      label: "Question",
-      detail: "Which option?",
+      label: "Waiting for user input",
+      detail: "2 questions awaiting response",
       sourceActivityKind: "user-input.requested",
     });
 
     expect(markup).toContain("lucide-message-circle");
+    expect(markup).toContain("Waiting for user input");
+    expect(markup).toContain("2 questions awaiting response");
+  });
+
+  it("renders concise answered, skipped, and cancelled user-input receipts (#430)", async () => {
+    const answered = await renderWorkEntry({
+      label: "Answered questions",
+      detail: "Scope: Server · Mode: Safe",
+      sourceActivityKind: "user-input.resolved",
+    });
+    expect(answered).toContain("lucide-message-circle");
+    expect(answered).toContain("Answered questions");
+    expect(answered).toContain("Scope: Server · Mode: Safe");
+
+    const skipped = await renderWorkEntry({
+      label: "Skipped questions",
+      detail: "Skipped all questions",
+      sourceActivityKind: "user-input.resolved",
+    });
+    expect(skipped).toContain("Skipped questions");
+    expect(skipped).toContain("Skipped all questions");
+
+    const cancelled = await renderWorkEntry({
+      label: "Cancelled questions",
+      detail: "No answers submitted",
+      sourceActivityKind: "user-input.resolved",
+    });
+    expect(cancelled).toContain("Cancelled questions");
+    expect(cancelled).toContain("No answers submitted");
   });
 
   it("renders provider warnings with an amber alert icon and normal text", async () => {

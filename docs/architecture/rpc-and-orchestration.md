@@ -3321,7 +3321,15 @@ The shell carries what the left panel's agent status reads (#187):
   refused answer that the provider did not call stale. That rule is one shared
   SQL fragment, `open_user_input_requests_sql`, which the queue head also uses.
   The count is recomputed only when a request's state changes, not on every
-  thread event.
+  thread event. `thread.user-input.respond` carries an optional backward-compatible
+  `disposition` (`"answered" | "skipped" | "cancelled"`, defaulting to `"answered"`
+  for older answers-only callers such as MCP `answer_question`). Providers map
+  skip/cancel outcomes explicitly (Cursor `outcome: "skipped"`, OpenCode v1
+  `POST /question/{id}/reject` and v2 session-scoped `DELETE /api/session/{sid}/form/{id}`,
+  empty entries for Claude/Codex/Grok) and persist self-sufficient `user-input.resolved`
+  receipt metadata (`answers`, `disposition`, and compact `questions` summaries) so
+  windowed history reloads render receipts even when `user-input.requested` is on
+  an older unloaded page.
 - **`lastActivityAt`** is the time of the thread's latest provider progress:
   either an event the engine attributes to the provider, or a session update to
   `starting` or `running`. Titles, modes, archiving and BiBCode's own

@@ -299,4 +299,42 @@ describe("ProviderRuntimeEvent", () => {
       }),
     ).toThrow();
   });
+
+  it("decodes self-sufficient user-input.resolved receipt metadata and legacy answers-only payloads (#430)", () => {
+    const legacy = decodeRuntimeEvent({
+      type: "user-input.resolved",
+      eventId: "event-user-input-legacy",
+      provider: "codex",
+      createdAt: "2026-11-27T00:00:01.000Z",
+      threadId: "thread-1",
+      requestId: "req-1",
+      payload: { answers: { scope: "Workspace" } },
+    });
+    expect(legacy.type).toBe("user-input.resolved");
+    if (legacy.type !== "user-input.resolved") throw new Error("expected user-input.resolved");
+    expect(legacy.payload.answers).toEqual({ scope: "Workspace" });
+
+    const enriched = decodeRuntimeEvent({
+      type: "user-input.resolved",
+      eventId: "event-user-input-enriched",
+      provider: "cursor",
+      createdAt: "2026-11-27T00:00:02.000Z",
+      threadId: "thread-1",
+      requestId: "req-2",
+      payload: {
+        answers: { scope: "Workspace" },
+        disposition: "skipped",
+        questions: [
+          { id: "scope", header: "Scope", question: "Which scope?" },
+          { id: "notes", question: "Any notes?" },
+        ],
+      },
+    });
+    if (enriched.type !== "user-input.resolved") throw new Error("expected user-input.resolved");
+    expect(enriched.payload.disposition).toBe("skipped");
+    expect(enriched.payload.questions).toEqual([
+      { id: "scope", header: "Scope", question: "Which scope?" },
+      { id: "notes", question: "Any notes?" },
+    ]);
+  });
 });

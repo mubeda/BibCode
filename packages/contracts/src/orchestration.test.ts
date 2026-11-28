@@ -2117,3 +2117,39 @@ describe("OrchestrationMessageActor", () => {
     expect(() => decodeMessageActor({ kind: "person" })).toThrow();
   });
 });
+
+const decodeUserInputRespondClientCommand = Schema.decodeUnknownSync(ClientOrchestrationCommand);
+
+describe("thread.user-input.respond disposition contract (#430)", () => {
+  const baseCommand = {
+    type: "thread.user-input.respond" as const,
+    commandId: "cmd-user-input-1",
+    threadId: "thread-1",
+    requestId: "req-user-input-1",
+    answers: { scope: "Workspace" },
+    createdAt: "2026-11-27T00:00:00.000Z",
+  };
+
+  it("decodes older answers-only commands (including MCP answer_question) without disposition", () => {
+    const decoded = decodeUserInputRespondClientCommand(baseCommand);
+    expect(decoded.type).toBe("thread.user-input.respond");
+    if (decoded.type !== "thread.user-input.respond") throw new Error("unexpected command");
+    expect(decoded.answers).toEqual({ scope: "Workspace" });
+    expect("disposition" in decoded).toBe(false);
+  });
+
+  it.each(["answered", "skipped", "cancelled"] as const)(
+    "preserves explicit %s disposition on thread.user-input.respond",
+    (disposition) => {
+      const decoded = decodeUserInputRespondClientCommand({ ...baseCommand, disposition });
+      if (decoded.type !== "thread.user-input.respond") throw new Error("unexpected command");
+      expect(decoded.disposition).toBe(disposition);
+    },
+  );
+
+  it("rejects unknown dispositions on thread.user-input.respond", () => {
+    expect(() =>
+      decodeUserInputRespondClientCommand({ ...baseCommand, disposition: "ignored" }),
+    ).toThrow();
+  });
+});

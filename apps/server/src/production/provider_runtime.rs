@@ -536,6 +536,7 @@ pub trait ProviderDriver: Send + Sync {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn set_mode(&self, mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn set_interaction_mode(
@@ -3553,6 +3554,7 @@ mod workspace_loss_tests {
             &self,
             _: String,
             _: Value,
+            _: crate::provider::UserInputResponseDisposition,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
             Box::pin(async { Ok(()) })
         }
@@ -12198,8 +12200,14 @@ async fn handle_command(
         OrchestrationCommand::ThreadUserInputRespond {
             request_id,
             answers,
+            disposition,
             ..
-        } => entry.driver.answer(request_id, answers).await,
+        } => {
+            entry
+                .driver
+                .answer(request_id, answers, disposition.unwrap_or_default())
+                .await
+        }
         OrchestrationCommand::ThreadRuntimeModeSet { runtime_mode, .. } => {
             match entry.driver.set_mode(runtime_mode.clone()).await {
                 Ok(()) => {
@@ -15465,7 +15473,11 @@ fn event_activity_summary(event_type: &str, payload: &Value, provider_label: &st
         "request.opened" => "Approval requested",
         "request.resolved" => "Approval resolved",
         "user-input.requested" => "Input requested",
-        "user-input.resolved" => "Input received",
+        "user-input.resolved" => match payload.get("disposition").and_then(Value::as_str) {
+            Some("skipped") => "Input skipped",
+            Some("cancelled") => "Input cancelled",
+            _ => "Input received",
+        },
         "mcp.status.updated" => "Tool connections updated",
         "runtime.warning" => {
             if payload.get("usageLimit").and_then(Value::as_bool) == Some(true) {
@@ -17742,10 +17754,11 @@ impl ProviderDriver for CodexDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.runtime
-                .respond_to_user_input(&request_id, answers)
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
                 .await
                 .map_err(provider_error("codex"))
         })
@@ -18087,10 +18100,11 @@ impl ProviderDriver for CursorDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.runtime
-                .respond_to_user_input(&request_id, answers)
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
                 .await
                 .map_err(provider_error("cursor"))
         })
@@ -18574,6 +18588,7 @@ impl ProviderDriver for AntigravityDriver {
         &self,
         _: String,
         _: Value,
+        _: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         // The client advertises no elicitation, so no question is ever pending (D-A7).
         unsupported("antigravity", "user input answers")
@@ -18795,10 +18810,11 @@ impl ProviderDriver for GrokDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.runtime
-                .respond_to_user_input(&request_id, answers)
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
                 .await
                 .map_err(provider_error("grok"))
         })
@@ -19189,10 +19205,11 @@ impl ProviderDriver for OpenCodeDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.runtime
-                .respond_to_user_input(&request_id, answers)
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
                 .await
                 .map_err(provider_error("opencode"))
         })
@@ -22989,13 +23006,14 @@ impl ProviderDriver for ClaudeDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             let Some(resolved) = self
                 .runtime
                 .lock()
                 .await
-                .resolve_user_input_request(&request_id, answers)
+                .resolve_user_input_request_with_disposition(&request_id, answers, disposition)
             else {
                 return Err(ProviderRuntimeError::Provider {
                     provider: self.provider.clone(),
@@ -24832,6 +24850,7 @@ mod tests {
             &self,
             _: String,
             _: Value,
+            _: crate::provider::UserInputResponseDisposition,
         ) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
             Box::pin(async move {
                 self.state.lock().unwrap().answers += 1;
@@ -39225,7 +39244,11 @@ done
         }
         assert!(
             claude
-                .answer("question-0".to_owned(), json!({"answer":"yes"}))
+                .answer(
+                    "question-0".to_owned(),
+                    json!({"answer":"yes"}),
+                    crate::provider::UserInputResponseDisposition::Answered,
+                )
                 .await
                 .expect_err("an unknown question is refused")
                 .to_string()
@@ -39240,7 +39263,11 @@ done
             "question-1",
         );
         claude
-            .answer("question-1".to_owned(), json!({"answer":"yes"}))
+            .answer(
+                "question-1".to_owned(),
+                json!({"answer":"yes"}),
+                crate::provider::UserInputResponseDisposition::Answered,
+            )
             .await
             .expect("Claude user input should resolve");
         claude
@@ -39488,7 +39515,16 @@ done
                 .await
                 .is_err()
         );
-        assert!(codex.answer("unknown".to_owned(), json!({})).await.is_err());
+        assert!(
+            codex
+                .answer(
+                    "unknown".to_owned(),
+                    json!({}),
+                    crate::provider::UserInputResponseDisposition::Answered,
+                )
+                .await
+                .is_err()
+        );
         codex.shutdown().await.expect("Codex should shut down");
 
         let acp_fixture = executable_fixture(&temp, "acp-fixture", ACP_FIXTURE);
@@ -39594,7 +39630,11 @@ done
             );
             assert!(
                 driver
-                    .answer("unknown".to_owned(), json!({}))
+                    .answer(
+                        "unknown".to_owned(),
+                        json!({}),
+                        crate::provider::UserInputResponseDisposition::Answered,
+                    )
                     .await
                     .is_err()
             );
@@ -40026,7 +40066,11 @@ done
         );
         assert!(
             driver
-                .answer("unknown".to_owned(), json!({}))
+                .answer(
+                    "unknown".to_owned(),
+                    json!({}),
+                    crate::provider::UserInputResponseDisposition::Answered,
+                )
                 .await
                 .is_err()
         );

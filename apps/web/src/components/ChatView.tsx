@@ -159,8 +159,15 @@ import {
   type TimelineScrollMode,
 } from "./chat/timelineScrollAnchoring";
 import {
+  buildPartialPendingUserInputSubmission,
   buildPendingUserInputAnswers,
+  clearPendingUserInputDraft,
   derivePendingUserInputProgress,
+  findFirstUnansweredPendingUserInputQuestionIndex,
+  loadPendingUserInputDraft,
+  providerSupportsPendingUserInputCancel,
+  prunePendingUserInputDraftsForThread,
+  savePendingUserInputDraft,
   setPendingUserInputCustomAnswer,
   togglePendingUserInputOptionSelection,
   type PendingUserInputDraftAnswer,
@@ -181,6 +188,7 @@ import {
   type TurnDeliveryResolutionAction,
   type TurnDiffSummary,
 } from "../types";
+import type { UserInputResponseDisposition } from "@bibcode/contracts";
 import { useTheme } from "../hooks/useTheme";
 import { slotTheme } from "../themes/customThemes";
 import {
@@ -1457,6 +1465,9 @@ function ChatViewContent(props: ChatViewProps) {
   >({});
   const [pendingUserInputQuestionIndexByRequestId, setPendingUserInputQuestionIndexByRequestId] =
     useState<Record<string, number>>({});
+  const [pendingUserInputCollapsedByRequestId, setPendingUserInputCollapsedByRequestId] = useState<
+    Record<string, boolean>
+  >({});
   const shouldUsePlanSidebarSheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
   const shouldUseCompactActivityDock = useMediaQuery(ACTIVITY_DOCK_COMPACT_MEDIA_QUERY);
   // Tracks whether the user explicitly dismissed the sidebar for the active turn.
@@ -2489,17 +2500,33 @@ function ChatViewContent(props: ChatViewProps) {
     [threadActivities],
   );
   const activePendingUserInput = pendingUserInputs[0] ?? null;
-  const activePendingDraftAnswers = useMemo(
-    () =>
-      activePendingUserInput
-        ? (pendingUserInputAnswersByRequestId[activePendingUserInput.requestId] ??
-          EMPTY_PENDING_USER_INPUT_ANSWERS)
-        : EMPTY_PENDING_USER_INPUT_ANSWERS,
-    [activePendingUserInput, pendingUserInputAnswersByRequestId],
-  );
+  const activePendingDraftAnswers = useMemo(() => {
+    if (!activePendingUserInput) {
+      return EMPTY_PENDING_USER_INPUT_ANSWERS;
+    }
+    return (
+      pendingUserInputAnswersByRequestId[activePendingUserInput.requestId] ??
+      loadPendingUserInputDraft(routeThreadKey, activePendingUserInput.requestId) ??
+      EMPTY_PENDING_USER_INPUT_ANSWERS
+    );
+  }, [activePendingUserInput, pendingUserInputAnswersByRequestId, routeThreadKey]);
   const activePendingQuestionIndex = activePendingUserInput
-    ? (pendingUserInputQuestionIndexByRequestId[activePendingUserInput.requestId] ?? 0)
+    ? (pendingUserInputQuestionIndexByRequestId[activePendingUserInput.requestId] ??
+      findFirstUnansweredPendingUserInputQuestionIndex(
+        activePendingUserInput.questions,
+        activePendingDraftAnswers,
+      ))
     : 0;
+  const activePendingCollapsed = activePendingUserInput
+    ? Boolean(pendingUserInputCollapsedByRequestId[activePendingUserInput.requestId])
+    : false;
+  const activePendingUserInputCanCancel = providerSupportsPendingUserInputCancel(
+    activeThread?.session?.providerName ?? selectedProvider,
+  );
+  useEffect(() => {
+    const openIds = new Set(pendingUserInputs.map((entry) => entry.requestId));
+    prunePendingUserInputDraftsForThread(routeThreadKey, openIds);
+  }, [pendingUserInputs, routeThreadKey]);
   const activePendingProgress = useMemo(
     () =>
       activePendingUserInput
@@ -6641,10 +6668,9 @@ function ChatViewContent(props: ChatViewProps) {
     // Resolved before the first await: a failure lands on the thread it was for.
     const errorTarget = resolveThreadErrorTarget(activeThread.id);
     // Enter and the mobile Send reach here without a disabled button to explain the refusal.
-    // Moving between a question's steps stays local; its final answer refuses on its own. A
-    // provider binding conflict keeps precedence (the composer names it), and an Enter that
-    // would send nothing is refused without a toast.
-    if (activeEnvironmentUnavailableState !== null && !activePendingProgress) {
+    // Clarifying-question answers live inside the question card (D9), so normal composer
+    // Send/Enter never submits or advances a pending question.
+    if (activeEnvironmentUnavailableState !== null) {
       if (providerBinding.conflict === null && composerWouldSend()) {
         refuseWhileEnvironmentUnavailable();
       }
@@ -6663,12 +6689,6 @@ function ChatViewContent(props: ChatViewProps) {
     const sendLease = attachmentAdmissionOwner.claim(routeThreadRef);
     if (sendLease === null) return;
     try {
-      // Moving between a question's steps is local: it neither needs the staged-attempt
-      // authority nor may replay a retained send, so it runs before both.
-      if (activePendingProgress) {
-        onAdvanceActivePendingUserInput();
-        return;
-      }
       let attachmentAuthority: AttachmentAdmissionAuthority | undefined;
       let attachmentAuthorityChecked = false;
       const authorizeAttempt = async () => {
@@ -7579,12 +7599,17 @@ function ChatViewContent(props: ChatViewProps) {
   );
 
   const onRespondToUserInput = useCallback(
-    async (requestId: ApprovalRequestId, answers: Record<string, unknown>) => {
+    async (
+      requestId: ApprovalRequestId,
+      answers: Record<string, unknown>,
+      disposition?: UserInputResponseDisposition,
+    ) => {
       if (!activeThreadId) return;
       // Also reached by the option's timed advance: the question and its answers stay put.
       if (refuseWhileEnvironmentUnavailable()) return;
       // Resolved before the first await: a failure lands on the thread it was for.
       const errorTarget = resolveThreadErrorTarget(activeThreadId);
+      const draftThreadKey = routeThreadKey;
 
       setRespondingUserInputRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
@@ -7595,6 +7620,7 @@ function ChatViewContent(props: ChatViewProps) {
           threadId: activeThreadId,
           requestId,
           answers,
+          ...(disposition ? { disposition } : {}),
         },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
@@ -7603,6 +7629,8 @@ function ChatViewContent(props: ChatViewProps) {
           errorTarget,
           error instanceof Error ? error.message : "Failed to submit user input.",
         );
+      } else if (result._tag === "Success") {
+        clearPendingUserInputDraft(draftThreadKey, requestId);
       }
       setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
       return result;
@@ -7613,6 +7641,7 @@ function ChatViewContent(props: ChatViewProps) {
       refuseWhileEnvironmentUnavailable,
       respondToThreadUserInput,
       resolveThreadErrorTarget,
+      routeThreadKey,
       writeThreadError,
     ],
   );
@@ -7636,6 +7665,7 @@ function ChatViewContent(props: ChatViewProps) {
         return;
       }
       const activeQuestion = activePendingProgress?.activeQuestion;
+      const requestId = activePendingUserInput.requestId;
       setPendingUserInputAnswersByRequestId((existing) => {
         const question =
           (activeQuestion?.id === questionId ? activeQuestion : undefined) ??
@@ -7643,58 +7673,60 @@ function ChatViewContent(props: ChatViewProps) {
         if (!question) {
           return existing;
         }
-
+        const baseAnswers =
+          existing[requestId] ?? loadPendingUserInputDraft(routeThreadKey, requestId) ?? {};
+        const nextForRequest = {
+          ...baseAnswers,
+          [questionId]: togglePendingUserInputOptionSelection(
+            question,
+            baseAnswers[questionId],
+            optionLabel,
+          ),
+        };
+        savePendingUserInputDraft(routeThreadKey, requestId, nextForRequest);
         return {
           ...existing,
-          [activePendingUserInput.requestId]: {
-            ...existing[activePendingUserInput.requestId],
-            [questionId]: togglePendingUserInputOptionSelection(
-              question,
-              existing[activePendingUserInput.requestId]?.[questionId],
-              optionLabel,
-            ),
-          },
+          [requestId]: nextForRequest,
         };
       });
-      promptRef.current = "";
-      readComposerHandle(composerRef)?.resetCursorState({ cursor: 0 });
     },
-    [activePendingProgress?.activeQuestion, activePendingUserInput, composerRef],
+    [activePendingProgress?.activeQuestion, activePendingUserInput, routeThreadKey],
+  );
+
+  const onChangeActivePendingUserInputCardCustomAnswer = useCallback(
+    (questionId: string, value: string) => {
+      if (!activePendingUserInput) {
+        return;
+      }
+      const requestId = activePendingUserInput.requestId;
+      setPendingUserInputAnswersByRequestId((existing) => {
+        const baseAnswers =
+          existing[requestId] ?? loadPendingUserInputDraft(routeThreadKey, requestId) ?? {};
+        const nextForRequest = {
+          ...baseAnswers,
+          [questionId]: setPendingUserInputCustomAnswer(baseAnswers[questionId], value),
+        };
+        savePendingUserInputDraft(routeThreadKey, requestId, nextForRequest);
+        return {
+          ...existing,
+          [requestId]: nextForRequest,
+        };
+      });
+    },
+    [activePendingUserInput, routeThreadKey],
   );
 
   const onChangeActivePendingUserInputCustomAnswer = useCallback(
     (
       questionId: string,
       value: string,
-      nextCursor: number,
-      expandedCursor: number,
+      _nextCursor: number,
+      _expandedCursor: number,
       _cursorAdjacentToMention: boolean,
     ) => {
-      if (!activePendingUserInput) {
-        return;
-      }
-      promptRef.current = value;
-      setPendingUserInputAnswersByRequestId((existing) => ({
-        ...existing,
-        [activePendingUserInput.requestId]: {
-          ...existing[activePendingUserInput.requestId],
-          [questionId]: setPendingUserInputCustomAnswer(
-            existing[activePendingUserInput.requestId]?.[questionId],
-            value,
-          ),
-        },
-      }));
-      const composer = readComposerHandle(composerRef);
-      const snapshot = composer?.readSnapshot();
-      if (
-        snapshot?.value !== value ||
-        snapshot.cursor !== nextCursor ||
-        snapshot.expandedCursor !== expandedCursor
-      ) {
-        composer?.focusAt(nextCursor);
-      }
+      onChangeActivePendingUserInputCardCustomAnswer(questionId, value);
     },
-    [activePendingUserInput, composerRef],
+    [onChangeActivePendingUserInputCardCustomAnswer],
   );
 
   const onAdvanceActivePendingUserInput = useCallback(() => {
@@ -7703,7 +7735,11 @@ function ChatViewContent(props: ChatViewProps) {
     }
     if (activePendingProgress.isLastQuestion) {
       if (activePendingResolvedAnswers) {
-        void onRespondToUserInput(activePendingUserInput.requestId, activePendingResolvedAnswers);
+        void onRespondToUserInput(
+          activePendingUserInput.requestId,
+          activePendingResolvedAnswers,
+          "answered",
+        );
       }
       return;
     }
@@ -7715,6 +7751,46 @@ function ChatViewContent(props: ChatViewProps) {
     onRespondToUserInput,
     setActivePendingUserInputQuestionIndex,
   ]);
+
+  const onSkipAndSubmitActivePendingUserInput = useCallback(() => {
+    if (!activePendingUserInput) {
+      return;
+    }
+    const submission = buildPartialPendingUserInputSubmission(
+      activePendingUserInput.questions,
+      activePendingDraftAnswers,
+      "skip",
+    );
+    void onRespondToUserInput(
+      activePendingUserInput.requestId,
+      submission.answers,
+      submission.disposition,
+    );
+  }, [activePendingDraftAnswers, activePendingUserInput, onRespondToUserInput]);
+
+  const onCancelActivePendingUserInput = useCallback(() => {
+    if (!activePendingUserInput) {
+      return;
+    }
+    if (activePendingUserInputCanCancel) {
+      void onRespondToUserInput(activePendingUserInput.requestId, {}, "cancelled");
+      return;
+    }
+    setPendingUserInputCollapsedByRequestId((existing) => ({
+      ...existing,
+      [activePendingUserInput.requestId]: true,
+    }));
+  }, [activePendingUserInput, activePendingUserInputCanCancel, onRespondToUserInput]);
+
+  const onToggleActivePendingUserInputCollapsed = useCallback(() => {
+    if (!activePendingUserInput) {
+      return;
+    }
+    setPendingUserInputCollapsedByRequestId((existing) => ({
+      ...existing,
+      [activePendingUserInput.requestId]: !existing[activePendingUserInput.requestId],
+    }));
+  }, [activePendingUserInput]);
 
   const onPreviousActivePendingUserInputQuestion = useCallback(() => {
     if (!activePendingProgress) {
@@ -8703,7 +8779,10 @@ function ChatViewContent(props: ChatViewProps) {
                             activePendingIsResponding={activePendingIsResponding}
                             activePendingDraftAnswers={activePendingDraftAnswers}
                             activePendingQuestionIndex={activePendingQuestionIndex}
+                            activePendingCollapsed={activePendingCollapsed}
+                            activePendingUserInputCanCancel={activePendingUserInputCanCancel}
                             respondingRequestIds={respondingRequestIds}
+                            respondingUserInputRequestIds={respondingUserInputRequestIds}
                             showPlanFollowUpPrompt={showPlanFollowUpPrompt}
                             activeProposedPlan={activeProposedPlan}
                             activePlan={activePlan as { turnId?: TurnId } | null}
@@ -8752,6 +8831,19 @@ function ChatViewContent(props: ChatViewProps) {
                             onPreviousActivePendingUserInputQuestion={
                               onPreviousActivePendingUserInputQuestion
                             }
+                            onSelectActivePendingUserInputQuestionIndex={
+                              setActivePendingUserInputQuestionIndex
+                            }
+                            onChangeActivePendingUserInputCardCustomAnswer={
+                              onChangeActivePendingUserInputCardCustomAnswer
+                            }
+                            onSkipAndSubmitActivePendingUserInput={
+                              onSkipAndSubmitActivePendingUserInput
+                            }
+                            onToggleActivePendingUserInputCollapsed={
+                              onToggleActivePendingUserInputCollapsed
+                            }
+                            onCancelActivePendingUserInput={onCancelActivePendingUserInput}
                             onChangeActivePendingUserInputCustomAnswer={
                               onChangeActivePendingUserInputCustomAnswer
                             }

@@ -640,6 +640,7 @@ struct PendingRequest {
     kind: PendingRequestKind,
     wire_id: Value,
     turn_id: Option<String>,
+    questions: Vec<Value>,
 }
 
 /// The model Codex runs for a request that names none: the one its configuration names, else
@@ -1724,6 +1725,26 @@ impl CodexSessionRuntime {
         request_id: &str,
         answers: Value,
     ) -> Result<(), RuntimeError> {
+        self.respond_to_user_input_internal(request_id, answers, None)
+            .await
+    }
+
+    pub async fn respond_to_user_input_with_disposition(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+    ) -> Result<(), RuntimeError> {
+        self.respond_to_user_input_internal(request_id, answers, Some(disposition))
+            .await
+    }
+
+    async fn respond_to_user_input_internal(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: Option<crate::provider::UserInputResponseDisposition>,
+    ) -> Result<(), RuntimeError> {
         let pending = self
             .inner
             .pending_requests
@@ -1733,25 +1754,38 @@ impl CodexSessionRuntime {
             .ok_or_else(|| RuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
             })?;
-        let wire_answers = answers
-            .as_object()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(question_id, value)| {
-                let answers = match value {
-                    Value::String(answer) => vec![Value::String(answer)],
-                    Value::Array(array) => array,
+        let skip_all = disposition.is_some_and(|disp| {
+            disp.is_skip_or_cancel() && !crate::provider::has_non_empty_user_input_answer(&answers)
+        });
+        let mut wire_answers = serde_json::Map::new();
+        if !skip_all {
+            for (question_id, value) in answers.as_object().cloned().unwrap_or_default() {
+                let items = match value {
+                    Value::String(answer) if !answer.trim().is_empty() => {
+                        vec![Value::String(answer)]
+                    }
+                    Value::Array(array) => array
+                        .into_iter()
+                        .filter(|entry| entry.as_str().is_none_or(|text| !text.trim().is_empty()))
+                        .collect(),
                     _ => Vec::new(),
                 };
-                (
-                    question_id,
-                    json!({
-                        "answers": answers,
-                    }),
-                )
-            })
-            .collect::<serde_json::Map<String, Value>>();
+                wire_answers.insert(question_id, json!({ "answers": items }));
+            }
+        }
+        if disposition.is_some() {
+            for question in &pending.questions {
+                if let Some(question_id) = question
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    wire_answers
+                        .entry(question_id.to_owned())
+                        .or_insert_with(|| json!({ "answers": [] }));
+                }
+            }
+        }
         self.inner
             .connection
             .lock()
@@ -1764,13 +1798,24 @@ impl CodexSessionRuntime {
                 }),
             )
             .await?;
+        let normalized_answers = normalize_user_input_answers(Value::Object(wire_answers));
+        let resolved_payload = match disposition {
+            Some(disp) => crate::provider::build_user_input_resolved_payload(
+                if skip_all {
+                    json!({})
+                } else {
+                    normalized_answers
+                },
+                disp,
+                &pending.questions,
+            ),
+            None => json!({ "answers": normalized_answers }),
+        };
         self.emit(
             "user-input.resolved",
             pending.turn_id,
             Some(request_id.to_owned()),
-            json!({
-                "answers": normalize_user_input_answers(Value::Object(wire_answers)),
-            }),
+            resolved_payload,
         )
         .await;
         Ok(())
@@ -3044,6 +3089,7 @@ impl CodexSessionRuntime {
                         kind: PendingRequestKind::CommandApproval,
                         wire_id,
                         turn_id: turn_id.clone(),
+                        questions: Vec::new(),
                     },
                 );
                 let detail = params
@@ -3075,6 +3121,7 @@ impl CodexSessionRuntime {
                         kind: PendingRequestKind::FileChangeApproval,
                         wire_id,
                         turn_id: turn_id.clone(),
+                        questions: Vec::new(),
                     },
                 );
                 let detail = params
@@ -3099,12 +3146,15 @@ impl CodexSessionRuntime {
                     .get("turnId")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let questions =
+                    normalize_questions(params.get("questions").cloned().unwrap_or(Value::Null));
                 self.inner.pending_requests.lock().await.insert(
                     request_id.clone(),
                     PendingRequest {
                         kind: PendingRequestKind::UserInput,
                         wire_id,
                         turn_id: turn_id.clone(),
+                        questions: questions.as_array().cloned().unwrap_or_default(),
                     },
                 );
                 self.emit(
@@ -3112,7 +3162,7 @@ impl CodexSessionRuntime {
                     turn_id,
                     Some(request_id),
                     json!({
-                        "questions": normalize_questions(params.get("questions").cloned().unwrap_or(Value::Null)),
+                        "questions": questions,
                     }),
                 )
                 .await;
@@ -9059,5 +9109,108 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn respond_to_user_input_with_disposition_wraps_partial_and_skipped_answers() {
+        let (connection, incoming, mut server_write, server_read, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        let mut reader = BufReader::new(server_read);
+
+        // 1. Partial submit wraps answered q1 and empty [] for skipped q2.
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 701,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "turnId": "turn-1",
+                    "questions": [
+                        { "id": "q1", "header": "Scope", "question": "Which scope?", "options": [{ "label": "Workspace", "description": "Repo" }] },
+                        { "id": "q2", "header": "Notes", "question": "Any notes?", "options": [] }
+                    ]
+                }
+            }),
+        )
+        .await;
+        let requested = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("requested timeout")
+            .expect("requested");
+        assert_eq!(requested.event_type, "user-input.requested");
+        let req_id = requested.request_id.expect("request id");
+        runtime
+            .respond_to_user_input_with_disposition(
+                &req_id,
+                json!({ "q1": "Workspace" }),
+                crate::provider::UserInputResponseDisposition::Answered,
+            )
+            .await
+            .expect("partial respond");
+        let wire = read_runtime_test_json(&mut reader).await;
+        assert_eq!(
+            wire["result"]["answers"],
+            json!({
+                "q1": { "answers": ["Workspace"] },
+                "q2": { "answers": [] }
+            })
+        );
+        let resolved = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("resolved timeout")
+            .expect("resolved");
+        assert_eq!(resolved.event_type, "user-input.resolved");
+        assert_eq!(resolved.payload["disposition"], json!("answered"));
+        assert_eq!(
+            resolved.payload["questions"].as_array().map(Vec::len),
+            Some(2)
+        );
+
+        // 2. Skip-all sends empty [] for both questions and records disposition "skipped".
+        write_runtime_test_json(
+            &mut server_write,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 702,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "turnId": "turn-1",
+                    "questions": [
+                        { "id": "q1", "header": "Scope", "question": "Which scope?", "options": [{ "label": "Workspace", "description": "Repo" }] },
+                        { "id": "q2", "header": "Notes", "question": "Any notes?", "options": [] }
+                    ]
+                }
+            }),
+        )
+        .await;
+        let requested2 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("requested2 timeout")
+            .expect("requested2");
+        let req_id_2 = requested2.request_id.expect("request id 2");
+        runtime
+            .respond_to_user_input_with_disposition(
+                &req_id_2,
+                json!({}),
+                crate::provider::UserInputResponseDisposition::Skipped,
+            )
+            .await
+            .expect("skip respond");
+        let wire2 = read_runtime_test_json(&mut reader).await;
+        assert_eq!(
+            wire2["result"]["answers"],
+            json!({
+                "q1": { "answers": [] },
+                "q2": { "answers": [] }
+            })
+        );
+        let resolved2 = tokio::time::timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("resolved2 timeout")
+            .expect("resolved2");
+        assert_eq!(resolved2.payload["disposition"], json!("skipped"));
+        assert_eq!(resolved2.payload["answers"], json!({}));
     }
 }

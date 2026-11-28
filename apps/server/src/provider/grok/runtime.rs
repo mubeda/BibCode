@@ -115,6 +115,7 @@ struct PendingRequest {
     accept_option_id: Option<String>,
     accept_for_session_option_id: Option<String>,
     reject_option_id: Option<String>,
+    questions: Vec<Value>,
 }
 
 impl GrokSessionRuntime {
@@ -423,6 +424,26 @@ impl GrokSessionRuntime {
         request_id: &str,
         answers: Value,
     ) -> Result<(), GrokRuntimeError> {
+        self.respond_to_user_input_internal(request_id, answers, None)
+            .await
+    }
+
+    pub async fn respond_to_user_input_with_disposition(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+    ) -> Result<(), GrokRuntimeError> {
+        self.respond_to_user_input_internal(request_id, answers, Some(disposition))
+            .await
+    }
+
+    async fn respond_to_user_input_internal(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: Option<crate::provider::UserInputResponseDisposition>,
+    ) -> Result<(), GrokRuntimeError> {
         let pending = self
             .inner
             .pending_requests
@@ -432,18 +453,39 @@ impl GrokSessionRuntime {
             .ok_or_else(|| GrokRuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
             })?;
-        let answer_map = answers.as_object().cloned().unwrap_or_default();
-        let normalized = answer_map
-            .into_iter()
-            .map(|(key, value)| {
+        let skip_all = disposition.is_some_and(|disp| {
+            disp.is_skip_or_cancel() && !crate::provider::has_non_empty_user_input_answer(&answers)
+        });
+        let mut normalized = serde_json::Map::new();
+        if !skip_all {
+            for (key, value) in answers.as_object().cloned().unwrap_or_default() {
                 let values = match value {
-                    Value::String(string) => vec![Value::String(string)],
-                    Value::Array(array) => array,
+                    Value::String(string) if !string.trim().is_empty() => {
+                        vec![Value::String(string)]
+                    }
+                    Value::Array(array) => array
+                        .into_iter()
+                        .filter(|entry| entry.as_str().is_none_or(|text| !text.trim().is_empty()))
+                        .collect(),
                     _ => Vec::new(),
                 };
-                (key, Value::Array(values))
-            })
-            .collect::<serde_json::Map<String, Value>>();
+                normalized.insert(key, Value::Array(values));
+            }
+        }
+        if disposition.is_some() {
+            for question in &pending.questions {
+                if let Some(key) = question
+                    .get("id")
+                    .or_else(|| question.get("question"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    normalized
+                        .entry(key.to_owned())
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                }
+            }
+        }
         let connection = self.inner.connection.lock().await.clone();
         connection
             .respond(
@@ -454,11 +496,19 @@ impl GrokSessionRuntime {
                 }),
             )
             .await?;
+        let resolved_payload = match disposition {
+            Some(disp) => crate::provider::build_user_input_resolved_payload(
+                if skip_all { json!({}) } else { answers },
+                disp,
+                &pending.questions,
+            ),
+            None => json!({ "answers": answers }),
+        };
         self.emit(
             "user-input.resolved",
             pending.turn_id,
             Some(request_id.to_owned()),
-            json!({ "answers": answers }),
+            resolved_payload,
         )
         .await;
         Ok(())
@@ -654,6 +704,7 @@ impl GrokSessionRuntime {
                         accept_option_id: find_option_id(&options, "allow_once"),
                         accept_for_session_option_id: find_option_id(&options, "allow_always"),
                         reject_option_id: find_option_id(&options, "reject_once"),
+                        questions: Vec::new(),
                     },
                 );
                 let detail = params
@@ -681,6 +732,21 @@ impl GrokSessionRuntime {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                let normalized_questions = questions
+                    .into_iter()
+                    .map(|question| {
+                        let prompt = question
+                            .get("question")
+                            .cloned()
+                            .unwrap_or(Value::String(String::new()));
+                        json!({
+                            "id": question.get("id").cloned().unwrap_or_else(|| prompt.clone()),
+                            "header": prompt,
+                            "question": question.get("question").cloned().unwrap_or(Value::String(String::new())),
+                            "options": question.get("options").cloned().unwrap_or(Value::Array(Vec::new())),
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 self.inner.pending_requests.lock().await.insert(
                     request_id.clone(),
                     PendingRequest {
@@ -689,6 +755,7 @@ impl GrokSessionRuntime {
                         accept_option_id: None,
                         accept_for_session_option_id: None,
                         reject_option_id: None,
+                        questions: normalized_questions.clone(),
                     },
                 );
                 self.emit(
@@ -696,15 +763,7 @@ impl GrokSessionRuntime {
                     turn_id,
                     Some(request_id),
                     json!({
-                        "questions": questions.into_iter().map(|question| {
-                            let prompt = question.get("question").cloned().unwrap_or(Value::String(String::new()));
-                            json!({
-                                "id": question.get("id").cloned().unwrap_or_else(|| prompt.clone()),
-                                "header": prompt,
-                                "question": question.get("question").cloned().unwrap_or(Value::String(String::new())),
-                                "options": question.get("options").cloned().unwrap_or(Value::Array(Vec::new())),
-                            })
-                        }).collect::<Vec<_>>(),
+                        "questions": normalized_questions,
                     }),
                 )
                 .await;

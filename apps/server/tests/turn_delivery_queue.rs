@@ -560,6 +560,7 @@ impl ProviderDriver for SteerDriver {
         &self,
         _: String,
         _: Value,
+        _: bibcode_server::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async { Ok(()) })
     }

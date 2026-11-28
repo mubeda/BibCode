@@ -2629,3 +2629,166 @@ where
         .expect("write line");
     writer.flush().await.expect("flush");
 }
+
+#[tokio::test]
+async fn cursor_user_input_retains_option_id_description_and_maps_skipped_disposition() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-q-430".to_owned(),
+            cwd: "/tmp/cursor-q".to_owned(),
+            runtime_mode: "approval-required".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+            code_review: false,
+        },
+        connection,
+        incoming,
+    );
+
+    peer.expect_request("initialize")
+        .respond(json!({ "protocolVersion": 1 }));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "cursor-q-session" }));
+    // Turn 1: differing option id (`workspace`) vs label (`Workspace`), description-only Recommended,
+    // plus an optionless question, answered by option ID for partial submit.
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 9101,
+            "method": "cursor/ask_question",
+            "params": {
+                "questions": [
+                    {
+                        "id": "scope",
+                        "prompt": "Which scope?",
+                        "options": [
+                            { "id": "workspace", "label": "Workspace", "description": "Current repo (Recommended)" },
+                            { "id": "global", "label": "Global", "description": "All projects" }
+                        ]
+                    },
+                    {
+                        "id": "notes",
+                        "prompt": "Any extra notes?",
+                        "options": []
+                    }
+                ]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 9101,
+            "result": { "answers": { "scope": "Workspace" } }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    // Turn 2: skip-all maps to `outcome: "skipped"`.
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 9102,
+            "method": "cursor/ask_question",
+            "params": {
+                "questions": [
+                    {
+                        "id": "scope",
+                        "prompt": "Which scope?",
+                        "options": [{ "id": "workspace", "label": "Workspace" }]
+                    }
+                ]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 9102,
+            "result": { "outcome": "skipped" }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    runtime
+        .send_turn(Some("ask partial"), Vec::new())
+        .await
+        .expect("turn 1");
+    let asked1 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("ev timeout")
+            .expect("ev");
+        if ev.event_type == "user-input.requested" {
+            break ev;
+        }
+    };
+    assert_eq!(
+        asked1.payload["questions"][0]["options"][0]["description"],
+        json!("Current repo (Recommended)")
+    );
+    assert_eq!(asked1.payload["questions"][1]["options"], json!([]));
+    let req1 = asked1.request_id.expect("req1");
+    // Caller submits option ID `workspace` for partial answer -> mapped cleanly to label `Workspace`.
+    runtime
+        .respond_to_user_input_with_disposition(
+            &req1,
+            json!({ "scope": "workspace" }),
+            bibcode_server::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("partial answer");
+    let resolved1 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("resolved1 timeout")
+            .expect("ev");
+        if ev.event_type == "user-input.resolved" {
+            break ev;
+        }
+    };
+    assert_eq!(resolved1.payload["disposition"], json!("answered"));
+    assert_eq!(
+        resolved1.payload["answers"],
+        json!({ "scope": "Workspace" })
+    );
+    assert_eq!(
+        resolved1.payload["questions"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    runtime
+        .send_turn(Some("ask skip"), Vec::new())
+        .await
+        .expect("turn 2");
+    let asked2 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("ev2 timeout")
+            .expect("ev");
+        if ev.event_type == "user-input.requested" {
+            break ev;
+        }
+    };
+    let req2 = asked2.request_id.expect("req2");
+    runtime
+        .respond_to_user_input_with_disposition(
+            &req2,
+            json!({}),
+            bibcode_server::provider::UserInputResponseDisposition::Skipped,
+        )
+        .await
+        .expect("skip answer");
+    let resolved2 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("resolved2 timeout")
+            .expect("ev");
+        if ev.event_type == "user-input.resolved" {
+            break ev;
+        }
+    };
+    assert_eq!(resolved2.payload["disposition"], json!("skipped"));
+    assert_eq!(resolved2.payload["answers"], json!({}));
+
+    peer_task.await.expect("peer");
+}

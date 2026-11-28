@@ -1647,6 +1647,7 @@ mod tests {
             &self,
             _request_id: String,
             _answers: Value,
+            _disposition: crate::provider::UserInputResponseDisposition,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
             Box::pin(ready(Ok(())))
         }
@@ -4152,6 +4153,7 @@ pub(super) mod removal_test_support {
             &self,
             _: String,
             _: Value,
+            _: crate::provider::UserInputResponseDisposition,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
             Box::pin(async { Ok(()) })
         }

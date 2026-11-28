@@ -10,6 +10,104 @@ pub mod opencode;
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// How a user settled a pending clarifying-question request (#430).
+///
+/// Older answers-only callers (including MCP `answer_question`) omit this field and default to
+/// [`UserInputResponseDisposition::Answered`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserInputResponseDisposition {
+    #[default]
+    Answered,
+    Skipped,
+    Cancelled,
+}
+
+impl UserInputResponseDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub const fn is_skip_or_cancel(self) -> bool {
+        matches!(self, Self::Skipped | Self::Cancelled)
+    }
+}
+
+/// Returns true when the answer object carries at least one non-empty string answer.
+pub(crate) fn has_non_empty_user_input_answer(answers: &Value) -> bool {
+    let Some(map) = answers.as_object() else {
+        return false;
+    };
+    map.values().any(|value| match value {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|item| !item.trim().is_empty()),
+        Value::Bool(_) | Value::Number(_) => true,
+        _ => false,
+    })
+}
+
+/// Compact question summaries embedded in `user-input.resolved` payloads so windowed history
+/// reloads render concise receipts even when `user-input.requested` lives on an unloaded page.
+pub(crate) fn compact_user_input_question_summaries(questions: &[Value]) -> Vec<Value> {
+    questions
+        .iter()
+        .filter_map(|question| {
+            let id = question
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())?;
+            let prompt = question
+                .get("question")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())?;
+            let header = question
+                .get("header")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            let mut summary = serde_json::Map::new();
+            summary.insert("id".to_owned(), Value::String(id.to_owned()));
+            if let Some(header) = header {
+                summary.insert("header".to_owned(), Value::String(header.to_owned()));
+            }
+            summary.insert("question".to_owned(), Value::String(prompt.to_owned()));
+            Some(Value::Object(summary))
+        })
+        .collect()
+}
+
+/// Builds a self-sufficient `user-input.resolved` payload carrying answers, disposition, and
+/// compact question metadata.
+pub(crate) fn build_user_input_resolved_payload(
+    answers: Value,
+    disposition: UserInputResponseDisposition,
+    questions: &[Value],
+) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("answers".to_owned(), answers);
+    payload.insert(
+        "disposition".to_owned(),
+        Value::String(disposition.as_str().to_owned()),
+    );
+    let summaries = compact_user_input_question_summaries(questions);
+    if !summaries.is_empty() {
+        payload.insert("questions".to_owned(), Value::Array(summaries));
+    }
+    Value::Object(payload)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RequestScope(uuid::Uuid);
 

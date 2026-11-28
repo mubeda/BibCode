@@ -729,19 +729,24 @@ const HOST_STATE = {
   },
   pendingRevert: { index: 8, expectInitial: isNull },
   maximizedRightPanelThreadKey: { index: 9, expectInitial: isNull },
-  terminalFocusRequestId: { index: 14, expectInitial: (value: unknown) => value === 0 },
-  pullRequestDialogState: { index: 15, expectInitial: isNull },
   pendingUserInputAnswersByRequestId: {
     index: 12,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
-  attachmentPreviewHandoffByMessageId: {
-    index: 16,
+  pendingUserInputCollapsedByRequestId: {
+    index: 14,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
-  composerOverlayElement: { index: 20, expectInitial: isNull },
+  terminalFocusRequestId: { index: 15, expectInitial: (value: unknown) => value === 0 },
+  pullRequestDialogState: { index: 16, expectInitial: isNull },
+  attachmentPreviewHandoffByMessageId: {
+    index: 17,
+    expectInitial: (value: unknown) =>
+      typeof value === "object" && value !== null && Object.keys(value).length === 0,
+  },
+  composerOverlayElement: { index: 21, expectInitial: isNull },
 } as const;
 
 function seedHostState(name: keyof typeof HOST_STATE, value: unknown): void {
@@ -2010,13 +2015,13 @@ describe("ChatView effects (captured and run manually)", () => {
       getBoundingClientRect: () => ({ height: 42 }),
     };
     seedHostState("composerOverlayElement", overlayElement);
-    h.stateSeeds.set(21, { value: 42, expectInitial: (value) => value === 0 });
+    h.stateSeeds.set(22, { value: 42, expectInitial: (value) => value === 0 });
     vi.stubGlobal("ResizeObserver", undefined);
 
     renderServerRoute();
     const cleanups = runEffects();
 
-    expect(h.setStateCalls.some((call) => call.index === 21 && call.applied === 42)).toBe(true);
+    expect(h.setStateCalls.some((call) => call.index === 22 && call.applied === 42)).toBe(true);
     for (const cleanup of cleanups) cleanup();
   });
 
@@ -2211,8 +2216,8 @@ describe("ChatView effects (captured and run manually)", () => {
     vi.stubGlobal("ResizeObserver", undefined);
     seedHostState("composerOverlayElement", { getBoundingClientRect: () => ({ height: 40 }) });
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
-    // The height is set (state 21) but this render, and its captured props, still hold 0.
-    expect(h.setStateCalls.some((call) => call.index === 21 && call.applied === 40)).toBe(true);
+    // The height is set (state 22) but this render, and its captured props, still hold 0.
+    expect(h.setStateCalls.some((call) => call.index === 22 && call.applied === 40)).toBe(true);
     onAnchorReady(messageId, 2);
     list.scrollNode.fire("scrollend");
 
@@ -2416,7 +2421,7 @@ describe("ChatView effects (captured and run manually)", () => {
         value: false,
         expectInitial: (value) => value === true,
       });
-      h.stateSeeds.set(21, { value: 80, expectInitial: (value) => value === 0 });
+      h.stateSeeds.set(22, { value: 80, expectInitial: (value) => value === 0 });
       renderServerRoute();
       const timeline = capturedProps("messagesTimeline");
       expect(timeline["followsEnd"], layout).toBe(false);
@@ -6476,7 +6481,7 @@ describe("ChatView pending user input", () => {
       ) => void
     )("question-1", "custom answer", 13, 13, false);
 
-    // Both handlers wrote draft answers for the request.
+    // Both handlers wrote draft answers for the request; in-card editing does not hijack composer focus.
     const answerWrites = h.setStateCalls.filter(
       (call) =>
         typeof call.applied === "object" &&
@@ -6484,7 +6489,7 @@ describe("ChatView pending user input", () => {
         "request-1" in (call.applied as Record<string, unknown>),
     );
     expect(answerWrites.length).toBeGreaterThanOrEqual(2);
-    expect(focusAtCalls).toEqual([13]);
+    expect(focusAtCalls).toEqual([]);
   });
 
   it("advances through questions and submits answers on the last one", async () => {
@@ -6500,14 +6505,39 @@ describe("ChatView pending user input", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    // Single question: advancing submits immediately.
+    // Single question: advancing submits immediately with explicit answered disposition.
     expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(1);
+    expect(commandCallsFor("thread.respondToUserInput")[0]?.input).toMatchObject({
+      input: {
+        disposition: "answered",
+        answers: { "question-1": "Yes" },
+      },
+    });
 
     (composer["onPreviousActivePendingUserInputQuestion"] as () => void)();
   });
 
-  it("onSend advances the pending user input instead of sending", async () => {
-    seedConnectedServerThread(threadWithQuestions(1));
+  it("decouples onSend from pending clarifying questions and preserves question picks (#430 D9)", async () => {
+    seedConnectedServerThread(threadWithQuestions(2));
+    seedHostState("pendingUserInputAnswersByRequestId", {
+      "request-1": { "question-1": { customAnswer: "", selectedOptionLabels: ["Yes"] } },
+    });
+    seedHostState("pendingUserInputCollapsedByRequestId", {
+      "request-1": true,
+    });
+    renderServerRoute();
+    const { promptRef } = installComposerHandle();
+    promptRef.current = "ordinary follow-up message";
+
+    const composer = capturedProps("chatComposer");
+    await (composer["onSend"] as () => Promise<void>)();
+
+    expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(0);
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
+  });
+
+  it("dispatches skipped and cancelled dispositions from card Skip and Close actions (#430)", async () => {
+    seedConnectedServerThread(threadWithQuestions(2));
     seedHostState("pendingUserInputAnswersByRequestId", {
       "request-1": { "question-1": { customAnswer: "", selectedOptionLabels: ["Yes"] } },
     });
@@ -6515,14 +6545,60 @@ describe("ChatView pending user input", () => {
     installComposerHandle();
 
     const composer = capturedProps("chatComposer");
-    await (composer["onSend"] as () => Promise<void>)();
+    (composer["onSkipAndSubmitActivePendingUserInput"] as () => void)();
+    await Promise.resolve();
+    await Promise.resolve();
 
-    expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
     expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(1);
+    expect(commandCallsFor("thread.respondToUserInput")[0]?.input).toMatchObject({
+      input: {
+        disposition: "skipped",
+        answers: { "question-1": "Yes" },
+      },
+    });
+
+    // Cursor supports real cancellation; Close dispatches disposition: "cancelled".
+    const cursorInstanceId = ProviderInstanceId.make("cursor-default");
+    const cursorThread = makeThread({
+      modelSelection: { instanceId: cursorInstanceId, model: "auto" },
+      activities: threadWithQuestions(1).activities,
+    });
+    seedConnectedServerThread(cursorThread);
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [
+            codexProvider,
+            {
+              ...codexProvider,
+              instanceId: cursorInstanceId,
+              driver: ProviderDriverKind.make("cursor"),
+            },
+          ],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    renderServerRoute();
+    installComposerHandle();
+
+    const cursorComposer = capturedProps("chatComposer");
+    expect(cursorComposer["activePendingUserInputCanCancel"]).toBe(true);
+    (cursorComposer["onCancelActivePendingUserInput"] as () => void)();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(2);
+    expect(commandCallsFor("thread.respondToUserInput")[1]?.input).toMatchObject({
+      input: {
+        disposition: "cancelled",
+        answers: {},
+      },
+    });
   });
 
   it.each(["connected", "disconnected"] as const)(
-    "onSend moves between a multi-step question's steps without replaying a retained send (%s)",
+    "advancing a multi-step question inside the card does not replay a retained send (%s)",
     async (connection) => {
       seedConnectedServerThread();
       renderServerRoute();
@@ -6573,7 +6649,7 @@ describe("ChatView pending user input", () => {
       }
       renderServerRoute();
       installComposerHandle();
-      await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+      (capturedProps("chatComposer")["onAdvanceActivePendingUserInput"] as () => void)();
 
       expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
       expect(commandCallsFor("thread.attachmentAdmissionAuthority")).toHaveLength(authorityReads);
