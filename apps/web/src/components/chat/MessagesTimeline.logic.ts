@@ -684,6 +684,13 @@ function deriveTurnFolds(input: {
         : group.assistantEntries.filter((entry) => !lateEntries.includes(entry));
 
     const visibleEntryIds = new Set<string>(lateEntries.map((entry) => entry.id));
+    // Usage-limit notices (#429) must remain visible in default (non-verbose) chat after the turn
+    // settles instead of hiding behind a collapsed "Worked for ..." fold.
+    for (const entry of group.entries) {
+      if (entry.kind === "work" && entry.entry.usageLimit === true) {
+        visibleEntryIds.add(entry.id);
+      }
+    }
     const terminalEntry = onTimeEntries.at(-1);
     if (terminalEntry) {
       visibleEntryIds.add(terminalEntry.id);

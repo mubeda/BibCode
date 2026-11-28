@@ -2856,6 +2856,21 @@ fn quota_chunk_classifier_enforces_allowlist_length_boundary_warning_prefix_and_
         "Antigravity usage limit reached. Try again later or switch models."
     );
 
+    // Single-line `⚠ agent executor error:` chunk matching quota allowlist (and fractional wait rounding up).
+    let notice = classify_quota_chunk(
+        "⚠ agent executor error: Error 429, RESOURCE_EXHAUSTED, retry in 56.5s",
+        now,
+    )
+    .expect("agent executor error quota chunk");
+    assert_eq!(
+        notice.resets_at.as_deref(),
+        Some("2026-11-27T18:00:56.500Z")
+    );
+    assert_eq!(
+        notice.message,
+        "Antigravity usage limit reached. Resets at 2026-11-27 18:00:57 UTC (in 57s)."
+    );
+
     // Exact 2,048-char boundary matches; 2,049 chars must NOT match.
     let prefix = "⚠ Individual quota reached. ";
     let exact_2048 = format!("{prefix}{}", "a".repeat(2_048 - prefix.chars().count()));
@@ -2865,8 +2880,27 @@ fn quota_chunk_classifier_enforces_allowlist_length_boundary_warning_prefix_and_
     assert_eq!(over_2049.chars().count(), 2_049);
     assert!(classify_quota_chunk(&over_2049, now).is_none());
 
-    // Negative cases: missing leading ⚠, multi-line, disk quota, ordinary assistant prose.
+    // Negative cases: missing leading ⚠, leading space before ⚠, non-anchored prose quoting a
+    // quota phrase, bare 429 executor error, multi-line, disk/EDQUOT quota, ordinary prose.
     assert!(classify_quota_chunk("Individual quota reached. Resets in 2h30m0s.", now).is_none());
+    assert!(classify_quota_chunk(" ⚠ Individual quota reached. Resets in 2h30m0s.", now).is_none());
+    assert!(
+        classify_quota_chunk(
+            "⚠ If you see \"Individual quota reached\", switch models.",
+            now
+        )
+        .is_none()
+    );
+    assert!(
+        classify_quota_chunk("⚠ agent executor error: Error 429, Too Many Requests", now).is_none()
+    );
+    assert!(
+        classify_quota_chunk(
+            "⚠ agent executor error: EDQUOT: quota exceeded for filesystem /tmp",
+            now
+        )
+        .is_none()
+    );
     assert!(classify_quota_chunk("⚠ Individual quota reached.\nResets in 2h30m0s.", now).is_none());
     assert!(classify_quota_chunk("⚠ Disk quota exceeded on /var", now).is_none());
     assert!(classify_quota_chunk("Disk quota exceeded on /var", now).is_none());
@@ -2882,13 +2916,14 @@ fn quota_chunk_classifier_enforces_allowlist_length_boundary_warning_prefix_and_
 #[test]
 fn quota_prompt_error_classifier_matches_allowlist_and_rejects_bare_429_and_disk_quota() {
     let now = fixed_clock();
-    let remote = |message: &str| AcpProtocolError::RemoteRequest {
-        method: "session/prompt".to_owned(),
+    let remote_for = |method: &str, message: &str| AcpProtocolError::RemoteRequest {
+        method: method.to_owned(),
         request_id: "req-1".to_owned(),
         code: -32603,
         message: message.to_owned(),
         data: None,
     };
+    let remote = |message: &str| remote_for("session/prompt", message);
 
     for phrase in [
         "Individual quota reached. Resets in 2h30m0s.",
@@ -2909,12 +2944,45 @@ fn quota_prompt_error_classifier_matches_allowlist_and_rejects_bare_429_and_disk
         );
     }
 
-    // Bare HTTP 429 without an explicit quota phrase must NOT match.
+    // Identical RESOURCE_EXHAUSTED text on a non-prompt control method must NOT classify as
+    // UsageLimitReached, preserving ModeUnavailable / protocol refusal handling.
+    let mode_write_error = classify_with_clock(
+        remote_for(
+            "session/set_config_option",
+            "Error 429: RESOURCE_EXHAUSTED retry in 56.5s",
+        ),
+        now,
+    );
+    assert!(
+        matches!(
+            mode_write_error,
+            AntigravityRuntimeError::Protocol(AcpProtocolError::RemoteRequest { .. })
+        ),
+        "non-prompt control errors must not classify as UsageLimitReached: {mode_write_error:?}"
+    );
+
+    // Fractional wait seconds preserve exact milliseconds in resetsAt and round display up.
+    match classify_with_clock(remote("Error 429: RESOURCE_EXHAUSTED, retry in 56.5s"), now) {
+        AntigravityRuntimeError::UsageLimitReached { message, resets_at } => {
+            assert_eq!(resets_at.as_deref(), Some("2026-11-27T18:00:56.500Z"));
+            assert_eq!(
+                message,
+                "Antigravity usage limit reached. Resets at 2026-11-27 18:00:57 UTC (in 57s)."
+            );
+        }
+        other => panic!("expected UsageLimitReached, got {other:?}"),
+    }
+
+    // Bare HTTP 429 without an explicit quota phrase and filesystem quota errors (including
+    // EDQUOT) must NOT match.
     for non_quota in [
         "HTTP 429 Too Many Requests",
         "Error 429 from upstream proxy",
         "Disk quota exceeded on /var",
         "Disk quota exceeded for /var/log (RESOURCE_EXHAUSTED)",
+        "EDQUOT: quota exceeded for filesystem /tmp",
+        "quota exceeded for file system /home",
+        "No space left on device: quota exceeded for /var",
         "Unexpected internal server error",
     ] {
         let classified = classify_with_clock(remote(non_quota), now);
@@ -2929,15 +2997,15 @@ fn quota_prompt_error_classifier_matches_allowlist_and_rejects_bare_429_and_disk
 }
 
 #[tokio::test]
-async fn quota_chunk_deduplicates_with_prompt_success_and_prompt_error_and_preserves_usage_update()
+async fn quota_chunk_publishes_immediately_deduplicates_with_completion_and_survives_cancel_grace()
 {
-    // Case 1: quota chunk followed by session/prompt success -> zero content.delta, ONE turn.completed usage_limit.
+    // Case 1: quota chunk publishes runtime.warning immediately before prompt reply, suppresses
+    // content.delta, settles with ONE turn.completed usage_limit, and preserves usage_update.
     {
         let (runtime, mut peer) = started("full-access", "auto").await;
         runtime.set_clock_for_test(fixed_clock);
         let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
 
-        // ACP usage_update still emits context-window usedTokens/maxTokens unchanged.
         peer.update(
             SESSION,
             json!({
@@ -2958,6 +3026,26 @@ async fn quota_chunk_deduplicates_with_prompt_success_and_prompt_error_and_prese
             }),
         )
         .await;
+
+        // Even before session/prompt replies, the usage-limit notice is already published!
+        let before_reply = events_until(&runtime, "runtime.warning").await;
+        assert_eq!(
+            types(&before_reply),
+            [
+                "turn.started",
+                "thread.token-usage.updated",
+                "runtime.warning"
+            ]
+        );
+        assert_eq!(before_reply[1].1["usage"]["usedTokens"], 12_345);
+        assert_eq!(before_reply[1].1["usage"]["maxTokens"], 200_000);
+        assert_eq!(before_reply[2].1["usageLimit"], true);
+        assert_eq!(before_reply[2].1["resetsAt"], "2026-11-27T20:30:00Z");
+        assert_eq!(
+            before_reply[2].1["message"],
+            "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m)."
+        );
+
         peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
             .await;
 
@@ -2973,31 +3061,22 @@ async fn quota_chunk_deduplicates_with_prompt_success_and_prompt_error_and_prese
             } if at == "2026-11-27T20:30:00Z"
         ));
 
-        let events = events_until(&runtime, "turn.completed").await;
+        let after_reply = events_until(&runtime, "turn.completed").await;
         assert_eq!(
-            types(&events),
-            [
-                "turn.started",
-                "thread.token-usage.updated",
-                "turn.completed"
-            ],
-            "quota chunk must not stream as content.delta and must emit exactly one turn.completed"
+            types(&after_reply),
+            ["turn.completed"],
+            "no duplicate runtime.warning when prompt reply adds no new reset time"
         );
-        assert_eq!(events[1].1["usage"]["usedTokens"], 12_345);
-        assert_eq!(events[1].1["usage"]["maxTokens"], 200_000);
-        let completed = &events[2].1;
+        let completed = &after_reply[0].1;
         assert_eq!(completed["state"], "failed");
         assert_eq!(completed["stopReason"], "usage_limit");
         assert_eq!(completed["errorClass"], "provider_error");
         assert_eq!(completed["errorReason"], "usage_limit");
         assert_eq!(completed["resetsAt"], "2026-11-27T20:30:00Z");
-        assert_eq!(
-            completed["errorMessage"],
-            "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m)."
-        );
     }
 
-    // Case 2: quota chunk followed by session/prompt quota error -> STILL exactly ONE turn.completed usage_limit.
+    // Case 2: chunk without reset time followed by prompt error WITH reset time upgrades via
+    // runtime.warning and emits ONE turn.completed usage_limit.
     {
         let (runtime, mut peer) = started("full-access", "auto").await;
         runtime.set_clock_for_test(fixed_clock);
@@ -3009,17 +3088,18 @@ async fn quota_chunk_deduplicates_with_prompt_success_and_prompt_error_and_prese
                 "sessionUpdate": "agent_message_chunk",
                 "content": {
                     "type": "text",
-                    "text": "⚠ You have exhausted your capacity on this model. Your quota will reset after 4 hours, 5 minutes."
+                    "text": "⚠ agent executor error: Error 429, RESOURCE_EXHAUSTED"
                 },
             }),
         )
         .await;
-        peer.fail(
-            &prompt,
-            -32603,
-            "⚠ agent executor error: Cloud Code Assist Error 429 RESOURCE_EXHAUSTED",
-        )
-        .await;
+        let initial = events_until(&runtime, "runtime.warning").await;
+        assert_eq!(types(&initial), ["turn.started", "runtime.warning"]);
+        assert_eq!(initial[1].1["usageLimit"], true);
+        assert!(initial[1].1.get("resetsAt").is_none());
+
+        peer.fail(&prompt, -32603, "RESOURCE_EXHAUSTED: retry in 56.5s")
+            .await;
 
         let err = receipt
             .completion()
@@ -3028,16 +3108,52 @@ async fn quota_chunk_deduplicates_with_prompt_success_and_prompt_error_and_prese
         assert_eq!(err.reason(), "usage_limit");
 
         let events = events_until(&runtime, "turn.completed").await;
-        assert_eq!(types(&events), ["turn.started", "turn.completed"]);
-        assert_eq!(events[1].1["stopReason"], "usage_limit");
-        assert_eq!(events[1].1["resetsAt"], "2026-11-27T22:05:00Z");
+        assert_eq!(types(&events), ["runtime.warning", "turn.completed"]);
+        assert_eq!(events[0].1["usageLimit"], true);
+        assert_eq!(events[0].1["resetsAt"], "2026-11-27T18:00:56.500Z");
         assert_eq!(
-            events[1].1["errorMessage"],
-            "Antigravity usage limit reached. Resets at 2026-11-27 22:05 UTC (in 4h 5m)."
+            events[0].1["message"],
+            "Antigravity usage limit reached. Resets at 2026-11-27 18:00:57 UTC (in 57s)."
         );
+        assert_eq!(events[1].1["stopReason"], "usage_limit");
+        assert_eq!(events[1].1["resetsAt"], "2026-11-27T18:00:56.500Z");
     }
 
-    // Case 3: ordinary assistant prose mentioning disk quota streams normally as content.delta.
+    // Case 3: CLI hangs after emitting a quota chunk and user presses Stop (cancel grace expires):
+    // the usage-limit notice ALREADY reached chat immediately on chunk arrival.
+    {
+        let mut opts = options("full-access");
+        opts.cancel_grace = Duration::from_millis(30);
+        let (runtime, mut peer) = started_with(opts, "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 45m."
+                },
+            }),
+        )
+        .await;
+        let warning_events = events_until(&runtime, "runtime.warning").await;
+        assert_eq!(types(&warning_events), ["turn.started", "runtime.warning"]);
+        assert_eq!(warning_events[1].1["usageLimit"], true);
+
+        runtime
+            .interrupt_turn(Some(&receipt.turn_id))
+            .await
+            .expect("interrupt_turn");
+        let _ = peer.expect("session/cancel").await;
+        let cancelled = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&cancelled), ["turn.completed"]);
+        assert_eq!(cancelled[0].1["state"], "cancelled");
+    }
+
+    // Case 4: ordinary prose & non-anchored ⚠ text stream normally as content.delta.
     {
         let (runtime, mut peer) = started("full-access", "auto").await;
         runtime.set_clock_for_test(fixed_clock);
@@ -3049,7 +3165,7 @@ async fn quota_chunk_deduplicates_with_prompt_success_and_prompt_error_and_prese
                 "sessionUpdate": "agent_message_chunk",
                 "content": {
                     "type": "text",
-                    "text": "Disk quota exceeded on /var"
+                    "text": "⚠ If you see \"Individual quota reached\", switch models."
                 },
             }),
         )
@@ -3066,7 +3182,151 @@ async fn quota_chunk_deduplicates_with_prompt_success_and_prompt_error_and_prese
             types(&events),
             ["turn.started", "content.delta", "turn.completed"]
         );
-        assert_eq!(events[1].1["delta"], "Disk quota exceeded on /var");
+        assert_eq!(
+            events[1].1["delta"],
+            "⚠ If you see \"Individual quota reached\", switch models."
+        );
         assert_eq!(events[2].1["state"], "completed");
     }
+}
+
+#[tokio::test]
+async fn superseded_prompt_quota_chunk_does_not_fail_healthy_steer_but_restores_on_steer_rejection()
+{
+    // Subcase A: Prompt 1 emits a quota chunk while Prompt 2 steer is in flight; Prompt 2 streams
+    // normally and finishes with end_turn -> turn completes cleanly as `completed` without any
+    // usage-limit warning or failure.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "initial reply" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("steer prompt"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+
+        // Prompt 1 emits a quota chunk BEFORE its wire reply, then ends.
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 2h30m0s."
+                },
+            }),
+        )
+        .await;
+        peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+
+        // Prompt 2 streams normally and completes cleanly.
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "steered answer" },
+            }),
+        )
+        .await;
+        peer.reply(&second_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+
+        steer_receipt
+            .completion()
+            .await
+            .expect("healthy steer must succeed");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["content.delta", "turn.completed"]);
+        assert_eq!(events[0].1["delta"], "steered answer");
+        assert_eq!(events[1].1["state"], "completed");
+    }
+
+    // Subcase B: Prompt 1 emits a quota chunk while Prompt 2 steer is in flight, then Prompt 2 is
+    // rejected -> Prompt 1's quota notice is restored and published!
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "initial reply" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("rejected steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+
+        // Prompt 1 emits a quota chunk while Prompt 2 is in flight.
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 45m."
+                },
+            }),
+        )
+        .await;
+        // Prompt 2 is rejected: Prompt 1 regains ownership and publishes its notice.
+        peer.fail(&second_prompt, -32602, "steer rejected").await;
+        assert!(steer_receipt.accepted().await.is_err());
+
+        let restored_warning = events_until(&runtime, "runtime.warning").await;
+        assert_eq!(types(&restored_warning), ["runtime.warning"]);
+        assert_eq!(restored_warning[0].1["usageLimit"], true);
+        assert_eq!(restored_warning[0].1["resetsAt"], "2026-11-27T18:45:00Z");
+
+        peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+        let completion_events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&completion_events), ["turn.completed"]);
+        assert_eq!(completion_events[0].1["state"], "failed");
+        assert_eq!(completion_events[0].1["stopReason"], "usage_limit");
+    }
+}
+
+#[tokio::test]
+async fn set_config_option_resource_exhausted_stays_mode_unavailable_not_usage_limit() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_runtime_mode("full-access").await }
+    });
+    let write = peer.expect("session/set_config_option").await;
+    peer.fail(&write, -32603, "Error 429: RESOURCE_EXHAUSTED")
+        .await;
+    let error = task
+        .await
+        .expect("task joined")
+        .expect_err("mode write must fail");
+    assert!(
+        matches!(error, AntigravityRuntimeError::ModeUnavailable { ref mode } if mode == "auto"),
+        "mode write RESOURCE_EXHAUSTED must stay ModeUnavailable, got {error:?}"
+    );
 }

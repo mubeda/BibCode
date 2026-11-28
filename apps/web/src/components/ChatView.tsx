@@ -141,6 +141,7 @@ import {
   deriveWorkLogEntries,
   hasActionableProposedPlan,
   isLatestTurnSettled,
+  isSessionErrorShownInline,
 } from "../session-logic";
 import { type LegendListRef } from "@legendapp/list/react";
 import {
@@ -1552,20 +1553,6 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const isServerThread = routeKind === "server" && serverThread !== null;
   const activeThread = isServerThread ? serverThread : localDraftThread;
-  const threadError = isServerThread
-    ? (localServerError ?? serverThread?.session?.lastError ?? null)
-    : localDraftError;
-  // Attribute the banner. `session.lastError` is mixed-provenance and
-  // `localServerError` is a BiBCode command that failed, so rendering them
-  // identically made a provider outage read as a BiBCode defect.
-  const threadErrorAttributionText =
-    threadError === null || !isServerThread
-      ? null
-      : threadErrorAttribution({
-          isBiBCodeAction: localServerError !== null,
-          errorClass: serverThread?.session?.lastErrorClass ?? null,
-          providerName: serverThread?.session?.providerName ?? null,
-        });
   const runtimeMode = composerRuntimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE;
   const interactionMode =
     composerInteractionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE;
@@ -2589,6 +2576,45 @@ function ChatViewContent(props: ChatViewProps) {
     () => findBlockingDelivery(activeThread?.messages ?? []),
     [activeThread?.messages],
   );
+  const sessionLastError = serverThread?.session?.lastError ?? null;
+  const sessionLastErrorClass = serverThread?.session?.lastErrorClass ?? null;
+  const sessionLastErrorShownInline = useMemo(
+    () =>
+      isServerThread &&
+      localServerError === null &&
+      isSessionErrorShownInline({
+        sessionLastError,
+        sessionLastErrorClass,
+        blockingDeliveryDetail: blocker?.delivery?.detail ?? null,
+        workLogEntries,
+        activities: threadActivities,
+        latestTurnId: activeLatestTurn?.turnId ?? null,
+      }),
+    [
+      activeLatestTurn?.turnId,
+      blocker?.delivery?.detail,
+      isServerThread,
+      localServerError,
+      sessionLastError,
+      sessionLastErrorClass,
+      threadActivities,
+      workLogEntries,
+    ],
+  );
+  const threadError = isServerThread
+    ? (localServerError ?? (sessionLastErrorShownInline ? null : sessionLastError))
+    : localDraftError;
+  // Attribute the banner. `session.lastError` is mixed-provenance and
+  // `localServerError` is a BiBCode command that failed, so rendering them
+  // identically made a provider outage read as a BiBCode defect.
+  const threadErrorAttributionText =
+    threadError === null || !isServerThread
+      ? null
+      : threadErrorAttribution({
+          isBiBCodeAction: localServerError !== null,
+          errorClass: sessionLastErrorClass,
+          providerName: serverThread?.session?.providerName ?? null,
+        });
   const blockingId = blocker?.id ?? null;
   const blockingCreatedAt = blocker?.createdAt ?? null;
   const blockingOffersRetry = blocker?.delivery ? deliveryOffersRetry(blocker.delivery) : true;

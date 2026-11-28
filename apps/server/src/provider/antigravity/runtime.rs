@@ -328,6 +328,8 @@ struct PreviousPrompt {
     /// order before any subsequent `session/update` notifications.
     wire_ended: bool,
     settled: Option<Result<Value, AcpProtocolError>>,
+    quota_notice: Option<QuotaLimitNotice>,
+    quota_published: Option<QuotaLimitNotice>,
 }
 
 struct Gate {
@@ -341,8 +343,10 @@ struct Gate {
     next_prompt_seq: u64,
     /// True once the currently running prompt has produced at least one turn update.
     active_turn_has_update: bool,
-    /// Classified quota notice intercepted from an `agent_message_chunk` on the active turn (#429).
-    active_turn_quota_notice: Option<QuotaLimitNotice>,
+    /// Classified quota notice intercepted from an `agent_message_chunk` on `active_prompt_seq` (#429).
+    active_prompt_quota_notice: Option<QuotaLimitNotice>,
+    /// Last quota notice already published via `runtime.warning` for `active_prompt_seq` (#429).
+    active_prompt_quota_published: Option<QuotaLimitNotice>,
     /// Non-none while a concurrent steer prompt is being written to the CLI.
     steer_in_flight: Option<u64>,
     /// Superseded prompt retained until the steered prompt's disposition is known, so a rejected
@@ -372,19 +376,26 @@ impl Gate {
     fn clear_active_turn(
         &mut self,
         turn_id: &str,
-    ) -> (Vec<(String, PendingRequest)>, Option<QuotaLimitNotice>) {
-        let quota_notice = if self.active_turn.as_deref() == Some(turn_id) {
+    ) -> (
+        Vec<(String, PendingRequest)>,
+        Option<QuotaLimitNotice>,
+        Option<QuotaLimitNotice>,
+    ) {
+        let (quota_notice, quota_published) = if self.active_turn.as_deref() == Some(turn_id) {
             self.active_turn = None;
             self.active_prompt_seq = 0;
             self.active_prompt_wire_id = None;
             self.active_turn_has_update = false;
             self.steer_in_flight = None;
             self.previous_prompt = None;
-            self.active_turn_quota_notice.take()
+            (
+                self.active_prompt_quota_notice.take(),
+                self.active_prompt_quota_published.take(),
+            )
         } else {
-            None
+            (None, None)
         };
-        (self.take_pending(turn_id), quota_notice)
+        (self.take_pending(turn_id), quota_notice, quota_published)
     }
 
     fn resolve_pending_accept(&mut self, outcome: Result<(), AntigravityRuntimeError>) {
@@ -456,7 +467,8 @@ impl AntigravitySessionRuntime {
             active_prompt_wire_id: None,
             next_prompt_seq: 0,
             active_turn_has_update: false,
-            active_turn_quota_notice: None,
+            active_prompt_quota_notice: None,
+            active_prompt_quota_published: None,
             steer_in_flight: None,
             previous_prompt: None,
             pending_accept: None,
@@ -988,7 +1000,8 @@ impl AntigravitySessionRuntime {
                     gate.active_prompt_seq = seq;
                     gate.active_prompt_wire_id = None;
                     gate.active_turn_has_update = false;
-                    gate.active_turn_quota_notice = None;
+                    gate.active_prompt_quota_notice = None;
+                    gate.active_prompt_quota_published = None;
                     gate.steer_in_flight = None;
                     gate.previous_prompt = None;
                     gate.pending_accept = Some((seq, accepted_tx));
@@ -1123,6 +1136,8 @@ impl AntigravitySessionRuntime {
             let prev_seq = gate.active_prompt_seq;
             let prev_wire_id = gate.active_prompt_wire_id.take();
             let prev_has_update = gate.active_turn_has_update;
+            let prev_quota_notice = gate.active_prompt_quota_notice.take();
+            let prev_quota_published = gate.active_prompt_quota_published.take();
             let new_seq = gate.allocate_prompt_seq();
             let new_wire_id = request.correlation_id().map(str::to_owned);
             gate.previous_prompt = Some(PreviousPrompt {
@@ -1131,6 +1146,8 @@ impl AntigravitySessionRuntime {
                 had_update: prev_has_update,
                 wire_ended: false,
                 settled: None,
+                quota_notice: prev_quota_notice,
+                quota_published: prev_quota_published,
             });
             gate.active_prompt_seq = new_seq;
             gate.active_prompt_wire_id = new_wire_id;
@@ -1175,7 +1192,17 @@ impl AntigravitySessionRuntime {
         prev_has_update: bool,
         new_seq: u64,
     ) {
-        let settled_previous = {
+        enum RollbackOutcome {
+            None,
+            PublishRestoredNotice(QuotaLimitNotice),
+            SettlePrevious {
+                pending: Vec<(String, PendingRequest)>,
+                quota_notice: Option<QuotaLimitNotice>,
+                quota_published: Option<QuotaLimitNotice>,
+                prev_result: Result<Value, AcpProtocolError>,
+            },
+        }
+        let outcome = {
             let mut gate = self.inner.gate.lock().await;
             if gate.steer_in_flight == Some(new_seq) {
                 gate.steer_in_flight = None;
@@ -1187,27 +1214,63 @@ impl AntigravitySessionRuntime {
                     Some(PreviousPrompt {
                         seq,
                         settled: Some(prev_result),
+                        quota_notice,
+                        quota_published,
                         ..
                     }) if seq == prev_seq => {
-                        let (pending, quota_notice) = gate.clear_active_turn(turn_id);
-                        Some((pending, quota_notice, prev_result))
+                        let (pending, _, _) = gate.clear_active_turn(turn_id);
+                        RollbackOutcome::SettlePrevious {
+                            pending,
+                            quota_notice,
+                            quota_published,
+                            prev_result,
+                        }
                     }
                     other => {
                         gate.active_prompt_seq = prev_seq;
-                        gate.active_prompt_wire_id = other.and_then(|p| p.wire_id);
+                        gate.active_prompt_wire_id = other.as_ref().and_then(|p| p.wire_id.clone());
                         gate.active_turn_has_update = prev_has_update;
-                        None
+                        let (restored_notice, restored_published) = match other {
+                            Some(p) => (p.quota_notice, p.quota_published),
+                            None => (None, None),
+                        };
+                        let publish = restored_notice
+                            .as_ref()
+                            .filter(|notice| restored_published.as_ref() != Some(*notice))
+                            .cloned();
+                        gate.active_prompt_quota_notice = restored_notice;
+                        gate.active_prompt_quota_published = publish.clone().or(restored_published);
+                        match publish {
+                            Some(notice) => RollbackOutcome::PublishRestoredNotice(notice),
+                            None => RollbackOutcome::None,
+                        }
                     }
                 }
             } else {
-                None
+                RollbackOutcome::None
             }
         };
-        if let Some((pending, quota_notice, prev_result)) = settled_previous {
-            self.cancel_pending_requests(pending);
-            let _ = self
-                .emit_prompt_completion(turn_id.to_owned(), prev_result, quota_notice)
-                .await;
+        match outcome {
+            RollbackOutcome::None => {}
+            RollbackOutcome::PublishRestoredNotice(notice) => {
+                self.emit_usage_limit_warning(turn_id, &notice);
+            }
+            RollbackOutcome::SettlePrevious {
+                pending,
+                quota_notice,
+                quota_published,
+                prev_result,
+            } => {
+                self.cancel_pending_requests(pending);
+                let _ = self
+                    .emit_prompt_completion(
+                        turn_id.to_owned(),
+                        prev_result,
+                        quota_notice,
+                        quota_published,
+                    )
+                    .await;
+            }
         }
     }
 
@@ -1234,7 +1297,7 @@ impl AntigravitySessionRuntime {
             error_reason,
             "antigravity turn failed before prompt delivery"
         );
-        let (pending, _) = {
+        let (pending, _, _) = {
             let mut gate = self.inner.gate.lock().await;
             gate.resolve_pending_accept_for(prompt_seq, Err(error.clone()));
             gate.clear_active_turn(turn_id)
@@ -1280,19 +1343,34 @@ impl AntigravitySessionRuntime {
         classify_with_clock(error, self.now_utc())
     }
 
+    fn emit_usage_limit_warning(&self, turn_id: &str, notice: &QuotaLimitNotice) {
+        let mut payload = json!({
+            "usageLimit": true,
+            "message": notice.message,
+        });
+        if let Some(resets_at) = &notice.resets_at {
+            payload["resetsAt"] = json!(resets_at);
+        }
+        self.emit("runtime.warning", Some(turn_id.to_owned()), None, payload);
+    }
+
     async fn emit_prompt_completion(
         &self,
         turn_id: String,
         result: Result<Value, AcpProtocolError>,
         chunk_quota_notice: Option<QuotaLimitNotice>,
+        published_quota_notice: Option<QuotaLimitNotice>,
     ) -> Result<(), AntigravityRuntimeError> {
         let abandoned = self.inner.abandoned_turns.lock().await.remove(&turn_id);
-        let emit_quota = |notice: QuotaLimitNotice| {
+        let emit_quota = |notice: QuotaLimitNotice, ensure_warning: bool| {
             let error = AntigravityRuntimeError::UsageLimitReached {
                 message: notice.message.clone(),
                 resets_at: notice.resets_at.clone(),
             };
             if !abandoned {
+                if ensure_warning && published_quota_notice.as_ref() != Some(&notice) {
+                    self.emit_usage_limit_warning(&turn_id, &notice);
+                }
                 tracing::warn!(
                     provider = PROVIDER,
                     error_class = error.class(),
@@ -1316,13 +1394,15 @@ impl AntigravitySessionRuntime {
         };
         match result {
             Ok(response) => {
-                if let Some(notice) = chunk_quota_notice {
-                    return emit_quota(notice);
-                }
                 let stop_reason = response
                     .get("stopReason")
                     .and_then(Value::as_str)
                     .unwrap_or("end_turn");
+                if stop_reason != "cancelled"
+                    && let Some(notice) = chunk_quota_notice
+                {
+                    return emit_quota(notice, true);
+                }
                 let (state, failure_message) = acp_turn_state(stop_reason);
                 let mut payload = json!({ "state": state, "stopReason": stop_reason });
                 if let Some(message) = failure_message {
@@ -1344,10 +1424,16 @@ impl AntigravitySessionRuntime {
                     }
                     _ => None,
                 };
+                let had_chunk_notice = chunk_quota_notice.is_some();
                 if let Some(notice) =
                     QuotaLimitNotice::merge(chunk_quota_notice, prompt_quota_notice)
                 {
-                    return emit_quota(notice);
+                    // Upgrade an already-published chunk notice if the prompt reply added a reset
+                    // time; when the prompt errored before any chunk arrived, the failed delivery
+                    // notice / session error is the single visible notice so no `runtime.warning`
+                    // is emitted.
+                    let ensure_warning = had_chunk_notice || published_quota_notice.is_some();
+                    return emit_quota(notice, ensure_warning);
                 }
                 let error_class = error.class();
                 let error_reason = error.reason();
@@ -1388,16 +1474,21 @@ impl AntigravitySessionRuntime {
     {
         enum Resolution {
             Superseded(Result<(), AntigravityRuntimeError>),
-            SteerRejectedKeepPrevious(AntigravityRuntimeError),
+            SteerRejectedKeepPrevious {
+                steer_error: AntigravityRuntimeError,
+                publish_restored_notice: Option<QuotaLimitNotice>,
+            },
             SteerRejectedSettlePrevious {
                 steer_error: AntigravityRuntimeError,
                 pending: Vec<(String, PendingRequest)>,
                 quota_notice: Option<QuotaLimitNotice>,
+                quota_published: Option<QuotaLimitNotice>,
                 prev_result: Result<Value, AcpProtocolError>,
             },
             CompleteTurn {
                 pending: Vec<(String, PendingRequest)>,
                 quota_notice: Option<QuotaLimitNotice>,
+                quota_published: Option<QuotaLimitNotice>,
                 result: Result<Value, AcpProtocolError>,
             },
         }
@@ -1450,19 +1541,31 @@ impl AntigravitySessionRuntime {
                     {
                         gate.resolve_pending_accept_for(prompt_seq, Err(steer_error.clone()));
                         if let Some(prev_result) = prev.settled {
-                            let (pending, quota_notice) = gate.clear_active_turn(&turn_id);
+                            let (pending, _, _) = gate.clear_active_turn(&turn_id);
                             Resolution::SteerRejectedSettlePrevious {
                                 steer_error,
                                 pending,
-                                quota_notice,
+                                quota_notice: prev.quota_notice,
+                                quota_published: prev.quota_published,
                                 prev_result,
                             }
                         } else {
                             gate.active_prompt_seq = prev.seq;
                             gate.active_prompt_wire_id = prev.wire_id;
                             gate.active_turn_has_update = prev.had_update;
+                            let publish_restored_notice = prev
+                                .quota_notice
+                                .as_ref()
+                                .filter(|notice| prev.quota_published.as_ref() != Some(*notice))
+                                .cloned();
+                            gate.active_prompt_quota_notice = prev.quota_notice;
+                            gate.active_prompt_quota_published =
+                                publish_restored_notice.clone().or(prev.quota_published);
                             gate.steer_in_flight = None;
-                            Resolution::SteerRejectedKeepPrevious(steer_error)
+                            Resolution::SteerRejectedKeepPrevious {
+                                steer_error,
+                                publish_restored_notice,
+                            }
                         }
                     } else {
                         let accept_outcome = match &result {
@@ -1470,10 +1573,12 @@ impl AntigravitySessionRuntime {
                             Err(error) => Err(runtime.classify(error.clone())),
                         };
                         gate.resolve_pending_accept_for(prompt_seq, accept_outcome);
-                        let (pending, quota_notice) = gate.clear_active_turn(&turn_id);
+                        let (pending, quota_notice, quota_published) =
+                            gate.clear_active_turn(&turn_id);
                         Resolution::CompleteTurn {
                             pending,
                             quota_notice,
+                            quota_published,
                             result,
                         }
                     }
@@ -1487,27 +1592,37 @@ impl AntigravitySessionRuntime {
             };
             let outcome = match resolution {
                 Resolution::Superseded(outcome) => outcome,
-                Resolution::SteerRejectedKeepPrevious(error) => Err(error),
+                Resolution::SteerRejectedKeepPrevious {
+                    steer_error,
+                    publish_restored_notice,
+                } => {
+                    if let Some(notice) = publish_restored_notice {
+                        runtime.emit_usage_limit_warning(&turn_id, &notice);
+                    }
+                    Err(steer_error)
+                }
                 Resolution::SteerRejectedSettlePrevious {
                     steer_error,
                     pending,
                     quota_notice,
+                    quota_published,
                     prev_result,
                 } => {
                     runtime.cancel_pending_requests(pending);
                     let _ = runtime
-                        .emit_prompt_completion(turn_id, prev_result, quota_notice)
+                        .emit_prompt_completion(turn_id, prev_result, quota_notice, quota_published)
                         .await;
                     Err(steer_error)
                 }
                 Resolution::CompleteTurn {
                     pending,
                     quota_notice,
+                    quota_published,
                     result,
                 } => {
                     runtime.cancel_pending_requests(pending);
                     runtime
-                        .emit_prompt_completion(turn_id, result, quota_notice)
+                        .emit_prompt_completion(turn_id, result, quota_notice, quota_published)
                         .await
                 }
             };
@@ -1574,7 +1689,8 @@ impl AntigravitySessionRuntime {
                 gate.active_turn = None;
                 gate.active_prompt_seq = 0;
                 gate.active_turn_has_update = false;
-                gate.active_turn_quota_notice = None;
+                gate.active_prompt_quota_notice = None;
+                gate.active_prompt_quota_published = None;
                 gate.steer_in_flight = None;
                 gate.previous_prompt = None;
                 // An unacknowledged prompt whose cancel grace expired remains ambiguous.
@@ -1819,12 +1935,41 @@ impl AntigravitySessionRuntime {
                 if let Some(active_turn_id) = turn_id.as_deref()
                     && let Some(notice) = classify_quota_chunk(delta, self.now_utc())
                 {
-                    let mut gate = self.inner.gate.lock().await;
-                    if gate.active_turn.as_deref() == Some(active_turn_id) {
-                        gate.active_turn_quota_notice = QuotaLimitNotice::merge(
-                            gate.active_turn_quota_notice.take(),
-                            Some(notice),
-                        );
+                    let to_publish = {
+                        let mut gate = self.inner.gate.lock().await;
+                        if gate.active_turn.as_deref() != Some(active_turn_id) {
+                            None
+                        } else if let Some(prev) = gate
+                            .previous_prompt
+                            .as_mut()
+                            .filter(|prev| !prev.wire_ended && prev.settled.is_none())
+                        {
+                            // This chunk belongs to the superseded prompt before its wire response:
+                            // retain it on `prev` so a healthy steer prompt settles cleanly, and
+                            // restore/publish it only if the steer is rejected.
+                            prev.quota_notice =
+                                QuotaLimitNotice::merge(prev.quota_notice.take(), Some(notice));
+                            None
+                        } else {
+                            let merged = QuotaLimitNotice::merge(
+                                gate.active_prompt_quota_notice.take(),
+                                Some(notice),
+                            );
+                            let publish = merged
+                                .as_ref()
+                                .filter(|next| {
+                                    gate.active_prompt_quota_published.as_ref() != Some(*next)
+                                })
+                                .cloned();
+                            gate.active_prompt_quota_notice = merged;
+                            if let Some(published) = &publish {
+                                gate.active_prompt_quota_published = Some(published.clone());
+                            }
+                            publish
+                        }
+                    };
+                    if let Some(notice) = to_publish {
+                        self.emit_usage_limit_warning(active_turn_id, &notice);
                     }
                     return;
                 }
@@ -2130,10 +2275,41 @@ fn classify_with_clock(
 const QUOTA_CHUNK_MAX_CHARS: usize = 2_048;
 const QUOTA_ERROR_SCAN_MAX_BYTES: usize = 8 * 1024;
 const MAX_RESET_DURATION_SECS: u64 = 365 * 24 * 3600;
+const MAX_RESET_DURATION_MILLIS: u128 = (MAX_RESET_DURATION_SECS as u128) * 1_000;
 
-/// Classifies a single short ACP `agent_message_chunk` starting with `⚠` (`U+26A0`) against the
-/// tight quota notice allowlist (#429). Ordinary prose, multi-line chunks, >2,048-char chunks,
-/// chunks without leading `⚠`, and disk-quota strings never match.
+const PROMPT_ERROR_QUOTA_PHRASES: &[&str] = &[
+    "individual quota reached",
+    "exhausted your quota on this model",
+    "exhausted your capacity on this model",
+    "resource_exhausted",
+    "exceeded your current quota",
+    "quota exceeded for",
+    "usage limit reached",
+];
+
+fn is_filesystem_quota_text(lower: &str) -> bool {
+    const FILESYSTEM_QUOTA_MARKERS: &[&str] = &[
+        "disk quota",
+        "edquot",
+        "filesystem",
+        "file system",
+        "no space left on device",
+    ];
+    FILESYSTEM_QUOTA_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn matches_prompt_quota_allowlist(lower: &str) -> bool {
+    PROMPT_ERROR_QUOTA_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
+/// Classifies a single short ACP `agent_message_chunk` starting directly with `⚠` (`U+26A0`)
+/// against the anchored quota notice allowlist (#429). Ordinary prose, indented warnings,
+/// multi-line chunks, >2,048-char chunks, chunks without leading `⚠`, and filesystem/disk quota
+/// strings never match.
 fn classify_quota_chunk(text: &str, now: time::OffsetDateTime) -> Option<QuotaLimitNotice> {
     if text.contains('\n') || text.contains('\r') {
         return None;
@@ -2141,56 +2317,57 @@ fn classify_quota_chunk(text: &str, now: time::OffsetDateTime) -> Option<QuotaLi
     if text.chars().count() > QUOTA_CHUNK_MAX_CHARS {
         return None;
     }
-    let trimmed = text.trim_start();
-    if !trimmed.starts_with('\u{26A0}') {
+    let after_warning = text.strip_prefix('\u{26A0}')?;
+    let body = after_warning
+        .strip_prefix('\u{FE0F}')
+        .unwrap_or(after_warning)
+        .trim_start_matches([' ', '\t']);
+    let body_lower = body.to_ascii_lowercase();
+    if is_filesystem_quota_text(&body_lower) {
         return None;
     }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.contains("disk quota") {
-        return None;
-    }
-    let matches_allowlist = lower.contains("individual quota reached")
-        || lower.contains("you have exhausted your quota on this model")
-        || lower.contains("you have exhausted your capacity on this model");
+    let matches_allowlist = body_lower.starts_with("individual quota reached")
+        || body_lower.starts_with("you have exhausted your quota on this model")
+        || body_lower.starts_with("you have exhausted your capacity on this model")
+        || body_lower
+            .strip_prefix("agent executor error:")
+            .is_some_and(matches_prompt_quota_allowlist);
     if !matches_allowlist {
         return None;
     }
-    let duration = parse_reset_duration(trimmed);
+    let duration = parse_reset_duration(body);
     Some(format_usage_limit_notice(duration, now))
 }
 
 /// Classifies a `session/prompt` JSON-RPC error against the tight quota error allowlist (#429).
-/// Bare HTTP 429 errors without an explicit quota phrase and filesystem/disk quota errors never
-/// match.
+/// Non-prompt ACP control errors, bare HTTP 429 errors without an explicit quota phrase, and
+/// filesystem/disk quota errors never match.
 fn classify_quota_prompt_error(
     error: &AcpProtocolError,
     now: time::OffsetDateTime,
 ) -> Option<QuotaLimitNotice> {
-    let AcpProtocolError::RemoteRequest { message, data, .. } = error else {
+    let AcpProtocolError::RemoteRequest {
+        method,
+        message,
+        data,
+        ..
+    } = error
+    else {
         return None;
     };
+    if method != "session/prompt" {
+        return None;
+    }
     let mut candidate = String::new();
     push_bounded(&mut candidate, message, QUOTA_ERROR_SCAN_MAX_BYTES);
     if let Some(data) = data {
         collect_error_data_text(data, &mut candidate, QUOTA_ERROR_SCAN_MAX_BYTES, 0);
     }
     let lower = candidate.to_ascii_lowercase();
-    if lower.contains("disk quota") {
+    if is_filesystem_quota_text(&lower) {
         return None;
     }
-    const PROMPT_ERROR_PHRASES: &[&str] = &[
-        "individual quota reached",
-        "exhausted your quota on this model",
-        "exhausted your capacity on this model",
-        "resource_exhausted",
-        "exceeded your current quota",
-        "quota exceeded for",
-        "usage limit reached",
-    ];
-    if !PROMPT_ERROR_PHRASES
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-    {
+    if !matches_prompt_quota_allowlist(&lower) {
         return None;
     }
     let duration = parse_reset_duration(&candidate);
@@ -2329,14 +2506,9 @@ fn parse_duration_expression(input: &str) -> Option<Duration> {
     if components == 0 || total_millis == 0 {
         return None;
     }
-    let secs = if total_millis < 1_000 {
-        1
-    } else {
-        u64::try_from(total_millis / 1_000)
-            .unwrap_or(MAX_RESET_DURATION_SECS)
-            .min(MAX_RESET_DURATION_SECS)
-    };
-    Some(Duration::from_secs(secs))
+    let clamped_millis = u64::try_from(total_millis.min(MAX_RESET_DURATION_MILLIS))
+        .unwrap_or(MAX_RESET_DURATION_SECS * 1_000);
+    Some(Duration::from_millis(clamped_millis))
 }
 
 fn parse_duration_unit(text: &str) -> Option<(f64, usize)> {
@@ -2413,29 +2585,12 @@ fn format_usage_limit_notice(
             resets_at: None,
         };
     };
+    let duration_millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
     let resets_at_dt =
-        (now + time::Duration::seconds(duration.as_secs() as i64)).to_offset(time::UtcOffset::UTC);
-    let resets_at_iso = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        resets_at_dt.year(),
-        u8::from(resets_at_dt.month()),
-        resets_at_dt.day(),
-        resets_at_dt.hour(),
-        resets_at_dt.minute(),
-        resets_at_dt.second(),
-    );
-    let absolute_display = if resets_at_dt.second() == 0 {
+        (now + time::Duration::milliseconds(duration_millis)).to_offset(time::UtcOffset::UTC);
+    let resets_at_iso = if resets_at_dt.millisecond() == 0 {
         format!(
-            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
-            resets_at_dt.year(),
-            u8::from(resets_at_dt.month()),
-            resets_at_dt.day(),
-            resets_at_dt.hour(),
-            resets_at_dt.minute(),
-        )
-    } else {
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
             resets_at_dt.year(),
             u8::from(resets_at_dt.month()),
             resets_at_dt.day(),
@@ -2443,8 +2598,46 @@ fn format_usage_limit_notice(
             resets_at_dt.minute(),
             resets_at_dt.second(),
         )
+    } else {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            resets_at_dt.year(),
+            u8::from(resets_at_dt.month()),
+            resets_at_dt.day(),
+            resets_at_dt.hour(),
+            resets_at_dt.minute(),
+            resets_at_dt.second(),
+            resets_at_dt.millisecond(),
+        )
     };
-    let relative = format_relative_duration(duration);
+    // Round displayed whole seconds up so users are never shown an earlier reset time than the
+    // real reset instant.
+    let display_secs = u64::try_from(duration.as_millis().div_ceil(1_000))
+        .unwrap_or(MAX_RESET_DURATION_SECS)
+        .min(MAX_RESET_DURATION_SECS);
+    let display_dt =
+        (now + time::Duration::seconds(display_secs as i64)).to_offset(time::UtcOffset::UTC);
+    let absolute_display = if display_dt.second() == 0 {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+            display_dt.year(),
+            u8::from(display_dt.month()),
+            display_dt.day(),
+            display_dt.hour(),
+            display_dt.minute(),
+        )
+    } else {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            display_dt.year(),
+            u8::from(display_dt.month()),
+            display_dt.day(),
+            display_dt.hour(),
+            display_dt.minute(),
+            display_dt.second(),
+        )
+    };
+    let relative = format_relative_duration(Duration::from_secs(display_secs));
     QuotaLimitNotice {
         message: format!(
             "Antigravity usage limit reached. Resets at {absolute_display} (in {relative})."

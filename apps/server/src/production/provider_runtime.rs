@@ -14982,6 +14982,13 @@ async fn project_provider_event(
                 "reasoning remained streaming after terminal projection"
             );
         }
+        // Usage-limit completions already publish their in-chat notice via `runtime.warning`
+        // (when a quota chunk arrived) or via the failed delivery card / session error (when the
+        // prompt rejected before its first update). Do not append a second timeline activity.
+        if failed && event.payload.get("errorReason").and_then(Value::as_str) == Some("usage_limit")
+        {
+            return Ok(());
+        }
     }
     if matches!(
         event.event_type.as_str(),
@@ -15075,11 +15082,7 @@ async fn project_provider_event(
             let (tone, kind) = if event.event_type == "turn.completed"
                 && event.payload.get("state").and_then(Value::as_str) == Some("failed")
             {
-                if event.payload.get("errorReason").and_then(Value::as_str) == Some("usage_limit") {
-                    ("warning", "provider.warning")
-                } else {
-                    ("error", "provider.error")
-                }
+                ("error", "provider.error")
             } else {
                 event_activity_shape(&event.event_type)
             };
@@ -15128,16 +15131,6 @@ async fn project_provider_event(
                             |detail| format!("{message}\n{detail}"),
                         );
                     object.insert("detail".to_owned(), Value::String(detail));
-                }
-                if event.event_type == "turn.completed"
-                    && object.get("errorReason").and_then(Value::as_str) == Some("usage_limit")
-                    && !object.contains_key("detail")
-                    && let Some(message) = object
-                        .get("errorMessage")
-                        .and_then(Value::as_str)
-                        .filter(|message| !message.trim().is_empty())
-                {
-                    object.insert("detail".to_owned(), Value::String(message.to_owned()));
                 }
                 object.insert("eventType".to_owned(), Value::String(event.event_type));
             } else {
@@ -15474,7 +15467,13 @@ fn event_activity_summary(event_type: &str, payload: &Value, provider_label: &st
         "user-input.requested" => "Input requested",
         "user-input.resolved" => "Input received",
         "mcp.status.updated" => "Tool connections updated",
-        "runtime.warning" => return format!("{provider_label} warning"),
+        "runtime.warning" => {
+            if payload.get("usageLimit").and_then(Value::as_bool) == Some(true) {
+                "Usage limit reached"
+            } else {
+                return format!("{provider_label} warning");
+            }
+        }
         // Includes runtime.error and future error-shaped events classified by
         // the same policy that assigns the activity's tone and kind.
         event if event_activity_shape(event).1 == "provider.error" => {
@@ -40772,6 +40771,63 @@ done
                 assert_eq!(activity.payload["detail"], "Connection lost.");
             }
         }
+
+        // Usage-limit runtime.warning projects as "Usage limit reached" (warning), while the
+        // subsequent turn.completed(usage_limit) updates session state without appending a second
+        // activity.
+        let notice = "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m).";
+        project_work_log_event(
+            &engine,
+            &launch,
+            "runtime.warning",
+            json!({
+                "usageLimit": true,
+                "message": notice,
+                "resetsAt": "2026-11-27T20:30:00Z",
+            }),
+        )
+        .await;
+        let snapshot_after_warning = load_snapshot(&engine.repositories()).await.unwrap();
+        let warning_count = snapshot_after_warning.activities.len();
+        let warning = snapshot_after_warning
+            .activities
+            .last()
+            .expect("usage limit warning activity");
+        assert_eq!(warning.summary, "Usage limit reached");
+        assert_eq!(warning.kind, "provider.warning");
+        assert_eq!(warning.tone, "warning");
+        assert_eq!(warning.payload["usageLimit"], true);
+        assert_eq!(warning.payload["detail"], notice);
+
+        project_work_log_event(
+            &engine,
+            &launch,
+            "turn.completed",
+            json!({
+                "state": "failed",
+                "stopReason": "usage_limit",
+                "errorReason": "usage_limit",
+                "errorClass": "provider_error",
+                "errorMessage": notice,
+                "resetsAt": "2026-11-27T20:30:00Z",
+            }),
+        )
+        .await;
+        let snapshot_after_completion = load_snapshot(&engine.repositories()).await.unwrap();
+        assert_eq!(
+            snapshot_after_completion.activities.len(),
+            warning_count,
+            "turn.completed(usage_limit) must not append a second timeline activity"
+        );
+        let session = engine
+            .repositories()
+            .get_thread_session("t1".to_owned())
+            .await
+            .unwrap()
+            .expect("thread session");
+        assert_eq!(session.status, "error");
+        assert_eq!(session.last_error.as_deref(), Some(notice));
+        assert_eq!(session.last_error_class.as_deref(), Some("provider_error"));
         engine.shutdown().await;
     }
 

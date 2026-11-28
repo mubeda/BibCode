@@ -9417,4 +9417,235 @@ describe("ChatView composer model picker provider scope (#347)", () => {
 
     expect(container.querySelector('[data-testid="composer-context-branch"]')).toBeNull();
   });
+
+  it("renders exactly one visible Antigravity usage-limit notice for chunk completion, reset-time enrichment, and pre-update delivery rejection (#429)", async () => {
+    const countOccurrences = (text: string, needle: string) => text.split(needle).length - 1;
+    const notice = "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m).";
+    const initialNotice = "Antigravity usage limit reached. Try again later or switch models.";
+    const turnId = TurnId.make("turn-quota-1");
+
+    const mountFullChat = async (thread: ReturnType<typeof makeThread>) => {
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      h.realChildren = true;
+      h.realTimeline = true;
+      seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+      seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+      seedServerThread(thread);
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(serverRoute);
+        await Promise.resolve();
+      });
+      return {
+        container,
+        unmount: async () => {
+          await act(async () => root.unmount());
+          container.remove();
+        },
+      };
+    };
+
+    // Case 1: quota chunk published as runtime.warning (provider.warning) + turn.completed sets
+    // session.lastError -> rendered ONCE in MessagesTimeline, NOT duplicated in ThreadErrorBanner.
+    const view1 = await mountFullChat(
+      makeThread({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("antigravity"),
+          model: "auto",
+        },
+        latestTurn: {
+          turnId,
+          state: "error",
+          requestedAt: "2026-11-27T18:00:00.000Z",
+          startedAt: "2026-11-27T18:00:00.000Z",
+          completedAt: "2026-11-27T18:00:01.000Z",
+          assistantMessageId: null,
+        },
+        session: {
+          threadId,
+          providerName: "Antigravity",
+          status: "error",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          updatedAt: "2026-11-27T18:00:01.000Z",
+          lastError: notice,
+          lastErrorClass: "provider_error",
+        },
+        messages: [
+          {
+            id: MessageId.make("user-quota-1"),
+            role: "user",
+            text: "Continue refactoring",
+            turnId: null,
+            createdAt: "2026-11-27T18:00:00.000Z",
+            updatedAt: "2026-11-27T18:00:00.000Z",
+            streaming: false,
+          },
+        ],
+        activities: [
+          {
+            id: EventId.make("evt-quota-1"),
+            tone: "warning",
+            kind: "provider.warning",
+            summary: "Usage limit reached",
+            payload: {
+              usageLimit: true,
+              message: notice,
+              detail: notice,
+              resetsAt: "2026-11-27T20:30:00Z",
+              eventType: "runtime.warning",
+            },
+            turnId,
+            sequence: 1,
+            createdAt: "2026-11-27T18:00:00.500Z",
+          },
+        ],
+      }),
+    );
+    try {
+      const text = view1.container.textContent ?? "";
+      expect(countOccurrences(text, notice)).toBe(1);
+      expect(text).toContain("Usage limit reached");
+      expect(capturedProps<Record<string, unknown>>("threadErrorBanner")["error"]).toBeNull();
+    } finally {
+      await view1.unmount();
+    }
+
+    // Case 2: chunk without reset time followed by enriched warning with reset time on same turn
+    // collapses to ONE timeline notice carrying the reset time.
+    const view2 = await mountFullChat(
+      makeThread({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("antigravity"),
+          model: "auto",
+        },
+        latestTurn: {
+          turnId,
+          state: "error",
+          requestedAt: "2026-11-27T18:00:00.000Z",
+          startedAt: "2026-11-27T18:00:00.000Z",
+          completedAt: "2026-11-27T18:00:01.000Z",
+          assistantMessageId: null,
+        },
+        session: {
+          threadId,
+          providerName: "Antigravity",
+          status: "error",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          updatedAt: "2026-11-27T18:00:01.000Z",
+          lastError: notice,
+          lastErrorClass: "provider_error",
+        },
+        messages: [
+          {
+            id: MessageId.make("user-quota-2"),
+            role: "user",
+            text: "Continue refactoring",
+            turnId: null,
+            createdAt: "2026-11-27T18:00:00.000Z",
+            updatedAt: "2026-11-27T18:00:00.000Z",
+            streaming: false,
+          },
+        ],
+        activities: [
+          {
+            id: EventId.make("evt-quota-2a"),
+            tone: "warning",
+            kind: "provider.warning",
+            summary: "Usage limit reached",
+            payload: {
+              usageLimit: true,
+              message: initialNotice,
+              detail: initialNotice,
+              eventType: "runtime.warning",
+            },
+            turnId,
+            sequence: 1,
+            createdAt: "2026-11-27T18:00:00.400Z",
+          },
+          {
+            id: EventId.make("evt-quota-2b"),
+            tone: "warning",
+            kind: "provider.warning",
+            summary: "Usage limit reached",
+            payload: {
+              usageLimit: true,
+              message: notice,
+              detail: notice,
+              resetsAt: "2026-11-27T20:30:00Z",
+              eventType: "runtime.warning",
+            },
+            turnId,
+            sequence: 2,
+            createdAt: "2026-11-27T18:00:00.800Z",
+          },
+        ],
+      }),
+    );
+    try {
+      const text = view2.container.textContent ?? "";
+      expect(countOccurrences(text, notice)).toBe(1);
+      expect(text).not.toContain(initialNotice);
+      expect(capturedProps<Record<string, unknown>>("threadErrorBanner")["error"]).toBeNull();
+    } finally {
+      await view2.unmount();
+    }
+
+    // Case 3: prompt rejected with quota error before first update -> rendered ONCE on the failed
+    // delivery card with Retry and Dismiss recovery controls intact, NOT duplicated in the banner.
+    const view3 = await mountFullChat(
+      makeThread({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("antigravity"),
+          model: "auto",
+        },
+        session: {
+          threadId,
+          providerName: "Antigravity",
+          status: "error",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          updatedAt: "2026-11-27T18:00:01.000Z",
+          lastError: notice,
+          lastErrorClass: "provider_error",
+        },
+        messages: [
+          {
+            id: MessageId.make("user-quota-3"),
+            role: "user",
+            text: "Continue refactoring",
+            turnId: null,
+            createdAt: "2026-11-27T18:00:00.000Z",
+            updatedAt: "2026-11-27T18:00:00.000Z",
+            streaming: false,
+            delivery: {
+              state: "failed",
+              mode: "start",
+              provider: ProviderDriverKind.make("antigravity"),
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+              detail: notice,
+            },
+          },
+        ],
+        activities: [],
+      }),
+    );
+    try {
+      const text = view3.container.textContent ?? "";
+      expect(countOccurrences(text, notice)).toBe(1);
+      expect(text).toContain("Delivery failed");
+      const buttonLabels = [...view3.container.querySelectorAll("button")].map(
+        (button) => button.textContent?.trim() ?? "",
+      );
+      expect(buttonLabels).toContain("Retry");
+      expect(buttonLabels).toContain("Dismiss");
+      expect(capturedProps<Record<string, unknown>>("threadErrorBanner")["error"]).toBeNull();
+    } finally {
+      await view3.unmount();
+    }
+  });
 });

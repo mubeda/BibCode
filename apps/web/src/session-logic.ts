@@ -69,6 +69,8 @@ export interface WorkLogEntry {
   toolLifecycleStatus?: WorkLogToolLifecycleStatus;
   /** Originating orchestration activity kind (e.g. `user-input.requested`) for row chrome. */
   sourceActivityKind?: OrchestrationThreadActivity["kind"];
+  /** True for Antigravity ACP usage-limit warnings so duplicate updates collapse per turn. */
+  usageLimit?: boolean;
 }
 
 interface DerivedWorkLogEntry extends WorkLogEntry {
@@ -781,6 +783,9 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (toolLifecycleStatus) {
     entry.toolLifecycleStatus = toolLifecycleStatus;
   }
+  if (activity.kind === "provider.warning" && payload?.usageLimit === true) {
+    entry.usageLimit = true;
+  }
   const collapseKey = deriveToolLifecycleCollapseKey(entry);
   if (collapseKey) {
     entry.collapseKey = collapseKey;
@@ -793,6 +798,15 @@ function collapseDerivedWorkLogEntries(
 ): DerivedWorkLogEntry[] {
   const collapsed: DerivedWorkLogEntry[] = [];
   for (const entry of entries) {
+    if (entry.usageLimit === true && entry.turnId != null) {
+      const existingIndex = collapsed.findIndex(
+        (candidate) => candidate.usageLimit === true && candidate.turnId === entry.turnId,
+      );
+      if (existingIndex >= 0) {
+        collapsed[existingIndex] = mergeDerivedWorkLogEntries(collapsed[existingIndex]!, entry);
+        continue;
+      }
+    }
     const previous = collapsed.at(-1);
     if (previous && shouldCollapseToolLifecycleEntries(previous, entry)) {
       collapsed[collapsed.length - 1] = mergeDerivedWorkLogEntries(previous, entry);
@@ -801,6 +815,53 @@ function collapseDerivedWorkLogEntries(
     collapsed.push(entry);
   }
   return collapsed;
+}
+
+/**
+ * True when `session.lastError` is already rendered inline in the chat timeline — either on the
+ * active failed delivery card or on a usage-limit warning row for the thread's latest turn — so
+ * `ThreadErrorBanner` should not display a duplicate copy. Never suppresses `context_limit`
+ * errors because the banner owns the Compact conversation action.
+ */
+export function isSessionErrorShownInline(input: {
+  readonly sessionLastError: string | null;
+  readonly sessionLastErrorClass: string | null;
+  readonly blockingDeliveryDetail: string | null;
+  readonly workLogEntries: ReadonlyArray<WorkLogEntry>;
+  readonly activities: ReadonlyArray<OrchestrationThreadActivity>;
+  readonly latestTurnId: TurnId | null;
+}): boolean {
+  if (input.sessionLastError === null || input.sessionLastErrorClass === "context_limit") {
+    return false;
+  }
+  const normalized = input.sessionLastError.trim();
+  if (normalized.length === 0) {
+    return false;
+  }
+  if ((input.blockingDeliveryDetail?.trim() ?? null) === normalized) {
+    return true;
+  }
+  let latestTurnId = input.latestTurnId;
+  if (latestTurnId === null && input.activities.length > 0) {
+    const ordered = [...input.activities].toSorted(compareActivitiesByOrder);
+    for (let index = ordered.length - 1; index >= 0; index -= 1) {
+      const turnId = ordered[index]?.turnId ?? null;
+      if (turnId !== null) {
+        latestTurnId = turnId;
+        break;
+      }
+    }
+  }
+  return input.workLogEntries.some(
+    (entry) =>
+      entry.sourceActivityKind === "provider.warning" &&
+      entry.usageLimit === true &&
+      (entry.detail?.trim() ?? null) === normalized &&
+      (latestTurnId === null ||
+        entry.turnId === null ||
+        entry.turnId === undefined ||
+        entry.turnId === latestTurnId),
+  );
 }
 
 function shouldCollapseToolLifecycleEntries(
