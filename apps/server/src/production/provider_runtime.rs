@@ -8544,21 +8544,51 @@ async fn run_supervisor(
                                     let reservation = engine.reserve_thread_turns(&thread_id).await;
                                     let deadline = tokio::time::Instant::now()
                                         + std::time::Duration::from_secs(10);
-                                    while engine.turns_held_for_checkpoint(&thread_id)
-                                        && tokio::time::Instant::now() < deadline
-                                    {
+                                    // Wait for any in-flight `turn/completed` projection to settle
+                                    // the session (which installs any checkpoint hold before
+                                    // leaving `running`/`starting`), and then wait for any active
+                                    // checkpoint hold to clear before admitting a follow-up turn.
+                                    loop {
+                                        let session_settling = match engine
+                                            .repositories()
+                                            .get_thread_session(thread_id.clone())
+                                            .await
+                                        {
+                                            Ok(Some(session)) => matches!(
+                                                session.status.as_str(),
+                                                "running" | "starting"
+                                            ),
+                                            Ok(None) => false,
+                                            Err(error) => {
+                                                tracing::warn!(
+                                                    %error,
+                                                    %thread_id,
+                                                    "failed to inspect Codex session state before starting async follow-up turn"
+                                                );
+                                                return Err(format!(
+                                                    "Could not check session state before starting a follow-up turn: {error}"
+                                                ));
+                                            }
+                                        };
+                                        let held_for_checkpoint =
+                                            engine.turns_held_for_checkpoint(&thread_id);
+                                        if !session_settling && !held_for_checkpoint {
+                                            break;
+                                        }
+                                        if tokio::time::Instant::now() >= deadline {
+                                            tracing::warn!(
+                                                %thread_id,
+                                                session_settling,
+                                                held_for_checkpoint,
+                                                "previous Codex turn completion or checkpoint capture did not settle before async follow-up; refusing follow-up turn start"
+                                            );
+                                            return Err(
+                                                "A checkpoint is still being captured for the previous turn. Try submitting your answer again in a moment."
+                                                    .to_owned(),
+                                            );
+                                        }
                                         tokio::time::sleep(std::time::Duration::from_millis(50))
                                             .await;
-                                    }
-                                    if engine.turns_held_for_checkpoint(&thread_id) {
-                                        tracing::warn!(
-                                            %thread_id,
-                                            "checkpoint capture did not settle before post-turn Codex async answer; refusing follow-up turn start"
-                                        );
-                                        return Err(
-                                            "A checkpoint is still being captured for the previous turn. Try submitting your answer again in a moment."
-                                                .to_owned(),
-                                        );
                                     }
                                     let Some(admission) =
                                         crate::production::orchestration_effects::admit_thread_turn(

@@ -239,7 +239,7 @@ export const ComposerContextStrip = memo(function ComposerContextStrip({
   return (
     <div
       data-testid="composer-context-strip"
-      className="pointer-events-auto mx-auto flex w-full max-w-3xl min-w-0 items-center gap-3 overflow-hidden pt-1.5 text-xs text-muted-foreground select-none"
+      className="pointer-events-auto mx-auto flex w-full max-w-3xl min-w-0 items-center gap-3 overflow-hidden px-5 pt-1.5 text-xs text-muted-foreground select-none"
     >
       {environmentLabel ? (
         <span
