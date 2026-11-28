@@ -410,155 +410,156 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
 
   const showIconBar = props.allowAddSurfaces !== false;
 
+  const dynamicTabList = (
+    <ScrollArea
+      ref={tabListRef}
+      hideScrollbars
+      scrollFade
+      className="min-w-0 flex-1 rounded-none"
+      data-right-panel-tab-list
+    >
+      <div className="flex h-full w-max min-w-full items-center gap-1">
+        {dynamicSurfaces.map((surface) => {
+          const active = surface.id === props.activeSurfaceId;
+          const conflicted = props.conflictSurfaceIds?.has(surface.id) ?? false;
+          const pending = conflicted || props.pendingSurfaceIds.has(surface.id);
+          const title = dynamicSurfaceTitle(
+            surface,
+            props.previewSessions,
+            props.previewDesktopByTabId,
+          );
+          const tabButton = (
+            <button
+              type="button"
+              className="flex min-w-0 flex-1 items-center gap-1.5 focus-visible:outline-none"
+              onClick={() => props.onActivate(surface)}
+            >
+              <DynamicSurfaceIcon surface={surface} theme={resolvedTheme} />
+              <span className="truncate">{title}</span>
+              {conflicted ? <span className="sr-only">(changed on disk)</span> : null}
+            </button>
+          );
+          return (
+            <div
+              key={surface.id}
+              data-active-tab={active}
+              onMouseDown={handleTabMouseDown}
+              onAuxClick={(event) => handleTabAuxClick(event, surface)}
+              onContextMenu={(event) => void handleTabContextMenu(event, surface)}
+              className={cn(
+                "group flex h-7 min-w-24 max-w-44 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs transition-colors focus-within:ring-2 focus-within:ring-ring",
+                active
+                  ? "bg-selected text-selected-foreground"
+                  : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+              )}
+            >
+              <Tooltip>
+                <TooltipTrigger render={tabButton} />
+                <TooltipPopup>{conflicted ? `${title} (changed on disk)` : title}</TooltipPopup>
+              </Tooltip>
+              <button
+                type="button"
+                className={cn(
+                  "relative flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted focus:opacity-100",
+                  pending ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+                )}
+                aria-label={`Close ${title}`}
+                onClick={() => props.onCloseSurface(surface)}
+              >
+                {pending ? (
+                  <>
+                    <span
+                      className={cn(
+                        "size-2 rounded-full group-hover:hidden",
+                        conflicted ? "bg-amber-500" : "bg-current",
+                      )}
+                      data-file-disk-conflict={conflicted ? "" : undefined}
+                      aria-hidden="true"
+                    />
+                    <X className="hidden size-3 group-hover:block" aria-hidden="true" />
+                  </>
+                ) : (
+                  <X className="size-3" aria-hidden="true" />
+                )}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </ScrollArea>
+  );
+
   return (
     <PreviewPanelShell
       mode={props.mode}
       {...(props.maximized !== undefined ? { maximized: props.maximized } : {})}
     >
       <div
-        className={cn(
-          "@container/right-panel-bar workspace-topbar flex-wrap gap-x-1 gap-y-0.5 pl-2",
-          dynamicSurfaces.length > 0 && "h-auto min-h-10 py-1",
-          props.mode === "inline" ? "pr-28" : "pr-3",
-          props.mode === "inline" && props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
-        )}
+        className="flex shrink-0 flex-col border-b border-panel-separator bg-background"
         data-right-panel-tabbar
       >
-        {showIconBar ? (
-          <div
-            ref={iconBarRef}
-            role="toolbar"
-            aria-label="Right panel surfaces"
-            data-right-panel-icon-bar
-            onKeyDown={handleIconBarKeyDown}
-            className="flex shrink-0 items-center gap-0.5 [-webkit-app-region:no-drag]"
-          >
-            {fixedIcons.map((item) => {
-              const Icon = item.icon;
-              const tooltipText =
-                !item.available && item.disabledReason ? item.disabledReason : item.label;
-              const iconButton = (
-                <button
-                  type="button"
-                  aria-label={item.label}
-                  aria-pressed={item.active}
-                  aria-disabled={!item.available ? "true" : undefined}
-                  data-right-panel-icon={item.key}
-                  data-active-icon={item.active ? "true" : "false"}
-                  onClick={() => {
-                    if (!item.available) return;
-                    item.onSelect();
-                  }}
-                  className={cn(
-                    "relative inline-flex size-7 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                    !item.available
-                      ? "cursor-not-allowed text-muted-foreground opacity-40"
-                      : item.active
-                        ? "text-foreground after:pointer-events-none after:absolute after:inset-x-1.5 after:bottom-0 after:h-0.5 after:rounded-full after:bg-foreground"
-                        : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
-                  )}
-                >
-                  <Icon className="size-4 stroke-[1.75]" aria-hidden="true" />
-                </button>
-              );
-              return (
-                <Tooltip key={item.key}>
-                  <TooltipTrigger render={iconButton} />
-                  <TooltipPopup side="bottom">{tooltipText}</TooltipPopup>
-                </Tooltip>
-              );
-            })}
-          </div>
-        ) : null}
-
-        {showIconBar && dynamicSurfaces.length > 0 ? (
-          <div
-            aria-hidden="true"
-            className="mx-1 hidden h-4 w-px shrink-0 bg-panel-separator @min-[520px]/right-panel-bar:block"
-          />
-        ) : null}
-
-        <ScrollArea
-          ref={tabListRef}
-          hideScrollbars
-          scrollFade
+        <div
           className={cn(
-            "min-w-0 flex-1 rounded-none",
-            dynamicSurfaces.length > 0 &&
-              "basis-full @min-[520px]/right-panel-bar:basis-auto @min-[520px]/right-panel-bar:min-w-28",
+            "workspace-topbar gap-1 pl-2",
+            props.mode === "inline" ? "pr-28" : "pr-3",
+            props.mode === "inline" && props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
           )}
-          data-right-panel-tab-list
         >
-          <div className="flex h-full w-max min-w-full items-center gap-1">
-            {dynamicSurfaces.map((surface) => {
-              const active = surface.id === props.activeSurfaceId;
-              const conflicted = props.conflictSurfaceIds?.has(surface.id) ?? false;
-              const pending = conflicted || props.pendingSurfaceIds.has(surface.id);
-              const title = dynamicSurfaceTitle(
-                surface,
-                props.previewSessions,
-                props.previewDesktopByTabId,
-              );
-              const tabButton = (
-                <button
-                  type="button"
-                  className="flex min-w-0 flex-1 items-center gap-1.5 focus-visible:outline-none"
-                  onClick={() => props.onActivate(surface)}
-                >
-                  <DynamicSurfaceIcon surface={surface} theme={resolvedTheme} />
-                  <span className="truncate">{title}</span>
-                  {conflicted ? <span className="sr-only">(changed on disk)</span> : null}
-                </button>
-              );
-              return (
-                <div
-                  key={surface.id}
-                  data-active-tab={active}
-                  onMouseDown={handleTabMouseDown}
-                  onAuxClick={(event) => handleTabAuxClick(event, surface)}
-                  onContextMenu={(event) => void handleTabContextMenu(event, surface)}
-                  className={cn(
-                    "group flex h-7 min-w-24 max-w-44 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs transition-colors focus-within:ring-2 focus-within:ring-ring",
-                    active
-                      ? "bg-selected text-selected-foreground"
-                      : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
-                  )}
-                >
-                  <Tooltip>
-                    <TooltipTrigger render={tabButton} />
-                    <TooltipPopup>{conflicted ? `${title} (changed on disk)` : title}</TooltipPopup>
-                  </Tooltip>
+          {showIconBar ? (
+            <div
+              ref={iconBarRef}
+              role="toolbar"
+              aria-label="Right panel surfaces"
+              data-right-panel-icon-bar
+              onKeyDown={handleIconBarKeyDown}
+              className="flex shrink-0 items-center gap-0.5 [-webkit-app-region:no-drag]"
+            >
+              {fixedIcons.map((item) => {
+                const Icon = item.icon;
+                const tooltipText =
+                  !item.available && item.disabledReason ? item.disabledReason : item.label;
+                const iconButton = (
                   <button
                     type="button"
+                    aria-label={item.label}
+                    aria-pressed={item.active}
+                    aria-disabled={!item.available ? "true" : undefined}
+                    data-right-panel-icon={item.key}
+                    data-active-icon={item.active ? "true" : "false"}
+                    onClick={() => {
+                      if (!item.available) return;
+                      item.onSelect();
+                    }}
                     className={cn(
-                      "relative flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted focus:opacity-100",
-                      pending ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+                      "relative inline-flex size-7 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                      !item.available
+                        ? "cursor-not-allowed text-muted-foreground opacity-40"
+                        : item.active
+                          ? "text-foreground after:pointer-events-none after:absolute after:inset-x-1.5 after:bottom-0 after:h-0.5 after:rounded-full after:bg-foreground"
+                          : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
                     )}
-                    aria-label={`Close ${title}`}
-                    onClick={() => props.onCloseSurface(surface)}
                   >
-                    {pending ? (
-                      <>
-                        <span
-                          className={cn(
-                            "size-2 rounded-full group-hover:hidden",
-                            conflicted ? "bg-amber-500" : "bg-current",
-                          )}
-                          data-file-disk-conflict={conflicted ? "" : undefined}
-                          aria-hidden="true"
-                        />
-                        <X className="hidden size-3 group-hover:block" aria-hidden="true" />
-                      </>
-                    ) : (
-                      <X className="size-3" aria-hidden="true" />
-                    )}
+                    <Icon className="size-4 stroke-[1.75]" aria-hidden="true" />
                   </button>
-                </div>
-              );
-            })}
+                );
+                return (
+                  <Tooltip key={item.key}>
+                    <TooltipTrigger render={iconButton} />
+                    <TooltipPopup side="bottom">{tooltipText}</TooltipPopup>
+                  </Tooltip>
+                );
+              })}
+            </div>
+          ) : (
+            dynamicTabList
+          )}
+          {props.layoutControls}
+        </div>
+        {showIconBar && dynamicSurfaces.length > 0 ? (
+          <div className="flex h-9 min-h-9 shrink-0 items-center border-t border-panel-separator/60 px-2">
+            {dynamicTabList}
           </div>
-        </ScrollArea>
-        {props.layoutControls}
+        ) : null}
       </div>
       <div className="flex min-h-0 flex-1 flex-col">
         {props.activeSurfaceId === null ? (
