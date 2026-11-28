@@ -2631,6 +2631,12 @@ export function TerminalViewport({
           const generation = readTerminalGeneration();
           const fallback = { remaining: 0, message: "Failed to paste into terminal" };
           inputBinding.pendingFallbacks.push(fallback);
+          const removeFallback = () => {
+            const index = inputBinding.pendingFallbacks.indexOf(fallback);
+            if (index !== -1) {
+              inputBinding.pendingFallbacks.splice(index, 1);
+            }
+          };
           const fill = inputScheduler.reserve(inputOrigin(text));
           let settled = false;
           let pendingEntry: {
@@ -2652,6 +2658,7 @@ export function TerminalViewport({
             window.clearTimeout(timer);
             pendingIdentityPasteTimers.delete(timer);
             if (disposed || inputBlocked() || readTerminalGeneration() !== generation) {
+              removeFallback();
               fill(null);
               return;
             }
@@ -2671,13 +2678,17 @@ export function TerminalViewport({
             }
             if (payload.length > 0) {
               fallback.remaining = payload.length;
+              fill(payload);
+            } else {
+              removeFallback();
+              fill(null);
             }
-            fill(payload.length > 0 ? payload : null);
           };
           const cancel = () => {
             if (settled) return;
             settled = true;
             removePendingEntry();
+            removeFallback();
             window.clearTimeout(timer);
             pendingIdentityPasteTimers.delete(timer);
             fill(null);

@@ -203,6 +203,9 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       ) {
         return;
       }
+      if (cardRef.current?.closest('[hidden], [aria-hidden="true"], [inert]')) {
+        return;
+      }
       const activeElement = document.activeElement;
       const focusedCard =
         activeElement instanceof HTMLElement
@@ -213,6 +216,14 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
           return;
         }
       } else {
+        if (
+          activeElement instanceof HTMLElement &&
+          activeElement.closest(
+            'button, a[href], select, [role="tab"], [role="button"], [role="menuitem"]',
+          )
+        ) {
+          return;
+        }
         const focusedSurface =
           activeElement instanceof HTMLElement
             ? activeElement.closest("[data-chat-surface]")

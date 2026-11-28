@@ -869,21 +869,8 @@ async fn dispatch_prepared_command(
         }
         _ => true,
     };
-    let retry_open_user_input = if !accepted_new.load(Ordering::Acquire)
-        && let OrchestrationCommand::ThreadUserInputRespond {
-            thread_id,
-            request_id,
-            ..
-        } = &command
-    {
-        is_user_input_request_open(&dispatch.repositories(), thread_id, request_id)
-            .await
-            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
-    } else {
-        false
-    };
     if let Some(provider) = provider
-        && (accepted_new.load(Ordering::Acquire) || retry_open_user_input)
+        && accepted_new.load(Ordering::Acquire)
         && should_route
     {
         if let Some((command_id, thread_id, created_at, dismissed)) = delivery_cancellation {
@@ -917,26 +904,6 @@ async fn dispatch_prepared_command(
         }
     }
     serde_json::to_value(result).map_err(|error| invalid_request(&request_tag, error.to_string()))
-}
-
-async fn is_user_input_request_open(
-    repositories: &crate::persistence::Repositories,
-    thread_id: &str,
-    request_id: &str,
-) -> crate::persistence::Result<bool> {
-    let thread_id = thread_id.to_owned();
-    let request_id = request_id.to_owned();
-    repositories
-        .database()
-        .call(move |connection| {
-            let open = crate::persistence::open_user_input_requests_sql("?1");
-            Ok(connection.query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM ({open}) WHERE request_id = ?2)"),
-                rusqlite::params![&thread_id, &request_id],
-                |row| row.get::<_, bool>(0),
-            )?)
-        })
-        .await
 }
 
 #[expect(

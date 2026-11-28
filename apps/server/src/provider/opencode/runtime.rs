@@ -306,16 +306,40 @@ async fn bounded_send(request: reqwest::RequestBuilder) -> Result<(), String> {
 }
 
 /// The questions of an OpenCode 1 question request, as BiBCode shows them.
+/// Preserves the header as the question ID when unique and non-empty, and disambiguates repeated
+/// or empty headers by index so distinct questions never overwrite each other in drafts/receipts.
 fn v1_questions(request: &Value) -> Vec<Value> {
+    let mut used_ids = HashSet::new();
     request
         .get("questions")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .map(|question| {
+        .enumerate()
+        .map(|(index, question)| {
+            let header = question
+                .get("header")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let id = if !header.is_empty() && used_ids.insert(header.to_owned()) {
+                header.to_owned()
+            } else {
+                let base = if header.is_empty() {
+                    format!("q{index}")
+                } else {
+                    format!("{header}_{index}")
+                };
+                let mut candidate = base.clone();
+                let mut suffix = 1usize;
+                while !used_ids.insert(candidate.clone()) {
+                    candidate = format!("{base}_{suffix}");
+                    suffix += 1;
+                }
+                candidate
+            };
             json!({
-                "id": question.get("header").cloned().unwrap_or(Value::String(String::new())),
+                "id": id,
                 "header": question.get("header").cloned().unwrap_or(Value::String(String::new())),
                 "question": question.get("question").cloned().unwrap_or(Value::String(String::new())),
                 "options": question.get("options").cloned().unwrap_or(Value::Array(Vec::new())),
@@ -514,7 +538,53 @@ struct RuntimeInner {
 #[derive(Clone, Debug)]
 struct SettledOutcome {
     disposition: crate::provider::UserInputResponseDisposition,
-    answers: Value,
+    /// Provider-confirmed answers when explicitly supplied by SSE (`None` on dismiss/cancel or
+    /// events that omit an answer payload; `Some({})` when an explicit empty answer was recorded).
+    answers: Option<Value>,
+}
+
+fn resolve_settled_user_input_outcome(
+    sent_ok: bool,
+    is_skip_or_cancel_only: bool,
+    caller_answers: Value,
+    expected_sse_answers: &Value,
+    caller_disposition: Option<crate::provider::UserInputResponseDisposition>,
+    sse_outcome: Option<SettledOutcome>,
+) -> (Value, Option<crate::provider::UserInputResponseDisposition>) {
+    let Some(outcome) = sse_outcome else {
+        return (
+            if is_skip_or_cancel_only {
+                json!({})
+            } else {
+                caller_answers
+            },
+            caller_disposition,
+        );
+    };
+    if outcome.disposition.is_skip_or_cancel() {
+        let final_disposition = if sent_ok && is_skip_or_cancel_only {
+            caller_disposition.or(Some(outcome.disposition))
+        } else {
+            Some(outcome.disposition)
+        };
+        return (json!({}), final_disposition);
+    }
+    if is_skip_or_cancel_only {
+        return (
+            outcome.answers.unwrap_or_else(|| json!({})),
+            Some(outcome.disposition),
+        );
+    }
+    match outcome.answers {
+        Some(ref confirmed) if confirmed == expected_sse_answers => {
+            (caller_answers, caller_disposition)
+        }
+        Some(confirmed) => (confirmed, Some(outcome.disposition)),
+        None => (
+            caller_answers,
+            caller_disposition.or(Some(outcome.disposition)),
+        ),
+    }
 }
 
 /// Normalizes OpenCode v1 `question.replied` SSE answers (`string[][]` ordered by question index,
@@ -2301,55 +2371,14 @@ impl OpenCodeSessionRuntime {
             let Some(form) = pending else {
                 return Ok(());
             };
-            let (recorded_answers, final_disposition) = if sent_ok {
-                (
-                    if is_skip_or_cancel_only {
-                        json!({})
-                    } else {
-                        answers
-                    },
-                    disposition,
-                )
-            } else {
-                match sse_outcome {
-                    Some(outcome) if outcome.disposition.is_skip_or_cancel() => (
-                        json!({}),
-                        if is_skip_or_cancel_only {
-                            disposition.or(Some(outcome.disposition))
-                        } else {
-                            Some(outcome.disposition)
-                        },
-                    ),
-                    Some(outcome) => {
-                        if !is_skip_or_cancel_only && outcome.answers == answer {
-                            (answers, disposition)
-                        } else if outcome
-                            .answers
-                            .as_object()
-                            .is_some_and(|map| !map.is_empty())
-                        {
-                            (outcome.answers, Some(outcome.disposition))
-                        } else {
-                            (
-                                if is_skip_or_cancel_only {
-                                    json!({})
-                                } else {
-                                    answers
-                                },
-                                Some(outcome.disposition),
-                            )
-                        }
-                    }
-                    None => (
-                        if is_skip_or_cancel_only {
-                            json!({})
-                        } else {
-                            answers
-                        },
-                        disposition,
-                    ),
-                }
-            };
+            let (recorded_answers, final_disposition) = resolve_settled_user_input_outcome(
+                sent_ok,
+                is_skip_or_cancel_only,
+                answers,
+                &answer,
+                disposition,
+                sse_outcome,
+            );
             let resolved_payload = match final_disposition {
                 Some(disp) => crate::provider::build_user_input_resolved_payload(
                     recorded_answers,
@@ -2456,57 +2485,16 @@ impl OpenCodeSessionRuntime {
         let Some(pending) = pending else {
             return Ok(());
         };
-        let (recorded_answers, final_disposition) = if sent_ok {
-            (
-                if is_skip_or_cancel_only {
-                    json!({})
-                } else {
-                    answers
-                },
-                disposition,
-            )
-        } else {
-            let expected_sse_answers =
-                parse_v1_sse_question_answers(&Value::Array(normalized), &pending.questions);
-            match sse_outcome {
-                Some(outcome) if outcome.disposition.is_skip_or_cancel() => (
-                    json!({}),
-                    if is_skip_or_cancel_only {
-                        disposition.or(Some(outcome.disposition))
-                    } else {
-                        Some(outcome.disposition)
-                    },
-                ),
-                Some(outcome) => {
-                    if !is_skip_or_cancel_only && outcome.answers == expected_sse_answers {
-                        (answers, disposition)
-                    } else if outcome
-                        .answers
-                        .as_object()
-                        .is_some_and(|map| !map.is_empty())
-                    {
-                        (outcome.answers, Some(outcome.disposition))
-                    } else {
-                        (
-                            if is_skip_or_cancel_only {
-                                json!({})
-                            } else {
-                                answers
-                            },
-                            Some(outcome.disposition),
-                        )
-                    }
-                }
-                None => (
-                    if is_skip_or_cancel_only {
-                        json!({})
-                    } else {
-                        answers
-                    },
-                    disposition,
-                ),
-            }
-        };
+        let expected_sse_answers =
+            parse_v1_sse_question_answers(&Value::Array(normalized), &pending.questions);
+        let (recorded_answers, final_disposition) = resolve_settled_user_input_outcome(
+            sent_ok,
+            is_skip_or_cancel_only,
+            answers,
+            &expected_sse_answers,
+            disposition,
+            sse_outcome,
+        );
         let resolved_payload = match final_disposition {
             Some(disp) => crate::provider::build_user_input_resolved_payload(
                 recorded_answers,
@@ -3395,16 +3383,17 @@ impl OpenCodeSessionRuntime {
                     } else {
                         crate::provider::UserInputResponseDisposition::Answered
                     };
-                    let sse_answers = properties
-                        .get("answers")
-                        .map(|raw| {
+                    let sse_answers = if event_type == "question.rejected" {
+                        None
+                    } else {
+                        properties.get("answers").map(|raw| {
                             let pending_questions = pending
                                 .get(&request_id)
                                 .map(|question| question.questions.as_slice())
                                 .unwrap_or(&[]);
                             parse_v1_sse_question_answers(raw, pending_questions)
                         })
-                        .unwrap_or_else(|| json!({}));
+                    };
                     if sync.answering.contains(&request_id) {
                         sync.settled_while_answering.insert(
                             request_id.clone(),
@@ -3422,7 +3411,7 @@ impl OpenCodeSessionRuntime {
                                     "user-input.resolved",
                                     question.turn_id,
                                     crate::provider::build_user_input_resolved_payload(
-                                        sse_answers,
+                                        sse_answers.unwrap_or_else(|| json!({})),
                                         disposition,
                                         &question.questions,
                                     ),
@@ -3731,7 +3720,7 @@ impl OpenCodeSessionRuntime {
                     };
                     let outcome = SettledOutcome {
                         disposition,
-                        answers: if cancelled { json!({}) } else { answers },
+                        answers: if cancelled { None } else { answers },
                     };
                     let (pending, auto_settled) = {
                         let mut v2 = self.inner.v2.lock().await;
@@ -3760,7 +3749,7 @@ impl OpenCodeSessionRuntime {
                             form.turn_id,
                             Some(form_id),
                             crate::provider::build_user_input_resolved_payload(
-                                outcome.answers,
+                                outcome.answers.unwrap_or_else(|| json!({})),
                                 outcome.disposition,
                                 &form.questions,
                             ),
@@ -10872,5 +10861,76 @@ mod code_review_auto_decline_tests {
         );
 
         server.abort();
+    }
+
+    #[test]
+    fn v1_questions_disambiguates_duplicate_headers_and_sse_settlement_respects_competing_races() {
+        let questions = v1_questions(&json!({
+            "questions": [
+                { "header": "Target", "question": "Primary target?", "options": [] },
+                { "header": "Target", "question": "Secondary target?", "options": [] }
+            ]
+        }));
+        assert_eq!(questions[0]["id"], json!("Target"));
+        assert_eq!(questions[1]["id"], json!("Target_1"));
+        let parsed = parse_v1_sse_question_answers(&json!([["macOS"], ["Linux"]]), &questions);
+        assert_eq!(
+            parsed,
+            json!({ "Target": ["macOS"], "Target_1": ["Linux"] })
+        );
+
+        // Competing v1 rejection wins over a local answer even when HTTP returned 200.
+        let (ans, disp) = resolve_settled_user_input_outcome(
+            true,
+            false,
+            json!({ "Target": "macOS" }),
+            &json!({ "Target": ["macOS"] }),
+            Some(crate::provider::UserInputResponseDisposition::Answered),
+            Some(SettledOutcome {
+                disposition: crate::provider::UserInputResponseDisposition::Skipped,
+                answers: None,
+            }),
+        );
+        assert_eq!(ans, json!({}));
+        assert_eq!(
+            disp,
+            Some(crate::provider::UserInputResponseDisposition::Skipped)
+        );
+
+        // Competing explicit empty answer (`[[]]` / `{}`) is preserved instead of substituting local answers.
+        let (ans, disp) = resolve_settled_user_input_outcome(
+            false,
+            false,
+            json!({ "Target": "macOS" }),
+            &json!({ "Target": ["macOS"] }),
+            Some(crate::provider::UserInputResponseDisposition::Answered),
+            Some(SettledOutcome {
+                disposition: crate::provider::UserInputResponseDisposition::Answered,
+                answers: Some(json!({})),
+            }),
+        );
+        assert_eq!(ans, json!({}));
+        assert_eq!(
+            disp,
+            Some(crate::provider::UserInputResponseDisposition::Answered)
+        );
+
+        // Failed local Skip while another client cancelled records Cancelled, not Skipped.
+        let (ans, disp) = resolve_settled_user_input_outcome(
+            false,
+            true,
+            json!({}),
+            &json!({}),
+            Some(crate::provider::UserInputResponseDisposition::Skipped),
+            Some(SettledOutcome {
+                disposition: crate::provider::UserInputResponseDisposition::Cancelled,
+                answers: None,
+            }),
+        );
+        assert_eq!(ans, json!({}));
+        assert_eq!(
+            disp,
+            Some(crate::provider::UserInputResponseDisposition::Cancelled)
+        );
     }
 }

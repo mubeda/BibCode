@@ -455,6 +455,9 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
 
     await mount(
       <div>
+        <button type="button" role="tab" id="split-pane-tab">
+          Side chat tab
+        </button>
         <div data-chat-surface="">
           {renderPanel({
             pendingUserInputs: [prompt(q)],
@@ -476,6 +479,15 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
     await act(async () => {
       sideButton.focus();
       sideButton.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+    });
+    expect(onHostToggleOption).not.toHaveBeenCalled();
+    expect(onHostAdvance).not.toHaveBeenCalled();
+
+    const splitTab = document.getElementById("split-pane-tab") as HTMLButtonElement;
+    expect(splitTab).not.toBeNull();
+    await act(async () => {
+      splitTab.focus();
+      splitTab.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
     });
     expect(onHostToggleOption).not.toHaveBeenCalled();
     expect(onHostAdvance).not.toHaveBeenCalled();

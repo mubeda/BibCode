@@ -8871,7 +8871,9 @@ function ChatViewContent(props: ChatViewProps) {
                             activePendingCollapsed={activePendingCollapsed}
                             activePendingUserInputCanCancel={activePendingUserInputCanCancel}
                             activePendingUserInputCanSkipAll={activePendingUserInputCanSkipAll}
-                            activePendingUserInputShortcutsEnabled={!isPanel}
+                            activePendingUserInputShortcutsEnabled={
+                              !isPanel && hostChatSurfaceVisible && !rightPanelMaximized
+                            }
                             respondingRequestIds={respondingRequestIds}
                             respondingUserInputRequestIds={respondingUserInputRequestIds}
                             showPlanFollowUpPrompt={showPlanFollowUpPrompt}

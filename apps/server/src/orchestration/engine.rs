@@ -5897,6 +5897,12 @@ async fn plan_command(
             created_at,
         } => {
             require_thread(model, command, thread_id)?;
+            if !answers.is_object() {
+                return invariant(
+                    command,
+                    "User-input answers must be a JSON object.".to_owned(),
+                );
+            }
             let persisted_answers = match disposition {
                 Some(crate::provider::UserInputResponseDisposition::Cancelled) => json!({}),
                 _ => answers.clone(),
@@ -16489,6 +16495,24 @@ mod timestamp_tie_tests {
             json!("cancelled")
         );
         assert_eq!(cancel_event.event.payload["answers"], json!({}));
+
+        let non_object = engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.user-input.respond",
+                    "commandId": "bad-answers-1",
+                    "threadId": "thread-1",
+                    "requestId": "req-2",
+                    "answers": ["not", "an", "object"],
+                    "createdAt": "2026-11-28T00:00:03.000Z"
+                }))
+                .expect("non-object command decodes"),
+            )
+            .await;
+        assert!(
+            non_object.is_err(),
+            "non-object answers must fail validation before persisting a durable event"
+        );
         engine.shutdown().await;
     }
 }
