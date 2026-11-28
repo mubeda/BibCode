@@ -1687,10 +1687,20 @@ async fn terminal_rpc_clear_resize_restart_exit_and_restart_if_not_running_round
             .as_u64()
             .expect("reattached snapshot sequence");
         assert!(snapshot_sequence >= cleared_sequence);
-        if snapshot["history"] != "" {
+        let history = snapshot["history"]
+            .as_str()
+            .expect("reattached snapshot history");
+        assert!(
+            !history.contains(token),
+            "cleared history must not retain pre-clear output"
+        );
+        // #431 intentionally replays `\x1b[?2004h` across `terminal.clear` when a running shell
+        // (such as bash with readline 8.1+ on Linux) already enabled bracketed paste mode.
+        let history_without_mode_restore = history.strip_prefix("\x1b[?2004h").unwrap_or(history);
+        if !history_without_mode_restore.is_empty() {
             assert!(
                 snapshot_sequence > cleared_sequence,
-                "non-empty history must contain output received after terminal.clear"
+                "non-empty history must contain output received after terminal.clear (got {history:?})"
             );
         }
 
