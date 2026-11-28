@@ -9647,5 +9647,102 @@ describe("ChatView composer model picker provider scope (#347)", () => {
     } finally {
       await view3.unmount();
     }
+
+    // Case 4: subsequent tool calls / session.exited rows never hide the quota notice inside
+    // work-group overflow, AND verbose chat renders the notice ONCE (never duplicated in `<pre>`).
+    const prevSettings = h.settings;
+    for (const verboseChat of [false, true]) {
+      h.settings = { ...prevSettings, verboseChat };
+      const view4 = await mountFullChat(
+        makeThread({
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "auto",
+          },
+          latestTurn: {
+            turnId,
+            state: "error",
+            requestedAt: "2026-11-27T18:00:00.000Z",
+            startedAt: "2026-11-27T18:00:00.000Z",
+            completedAt: "2026-11-27T18:00:02.000Z",
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            providerName: "Antigravity",
+            status: "error",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            updatedAt: "2026-11-27T18:00:02.000Z",
+            lastError: notice,
+            lastErrorClass: "provider_error",
+          },
+          messages: [
+            {
+              id: MessageId.make("user-quota-4"),
+              role: "user",
+              text: "Continue refactoring",
+              turnId: null,
+              createdAt: "2026-11-27T18:00:00.000Z",
+              updatedAt: "2026-11-27T18:00:00.000Z",
+              streaming: false,
+            },
+          ],
+          activities: [
+            {
+              id: EventId.make("evt-quota-4-warning"),
+              tone: "warning",
+              kind: "provider.warning",
+              summary: "Usage limit reached",
+              payload: {
+                usageLimit: true,
+                message: notice,
+                detail: notice,
+                resetsAt: "2026-11-27T20:30:00Z",
+                eventType: "runtime.warning",
+              },
+              turnId,
+              sequence: 1,
+              createdAt: "2026-11-27T18:00:00.500Z",
+            },
+            {
+              id: EventId.make("evt-quota-4-tool"),
+              tone: "tool",
+              kind: "tool.completed",
+              summary: "Shell completed",
+              payload: {
+                itemType: "command_execution",
+                detail: "ls",
+                status: "completed",
+              },
+              turnId,
+              sequence: 2,
+              createdAt: "2026-11-27T18:00:01.000Z",
+            },
+            {
+              id: EventId.make("evt-quota-4-exit"),
+              tone: "info",
+              kind: "provider.session",
+              summary: "Session ended",
+              payload: {
+                reason: "Antigravity session closed",
+                eventType: "session.exited",
+              },
+              turnId: null,
+              sequence: 3,
+              createdAt: "2026-11-27T18:00:02.000Z",
+            },
+          ],
+        }),
+      );
+      try {
+        const text = view4.container.textContent ?? "";
+        expect(countOccurrences(text, notice)).toBe(1);
+        expect(capturedProps<Record<string, unknown>>("threadErrorBanner")["error"]).toBeNull();
+      } finally {
+        await view4.unmount();
+      }
+    }
+    h.settings = prevSettings;
   });
 });

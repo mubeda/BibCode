@@ -2657,8 +2657,11 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
       normalizeCompactToolLabel(heading).toLowerCase()
       ? null
       : rawPreview;
+  const isUsageLimitNotice = workEntry.usageLimit === true;
   const displayText = preview ? `${heading} - ${preview}` : heading;
-  const expandedBody = buildToolCallExpandedBody(workEntry, workspaceRoot);
+  const expandedBody = isUsageLimitNotice
+    ? null
+    : buildToolCallExpandedBody(workEntry, workspaceRoot);
   const canExpand = expandedBody !== null;
   const showFailedIndicator = workEntryIndicatesToolFailure(workEntry);
   const showDestructiveRowStyle =
@@ -2714,10 +2717,22 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
         </span>
         <div className="flex min-w-0 flex-1 items-center gap-1.5">
           <div className="min-w-0 flex-1 overflow-hidden">
-            <p className="flex min-w-0 w-full items-baseline gap-1.5 text-[12px] leading-5">
+            <p
+              className={cn(
+                "flex min-w-0 w-full items-baseline gap-1.5 text-[12px] leading-5",
+                isUsageLimitNotice && "flex-wrap",
+              )}
+            >
               <span className={cn("min-w-0 shrink truncate", headingClass)}>{heading}</span>
               {preview && (
-                <span className="min-w-0 flex-1 truncate text-muted-foreground">{preview}</span>
+                <span
+                  className={cn(
+                    "min-w-0 flex-1 text-muted-foreground",
+                    isUsageLimitNotice ? "wrap-break-word whitespace-normal" : "truncate",
+                  )}
+                >
+                  {preview}
+                </span>
               )}
             </p>
           </div>

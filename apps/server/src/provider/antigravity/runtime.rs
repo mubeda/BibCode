@@ -327,7 +327,7 @@ struct PreviousPrompt {
     /// True once stdout delivered the JSON-RPC response for `wire_id`, observed in exact wire
     /// order before any subsequent `session/update` notifications.
     wire_ended: bool,
-    settled: Option<Result<Value, AcpProtocolError>>,
+    settled: Option<Result<Value, AntigravityRuntimeError>>,
     quota_notice: Option<QuotaLimitNotice>,
     quota_published: Option<QuotaLimitNotice>,
 }
@@ -367,35 +367,45 @@ struct Gate {
     pending: HashMap<String, PendingRequest>,
 }
 
+struct ClearedActiveTurn {
+    pending: Vec<(String, PendingRequest)>,
+    quota_notice: Option<QuotaLimitNotice>,
+    quota_published: Option<QuotaLimitNotice>,
+    prev_unpublished_notice: Option<QuotaLimitNotice>,
+}
+
 impl Gate {
     fn allocate_prompt_seq(&mut self) -> u64 {
         self.next_prompt_seq = self.next_prompt_seq.saturating_add(1);
         self.next_prompt_seq
     }
 
-    fn clear_active_turn(
-        &mut self,
-        turn_id: &str,
-    ) -> (
-        Vec<(String, PendingRequest)>,
-        Option<QuotaLimitNotice>,
-        Option<QuotaLimitNotice>,
-    ) {
-        let (quota_notice, quota_published) = if self.active_turn.as_deref() == Some(turn_id) {
-            self.active_turn = None;
-            self.active_prompt_seq = 0;
-            self.active_prompt_wire_id = None;
-            self.active_turn_has_update = false;
-            self.steer_in_flight = None;
-            self.previous_prompt = None;
-            (
-                self.active_prompt_quota_notice.take(),
-                self.active_prompt_quota_published.take(),
-            )
-        } else {
-            (None, None)
-        };
-        (self.take_pending(turn_id), quota_notice, quota_published)
+    fn clear_active_turn(&mut self, turn_id: &str) -> ClearedActiveTurn {
+        let (quota_notice, quota_published, prev_unpublished_notice) =
+            if self.active_turn.as_deref() == Some(turn_id) {
+                self.active_turn = None;
+                self.active_prompt_seq = 0;
+                self.active_prompt_wire_id = None;
+                self.active_turn_has_update = false;
+                self.steer_in_flight = None;
+                let prev_unpublished_notice = self.previous_prompt.take().and_then(|prev| {
+                    prev.quota_notice
+                        .filter(|notice| prev.quota_published.as_ref() != Some(notice))
+                });
+                (
+                    self.active_prompt_quota_notice.take(),
+                    self.active_prompt_quota_published.take(),
+                    prev_unpublished_notice,
+                )
+            } else {
+                (None, None, None)
+            };
+        ClearedActiveTurn {
+            pending: self.take_pending(turn_id),
+            quota_notice,
+            quota_published,
+            prev_unpublished_notice,
+        }
     }
 
     fn resolve_pending_accept(&mut self, outcome: Result<(), AntigravityRuntimeError>) {
@@ -1199,7 +1209,8 @@ impl AntigravitySessionRuntime {
                 pending: Vec<(String, PendingRequest)>,
                 quota_notice: Option<QuotaLimitNotice>,
                 quota_published: Option<QuotaLimitNotice>,
-                prev_result: Result<Value, AcpProtocolError>,
+                delivery_accepted: bool,
+                prev_result: Result<Value, AntigravityRuntimeError>,
             },
         }
         let outcome = {
@@ -1213,16 +1224,18 @@ impl AntigravitySessionRuntime {
                 match prev {
                     Some(PreviousPrompt {
                         seq,
+                        had_update,
                         settled: Some(prev_result),
                         quota_notice,
                         quota_published,
                         ..
                     }) if seq == prev_seq => {
-                        let (pending, _, _) = gate.clear_active_turn(turn_id);
+                        let cleared = gate.clear_active_turn(turn_id);
                         RollbackOutcome::SettlePrevious {
-                            pending,
+                            pending: cleared.pending,
                             quota_notice,
                             quota_published,
+                            delivery_accepted: had_update,
                             prev_result,
                         }
                     }
@@ -1259,6 +1272,7 @@ impl AntigravitySessionRuntime {
                 pending,
                 quota_notice,
                 quota_published,
+                delivery_accepted,
                 prev_result,
             } => {
                 self.cancel_pending_requests(pending);
@@ -1268,6 +1282,8 @@ impl AntigravitySessionRuntime {
                         prev_result,
                         quota_notice,
                         quota_published,
+                        None,
+                        delivery_accepted,
                     )
                     .await;
             }
@@ -1297,10 +1313,10 @@ impl AntigravitySessionRuntime {
             error_reason,
             "antigravity turn failed before prompt delivery"
         );
-        let (pending, _, _) = {
+        let pending = {
             let mut gate = self.inner.gate.lock().await;
             gate.resolve_pending_accept_for(prompt_seq, Err(error.clone()));
-            gate.clear_active_turn(turn_id)
+            gate.clear_active_turn(turn_id).pending
         };
         self.cancel_pending_requests(pending);
         self.emit(
@@ -1357,9 +1373,11 @@ impl AntigravitySessionRuntime {
     async fn emit_prompt_completion(
         &self,
         turn_id: String,
-        result: Result<Value, AcpProtocolError>,
+        result: Result<Value, AntigravityRuntimeError>,
         chunk_quota_notice: Option<QuotaLimitNotice>,
         published_quota_notice: Option<QuotaLimitNotice>,
+        cancelled_prev_notice: Option<QuotaLimitNotice>,
+        delivery_accepted: bool,
     ) -> Result<(), AntigravityRuntimeError> {
         let abandoned = self.inner.abandoned_turns.lock().await.remove(&turn_id);
         let emit_quota = |notice: QuotaLimitNotice, ensure_warning: bool| {
@@ -1398,9 +1416,11 @@ impl AntigravitySessionRuntime {
                     .get("stopReason")
                     .and_then(Value::as_str)
                     .unwrap_or("end_turn");
-                if stop_reason != "cancelled"
-                    && let Some(notice) = chunk_quota_notice
-                {
+                if stop_reason == "cancelled" {
+                    if !abandoned && let Some(notice) = cancelled_prev_notice {
+                        self.emit_usage_limit_warning(&turn_id, &notice);
+                    }
+                } else if let Some(notice) = chunk_quota_notice {
                     return emit_quota(notice, true);
                 }
                 let (state, failure_message) = acp_turn_state(stop_reason);
@@ -1414,7 +1434,6 @@ impl AntigravitySessionRuntime {
                 Ok(())
             }
             Err(error) => {
-                let error = self.classify(error);
                 let prompt_quota_notice = match &error {
                     AntigravityRuntimeError::UsageLimitReached { message, resets_at } => {
                         Some(QuotaLimitNotice {
@@ -1428,11 +1447,12 @@ impl AntigravitySessionRuntime {
                 if let Some(notice) =
                     QuotaLimitNotice::merge(chunk_quota_notice, prompt_quota_notice)
                 {
-                    // Upgrade an already-published chunk notice if the prompt reply added a reset
-                    // time; when the prompt errored before any chunk arrived, the failed delivery
-                    // notice / session error is the single visible notice so no `runtime.warning`
-                    // is emitted.
-                    let ensure_warning = had_chunk_notice || published_quota_notice.is_some();
+                    // Publish a timeline warning whenever a chunk notice arrived OR delivery was
+                    // already accepted (e.g. via `usage_update`), so the notice persists in turn
+                    // history; when the prompt rejected before any update, the failed delivery
+                    // card is the single visible notice.
+                    let ensure_warning =
+                        had_chunk_notice || published_quota_notice.is_some() || delivery_accepted;
                     return emit_quota(notice, ensure_warning);
                 }
                 let error_class = error.class();
@@ -1483,22 +1503,28 @@ impl AntigravitySessionRuntime {
                 pending: Vec<(String, PendingRequest)>,
                 quota_notice: Option<QuotaLimitNotice>,
                 quota_published: Option<QuotaLimitNotice>,
-                prev_result: Result<Value, AcpProtocolError>,
+                delivery_accepted: bool,
+                prev_result: Result<Value, AntigravityRuntimeError>,
             },
             CompleteTurn {
                 pending: Vec<(String, PendingRequest)>,
                 quota_notice: Option<QuotaLimitNotice>,
                 quota_published: Option<QuotaLimitNotice>,
-                result: Result<Value, AcpProtocolError>,
+                cancelled_prev_notice: Option<QuotaLimitNotice>,
+                delivery_accepted: bool,
+                result: Result<Value, AntigravityRuntimeError>,
             },
         }
 
         let runtime = self.clone();
         let (completion_tx, completion) = oneshot::channel();
         tokio::spawn(async move {
-            let result = response.await;
+            let raw_result = response.await;
             // Chunks the agent wrote before its answer may still wait in the incoming queue.
             let _ = runtime.inner.connection.barrier().await;
+            // Classify once so the delivery acceptance error and turn completion error share the
+            // exact same timestamp and message even across a wall-clock second boundary (#429).
+            let result = raw_result.map_err(|error| runtime.classify(error));
             // Check ownership and perform the terminal state transition under ONE lock so a
             // concurrent steer cannot slip between them.
             let resolution = {
@@ -1510,7 +1536,7 @@ impl AntigravitySessionRuntime {
                 {
                     let outcome = match &result {
                         Ok(_) => Ok(()),
-                        Err(error) => Err(runtime.classify(error.clone())),
+                        Err(error) => Err(error.clone()),
                     };
                     prev.settled = Some(result);
                     Resolution::Superseded(outcome)
@@ -1518,12 +1544,7 @@ impl AntigravitySessionRuntime {
                     && gate.active_prompt_seq == prompt_seq
                 {
                     let steer_rejection = is_steer
-                        .then(|| {
-                            result
-                                .as_ref()
-                                .err()
-                                .map(|error| runtime.classify(error.clone()))
-                        })
+                        .then(|| result.as_ref().err().cloned())
                         .flatten()
                         .filter(|error| {
                             matches!(
@@ -1541,12 +1562,13 @@ impl AntigravitySessionRuntime {
                     {
                         gate.resolve_pending_accept_for(prompt_seq, Err(steer_error.clone()));
                         if let Some(prev_result) = prev.settled {
-                            let (pending, _, _) = gate.clear_active_turn(&turn_id);
+                            let cleared = gate.clear_active_turn(&turn_id);
                             Resolution::SteerRejectedSettlePrevious {
                                 steer_error,
-                                pending,
+                                pending: cleared.pending,
                                 quota_notice: prev.quota_notice,
                                 quota_published: prev.quota_published,
+                                delivery_accepted: prev.had_update,
                                 prev_result,
                             }
                         } else {
@@ -1570,22 +1592,24 @@ impl AntigravitySessionRuntime {
                     } else {
                         let accept_outcome = match &result {
                             Ok(_) => Ok(()),
-                            Err(error) => Err(runtime.classify(error.clone())),
+                            Err(error) => Err(error.clone()),
                         };
+                        let delivery_accepted = gate.active_turn_has_update;
                         gate.resolve_pending_accept_for(prompt_seq, accept_outcome);
-                        let (pending, quota_notice, quota_published) =
-                            gate.clear_active_turn(&turn_id);
+                        let cleared = gate.clear_active_turn(&turn_id);
                         Resolution::CompleteTurn {
-                            pending,
-                            quota_notice,
-                            quota_published,
+                            pending: cleared.pending,
+                            quota_notice: cleared.quota_notice,
+                            quota_published: cleared.quota_published,
+                            cancelled_prev_notice: cleared.prev_unpublished_notice,
+                            delivery_accepted,
                             result,
                         }
                     }
                 } else {
                     let outcome = match result {
                         Ok(_) => Ok(()),
-                        Err(error) => Err(runtime.classify(error)),
+                        Err(error) => Err(error),
                     };
                     Resolution::Superseded(outcome)
                 }
@@ -1606,11 +1630,19 @@ impl AntigravitySessionRuntime {
                     pending,
                     quota_notice,
                     quota_published,
+                    delivery_accepted,
                     prev_result,
                 } => {
                     runtime.cancel_pending_requests(pending);
                     let _ = runtime
-                        .emit_prompt_completion(turn_id, prev_result, quota_notice, quota_published)
+                        .emit_prompt_completion(
+                            turn_id,
+                            prev_result,
+                            quota_notice,
+                            quota_published,
+                            None,
+                            delivery_accepted,
+                        )
                         .await;
                     Err(steer_error)
                 }
@@ -1618,11 +1650,20 @@ impl AntigravitySessionRuntime {
                     pending,
                     quota_notice,
                     quota_published,
+                    cancelled_prev_notice,
+                    delivery_accepted,
                     result,
                 } => {
                     runtime.cancel_pending_requests(pending);
                     runtime
-                        .emit_prompt_completion(turn_id, result, quota_notice, quota_published)
+                        .emit_prompt_completion(
+                            turn_id,
+                            result,
+                            quota_notice,
+                            quota_published,
+                            cancelled_prev_notice,
+                            delivery_accepted,
+                        )
                         .await
                 }
             };
@@ -1681,7 +1722,7 @@ impl AntigravitySessionRuntime {
         let grace = self.inner.options.cancel_grace;
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
-            {
+            let unpublished_prev_notice = {
                 let mut gate = runtime.inner.gate.lock().await;
                 if gate.active_turn.as_deref() != Some(turn_id.as_str()) {
                     return;
@@ -1692,7 +1733,10 @@ impl AntigravitySessionRuntime {
                 gate.active_prompt_quota_notice = None;
                 gate.active_prompt_quota_published = None;
                 gate.steer_in_flight = None;
-                gate.previous_prompt = None;
+                let unpublished_prev_notice = gate.previous_prompt.take().and_then(|prev| {
+                    prev.quota_notice
+                        .filter(|notice| prev.quota_published.as_ref() != Some(notice))
+                });
                 // An unacknowledged prompt whose cancel grace expired remains ambiguous.
                 gate.resolve_pending_accept(Err(AntigravityRuntimeError::Protocol(
                     AcpProtocolError::Closed {
@@ -1705,7 +1749,8 @@ impl AntigravitySessionRuntime {
                     .lock()
                     .await
                     .insert(turn_id.clone());
-            }
+                unpublished_prev_notice
+            };
             tracing::warn!(
                 provider = PROVIDER,
                 "the provider did not end a cancelled turn; stopping its process"
@@ -1713,6 +1758,9 @@ impl AntigravitySessionRuntime {
             // Mark unavailable for new prompts before publishing cancellation so no prompt slips
             // in between turn settlement and driver shutdown.
             runtime.inner.retired.store(true, Ordering::SeqCst);
+            if let Some(notice) = unpublished_prev_notice {
+                runtime.emit_usage_limit_warning(&turn_id, &notice);
+            }
             runtime.emit(
                 "turn.completed",
                 Some(turn_id),
@@ -2306,6 +2354,14 @@ fn matches_prompt_quota_allowlist(lower: &str) -> bool {
         .any(|phrase| lower.contains(phrase))
 }
 
+fn starts_with_phrase_boundary(text: &str, phrase: &str) -> bool {
+    text.strip_prefix(phrase).is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+    })
+}
+
 /// Classifies a single short ACP `agent_message_chunk` starting directly with `⚠` (`U+26A0`)
 /// against the anchored quota notice allowlist (#429). Ordinary prose, indented warnings,
 /// multi-line chunks, >2,048-char chunks, chunks without leading `⚠`, and filesystem/disk quota
@@ -2326,9 +2382,12 @@ fn classify_quota_chunk(text: &str, now: time::OffsetDateTime) -> Option<QuotaLi
     if is_filesystem_quota_text(&body_lower) {
         return None;
     }
-    let matches_allowlist = body_lower.starts_with("individual quota reached")
-        || body_lower.starts_with("you have exhausted your quota on this model")
-        || body_lower.starts_with("you have exhausted your capacity on this model")
+    let matches_allowlist = starts_with_phrase_boundary(&body_lower, "individual quota reached")
+        || starts_with_phrase_boundary(&body_lower, "you have exhausted your quota on this model")
+        || starts_with_phrase_boundary(
+            &body_lower,
+            "you have exhausted your capacity on this model",
+        )
         || body_lower
             .strip_prefix("agent executor error:")
             .is_some_and(matches_prompt_quota_allowlist);
@@ -2408,7 +2467,14 @@ fn collect_error_data_text(value: &Value, out: &mut String, max_bytes: usize, de
             for (key, entry) in map {
                 if matches!(
                     key.as_str(),
-                    "message" | "detail" | "details" | "error" | "reason" | "status"
+                    "code"
+                        | "errno"
+                        | "message"
+                        | "detail"
+                        | "details"
+                        | "error"
+                        | "reason"
+                        | "status"
                 ) {
                     collect_error_data_text(entry, out, max_bytes, depth + 1);
                 }
@@ -2610,13 +2676,16 @@ fn format_usage_limit_notice(
             resets_at_dt.millisecond(),
         )
     };
-    // Round displayed whole seconds up so users are never shown an earlier reset time than the
-    // real reset instant.
+    // Round both the relative wait and the absolute UTC display time up independently so neither
+    // is ever earlier than the real reset instant (even when `now` has sub-second milliseconds).
     let display_secs = u64::try_from(duration.as_millis().div_ceil(1_000))
         .unwrap_or(MAX_RESET_DURATION_SECS)
         .min(MAX_RESET_DURATION_SECS);
-    let display_dt =
-        (now + time::Duration::seconds(display_secs as i64)).to_offset(time::UtcOffset::UTC);
+    let display_dt = if resets_at_dt.nanosecond() > 0 {
+        resets_at_dt.replace_nanosecond(0).unwrap_or(resets_at_dt) + time::Duration::seconds(1)
+    } else {
+        resets_at_dt
+    };
     let absolute_display = if display_dt.second() == 0 {
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02} UTC",

@@ -846,11 +846,17 @@ function collectWorkRun(
   const first = timelineEntries[startIndex];
   const groupedEntries: WorkLogEntry[] = first?.kind === "work" ? [first.entry] : [];
   let cursor = startIndex + 1;
+  // Keep usage-limit notices standalone so neither subsequent tool calls nor session lifecycle
+  // rows can push them into work-group overflow (#429).
+  if (first?.kind === "work" && first.entry.usageLimit === true) {
+    return { groupedEntries, end: cursor };
+  }
   while (cursor < timelineEntries.length) {
     const nextEntry = timelineEntries[cursor];
     if (
       !nextEntry ||
       nextEntry.kind !== "work" ||
+      nextEntry.entry.usageLimit === true ||
       collapsedEntryIds.has(nextEntry.id) ||
       foldsByAnchorEntryId.has(nextEntry.id)
     ) {
