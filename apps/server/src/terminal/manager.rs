@@ -612,7 +612,14 @@ impl TerminalSessionIdentity {
         cancelled: &CancellationToken,
         connection_closed: &CancellationToken,
     ) -> Result<super::writer::PendingWrite, TerminalError> {
-        loop {
+        let _publication = loop {
+            let publication = tokio::select! {
+                biased;
+                () = cancelled.cancelled() => return Err(TerminalError::PublicationCancelled),
+                () = connection_closed.cancelled() => return Err(TerminalError::PublicationCancelled),
+                () = self.generation.cancellation.cancelled() => return Err(TerminalError::PublicationCancelled),
+                guard = self.generation.publication.lock() => guard,
+            };
             let notified = self.generation.legacy_delimiter_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -634,8 +641,9 @@ impl TerminalSessionIdentity {
                 }
             };
             let Some(deadline) = wait_until else {
-                break;
+                break publication;
             };
+            drop(publication);
             tokio::select! {
                 biased;
                 () = cancelled.cancelled() => return Err(TerminalError::PublicationCancelled),
@@ -644,13 +652,6 @@ impl TerminalSessionIdentity {
                 () = &mut notified => {}
                 () = tokio::time::sleep_until(deadline) => {}
             }
-        }
-        let _publication = tokio::select! {
-            biased;
-            () = cancelled.cancelled() => return Err(TerminalError::PublicationCancelled),
-            () = connection_closed.cancelled() => return Err(TerminalError::PublicationCancelled),
-            () = self.generation.cancellation.cancelled() => return Err(TerminalError::PublicationCancelled),
-            guard = self.generation.publication.lock() => guard,
         };
         let mut session = self.session.lock().await;
         if cancelled.is_cancelled()
@@ -15101,5 +15102,124 @@ while True:
         assert_eq!(normalize_child_command_name("[]"), None);
         assert_eq!(terminal_label("custom"), "custom");
         assert_eq!(terminal_label("term-"), "term-");
+    }
+
+    #[tokio::test]
+    async fn enqueue_input_rechecks_legacy_delimiter_fence_after_waiting_on_publication() {
+        let root = tempfile::tempdir().expect("root");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-fence",
+                "term-fence",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("open");
+
+        let session = manager
+            .require_session("thread-fence", "term-fence")
+            .await
+            .expect("session");
+        let lease = {
+            let current = session.lock().await;
+            TerminalSessionIdentity {
+                key: ("thread-fence".to_owned(), "term-fence".to_owned()),
+                session: session.clone(),
+                generation: current.generation.clone(),
+                process: current.process.clone().expect("running process"),
+            }
+        };
+        // Hold the publication lock so both owner A (splitting a legacy bracketed paste
+        // delimiter) and owner B (an independent write) queue on publication with no fence yet.
+        let held_publication = lease.generation.publication.lock().await;
+        let lease_a = lease.clone();
+        let lease_b = lease.clone();
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let conn_a = CancellationToken::new();
+        let conn_b = CancellationToken::new();
+
+        let task_a = tokio::spawn(async move {
+            lease_a
+                .enqueue_input(
+                    "\x1b[200",
+                    TerminalInputOrigin::User("\x1b[200"),
+                    "owner-a",
+                    true,
+                    &cancel_a,
+                    &conn_a,
+                )
+                .await
+                .expect("owner-a partial delimiter chunk")
+                .wait()
+                .await
+                .expect("owner-a write completes");
+        });
+        tokio::task::yield_now().await;
+
+        let task_b = tokio::spawn(async move {
+            lease_b
+                .enqueue_input(
+                    "interloper",
+                    TerminalInputOrigin::User("interloper"),
+                    "owner-b",
+                    true,
+                    &cancel_b,
+                    &conn_b,
+                )
+                .await
+                .expect("owner-b queued after fence clears")
+                .wait()
+                .await
+                .expect("owner-b write completes");
+        });
+        tokio::task::yield_now().await;
+
+        drop(held_publication);
+        task_a.await.expect("task_a");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !task_b.is_finished(),
+            "owner-b must recheck the fence under publication and wait until owner-a completes the delimiter"
+        );
+
+        // Owner A completes the bracketed-paste delimiter; only then may owner B write.
+        let cancel_close = CancellationToken::new();
+        let conn_close = CancellationToken::new();
+        lease
+            .enqueue_input(
+                "~payload",
+                TerminalInputOrigin::User("~payload"),
+                "owner-a",
+                true,
+                &cancel_close,
+                &conn_close,
+            )
+            .await
+            .expect("owner-a delimiter completion chunk")
+            .wait()
+            .await
+            .expect("owner-a close write completes");
+
+        tokio::time::timeout(Duration::from_secs(2), task_b)
+            .await
+            .expect("owner-b finishes after delimiter completes")
+            .expect("task_b");
+
+        assert_eq!(
+            backend.latest().writes(),
+            ["\x1b[200", "~payload", "interloper"]
+        );
+        manager.shutdown().await;
     }
 }
