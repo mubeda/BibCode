@@ -575,7 +575,9 @@ export default function FileBrowserPanel({
                 return;
               }
               lease?.commitDelete();
-              closeFileSurfacesUnder(threadRef, relativePath);
+              closeFileSurfacesUnder(threadRef, relativePath, {
+                availableSingletons: new Set(["files"]),
+              });
               entriesQuery.revalidate();
             } catch (error) {
               showMutationError(error, `Failed to delete "${name}"`);

@@ -319,6 +319,10 @@ async fn the_handshake_speaks_protocol_one_and_never_authenticates() {
         initialize["params"]["clientCapabilities"]["terminal"],
         false
     );
+    assert_eq!(
+        initialize["params"]["clientCapabilities"]["elicitation"],
+        json!({ "form": {} })
+    );
     peer.reply(
         &initialize,
         initialize_result("1.5.13", 1, all_capabilities()),
@@ -2180,4 +2184,2104 @@ async fn code_review_non_auto_and_ordinary_chats_keep_showing_permission_cards()
         .reply(&plan_prompt.1, json!({ "stopReason": "end_turn" }))
         .await;
     let _ = events_until(&review, "turn.completed").await;
+}
+
+#[tokio::test]
+async fn transport_errors_log_sanitized_reason_variants_and_retire_runtime() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct FailAfterRead {
+        inner: DuplexStream,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for FailAfterRead {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("synthetic read failure {MARKER}"),
+                )));
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    struct FailAfterWrite {
+        inner: DuplexStream,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for FailAfterWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("synthetic write failure {MARKER}"),
+                )));
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let Some(child) = crate::test_support::in_own_process(
+        "provider::antigravity::runtime::tests::transport_errors_log_sanitized_reason_variants_and_retire_runtime",
+    ) else {
+        return;
+    };
+    let log = CapturedLog::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish(),
+    );
+
+    let prompt_secret = format!("prompt secret {MARKER} /workspace/private/path");
+
+    // 1. connection_closed (peer drops stdout mid-turn)
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        assert!(!runtime.is_retired());
+        assert!(!runtime.is_transport_closed());
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        drop(peer);
+        let error = receipt
+            .completion()
+            .await
+            .expect_err("closed transport fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "connection_closed");
+        let events = events_until(&runtime, "turn.completed").await;
+        let completed = &events.last().unwrap().1;
+        assert_eq!(completed["errorClass"], "transport_error");
+        assert_eq!(completed["errorReason"], "connection_closed");
+        assert!(
+            completed["errorMessage"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("connection_closed") && !msg.contains(MARKER)),
+            "expected sanitized errorMessage: {completed}"
+        );
+        assert!(runtime.is_transport_closed());
+    }
+
+    // 2. line_too_long (stdout line exceeds configured max)
+    {
+        let (stdout, output) = duplex(1 << 16);
+        let (requests, stdin) = duplex(1 << 16);
+        let (stderr_reader, stderr) = duplex(4096);
+        let (connection, incoming) = AcpJsonRpcConnection::spawn(
+            stdout,
+            stdin,
+            stderr_reader,
+            AcpConnectionConfig {
+                max_stdout_line_bytes: 2048,
+                max_stderr_line_bytes: 4096,
+            },
+        );
+        let runtime = AntigravitySessionRuntime::new(options("full-access"), connection, incoming);
+        let mut peer = Peer {
+            requests: BufReader::new(requests).lines(),
+            output,
+            stderr,
+        };
+        let start = spawn_start(&runtime);
+        let init = peer.expect("initialize").await;
+        peer.reply(&init, initialize_result("1.5.13", 1, all_capabilities()))
+            .await;
+        let new = peer.expect("session/new").await;
+        peer.reply(&new, session_result(SESSION, standard_options("default")))
+            .await;
+        answer_mode(&mut peer, "auto").await;
+        finish(start).await.expect("started");
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        let oversized = format!("{{\"oversized\":\"{}\"}}\n", "x".repeat(4096));
+        let _ = peer.output.write_all(oversized.as_bytes()).await;
+        let error = receipt
+            .completion()
+            .await
+            .expect_err("oversized line fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "line_too_long");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(events.last().unwrap().1["errorReason"], "line_too_long");
+        assert!(runtime.is_transport_closed());
+    }
+
+    // 3. invalid_message (malformed JSON on stdout)
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        let _ = peer
+            .output
+            .write_all(format!("not-json-{MARKER}\n").as_bytes())
+            .await;
+        let error = receipt
+            .completion()
+            .await
+            .expect_err("invalid message fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "invalid_message");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(events.last().unwrap().1["errorReason"], "invalid_message");
+        assert!(runtime.is_transport_closed());
+    }
+
+    // 4. unknown_response (uncorrelated string JSON-RPC id must not leak into errorMessage or session.exited)
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        peer.send(json!({ "jsonrpc": "2.0", "id": format!("secret-id-{MARKER}"), "result": {} }))
+            .await;
+        let error = receipt
+            .completion()
+            .await
+            .expect_err("unknown response fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "unknown_response");
+        let events = events_until(&runtime, "turn.completed").await;
+        let completed = &events.last().unwrap().1;
+        assert_eq!(completed["errorReason"], "unknown_response");
+        assert!(
+            completed["errorMessage"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("unknown_response") && !msg.contains(MARKER)),
+            "uncorrelated string id leaked into turn.completed errorMessage: {completed}"
+        );
+        for (kind, payload) in &events {
+            if kind == "session.exited" {
+                assert_eq!(payload["errorReason"], "unknown_response");
+                assert!(
+                    !payload.to_string().contains(MARKER),
+                    "uncorrelated string id leaked into session.exited: {payload}"
+                );
+            }
+        }
+        assert!(runtime.is_transport_closed());
+    }
+
+    // 5. read_failure (stdout read returns io::Error)
+    {
+        let (stdout, output) = duplex(1 << 16);
+        let (requests, stdin) = duplex(1 << 16);
+        let (stderr_reader, stderr) = duplex(4096);
+        let fail_read = Arc::new(AtomicBool::new(false));
+        let (connection, incoming) = AcpJsonRpcConnection::spawn(
+            FailAfterRead {
+                inner: stdout,
+                fail: fail_read.clone(),
+            },
+            stdin,
+            stderr_reader,
+            AcpConnectionConfig::default(),
+        );
+        let runtime = AntigravitySessionRuntime::new(options("full-access"), connection, incoming);
+        let mut peer = Peer {
+            requests: BufReader::new(requests).lines(),
+            output,
+            stderr,
+        };
+        let start = spawn_start(&runtime);
+        let init = peer.expect("initialize").await;
+        peer.reply(&init, initialize_result("1.5.13", 1, all_capabilities()))
+            .await;
+        let new = peer.expect("session/new").await;
+        peer.reply(&new, session_result(SESSION, standard_options("default")))
+            .await;
+        answer_mode(&mut peer, "auto").await;
+        finish(start).await.expect("started");
+        let receipt = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect("prompt written");
+        let _prompt = peer.expect("session/prompt").await;
+        fail_read.store(true, Ordering::SeqCst);
+        let _ = peer.output.write_all(b"{}\n").await;
+        let error = receipt.completion().await.expect_err("read failure fails");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "read_failure");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(events.last().unwrap().1["errorReason"], "read_failure");
+        assert!(runtime.is_transport_closed());
+    }
+
+    // 6. write_failure (stdin write returns io::Error before prompt bytes leave)
+    {
+        let (stdout, output) = duplex(1 << 16);
+        let (requests, stdin) = duplex(1 << 16);
+        let (stderr_reader, stderr) = duplex(4096);
+        let fail_write = Arc::new(AtomicBool::new(false));
+        let (connection, incoming) = AcpJsonRpcConnection::spawn(
+            stdout,
+            FailAfterWrite {
+                inner: stdin,
+                fail: fail_write.clone(),
+            },
+            stderr_reader,
+            AcpConnectionConfig::default(),
+        );
+        let runtime = AntigravitySessionRuntime::new(options("full-access"), connection, incoming);
+        let mut peer = Peer {
+            requests: BufReader::new(requests).lines(),
+            output,
+            stderr,
+        };
+        let start = spawn_start(&runtime);
+        let init = peer.expect("initialize").await;
+        peer.reply(&init, initialize_result("1.5.13", 1, all_capabilities()))
+            .await;
+        let new = peer.expect("session/new").await;
+        peer.reply(&new, session_result(SESSION, standard_options("default")))
+            .await;
+        answer_mode(&mut peer, "auto").await;
+        finish(start).await.expect("started");
+        fail_write.store(true, Ordering::SeqCst);
+        let error = runtime
+            .send_turn_with_receipt(Some(&prompt_secret), Vec::new())
+            .await
+            .expect_err("write failure fails unsent turn");
+        assert_eq!(error.class(), "transport_error");
+        assert_eq!(error.reason(), "write_failure");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(events.last().unwrap().1["errorReason"], "write_failure");
+        assert!(runtime.is_transport_closed());
+    }
+
+    let rendered = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    for reason in [
+        "connection_closed",
+        "line_too_long",
+        "invalid_message",
+        "unknown_response",
+        "read_failure",
+        "write_failure",
+    ] {
+        assert!(
+            rendered.contains(&format!("error_reason=\"{reason}\""))
+                || rendered.contains(&format!("error_reason={reason}")),
+            "expected sanitized WARN log for {reason}:\n{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("error_class=\"transport_error\"")
+            || rendered.contains("error_class=transport_error"),
+        "expected transport_error class in WARN log:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(MARKER) && !rendered.contains("/workspace/private/path"),
+        "prompt text or paths leaked into WARN log:\n{rendered}"
+    );
+    child.complete();
+}
+
+#[tokio::test]
+async fn steer_sends_concurrent_session_prompt_without_cancel_and_keeps_turn_alive_when_first_prompt_ends()
+ {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+    let turn_id = first_receipt.turn_id.clone();
+
+    // Before the first update arrives, steer is refused and sends nothing on the wire.
+    let too_early = runtime
+        .steer_turn(Some("steer too early"), Vec::new(), &turn_id)
+        .await
+        .expect_err("steer before first update must be refused");
+    assert!(matches!(
+        too_early,
+        AntigravityRuntimeError::SteerUnavailable { .. }
+    ));
+    assert!(peer.silent().await, "refused steer must write nothing");
+
+    // Once the first update arrives, Turn 1 is accepted and steer can send a second concurrent
+    // `session/prompt` without ever sending `session/cancel`.
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "initial chunk" },
+        }),
+    )
+    .await;
+    let first_events = events_until(&runtime, "content.delta").await;
+    assert_eq!(first_events.last().unwrap().1["delta"], "initial chunk");
+    first_receipt
+        .accepted()
+        .await
+        .expect("first turn accepted on first update");
+
+    let steer_receipt = runtime
+        .steer_turn(Some("steered instruction"), Vec::new(), &turn_id)
+        .await
+        .expect("steer written");
+    assert_eq!(steer_receipt.turn_id, turn_id);
+
+    let second_prompt = peer.expect("session/prompt").await;
+    assert_eq!(second_prompt["params"]["sessionId"], SESSION);
+    assert!(
+        second_prompt["params"]["prompt"]
+            .to_string()
+            .contains("steered instruction"),
+        "expected steered prompt text: {second_prompt}"
+    );
+    assert_ne!(
+        second_prompt["id"], first_prompt["id"],
+        "steer must be a distinct concurrent session/prompt request"
+    );
+
+    // A late update emitted before Prompt 1 settles does NOT accept Prompt 2 or unlock a second steer.
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "late first chunk" },
+        }),
+    )
+    .await;
+    let late_events = events_until(&runtime, "content.delta").await;
+    assert_eq!(late_events.last().unwrap().1["delta"], "late first chunk");
+    assert!(
+        runtime
+            .steer_turn(Some("nested steer too early"), Vec::new(), &turn_id)
+            .await
+            .is_err(),
+        "late Prompt 1 update must not unlock a second steer before Prompt 2 responds"
+    );
+
+    // `agy >= 1.5.0` resolves the superseded first prompt with `stopReason: "end_turn"` without
+    // ending or failing the running turn, then streams updates for Prompt 2 (which accepts Prompt 2).
+    peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "steered reply" },
+        }),
+    )
+    .await;
+    steer_receipt
+        .accepted()
+        .await
+        .expect("steer accepted once Prompt 2 produced its first update");
+
+    peer.reply(&second_prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+
+    let remaining = events_until(&runtime, "turn.completed").await;
+    assert_eq!(
+        types(&remaining),
+        ["content.delta", "turn.completed"],
+        "first prompt end_turn must not emit a premature turn.completed: {remaining:?}"
+    );
+    assert_eq!(remaining[0].1["delta"], "steered reply");
+    assert_eq!(remaining[1].1["state"], "completed");
+    assert!(
+        peer.silent().await,
+        "non-cancelling steer must never emit session/cancel"
+    );
+}
+
+#[tokio::test]
+async fn rejected_steer_preserves_running_or_settled_prompt_one() {
+    // Case A: Prompt 2 is rejected while Prompt 1 is still running -> Prompt 1 keeps running and
+    // completes cleanly without premature failure.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "working" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("rejected steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+        peer.fail(&second_prompt, -32602, "steer unsupported").await;
+        assert!(
+            steer_receipt.accepted().await.is_err(),
+            "rejected steer must fail acceptance so delivery requeues it"
+        );
+
+        // Prompt 1 is still running and finishes cleanly.
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "still running" },
+            }),
+        )
+        .await;
+        peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+        let remaining = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&remaining), ["content.delta", "turn.completed"]);
+        assert_eq!(remaining[0].1["delta"], "still running");
+        assert_eq!(remaining[1].1["state"], "completed");
+    }
+
+    // Case B: Prompt 1 finishes with `end_turn` BEFORE Prompt 2 is rejected -> Prompt 2 must NOT
+    // be accepted, and Prompt 1's deferred `turn.completed` must settle once cleanly.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "working" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("late rejected steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+        peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+        peer.fail(&second_prompt, -32602, "steer rejected").await;
+        assert!(
+            steer_receipt.accepted().await.is_err(),
+            "Prompt 1 ending must never acknowledge a rejected Prompt 2"
+        );
+        let remaining = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&remaining), ["turn.completed"]);
+        assert_eq!(remaining[0].1["state"], "completed");
+    }
+}
+
+#[tokio::test]
+async fn steer_refuses_while_permission_pending_or_on_older_cli_version() {
+    let (runtime, mut peer) = started("full-access", "auto").await;
+    let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+    let turn_id = first_receipt.turn_id.clone();
+
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "working" },
+        }),
+    )
+    .await;
+    let _ = events_until(&runtime, "content.delta").await;
+    first_receipt.accepted().await.expect("first turn accepted");
+
+    // Open a permission request: steer must be refused while any approval is pending.
+    peer.permission(allow_or_deny()).await;
+    let request_id = opened_request_id(&runtime).await;
+    let blocked = runtime
+        .steer_turn(Some("cannot steer during approval"), Vec::new(), &turn_id)
+        .await
+        .expect_err("steer must refuse while permission is pending");
+    assert!(matches!(
+        blocked,
+        AntigravityRuntimeError::SteerUnavailable { .. }
+    ));
+    assert!(peer.silent().await);
+
+    // Resolve the approval, then downgrade the recorded CLI version below 1.5.0: steer must refuse.
+    runtime
+        .respond_to_request(&request_id, "accept")
+        .await
+        .expect("approve");
+    let _ = peer.next().await;
+
+    for unsupported_version in [Some((1, 4, 9)), Some((1, 4, 99)), None] {
+        runtime
+            .set_agent_version_for_test(unsupported_version)
+            .await;
+        let refused = runtime
+            .steer_turn(Some("old cli steer"), Vec::new(), &turn_id)
+            .await
+            .expect_err("steer on agy < 1.5.0 or unknown version must be refused");
+        assert!(
+            matches!(refused, AntigravityRuntimeError::SteerUnavailable { .. }),
+            "{unsupported_version:?}: {refused:?}"
+        );
+        assert!(peer.silent().await);
+    }
+
+    peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    let events = events_until(&runtime, "turn.completed").await;
+    assert_eq!(events.last().unwrap().1["state"], "completed");
+}
+
+#[tokio::test]
+async fn permission_request_from_previous_prompt_does_not_accept_unconfirmed_steer() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+    let turn_id = first_receipt.turn_id.clone();
+
+    peer.update(
+        SESSION,
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "working" },
+        }),
+    )
+    .await;
+    let _ = events_until(&runtime, "content.delta").await;
+    first_receipt.accepted().await.expect("first accepted");
+
+    let steer_receipt = runtime
+        .steer_turn(Some("unconfirmed steer"), Vec::new(), &turn_id)
+        .await
+        .expect("steer written");
+    let second_prompt = peer.expect("session/prompt").await;
+
+    // Prompt 1 has not ended on the wire yet and opens a permission request.
+    peer.permission(allow_or_deny()).await;
+    let request_id = opened_request_id(&runtime).await;
+
+    // The CLI rejects Prompt 2: Prompt 1's approval must NOT have accepted the steer.
+    peer.fail(&second_prompt, -32602, "steer rejected").await;
+    assert!(
+        steer_receipt.accepted().await.is_err(),
+        "an approval opened before Prompt 1 ends must not acknowledge a rejected concurrent steer"
+    );
+
+    // Prompt 1's approval and turn remain alive and finish cleanly.
+    runtime
+        .respond_to_request(&request_id, "accept")
+        .await
+        .expect("approve");
+    let _ = peer.next().await;
+    peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    let remaining = events_until(&runtime, "turn.completed").await;
+    assert_eq!(types(&remaining), ["request.resolved", "turn.completed"]);
+    assert_eq!(remaining.last().unwrap().1["state"], "completed");
+}
+
+fn fixed_clock() -> time::OffsetDateTime {
+    time::OffsetDateTime::parse(
+        "2026-11-27T18:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("fixed UTC clock")
+}
+
+#[test]
+fn quota_chunk_classifier_enforces_allowlist_length_boundary_warning_prefix_and_reset_parsing() {
+    let now = fixed_clock();
+
+    // Every chunk allowlist pattern + reset introducers (Go duration, unit words, retry in, none).
+    let notice = classify_quota_chunk("⚠ Individual quota reached. Resets in 2h30m0s.", now)
+        .expect("Individual quota reached chunk");
+    assert_eq!(notice.resets_at.as_deref(), Some("2026-11-27T20:30:00Z"));
+    assert_eq!(
+        notice.message,
+        "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m)."
+    );
+
+    let notice = classify_quota_chunk(
+        "⚠ You have exhausted your capacity on this model. Your quota will reset after 4 hours, 5 minutes.",
+        now,
+    )
+    .expect("exhausted capacity chunk");
+    assert_eq!(notice.resets_at.as_deref(), Some("2026-11-27T22:05:00Z"));
+    assert_eq!(
+        notice.message,
+        "Antigravity usage limit reached. Resets at 2026-11-27 22:05 UTC (in 4h 5m)."
+    );
+
+    let notice = classify_quota_chunk(
+        "⚠ You have exhausted your quota on this model. Please retry in 45m.",
+        now,
+    )
+    .expect("exhausted quota chunk");
+    assert_eq!(notice.resets_at.as_deref(), Some("2026-11-27T18:45:00Z"));
+    assert_eq!(
+        notice.message,
+        "Antigravity usage limit reached. Resets at 2026-11-27 18:45 UTC (in 45m)."
+    );
+
+    let notice = classify_quota_chunk("⚠ Individual quota reached.", now)
+        .expect("chunk without reset duration");
+    assert_eq!(notice.resets_at, None);
+    assert_eq!(
+        notice.message,
+        "Antigravity usage limit reached. Try again later or switch models."
+    );
+
+    // Single-line `⚠ agent executor error:` chunk matching quota allowlist (and fractional wait rounding up).
+    let notice = classify_quota_chunk(
+        "⚠ agent executor error: Error 429, RESOURCE_EXHAUSTED, retry in 56.5s",
+        now,
+    )
+    .expect("agent executor error quota chunk");
+    assert_eq!(
+        notice.resets_at.as_deref(),
+        Some("2026-11-27T18:00:56.500Z")
+    );
+    assert_eq!(
+        notice.message,
+        "Antigravity usage limit reached. Resets at 2026-11-27 18:00:57 UTC (in 57s)."
+    );
+
+    // Exact 2,048-char boundary matches; 2,049 chars must NOT match.
+    let prefix = "⚠ Individual quota reached. ";
+    let exact_2048 = format!("{prefix}{}", "a".repeat(2_048 - prefix.chars().count()));
+    assert_eq!(exact_2048.chars().count(), 2_048);
+    assert!(classify_quota_chunk(&exact_2048, now).is_some());
+    let over_2049 = format!("{exact_2048}a");
+    assert_eq!(over_2049.chars().count(), 2_049);
+    assert!(classify_quota_chunk(&over_2049, now).is_none());
+
+    // Negative cases: missing leading ⚠, leading space before ⚠, non-anchored prose quoting a
+    // quota phrase, bare 429 executor error, multi-line, disk/EDQUOT quota, ordinary prose.
+    assert!(classify_quota_chunk("Individual quota reached. Resets in 2h30m0s.", now).is_none());
+    assert!(classify_quota_chunk(" ⚠ Individual quota reached. Resets in 2h30m0s.", now).is_none());
+    assert!(
+        classify_quota_chunk(
+            "⚠ If you see \"Individual quota reached\", switch models.",
+            now
+        )
+        .is_none()
+    );
+    assert!(
+        classify_quota_chunk(
+            "⚠ You have exhausted your quota on this modeling exercise.",
+            now
+        )
+        .is_none()
+    );
+    assert!(
+        classify_quota_chunk(
+            "⚠ agent executor error: You have exhausted your quota on this modeling exercise.",
+            now
+        )
+        .is_none()
+    );
+    assert!(
+        classify_quota_chunk("⚠ agent executor error: Error 429, Too Many Requests", now).is_none()
+    );
+    assert!(
+        classify_quota_chunk(
+            "⚠ agent executor error: EDQUOT: quota exceeded for filesystem /tmp",
+            now
+        )
+        .is_none()
+    );
+    assert!(classify_quota_chunk("⚠ Individual quota reached.\nResets in 2h30m0s.", now).is_none());
+    assert!(classify_quota_chunk("⚠ Disk quota exceeded on /var", now).is_none());
+    assert!(classify_quota_chunk("Disk quota exceeded on /var", now).is_none());
+    assert!(
+        classify_quota_chunk(
+            "You can monitor quota usage or individual capacity limits in Cloud Monitoring.",
+            now
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn quota_prompt_error_classifier_matches_allowlist_and_rejects_bare_429_and_disk_quota() {
+    let now = fixed_clock();
+    let remote_for = |method: &str, message: &str| AcpProtocolError::RemoteRequest {
+        method: method.to_owned(),
+        request_id: "req-1".to_owned(),
+        code: -32603,
+        message: message.to_owned(),
+        data: None,
+    };
+    let remote = |message: &str| remote_for("session/prompt", message);
+
+    for phrase in [
+        "Individual quota reached. Resets in 2h30m0s.",
+        "You have exhausted your quota on this model. Retry in 45m.",
+        "You have exhausted your capacity on this model. Your quota will reset after 4 hours, 5 minutes.",
+        "⚠ agent executor error: Cloud Code Assist Error 429: RESOURCE_EXHAUSTED (resets in 15m)",
+        "You exceeded your current quota, please check your plan.",
+        "Quota exceeded for metric generativelanguage.googleapis.com/generate_content",
+        "Usage limit reached. Retry in 30m.",
+    ] {
+        let classified = classify_with_clock(remote(phrase), now);
+        assert!(
+            matches!(
+                classified,
+                AntigravityRuntimeError::UsageLimitReached { .. }
+            ),
+            "expected UsageLimitReached for {phrase:?}, got {classified:?}"
+        );
+    }
+
+    // Identical RESOURCE_EXHAUSTED text on a non-prompt control method must NOT classify as
+    // UsageLimitReached, preserving ModeUnavailable / protocol refusal handling.
+    let mode_write_error = classify_with_clock(
+        remote_for(
+            "session/set_config_option",
+            "Error 429: RESOURCE_EXHAUSTED retry in 56.5s",
+        ),
+        now,
+    );
+    assert!(
+        matches!(
+            mode_write_error,
+            AntigravityRuntimeError::Protocol(AcpProtocolError::RemoteRequest { .. })
+        ),
+        "non-prompt control errors must not classify as UsageLimitReached: {mode_write_error:?}"
+    );
+
+    // Fractional wait seconds preserve exact milliseconds in resetsAt and round display up,
+    // including when `now` itself carries sub-second milliseconds.
+    match classify_with_clock(remote("Error 429: RESOURCE_EXHAUSTED, retry in 56.5s"), now) {
+        AntigravityRuntimeError::UsageLimitReached { message, resets_at } => {
+            assert_eq!(resets_at.as_deref(), Some("2026-11-27T18:00:56.500Z"));
+            assert_eq!(
+                message,
+                "Antigravity usage limit reached. Resets at 2026-11-27 18:00:57 UTC (in 57s)."
+            );
+        }
+        other => panic!("expected UsageLimitReached, got {other:?}"),
+    }
+    let fractional_now = time::OffsetDateTime::parse(
+        "2026-11-27T18:00:00.750Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("fractional UTC clock");
+    match classify_with_clock(
+        remote("Error 429: RESOURCE_EXHAUSTED, retry in 56.5s"),
+        fractional_now,
+    ) {
+        AntigravityRuntimeError::UsageLimitReached { message, resets_at } => {
+            assert_eq!(resets_at.as_deref(), Some("2026-11-27T18:00:57.250Z"));
+            assert_eq!(
+                message,
+                "Antigravity usage limit reached. Resets at 2026-11-27 18:00:58 UTC (in 57s)."
+            );
+        }
+        other => panic!("expected UsageLimitReached, got {other:?}"),
+    }
+
+    // Structured `data.code: "EDQUOT"` must also be excluded even when `message` exceeds 8 KiB.
+    let large_message = format!("RESOURCE_EXHAUSTED {}", "x".repeat(9 * 1024));
+    for message in ["RESOURCE_EXHAUSTED".to_owned(), large_message] {
+        let structured_edquot = AcpProtocolError::RemoteRequest {
+            method: "session/prompt".to_owned(),
+            request_id: "req-edquot".to_owned(),
+            code: -32603,
+            message,
+            data: Some(json!({ "code": "EDQUOT" })),
+        };
+        assert!(
+            !matches!(
+                classify_with_clock(structured_edquot, now),
+                AntigravityRuntimeError::UsageLimitReached { .. }
+            ),
+            "structured EDQUOT error must not classify as account UsageLimitReached"
+        );
+    }
+
+    // Bare HTTP 429 without an explicit quota phrase and filesystem quota errors (including
+    // EDQUOT) must NOT match.
+    for non_quota in [
+        "HTTP 429 Too Many Requests",
+        "Error 429 from upstream proxy",
+        "Disk quota exceeded on /var",
+        "Disk quota exceeded for /var/log (RESOURCE_EXHAUSTED)",
+        "EDQUOT: quota exceeded for filesystem /tmp",
+        "quota exceeded for file system /home",
+        "No space left on device: quota exceeded for /var",
+        "Unexpected internal server error",
+    ] {
+        let classified = classify_with_clock(remote(non_quota), now);
+        assert!(
+            !matches!(
+                classified,
+                AntigravityRuntimeError::UsageLimitReached { .. }
+            ),
+            "must NOT classify {non_quota:?} as UsageLimitReached: {classified:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quota_chunk_publishes_immediately_deduplicates_with_completion_and_survives_cancel_grace()
+{
+    // Case 1: quota chunk publishes runtime.warning immediately before prompt reply, suppresses
+    // content.delta, settles with ONE turn.completed usage_limit, and preserves usage_update.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "usage_update",
+                "used": 12_345,
+                "size": 200_000,
+            }),
+        )
+        .await;
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 2h30m0s."
+                },
+            }),
+        )
+        .await;
+
+        // Even before session/prompt replies, the usage-limit notice is already published!
+        let before_reply = events_until(&runtime, "runtime.warning").await;
+        assert_eq!(
+            types(&before_reply),
+            [
+                "turn.started",
+                "thread.token-usage.updated",
+                "runtime.warning"
+            ]
+        );
+        assert_eq!(before_reply[1].1["usage"]["usedTokens"], 12_345);
+        assert_eq!(before_reply[1].1["usage"]["maxTokens"], 200_000);
+        assert_eq!(before_reply[2].1["usageLimit"], true);
+        assert_eq!(before_reply[2].1["resetsAt"], "2026-11-27T20:30:00Z");
+        assert_eq!(
+            before_reply[2].1["message"],
+            "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m)."
+        );
+
+        peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+
+        let err = receipt
+            .completion()
+            .await
+            .expect_err("quota chunk settles turn as UsageLimitReached");
+        assert!(matches!(
+            err,
+            AntigravityRuntimeError::UsageLimitReached {
+                resets_at: Some(ref at),
+                ..
+            } if at == "2026-11-27T20:30:00Z"
+        ));
+
+        let after_reply = events_until(&runtime, "turn.completed").await;
+        assert_eq!(
+            types(&after_reply),
+            ["turn.completed"],
+            "no duplicate runtime.warning when prompt reply adds no new reset time"
+        );
+        let completed = &after_reply[0].1;
+        assert_eq!(completed["state"], "failed");
+        assert_eq!(completed["stopReason"], "usage_limit");
+        assert_eq!(completed["errorClass"], "provider_error");
+        assert_eq!(completed["errorReason"], "usage_limit");
+        assert_eq!(completed["resetsAt"], "2026-11-27T20:30:00Z");
+    }
+
+    // Case 2: chunk without reset time followed by prompt error WITH reset time upgrades via
+    // runtime.warning and emits ONE turn.completed usage_limit.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ agent executor error: Error 429, RESOURCE_EXHAUSTED"
+                },
+            }),
+        )
+        .await;
+        let initial = events_until(&runtime, "runtime.warning").await;
+        assert_eq!(types(&initial), ["turn.started", "runtime.warning"]);
+        assert_eq!(initial[1].1["usageLimit"], true);
+        assert!(initial[1].1.get("resetsAt").is_none());
+
+        peer.fail(&prompt, -32603, "RESOURCE_EXHAUSTED: retry in 56.5s")
+            .await;
+
+        let err = receipt
+            .completion()
+            .await
+            .expect_err("quota chunk + prompt error fails once");
+        assert_eq!(err.reason(), "usage_limit");
+
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["runtime.warning", "turn.completed"]);
+        assert_eq!(events[0].1["usageLimit"], true);
+        assert_eq!(events[0].1["resetsAt"], "2026-11-27T18:00:56.500Z");
+        assert_eq!(
+            events[0].1["message"],
+            "Antigravity usage limit reached. Resets at 2026-11-27 18:00:57 UTC (in 57s)."
+        );
+        assert_eq!(events[1].1["stopReason"], "usage_limit");
+        assert_eq!(events[1].1["resetsAt"], "2026-11-27T18:00:56.500Z");
+    }
+
+    // Case 3: CLI hangs after emitting a quota chunk and user presses Stop (cancel grace expires):
+    // the usage-limit notice ALREADY reached chat immediately on chunk arrival.
+    {
+        let mut opts = options("full-access");
+        opts.cancel_grace = Duration::from_millis(30);
+        let (runtime, mut peer) = started_with(opts, "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (receipt, _prompt) = begin_turn(&runtime, &mut peer).await;
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 45m."
+                },
+            }),
+        )
+        .await;
+        let warning_events = events_until(&runtime, "runtime.warning").await;
+        assert_eq!(types(&warning_events), ["turn.started", "runtime.warning"]);
+        assert_eq!(warning_events[1].1["usageLimit"], true);
+
+        runtime
+            .interrupt_turn(Some(&receipt.turn_id))
+            .await
+            .expect("interrupt_turn");
+        let _ = peer.expect("session/cancel").await;
+        let cancelled = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&cancelled), ["turn.completed"]);
+        assert_eq!(cancelled[0].1["state"], "cancelled");
+    }
+
+    // Case 4: ordinary prose & non-anchored ⚠ text stream normally as content.delta.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ If you see \"Individual quota reached\", switch models."
+                },
+            }),
+        )
+        .await;
+        peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+
+        receipt
+            .completion()
+            .await
+            .expect("normal prose completes normally");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(
+            types(&events),
+            ["turn.started", "content.delta", "turn.completed"]
+        );
+        assert_eq!(
+            events[1].1["delta"],
+            "⚠ If you see \"Individual quota reached\", switch models."
+        );
+        assert_eq!(events[2].1["state"], "completed");
+    }
+}
+
+#[tokio::test]
+async fn superseded_prompt_quota_chunk_does_not_fail_healthy_steer_but_restores_on_steer_rejection()
+{
+    // Subcase A: Prompt 1 emits a quota chunk while Prompt 2 steer is in flight; Prompt 2 streams
+    // normally and finishes with end_turn -> turn completes cleanly as `completed` without any
+    // usage-limit warning or failure.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "initial reply" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("steer prompt"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+
+        // Prompt 1 emits a quota chunk BEFORE its wire reply, then ends.
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 2h30m0s."
+                },
+            }),
+        )
+        .await;
+        peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+
+        // Prompt 2 streams normally and completes cleanly.
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "steered answer" },
+            }),
+        )
+        .await;
+        peer.reply(&second_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+
+        steer_receipt
+            .completion()
+            .await
+            .expect("healthy steer must succeed");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["content.delta", "turn.completed"]);
+        assert_eq!(events[0].1["delta"], "steered answer");
+        assert_eq!(events[1].1["state"], "completed");
+    }
+
+    // Subcase B: Prompt 1 emits a quota chunk while Prompt 2 steer is in flight, then Prompt 2 is
+    // rejected -> Prompt 1's quota notice is restored and published!
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "initial reply" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("rejected steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+
+        // Prompt 1 emits a quota chunk while Prompt 2 is in flight.
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 45m."
+                },
+            }),
+        )
+        .await;
+        // Prompt 2 is rejected: Prompt 1 regains ownership and publishes its notice.
+        peer.fail(&second_prompt, -32602, "steer rejected").await;
+        assert!(steer_receipt.accepted().await.is_err());
+
+        let restored_warning = events_until(&runtime, "runtime.warning").await;
+        assert_eq!(types(&restored_warning), ["runtime.warning"]);
+        assert_eq!(restored_warning[0].1["usageLimit"], true);
+        assert_eq!(restored_warning[0].1["resetsAt"], "2026-11-27T18:45:00Z");
+
+        peer.reply(&first_prompt, json!({ "stopReason": "end_turn" }))
+            .await;
+        let completion_events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&completion_events), ["turn.completed"]);
+        assert_eq!(completion_events[0].1["state"], "failed");
+        assert_eq!(completion_events[0].1["stopReason"], "usage_limit");
+    }
+}
+
+#[tokio::test]
+async fn set_config_option_resource_exhausted_stays_mode_unavailable_not_usage_limit() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.set_runtime_mode("full-access").await }
+    });
+    let write = peer.expect("session/set_config_option").await;
+    peer.fail(&write, -32603, "Error 429: RESOURCE_EXHAUSTED")
+        .await;
+    let error = task
+        .await
+        .expect("task joined")
+        .expect_err("mode write must fail");
+    assert!(
+        matches!(error, AntigravityRuntimeError::ModeUnavailable { ref mode } if mode == "auto"),
+        "mode write RESOURCE_EXHAUSTED must stay ModeUnavailable, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_quota_error_after_update_publishes_warning_and_pre_update_classifies_once() {
+    // Subcase A: ordinary usage_update accepts delivery, then session/prompt returns
+    // RESOURCE_EXHAUSTED -> runtime emits runtime.warning so turn history keeps the notice.
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "usage_update",
+                "used": 1_000,
+                "size": 100_000,
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "thread.token-usage.updated").await;
+        peer.fail(&prompt, -32603, "RESOURCE_EXHAUSTED: retry in 45m")
+            .await;
+
+        let err = receipt
+            .completion()
+            .await
+            .expect_err("prompt quota error fails turn");
+        assert_eq!(err.reason(), "usage_limit");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["runtime.warning", "turn.completed"]);
+        assert_eq!(events[0].1["usageLimit"], true);
+        assert_eq!(events[0].1["resetsAt"], "2026-11-27T18:45:00Z");
+        assert_eq!(events[1].1["stopReason"], "usage_limit");
+    }
+
+    // Subcase B: pre-update quota rejection classifies ONCE even if the clock advances on every
+    // read, so receipt.accepted() and turn.completed carry the exact same message.
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        let tick = Arc::new(AtomicU64::new(0));
+        let tick_for_clock = Arc::clone(&tick);
+        runtime.set_clock_for_test(move || {
+            let secs = tick_for_clock.fetch_add(1, Ordering::SeqCst) as i64;
+            fixed_clock() + time::Duration::seconds(secs)
+        });
+        let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+        peer.fail(&prompt, -32603, "RESOURCE_EXHAUSTED: retry in 45m")
+            .await;
+
+        let accepted_err = receipt
+            .accepted()
+            .await
+            .expect_err("pre-update quota error rejects delivery");
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["turn.started", "turn.completed"]);
+        assert_eq!(
+            events[1].1["errorMessage"],
+            accepted_err.to_string(),
+            "delivery rejection and turn.completed must share one classification timestamp"
+        );
+    }
+
+    // Subcase C: Prompt 1 emits quota chunk during steer, both prompts hang, and cancel-grace
+    // expires -> unpublished Prompt 1 quota notice is published before turn.completed(cancelled).
+    {
+        let mut opts = options("full-access");
+        opts.cancel_grace = Duration::from_millis(30);
+        let (runtime, mut peer) = started_with(opts, "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (first_receipt, _first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "initial reply" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let _steer_receipt = runtime
+            .steer_turn(Some("hanging steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let _second_prompt = peer.expect("session/prompt").await;
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 45m."
+                },
+            }),
+        )
+        .await;
+        // Wait for the reader task to process Prompt 1's quota chunk before the user presses Stop.
+        let _ = runtime.inner.connection.barrier().await;
+        runtime
+            .interrupt_turn(Some(&turn_id))
+            .await
+            .expect("interrupt_turn");
+        let _ = peer.expect("session/cancel").await;
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["runtime.warning", "turn.completed"]);
+        assert_eq!(events[0].1["usageLimit"], true);
+        assert_eq!(events[0].1["resetsAt"], "2026-11-27T18:45:00Z");
+        assert_eq!(events[1].1["state"], "cancelled");
+    }
+
+    // Subcase D: Prompt 1 emits quota chunk and returns `cancelled`, then steer is rejected ->
+    // rejected-steer settlement still publishes the quota warning before turn.completed(cancelled).
+    {
+        let (runtime, mut peer) = started("full-access", "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "initial reply" },
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "content.delta").await;
+        first_receipt.accepted().await.expect("first accepted");
+
+        let steer_receipt = runtime
+            .steer_turn(Some("rejected steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let second_prompt = peer.expect("session/prompt").await;
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "⚠ Individual quota reached. Resets in 45m."
+                },
+            }),
+        )
+        .await;
+        peer.reply(&first_prompt, json!({ "stopReason": "cancelled" }))
+            .await;
+        let _ = runtime.inner.connection.barrier().await;
+        peer.fail(&second_prompt, -32602, "steer rejected").await;
+        assert!(steer_receipt.accepted().await.is_err());
+
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["runtime.warning", "turn.completed"]);
+        assert_eq!(events[0].1["usageLimit"], true);
+        assert_eq!(events[0].1["resetsAt"], "2026-11-27T18:45:00Z");
+        assert_eq!(events[1].1["state"], "cancelled");
+    }
+
+    // Subcase E: Accepted Prompt 1 fails with a prompt-only quota error (no chunk) while steer is
+    // pending, then cancel-grace expires -> settled quota error is published via runtime.warning.
+    {
+        let mut opts = options("full-access");
+        opts.cancel_grace = Duration::from_millis(30);
+        let (runtime, mut peer) = started_with(opts, "auto").await;
+        runtime.set_clock_for_test(fixed_clock);
+        let (first_receipt, first_prompt) = begin_turn(&runtime, &mut peer).await;
+        let turn_id = first_receipt.turn_id.clone();
+
+        peer.update(
+            SESSION,
+            json!({
+                "sessionUpdate": "usage_update",
+                "used": 1_000,
+                "size": 100_000,
+            }),
+        )
+        .await;
+        let _ = events_until(&runtime, "thread.token-usage.updated").await;
+        first_receipt
+            .accepted
+            .await
+            .expect("accepted channel")
+            .expect("first accepted");
+
+        let _steer_receipt = runtime
+            .steer_turn(Some("hanging steer"), Vec::new(), &turn_id)
+            .await
+            .expect("steer written");
+        let _second_prompt = peer.expect("session/prompt").await;
+
+        peer.fail(&first_prompt, -32603, "RESOURCE_EXHAUSTED: retry in 45m")
+            .await;
+        let _ = first_receipt.completion.await;
+        runtime
+            .interrupt_turn(Some(&turn_id))
+            .await
+            .expect("interrupt_turn");
+        let _ = peer.expect("session/cancel").await;
+        let events = events_until(&runtime, "turn.completed").await;
+        assert_eq!(types(&events), ["runtime.warning", "turn.completed"]);
+        assert_eq!(events[0].1["usageLimit"], true);
+        assert_eq!(events[0].1["resetsAt"], "2026-11-27T18:45:00Z");
+        assert_eq!(events[1].1["state"], "cancelled");
+    }
+}
+
+#[tokio::test]
+async fn elicitation_form_mode_normalizes_schema_maps_dispositions_and_enforces_guards() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+    let turn_id = receipt.turn_id.clone();
+
+    // 1. Multi-field form: titled single-select oneOf, multi-select items.anyOf, boolean, integer, freeform string.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-1",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Configure deployment",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "title": "Target",
+                        "description": "Where should this deploy?",
+                        "oneOf": [
+                            { "const": "staging_eu", "title": "Staging (Recommended)", "description": "Safe pre-prod" },
+                            { "const": "prod_us", "title": "Production", "description": "Live traffic" }
+                        ]
+                    },
+                    "checks": {
+                        "type": "array",
+                        "title": "Checks",
+                        "description": "Which checks should run?",
+                        "items": {
+                            "anyOf": [
+                                { "const": "lint", "title": "Lint" },
+                                { "const": "e2e", "title": "End-to-end" }
+                            ]
+                        }
+                    },
+                    "dryRun": {
+                        "type": "boolean",
+                        "title": "Dry run",
+                        "description": "Preview without applying?"
+                    },
+                    "retries": {
+                        "type": "integer",
+                        "title": "Retries",
+                        "description": "How many retries?"
+                    },
+                    "notes": {
+                        "type": "string",
+                        "title": "Notes",
+                        "description": "Optional release note"
+                    }
+                },
+                "required": ["target"]
+            }
+        }
+    }))
+    .await;
+
+    let requested = loop {
+        let event = next_event(&runtime).await;
+        if event.event_type == "user-input.requested" {
+            break event;
+        }
+    };
+    assert_eq!(requested.event_type, "user-input.requested");
+    let request_id = requested
+        .request_id
+        .clone()
+        .expect("elicitation request id");
+    let questions = requested.payload["questions"]
+        .as_array()
+        .expect("questions array");
+    assert_eq!(questions.len(), 5);
+    let target_q = questions.iter().find(|q| q["id"] == "target").unwrap();
+    assert_eq!(target_q["question"], "Where should this deploy?");
+    assert_eq!(target_q["multiSelect"], false);
+    assert_eq!(target_q["options"][0]["label"], "Staging (Recommended)");
+    let checks_q = questions.iter().find(|q| q["id"] == "checks").unwrap();
+    assert_eq!(checks_q["multiSelect"], true);
+    assert_eq!(checks_q["options"].as_array().unwrap().len(), 2);
+    let dry_run_q = questions.iter().find(|q| q["id"] == "dryRun").unwrap();
+    assert_eq!(dry_run_q["options"][0]["label"], "Yes");
+    assert_eq!(dry_run_q["options"][0]["description"], "True");
+    assert_eq!(dry_run_q["options"][1]["label"], "No");
+    assert_eq!(dry_run_q["options"][1]["description"], "False");
+
+    // Partial Skipped missing required field `target` is rejected and keeps the elicitation open.
+    let missing_required = runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "notes": "Only optional field" }),
+            crate::provider::UserInputResponseDisposition::Skipped,
+        )
+        .await
+        .expect_err("partial skip without required field must fail validation");
+    assert_eq!(missing_required.reason(), "invalid_user_input_answer");
+
+    // Out-of-schema custom text on a constrained enum field is rejected and keeps the form open.
+    let invalid_enum = runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "target": "not-an-option" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect_err("out-of-schema enum choice must fail validation");
+    assert_eq!(invalid_enum.reason(), "invalid_user_input_answer");
+
+    // Permission endpoint must not cross-wire onto a pending elicitation.
+    let wrong_kind = runtime
+        .respond_to_request(&request_id, "accept")
+        .await
+        .expect_err("respond_to_request must reject elicitation id");
+    assert!(matches!(
+        wrong_kind,
+        AntigravityRuntimeError::PendingRequestNotFound { .. }
+    ));
+
+    // Duplicate wire_id is refused with -32600 while the first elicitation stays pending.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-1",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Duplicate",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "x": { "type": "string" } }
+            }
+        }
+    }))
+    .await;
+    let dup_reply = peer.next().await;
+    assert_eq!(dup_reply["id"], "elicit-1");
+    assert_eq!(dup_reply["error"]["code"], -32600);
+
+    // Non-numeric integer input returns validation error and keeps the elicitation retryable.
+    let bad_int = runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "retries": "not-a-number" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect_err("invalid integer must fail validation");
+    assert_eq!(bad_int.reason(), "invalid_user_input_answer");
+
+    // Valid answer coerces labels back to const values and primitive types.
+    runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({
+                "target": "Staging (Recommended)",
+                "checks": ["Lint", "End-to-end"],
+                "dryRun": "Yes",
+                "retries": "3",
+                "notes": "Ship tonight"
+            }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("accept elicitation");
+    let wire_accept = peer.next().await;
+    assert_eq!(wire_accept["id"], "elicit-1");
+    assert_eq!(wire_accept["result"]["action"], "accept");
+    assert_eq!(
+        wire_accept["result"]["content"],
+        json!({
+            "target": "staging_eu",
+            "checks": ["lint", "e2e"],
+            "dryRun": true,
+            "retries": 3,
+            "notes": "Ship tonight"
+        })
+    );
+    let resolved = next_event(&runtime).await;
+    assert_eq!(resolved.event_type, "user-input.resolved");
+    assert_eq!(resolved.payload["disposition"], "answered");
+    assert_eq!(
+        resolved.payload["questions"].as_array().map(Vec::len),
+        Some(5)
+    );
+
+    // 2. Skip-all sends action "decline" and emits disposition "skipped".
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-2",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Pick a color",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "color": { "type": "string", "enum": ["red", "blue"] }
+                }
+            }
+        }
+    }))
+    .await;
+    let req2 = next_event(&runtime).await;
+    let req2_id = req2.request_id.expect("req2 id");
+    assert_eq!(req2.payload["questions"][0]["question"], "Pick a color");
+    runtime
+        .respond_to_user_input_with_disposition(
+            &req2_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Skipped,
+        )
+        .await
+        .expect("skip elicitation");
+    let wire_decline = peer.next().await;
+    assert_eq!(wire_decline["id"], "elicit-2");
+    assert_eq!(wire_decline["result"], json!({ "action": "decline" }));
+    let res2 = next_event(&runtime).await;
+    assert_eq!(res2.event_type, "user-input.resolved");
+    assert_eq!(res2.payload["disposition"], "skipped");
+
+    // 3. Cancel sends action "cancel" and emits disposition "cancelled".
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-3",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Confirm branch",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "branch": { "type": "string" }
+                }
+            }
+        }
+    }))
+    .await;
+    let req3 = next_event(&runtime).await;
+    let req3_id = req3.request_id.expect("req3 id");
+    runtime
+        .respond_to_user_input_with_disposition(
+            &req3_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Cancelled,
+        )
+        .await
+        .expect("cancel elicitation");
+    let wire_cancel = peer.next().await;
+    assert_eq!(wire_cancel["id"], "elicit-3");
+    assert_eq!(wire_cancel["result"], json!({ "action": "cancel" }));
+    let res3 = next_event(&runtime).await;
+    assert_eq!(res3.event_type, "user-input.resolved");
+    assert_eq!(res3.payload["disposition"], "cancelled");
+
+    // 4. Unsupported/missing/malformed modes ("url", omitted, null, numeric) are rejected with -32602.
+    for (bad_id, bad_params) in [
+        (
+            "elicit-url",
+            json!({
+                "sessionId": SESSION,
+                "mode": "url",
+                "message": "Open browser",
+                "url": "https://example.test/auth"
+            }),
+        ),
+        (
+            "elicit-missing-mode",
+            json!({
+                "sessionId": SESSION,
+                "message": "Missing mode",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": { "x": { "type": "string" } }
+                }
+            }),
+        ),
+        (
+            "elicit-numeric-mode",
+            json!({
+                "sessionId": SESSION,
+                "mode": 42,
+                "message": "Numeric mode",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": { "x": { "type": "string" } }
+                }
+            }),
+        ),
+    ] {
+        peer.send(json!({
+            "jsonrpc": "2.0",
+            "id": bad_id,
+            "method": "elicitation/create",
+            "params": bad_params
+        }))
+        .await;
+        let mode_err = peer.next().await;
+        assert_eq!(mode_err["id"], bad_id);
+        assert_eq!(mode_err["error"]["code"], -32602);
+    }
+
+    // 5. Secret/password field is auto-declined with runtime.warning.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-secret",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Enter token",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "apiKey": { "type": "string", "format": "password" }
+                }
+            }
+        }
+    }))
+    .await;
+    let secret_reply = peer.next().await;
+    assert_eq!(secret_reply["id"], "elicit-secret");
+    assert_eq!(secret_reply["result"], json!({ "action": "decline" }));
+    let warning = next_event(&runtime).await;
+    assert_eq!(warning.event_type, "runtime.warning");
+
+    // 6. Interrupting the turn while an elicitation is pending answers "cancel" and emits user-input.expired.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-open",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Pending during cancel",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "choice": { "type": "string" } }
+            }
+        }
+    }))
+    .await;
+    let req_open = next_event(&runtime).await;
+    let req_open_id = req_open.request_id.expect("open id");
+    runtime
+        .interrupt_turn(Some(&turn_id))
+        .await
+        .expect("interrupt");
+    let cancel_msg = peer.next().await;
+    assert_eq!(cancel_msg["id"], "elicit-open");
+    assert_eq!(cancel_msg["result"], json!({ "action": "cancel" }));
+    let _ = peer.expect("session/cancel").await;
+    let expired = next_event(&runtime).await;
+    assert_eq!(expired.event_type, "user-input.expired");
+    assert_eq!(expired.request_id.as_deref(), Some(req_open_id.as_str()));
+
+    peer.reply(&prompt, json!({ "stopReason": "cancelled" }))
+        .await;
+    let _ = receipt.completion.await;
+}
+
+#[tokio::test]
+async fn elicitation_form_auto_declines_during_autonomous_code_review() {
+    let mut opts = options("full-access");
+    opts.code_review = true;
+    let (runtime, mut peer) = started_with(opts, "auto").await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-review",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Should I skip tests?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "skip": { "type": "boolean" } }
+            }
+        }
+    }))
+    .await;
+    let reply = peer.next().await;
+    assert_eq!(reply["id"], "elicit-review");
+    assert_eq!(reply["result"], json!({ "action": "decline" }));
+    assert!(runtime.pending_request_ids().await.is_empty());
+
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    receipt.completion.await.expect("receipt").expect("turn ok");
+}
+
+#[tokio::test]
+async fn elicitation_disambiguates_duplicate_titles_enforces_bounds_and_cancels_on_turn_end() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+    // Duplicate `oneOf` display titles must disambiguate so choosing the second sends `production`.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-dup-titles",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Choose target",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "env": {
+                        "type": "string",
+                        "title": "Environment",
+                        "oneOf": [
+                            { "const": "staging", "title": "Deploy", "description": "Pre-prod" },
+                            { "const": "production", "title": "Deploy", "description": "Live" }
+                        ]
+                    },
+                    "count": {
+                        "type": "integer",
+                        "title": "Count",
+                        "minimum": 1,
+                        "maximum": 5
+                    }
+                },
+                "required": ["env", "count"]
+            }
+        }
+    }))
+    .await;
+    let requested = loop {
+        let event = next_event(&runtime).await;
+        if event.event_type == "user-input.requested" {
+            break event;
+        }
+    };
+    let request_id = requested.request_id.expect("request id");
+    let questions = requested.payload["questions"].as_array().unwrap();
+    let env_q = questions.iter().find(|q| q["id"] == "env").unwrap();
+    let second_label = env_q["options"][1]["label"].as_str().unwrap().to_owned();
+    assert_ne!(
+        env_q["options"][0]["label"], env_q["options"][1]["label"],
+        "duplicate display titles must be disambiguated"
+    );
+
+    // Out-of-bounds integer fails validation and keeps the elicitation pending.
+    let out_of_bounds = runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "env": second_label, "count": "9" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect_err("count above maximum must fail validation");
+    assert_eq!(out_of_bounds.reason(), "invalid_user_input_answer");
+
+    // Valid answer sends `production` (second choice) and `3`.
+    runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({ "env": second_label, "count": "3" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("valid answer succeeds");
+    let accept = peer.next().await;
+    assert_eq!(accept["id"], "elicit-dup-titles");
+    assert_eq!(
+        accept["result"],
+        json!({ "action": "accept", "content": { "env": "production", "count": 3 } })
+    );
+    let _ = next_event(&runtime).await;
+
+    // Prompt completion on a live connection sends `action: "cancel"` for any outstanding form.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-end-turn",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Still open when turn ends",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        }
+    }))
+    .await;
+    let open = next_event(&runtime).await;
+    assert_eq!(open.event_type, "user-input.requested");
+    let open_id = open.request_id.expect("open id");
+
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    let cancel_on_end = peer.next().await;
+    assert_eq!(cancel_on_end["id"], "elicit-end-turn");
+    assert_eq!(cancel_on_end["result"], json!({ "action": "cancel" }));
+
+    let expired = next_event(&runtime).await;
+    assert_eq!(expired.event_type, "user-input.expired");
+    assert_eq!(expired.request_id.as_deref(), Some(open_id.as_str()));
+    receipt.completion.await.expect("receipt").expect("turn ok");
+}
+
+#[tokio::test]
+async fn elicitation_folds_companion_other_fields_and_routes_custom_answers() {
+    let (runtime, mut peer) = started("approval-required", "default").await;
+    let (receipt, prompt) = begin_turn(&runtime, &mut peer).await;
+
+    // Exact wire shape emitted by live `agy 1.5.18` for `ask_question`.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-agy-live",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "toolCallId": "call_123",
+            "mode": "form",
+            "message": "The agent has 2 questions.",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "q1": {
+                        "type": "string",
+                        "title": "Which coffee style would you like?",
+                        "oneOf": [
+                            { "const": "1", "title": "(Recommended) Espresso" },
+                            { "const": "2", "title": "Latte" }
+                        ]
+                    },
+                    "q1_other": {
+                        "type": "string",
+                        "title": "Other",
+                        "description": "Optional free-form answer to: Which coffee style would you like?"
+                    },
+                    "q2": {
+                        "type": "array",
+                        "title": "Which toppings would you like?",
+                        "items": {
+                            "anyOf": [
+                                { "const": "1", "title": "Cinnamon" },
+                                { "const": "2", "title": "Cocoa" }
+                            ]
+                        }
+                    },
+                    "q2_other": {
+                        "type": "string",
+                        "title": "Other",
+                        "description": "Optional free-form answer to: Which toppings would you like?"
+                    }
+                }
+            }
+        }
+    }))
+    .await;
+
+    let requested = loop {
+        let event = next_event(&runtime).await;
+        if event.event_type == "user-input.requested" {
+            break event;
+        }
+    };
+    let request_id = requested.request_id.expect("request id");
+    let questions = requested.payload["questions"].as_array().unwrap();
+    assert_eq!(questions.len(), 2, "companion _other fields must be folded");
+    assert_eq!(questions[0]["id"], "q1");
+    assert_eq!(questions[0]["header"], "Question 1");
+    assert_eq!(
+        questions[0]["question"],
+        "Which coffee style would you like?"
+    );
+    assert_eq!(questions[1]["id"], "q2");
+    assert_eq!(questions[1]["multiSelect"], true);
+
+    runtime
+        .respond_to_user_input_with_disposition(
+            &request_id,
+            json!({
+                "q1": "Cold brew with oat milk",
+                "q2": ["Cinnamon", "Cardamom"]
+            }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("custom answers route to companion _other keys");
+
+    let wire = peer.next().await;
+    assert_eq!(wire["id"], "elicit-agy-live");
+    assert_eq!(
+        wire["result"],
+        json!({
+            "action": "accept",
+            "content": {
+                "q1_other": "Cold brew with oat milk",
+                "q2": ["1"],
+                "q2_other": "Cardamom"
+            }
+        })
+    );
+    let resolved = next_event(&runtime).await;
+    assert_eq!(resolved.event_type, "user-input.resolved");
+    assert_eq!(resolved.payload["disposition"], "answered");
+
+    // Password-marked array items are declined as secrets without opening a card.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-secret-array",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Enter tokens",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "tokens": {
+                        "type": "array",
+                        "items": { "type": "string", "format": "password" }
+                    }
+                }
+            }
+        }
+    }))
+    .await;
+    let secret_reply = peer.next().await;
+    assert_eq!(secret_reply["id"], "elicit-secret-array");
+    assert_eq!(secret_reply["result"], json!({ "action": "decline" }));
+    let warning = next_event(&runtime).await;
+    assert_eq!(warning.event_type, "runtime.warning");
+
+    // 64-bit integer maximum bound keeps exact i64 precision beyond 2^53.
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-big-int",
+        "method": "elicitation/create",
+        "params": {
+            "sessionId": SESSION,
+            "mode": "form",
+            "message": "Big number",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "big": {
+                        "type": "integer",
+                        "maximum": 9007199254740992_i64
+                    }
+                },
+                "required": ["big"]
+            }
+        }
+    }))
+    .await;
+    let big_req = next_event(&runtime).await;
+    let big_req_id = big_req.request_id.expect("big req id");
+    let too_big = runtime
+        .respond_to_user_input_with_disposition(
+            &big_req_id,
+            json!({ "big": "9007199254740993" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect_err("9007199254740993 exceeds 9007199254740992");
+    assert_eq!(too_big.reason(), "invalid_user_input_answer");
+    runtime
+        .respond_to_user_input_with_disposition(
+            &big_req_id,
+            json!({ "big": "9007199254740992" }),
+            crate::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("exact max i64 passes");
+    let big_wire = peer.next().await;
+    assert_eq!(big_wire["id"], "elicit-big-int");
+    assert_eq!(
+        big_wire["result"],
+        json!({ "action": "accept", "content": { "big": 9007199254740992_i64 } })
+    );
+    let _ = next_event(&runtime).await;
+
+    peer.reply(&prompt, json!({ "stopReason": "end_turn" }))
+        .await;
+    receipt.completion.await.expect("receipt").expect("turn ok");
 }

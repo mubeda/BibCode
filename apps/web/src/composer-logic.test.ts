@@ -24,6 +24,10 @@ const unsupportedDollarSkillContext = {
 const refactorDollarSkillContext = {
   enabledDollarSkillNames: new Set(["refactor"]),
 };
+const docsSlashSkillContext = {
+  enabledDollarSkillNames: new Set<string>(),
+  enabledSlashSkillNames: new Set(["docs"]),
+};
 
 function detectComposerTrigger(text: string, cursor: number) {
   return detectCapabilityComposerTrigger(text, cursor, allCapabilities);
@@ -267,6 +271,40 @@ describe("expandCollapsedComposerCursor", () => {
     expect(
       expandCollapsedComposerCursor(text, collapsedCursorAfterSkill, refactorDollarSkillContext),
     ).toBe(expandedCursorAfterSkill);
+  });
+
+  it("maps collapsed slash skill cursor to expanded text cursor and keeps non-skill slash commands plain", () => {
+    const skillText = "/docs explain this";
+    const collapsedAfterSkill = 2; // chip (1) + space (1)
+    const expandedAfterSkill = "/docs ".length;
+    const collapsedAtEnd = 1 + " explain this".length;
+
+    expect(
+      expandCollapsedComposerCursor(skillText, collapsedAfterSkill, docsSlashSkillContext),
+    ).toBe(expandedAfterSkill);
+    expect(
+      collapseExpandedComposerCursor(skillText, expandedAfterSkill, docsSlashSkillContext),
+    ).toBe(collapsedAfterSkill);
+    expect(clampCollapsedComposerCursor(skillText, skillText.length, docsSlashSkillContext)).toBe(
+      collapsedAtEnd,
+    );
+    expect(expandCollapsedComposerCursor(skillText, collapsedAtEnd, docsSlashSkillContext)).toBe(
+      skillText.length,
+    );
+    expect(
+      isCollapsedCursorAdjacentToInlineToken(skillText, 1, "left", docsSlashSkillContext),
+    ).toBe(true);
+    expect(
+      isCollapsedCursorAdjacentToInlineToken(skillText, 0, "right", docsSlashSkillContext),
+    ).toBe(true);
+
+    const commandText = "/review explain this";
+    expect(
+      collapseExpandedComposerCursor(commandText, "/review ".length, docsSlashSkillContext),
+    ).toBe("/review ".length);
+    expect(
+      expandCollapsedComposerCursor(commandText, "/review ".length, docsSlashSkillContext),
+    ).toBe("/review ".length);
   });
 
   it("keeps unsupported dollar text in identity cursor space", () => {

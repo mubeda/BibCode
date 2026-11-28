@@ -126,6 +126,10 @@ struct ProviderCapabilities {
     /// snapshot's `supportsContextWindowUsage`, never with the workspace capabilities.
     #[serde(skip)]
     context_window_usage: bool,
+    /// Pre-normalization turn-steer capability computed from the raw CLI version before
+    /// display normalization strips prerelease suffixes (e.g. `1.5.0-rc.1`).
+    #[serde(skip)]
+    supports_turn_steer: Option<bool>,
 }
 
 struct ClaudeProbeMetadata {
@@ -957,6 +961,7 @@ async fn probe_one_snapshot(
         .and_then(|output| version_line(&definition.driver, output));
     // The peer's own text, before any parsing could strip what identifies a stored secret.
     let mut raw_versions = version.iter().cloned().collect::<Vec<_>>();
+    let raw_version_for_capabilities = version.clone();
     let mut version = normalize_provider_version(&definition.driver, version);
     let mut installed = version_output.is_some();
     let mut status = match version_output.as_ref() {
@@ -968,6 +973,10 @@ async fn probe_one_snapshot(
     let mut models = default_models;
     let mut capabilities = ProviderCapabilities {
         slash_commands: built_in_slash_commands(&definition.driver),
+        supports_turn_steer: Some(crate::provider::supports_turn_steer_for_version(
+            &definition.driver,
+            raw_version_for_capabilities.as_deref(),
+        )),
         ..ProviderCapabilities::default()
     };
     let mut message = match version_output.as_ref() {
@@ -2982,13 +2991,16 @@ fn snapshot_owned_message(
     if let Some(message) = message {
         result["message"] = json!(message);
     }
-    if crate::provider::supports_turn_steer(&definition.driver) {
+    if capabilities.supports_turn_steer.unwrap_or_else(|| {
+        crate::provider::supports_turn_steer_for_version(&definition.driver, version.as_deref())
+    }) {
         result["supportsTurnSteer"] = json!(true);
     }
     // Always present: a client reads an absent flag (an older server) as unknown.
     result["supportsConversationRewind"] = json!(crate::provider::supports_conversation_rewind(
         &definition.driver
     ));
+    result["supportsUserInputDisposition"] = json!(true);
     if matches!(definition.driver.as_str(), "codex" | "claudeAgent") {
         result["supportsMcpStatus"] = json!(true);
     }
@@ -5570,6 +5582,60 @@ done
         assert!(cursor.get("supportsTurnSteer").is_none());
         assert!(grok.get("supportsTurnSteer").is_none());
         assert!(opencode.get("supportsTurnSteer").is_none());
+
+        let antigravity_def = definitions
+            .iter()
+            .find(|definition| definition.driver == "antigravity")
+            .expect("built-in antigravity definition");
+        let antigravity_with_version = |version: Option<&str>| {
+            snapshot_owned_message(
+                antigravity_def,
+                true,
+                version.map(str::to_owned),
+                "ready",
+                json!({ "status": "authenticated" }),
+                Vec::new(),
+                ProviderCapabilities::default(),
+                None,
+                "2026-08-01T00:00:00.000Z".to_owned(),
+            )
+        };
+        assert_eq!(
+            antigravity_with_version(Some("1.5.0"))["supportsTurnSteer"],
+            true
+        );
+        assert_eq!(
+            antigravity_with_version(Some("1.5.1-rc.1"))["supportsTurnSteer"],
+            true
+        );
+        assert_eq!(
+            antigravity_with_version(Some("1.5.15"))["supportsTurnSteer"],
+            true
+        );
+        assert_eq!(
+            antigravity_with_version(Some("1.10.0"))["supportsTurnSteer"],
+            true
+        );
+        assert!(
+            antigravity_with_version(Some("1.5.0-rc.1"))
+                .get("supportsTurnSteer")
+                .is_none()
+        );
+        assert!(
+            antigravity_with_version(Some("1.4.9"))
+                .get("supportsTurnSteer")
+                .is_none()
+        );
+        assert!(
+            antigravity_with_version(Some("1.4.99"))
+                .get("supportsTurnSteer")
+                .is_none()
+        );
+        assert!(
+            antigravity_with_version(None)
+                .get("supportsTurnSteer")
+                .is_none()
+        );
         assert_eq!(codex["supportsMcpStatus"], true);
         assert_eq!(claude["supportsMcpStatus"], true);
         assert!(cursor.get("supportsMcpStatus").is_none());
@@ -5625,6 +5691,58 @@ done
             normalize_provider_version("codex", Some("codex-cli 0.144.1".to_owned())),
             Some("0.144.1".to_owned())
         );
+    }
+
+    #[test]
+    fn antigravity_prerelease_does_not_advertise_turn_steer_after_version_normalization() {
+        let definition = definitions(&json!({}))
+            .into_iter()
+            .find(|entry| entry.driver == "antigravity")
+            .expect("antigravity definition");
+        let raw_rc = Some("antigravity 1.5.0-rc.1".to_owned());
+        let normalized_rc = normalize_provider_version("antigravity", raw_rc.clone());
+        assert_eq!(normalized_rc.as_deref(), Some("1.5.0"));
+        let caps_rc = ProviderCapabilities {
+            supports_turn_steer: Some(crate::provider::supports_turn_steer_for_version(
+                "antigravity",
+                raw_rc.as_deref(),
+            )),
+            ..ProviderCapabilities::default()
+        };
+        let snap_rc = snapshot_owned_message(
+            &definition,
+            true,
+            normalized_rc,
+            "ready",
+            json!({ "status": "authenticated" }),
+            Vec::new(),
+            caps_rc,
+            None,
+            "2026-11-28T00:00:00Z".to_owned(),
+        );
+        assert!(snap_rc.get("supportsTurnSteer").is_none());
+        assert_eq!(snap_rc["supportsUserInputDisposition"], json!(true));
+
+        let raw_stable = Some("antigravity 1.5.0".to_owned());
+        let caps_stable = ProviderCapabilities {
+            supports_turn_steer: Some(crate::provider::supports_turn_steer_for_version(
+                "antigravity",
+                raw_stable.as_deref(),
+            )),
+            ..ProviderCapabilities::default()
+        };
+        let snap_stable = snapshot_owned_message(
+            &definition,
+            true,
+            normalize_provider_version("antigravity", raw_stable),
+            "ready",
+            json!({ "status": "authenticated" }),
+            Vec::new(),
+            caps_stable,
+            None,
+            "2026-11-28T00:00:00Z".to_owned(),
+        );
+        assert_eq!(snap_stable["supportsTurnSteer"], json!(true));
     }
 
     #[test]

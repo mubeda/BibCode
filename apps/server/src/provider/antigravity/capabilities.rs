@@ -15,6 +15,11 @@ const PROJECT_SKILL_SUBDIRS: [&str; 4] = [
     "_agent/skills",
 ];
 const USER_GEMINI_SKILLS_SUBDIR: &str = ".gemini/config/skills";
+const USER_AGENTS_SKILLS_SUBDIR: &str = ".agents/skills";
+const USER_GEMINI_PLUGINS_SUBDIR: &str = ".gemini/config/plugins";
+const USER_ANTIGRAVITY_BUILTIN_SKILLS_SUBDIR: &str = ".gemini/antigravity-cli/builtin/skills";
+const MAX_PLUGIN_SCAN_ENTRIES: usize = 1024;
+const MAX_PLUGIN_SKILL_ROOTS: usize = 512;
 
 /// Dependency and build folders hold no skills and can be huge.
 const SKIPPED_FOLDERS: [&str; 6] = [
@@ -88,9 +93,9 @@ pub async fn discover_local_skills_with_environment(
     environment: &[(OsString, OsString)],
 ) -> LocalSkillScanResult {
     let home = configured_home(environment).or_else(dirs::home_dir);
-    let roots = antigravity_skill_roots(workspace, home.as_deref()).await;
-    let mut scan = SkillScan::default();
     let mut result = LocalSkillScanResult::default();
+    let roots = antigravity_skill_roots(workspace, home.as_deref(), &mut result.issues).await;
+    let mut scan = SkillScan::default();
     for (root, scope) in roots {
         if scan.exhausted {
             break;
@@ -222,6 +227,7 @@ fn build_slash_command_json(name: &str, command: &AcpAvailableCommand) -> Value 
 async fn antigravity_skill_roots(
     workspace: &Path,
     home: Option<&Path>,
+    issues: &mut Vec<String>,
 ) -> Vec<(PathBuf, &'static str)> {
     let mut project_directories = vec![workspace];
     // Stay inside the containing repository; outside a repository only scan `workspace` itself.
@@ -243,6 +249,36 @@ async fn antigravity_skill_roots(
         .collect();
     if let Some(home) = home {
         roots.push((home.join(USER_GEMINI_SKILLS_SUBDIR), "user"));
+        roots.push((home.join(USER_AGENTS_SKILLS_SUBDIR), "user"));
+        roots.push((home.join(USER_ANTIGRAVITY_BUILTIN_SKILLS_SUBDIR), "user"));
+        let plugins_root = home.join(USER_GEMINI_PLUGINS_SUBDIR);
+        if let Ok(mut entries) = fs::read_dir(&plugins_root).await {
+            let mut examined = 0_usize;
+            let mut entry_limit_hit = false;
+            let mut plugin_dirs: Vec<PathBuf> = Vec::new();
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if examined >= MAX_PLUGIN_SCAN_ENTRIES {
+                    entry_limit_hit = true;
+                    break;
+                }
+                examined += 1;
+                let path = entry.path();
+                if fs::metadata(&path).await.is_ok_and(|meta| meta.is_dir()) {
+                    plugin_dirs.push(path);
+                }
+            }
+            plugin_dirs.sort();
+            if entry_limit_hit || plugin_dirs.len() > MAX_PLUGIN_SKILL_ROOTS {
+                issues.push(format!(
+                    "Antigravity plugin skill scan truncated at {} (limit: {MAX_PLUGIN_SKILL_ROOTS} plugin directories, {MAX_PLUGIN_SCAN_ENTRIES} entries).",
+                    plugins_root.display()
+                ));
+            }
+            plugin_dirs.truncate(MAX_PLUGIN_SKILL_ROOTS);
+            for plugin_dir in plugin_dirs {
+                roots.push((plugin_dir.join("skills"), "user"));
+            }
+        }
     }
     roots
 }
@@ -1005,5 +1041,72 @@ mod tests {
             literal.description.as_deref(),
             Some("First line\nSecond line")
         );
+    }
+
+    #[tokio::test]
+    async fn discovers_user_agents_plugin_and_builtin_skill_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create .git");
+        let home = temp.path().join("home");
+
+        write_skill(
+            &home.join(".agents/skills/mstack-sharpen-prompt"),
+            "---\nname: mstack-sharpen-prompt\ndescription: Sharpen a prompt\n---\n",
+        );
+        write_skill(
+            &home.join(".gemini/config/plugins/my-plugin/skills/plugin-review"),
+            "---\nname: plugin-review\ndescription: Review from plugin\n---\n",
+        );
+        write_skill(
+            &home.join(".gemini/antigravity-cli/builtin/skills/builtin-helper"),
+            "---\nname: builtin-helper\ndescription: Builtin helper\n---\n",
+        );
+
+        let local = discover_local_skills_with_environment(&repo, &isolated_home_env(&home)).await;
+        assert!(local.issues.is_empty(), "issues: {:?}", local.issues);
+
+        let merged = merge_acp_available_commands(
+            Some(&[
+                AcpAvailableCommand {
+                    name: "mstack-sharpen-prompt".to_owned(),
+                    description: Some("Sharpen prompt".to_owned()),
+                    input_hint: None,
+                },
+                AcpAvailableCommand {
+                    name: "plugin-review".to_owned(),
+                    description: None,
+                    input_hint: None,
+                },
+                AcpAvailableCommand {
+                    name: "builtin-helper".to_owned(),
+                    description: None,
+                    input_hint: None,
+                },
+                AcpAvailableCommand {
+                    name: "compact".to_owned(),
+                    description: Some("Compact context".to_owned()),
+                    input_hint: None,
+                },
+            ]),
+            &local.skills,
+        );
+        let skill_names: Vec<&str> = merged
+            .skills
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert_eq!(
+            skill_names,
+            vec!["mstack-sharpen-prompt", "plugin-review", "builtin-helper"]
+        );
+        assert!(
+            merged
+                .skills
+                .iter()
+                .all(|s| s["invocation"] == "slash" && s["enabled"] == true)
+        );
+        assert_eq!(merged.slash_commands.len(), 1);
+        assert_eq!(merged.slash_commands[0]["name"], "compact");
     }
 }

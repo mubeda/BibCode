@@ -47,7 +47,16 @@ const PullRequestRow = memo(function PullRequestRow({
   providerKind,
   cwd,
   projectRef,
-}: PullRequestRowProps) {
+  onOpenPullRequest,
+}: PullRequestRowProps & {
+  readonly onOpenPullRequest?:
+    | ((target: {
+        readonly number: number;
+        readonly provider: SourceControlProviderKind;
+        readonly cwd: string;
+      }) => void)
+    | undefined;
+}) {
   const url = safeExternalUrl(pullRequest.url);
   return (
     <li className="rounded-md border border-border p-3">
@@ -72,15 +81,31 @@ const PullRequestRow = memo(function PullRequestRow({
             {pullRequest.state}
           </p>
           {projectRef ? (
-            <Link
-              className="mt-1 inline-block text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
-              to="/project/$environmentId/$projectId/pull-requests/$number"
-              params={{ ...projectRef, number: String(pullRequest.number) }}
-              search={{ tab: "conversation" }}
-              onClick={() => usePullRequestsStore.getState().setCheckoutCwd(projectRef, cwd)}
-            >
-              Open in Pull Requests
-            </Link>
+            onOpenPullRequest ? (
+              <button
+                type="button"
+                className="mt-1 inline-block text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
+                onClick={() =>
+                  onOpenPullRequest({
+                    number: pullRequest.number,
+                    provider: providerKind ?? "unknown",
+                    cwd,
+                  })
+                }
+              >
+                Open in Pull Requests
+              </button>
+            ) : (
+              <Link
+                className="mt-1 inline-block text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                to="/project/$environmentId/$projectId/pull-requests/$number"
+                params={{ ...projectRef, number: String(pullRequest.number) }}
+                search={{ tab: "conversation" }}
+                onClick={() => usePullRequestsStore.getState().setCheckoutCwd(projectRef, cwd)}
+              >
+                Open in Pull Requests
+              </Link>
+            )
           ) : null}
         </div>
       </div>
@@ -133,6 +158,13 @@ export interface GitManagerPullRequestPanelProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly disabledReason?: string | null;
   readonly onRefresh: () => void;
+  readonly onOpenPullRequest?:
+    | ((target: {
+        readonly number: number;
+        readonly provider: SourceControlProviderKind;
+        readonly cwd: string;
+      }) => void)
+    | undefined;
 }
 
 export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPanel({
@@ -142,6 +174,7 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
   statusLoaded,
   disabledReason = null,
   onRefresh,
+  onOpenPullRequest,
 }: GitManagerPullRequestPanelProps) {
   const [requested, setRequested] = useState(false);
   const queryAtom = useMemo(
@@ -238,6 +271,7 @@ export const GitManagerPullRequestPanel = memo(function GitManagerPullRequestPan
                 providerKind={providerKind}
                 cwd={scope.cwd}
                 {...(projectRef ? { projectRef } : {})}
+                onOpenPullRequest={onOpenPullRequest}
               />
             ))}
           </ul>

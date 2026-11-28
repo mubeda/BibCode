@@ -112,6 +112,16 @@ struct Replay {
     stall_active: AtomicBool,
     /// Cancelling a form (`DELETE /api/session/{id}/form/{form}`) never answers.
     stall_form_cancel: AtomicBool,
+    /// Set by `DELETE /api/session/{id}/form/{form}` before waking SSE replay so the replayed
+    /// `form.replied` fixture event is rewritten into `form.cancelled`, matching real OpenCode v2.
+    last_form_cancelled: AtomicBool,
+    /// Hold the `204 No Content` reply on `DELETE /form/{id}` until `release_form_cancel_response`
+    /// is notified so tests can deterministically verify SSE-first settlement before HTTP returns.
+    hold_form_cancel_response: AtomicBool,
+    /// Released by the test once SSE `form.cancelled` has been emitted while HTTP 204 is pending.
+    release_form_cancel_response: Notify,
+    /// Notified right after `subscribe()` emits a rewritten `form.cancelled` SSE frame.
+    form_cancelled_sse_sent: Notify,
     /// Forms the root session's form list also holds, as if created while BiBCode was away.
     extra_forms: StdMutex<Vec<Value>>,
     /// How many more permission and form list reads answer HTTP 500.
@@ -458,8 +468,25 @@ async fn subscribe(State(replay): State<Arc<Replay>>) -> Response {
             loop {
                 match steps.pop_front()? {
                     Step::AwaitReply => replay.replied.notified().await,
-                    Step::Send(event) => {
+                    Step::Send(mut event) => {
+                        let mut sent_form_cancelled = false;
+                        if event["type"] == "form.replied"
+                            && replay.last_form_cancelled.swap(false, Ordering::SeqCst)
+                        {
+                            event = json!({
+                                "id": event["id"],
+                                "type": "form.cancelled",
+                                "data": {
+                                    "id": event["data"]["id"],
+                                    "sessionID": event["data"]["sessionID"],
+                                },
+                            });
+                            sent_form_cancelled = true;
+                        }
                         let chunk = format!("data: {event}\n\n");
+                        if sent_form_cancelled {
+                            replay.form_cancelled_sse_sent.notify_one();
+                        }
                         return Some((
                             Ok::<_, std::convert::Infallible>(Bytes::from(chunk)),
                             (replay, steps, false),
@@ -508,6 +535,10 @@ async fn serve(scenario: &'static str) -> (String, Arc<Replay>) {
         answer_asks_after_first_list: AtomicBool::new(false),
         stall_active: AtomicBool::new(false),
         stall_form_cancel: AtomicBool::new(false),
+        last_form_cancelled: AtomicBool::new(false),
+        hold_form_cancel_response: AtomicBool::new(false),
+        release_form_cancel_response: Notify::new(),
+        form_cancelled_sse_sent: Notify::new(),
         extra_forms: StdMutex::new(Vec::new()),
         failing_ask_lists: std::sync::atomic::AtomicUsize::new(0),
         failing_session_tree: std::sync::atomic::AtomicUsize::new(0),
@@ -566,6 +597,14 @@ async fn serve(scenario: &'static str) -> (String, Arc<Replay>) {
                     ));
                     if replay.stall_form_cancel.load(Ordering::SeqCst) {
                         std::future::pending::<()>().await;
+                    }
+                    if replay.fail_next_reply.swap(false, Ordering::SeqCst) {
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                    replay.last_form_cancelled.store(true, Ordering::SeqCst);
+                    replay.replied.notify_one();
+                    if replay.hold_form_cancel_response.load(Ordering::SeqCst) {
+                        replay.release_form_cancel_response.notified().await;
                     }
                     StatusCode::NO_CONTENT
                 },
@@ -2328,5 +2367,150 @@ async fn a_keyless_rewind_record_is_continued_not_restarted() {
         "no further turns are dropped"
     );
     assert!(!runtime.has_unfinished_rewind().await);
+    runtime.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn v2_form_skip_and_cancel_use_session_scoped_delete_and_emit_receipt_metadata() {
+    let (endpoint, replay) = serve("question").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.start().await.expect("starts");
+    runtime
+        .send_turn(Some("ASK_QUESTION please"), Vec::new(), None)
+        .await
+        .expect("prompt is accepted");
+    let requested = wait_for(&runtime, "user-input.requested").await;
+    let form_id = requested.request_id.as_deref().unwrap();
+    runtime
+        .respond_to_user_input_with_disposition(
+            form_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Skipped,
+        )
+        .await
+        .expect("dismiss succeeds");
+    let mut events = until_turns_complete(&runtime, 1).await;
+    events.extend(drain(&runtime).await);
+    let resolved = of_type(&events, "user-input.resolved");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].payload["disposition"], json!("skipped"));
+    assert_eq!(resolved[0].payload["answers"], json!({}));
+    assert!(
+        resolved[0].payload["questions"]
+            .as_array()
+            .is_some_and(|q| !q.is_empty())
+    );
+    let expected_delete = format!("/api/session/{}/form/{form_id}", replay.root);
+    {
+        let requests = replay.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path, _)| method == "DELETE" && path.starts_with(&expected_delete)),
+            "expected session-scoped DELETE {expected_delete}, got {requests:?}"
+        );
+    }
+    runtime.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn v2_form_cancel_surfaces_http_500_before_settlement_and_remains_retryable() {
+    let (endpoint, replay) = serve("question").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.start().await.expect("starts");
+    runtime
+        .send_turn(Some("ASK_QUESTION please"), Vec::new(), None)
+        .await
+        .expect("prompt is accepted");
+    let requested = wait_for(&runtime, "user-input.requested").await;
+    let form_id = requested.request_id.as_deref().unwrap();
+
+    replay.fail_next_reply.store(true, Ordering::SeqCst);
+    let err = runtime
+        .respond_to_user_input_with_disposition(
+            form_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Cancelled,
+        )
+        .await
+        .expect_err("HTTP 500 before settlement must fail");
+    assert!(err.to_string().contains("500"), "unexpected error: {err}");
+
+    // Retry succeeds and emits the cancelled receipt once.
+    runtime
+        .respond_to_user_input_with_disposition(
+            form_id,
+            json!({}),
+            crate::provider::UserInputResponseDisposition::Cancelled,
+        )
+        .await
+        .expect("retry cancel succeeds");
+    let mut events = until_turns_complete(&runtime, 1).await;
+    events.extend(drain(&runtime).await);
+    let resolved = of_type(&events, "user-input.resolved");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].payload["disposition"], json!("cancelled"));
+    assert_eq!(resolved[0].payload["answers"], json!({}));
+    assert!(
+        resolved[0].payload["questions"]
+            .as_array()
+            .is_some_and(|q| !q.is_empty())
+    );
+    runtime.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn v2_form_skip_preserves_disposition_when_sse_cancelled_arrives_before_204() {
+    let (endpoint, replay) = serve("question").await;
+    replay
+        .hold_form_cancel_response
+        .store(true, Ordering::SeqCst);
+    let runtime = v2_runtime(&endpoint);
+    runtime.start().await.expect("starts");
+    runtime
+        .send_turn(Some("ASK_QUESTION please"), Vec::new(), None)
+        .await
+        .expect("prompt is accepted");
+    let requested = wait_for(&runtime, "user-input.requested").await;
+    let form_id = requested.request_id.expect("form id");
+
+    let runtime_for_skip = runtime.clone();
+    let form_id_for_skip = form_id.clone();
+    let skip_task = tokio::spawn(async move {
+        runtime_for_skip
+            .respond_to_user_input_with_disposition(
+                &form_id_for_skip,
+                json!({}),
+                crate::provider::UserInputResponseDisposition::Skipped,
+            )
+            .await
+    });
+
+    // Wait until the SSE task has sent `form.cancelled` AND the runtime's SSE loop has finished
+    // processing the rest of the turn (proving `form.cancelled` was processed while HTTP DELETE
+    // is still held open before returning 204).
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        replay.form_cancelled_sse_sent.notified(),
+    )
+    .await
+    .expect("form.cancelled SSE frame must be sent before timeout");
+    let mut events = until_turns_complete(&runtime, 1).await;
+    assert!(
+        !skip_task.is_finished(),
+        "HTTP 204 must still be held open while SSE form.cancelled settled the turn"
+    );
+
+    // Release HTTP 204 and verify exactly one skipped receipt is emitted.
+    replay.release_form_cancel_response.notify_one();
+    skip_task
+        .await
+        .expect("skip task join")
+        .expect("skip succeeds after pre-204 SSE form.cancelled");
+    events.extend(drain(&runtime).await);
+    let resolved = of_type(&events, "user-input.resolved");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].payload["disposition"], json!("skipped"));
+    assert_eq!(resolved[0].payload["answers"], json!({}));
     runtime.stop().await.expect("stop");
 }

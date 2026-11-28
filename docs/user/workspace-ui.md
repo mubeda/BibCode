@@ -4,11 +4,13 @@ BiBCode is split into left, center, and right work areas. The left panel
 navigates agents and project/worktree threads, the center panel runs chats and
 terminals, and the right panel hosts project tools.
 
-The bottom status bar shows Claude, Codex, and Antigravity usage for the
-environment selected in the left rail (all three are on by default; toggle any
-of them in status bar settings, see [Antigravity](../providers/antigravity.md)). Selecting a remote server changes both the displayed account
-usage and the target of refresh or usage-reset actions. A server that has not
-returned usage does not borrow the local server's values.
+The bottom status bar shows Claude and Codex usage for the environment selected
+in the left rail (both are on by default; toggle either in status bar settings;
+Antigravity quota limits appear in chat instead, see
+[Antigravity](../providers/antigravity.md)). Selecting a remote server changes
+both the displayed account usage and the target of refresh or usage-reset
+actions. A server that has not returned usage does not borrow the local server's
+values.
 
 When a request has waited more than 15 seconds for a response, the status bar
 shows a warning such as **2 slow requests**. Click it to see each request's name,
@@ -1878,29 +1880,47 @@ idle provider sessions are stopped and start again with their next message.
 
 ## Right Panel
 
-The right panel hosts persistent tool surfaces for the active thread. Use its
-`+` menu to add Browser, Terminal, Files, Diff, or Source Control. Activity and
-Plan surfaces can also appear when the active provider/session supplies them.
+The right panel hosts project and thread tools behind a fixed top outline-icon
+bar, with the active icon underlined. Surfaces mount lazily on first selection;
+opening an empty right panel does not spawn terminals or preview sessions until
+you pick an icon.
 
-- **Browser** opens a local application preview or URL. In the desktop app on
-  macOS 14+, Windows, and Linux it is a Tauri child webview. In a browser tab
-  served over plain HTTP it shows the server's localhost dev servers in a frame
-  (see [Previewing the server's dev servers](#previewing-the-servers-dev-servers));
-  a browser tab served over HTTPS has no Browser surface.
-- **Terminal** starts a shell in the active workspace.
+Fixed top-bar surfaces (single instance per thread unless noted):
+
+- **Browser** opens a new closable Browser tab for a local application preview
+  or URL (multiple Browser tabs can stay open beside the bar). In the desktop
+  app on macOS 14+, Windows, and Linux it is a Tauri child webview. In a
+  browser tab served over plain HTTP it shows the server's localhost dev
+  servers in a frame (see
+  [Previewing the server's dev servers](#previewing-the-servers-dev-servers));
+  a browser tab served over HTTPS disables the Browser icon with a tooltip
+  explaining why.
+- **Terminal** opens or focuses the thread's single Terminal surface, which can
+  hold up to 4 split panes (using **New terminal** or split controls).
+- **Files** opens or returns to the workspace file tree; opening individual
+  files adds closable file tabs beside the fixed icon bar.
 - **Diff** reviews the working tree, branch changes, or a turn's changes (see
   [Diff](#diff)).
-- **Activity** shows structured provider activity when available.
-- **Plan** displays the active agent plan when available. With **Auto-open task
-  panel** on, it opens when a turn's steps appear. Closing it, or switching to
-  another surface such as a turn's **View diff**, keeps it closed until the next
-  turn's steps.
+- **Source Control** stages, commits, and reviews changes in the active
+  checkout.
 - **Device** shows an Android emulator or, on a macOS server, an iOS simulator
   running on the environment's server (see [Device previews](#device-previews)).
-  It is in the `+` menu only while device previews are on.
-- **Pull request** shows one pull or merge request beside the thread (see
+  The icon appears only while device previews are enabled in settings.
+- **Git Manager** embeds the project's Git Manager beside the active chat.
+- **Pipelines** embeds the project's Pipelines list, pipeline details, and job
+  logs beside the active chat without leaving the conversation.
+- **Pull Request** embeds the project's Pull/Merge Requests list and request
+  details beside the active chat (see
   [Pull and merge requests in the panel](#pull-and-merge-requests-in-the-panel)).
-  It has no entry in the `+` menu; it opens from the places listed there.
+- **Plan** appears as a closable tab when the active agent supplies a plan.
+  With **Auto-open task panel** on, it opens when a turn's steps appear.
+  Closing it, or switching to another surface such as a turn's **View diff**,
+  keeps it closed until the next turn's steps.
+
+Opening Git Manager, Pipelines, or Pull Requests from the sidebar opens the
+matching surface in the active or most relevant eligible chat thread's right
+panel, falling back to a standalone project view only when the project has no
+eligible chat threads.
 
 ### Diff
 
@@ -1985,15 +2005,20 @@ the Pull Requests page or the Git Manager. Nothing opens in the panel while
 **Settings → Source Control → Pull requests** is off, or for a Bitbucket or
 Azure DevOps repository, which Pull Requests does not support.
 
-Each request is its own tab, labelled `!N` (`#N` on GitHub); opening one that is
-already open selects its tab. The tab and its selected section survive a reload.
-**Open full page** shows the request on the Pull Requests page for the thread's
-checkout, and switches that page's **Worktree** picker to it. Deleting the request closes its tab, and a revert request opens in a
-new one. A tab whose Pull Requests setting is off, environment is
-disconnected, workspace was removed or host is unsupported explains what to do
-instead of showing an error, and recovers when the workspace returns. The detail
-switches to its narrow layout, with the request's details above the merge box,
-when the panel is narrow, not only when the window is.
+Each thread has one **Pull Request** surface in its fixed top icon bar showing
+either the embedded Pull Requests list or a selected request; opening a request
+replaces the current selection inside that surface, and Back returns to the
+list (or to Pipelines when opened from a pipeline's merge request link). The
+selected request and section survive a reload. **Open full page** shows the
+request on the Pull Requests page for the selected checkout, and switches that
+page's **Worktree** picker to it. Deleting the selected request returns the
+surface to the embedded list, and a revert request switches the surface to the
+revert request. When the Pull Requests setting is off, the environment is
+disconnected, the workspace was removed, or the host is unsupported, the
+surface explains what to do instead of showing an error, and recovers when the
+workspace returns. The detail switches to its narrow layout, with the request's
+details above the merge box, when the panel is narrow, not only when the window
+is.
 
 ### Opening links
 
@@ -2251,7 +2276,7 @@ has no device previews. Update the server to use them."
   simulator, created in Xcode under **Window → Devices and Simulators**.
   BiBCode uses the Xcode that `xcode-select` points to.
 
-**Open it.** Choose **Device** from the right panel's `+` menu, or run **Open
+**Open it.** Choose **Device** in the right panel's top icon bar, or run **Open
 device preview** from the command palette. The device list groups devices
 under **Android** and **iOS**. When a platform cannot run a device, its group
 says why (for example Android SDK not found, no virtual devices, Xcode not

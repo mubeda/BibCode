@@ -781,8 +781,7 @@ async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() 
         bibcode_server::server_settings::ProviderSettingsStore::new(temporary.path().join("state")),
         None,
     );
-    assert_eq!(fetchers.len(), 3);
-    assert_eq!(fetchers[2].provider, ProviderUsageProvider::Antigravity);
+    assert_eq!(fetchers.len(), 2);
     assert_eq!(fetchers[0].provider, ProviderUsageProvider::Claude);
     assert_eq!(fetchers[1].provider, ProviderUsageProvider::Codex);
     let claude_fetch = &fetchers[0].fetch;

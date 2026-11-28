@@ -58,12 +58,15 @@ describe("OpenBesideThreadButton", () => {
     await click(triggerLabel);
     expect(document.body.textContent).toContain("On this branch");
     await click("Thread t1, on this branch");
-    expect(
-      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, {
-        environmentId: "env",
-        threadId: "t1",
-      } as never).activeSurfaceId,
-    ).toBe("pullRequest:89");
+    const panel = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, {
+      environmentId: "env",
+      threadId: "t1",
+    } as never);
+    expect(panel.activeSurfaceId).toBe("pullRequest");
+    expect(panel.surfaces[0]).toMatchObject({
+      kind: "pullRequest",
+      selection: { number: 89, provider: "gitlab" },
+    });
     expect(h.navigate).toHaveBeenCalledWith({
       to: "/$environmentId/$threadId",
       params: { environmentId: "env", threadId: "t1" },

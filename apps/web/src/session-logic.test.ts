@@ -242,6 +242,78 @@ describe("expired requests (#187)", () => {
     expect(derivePendingApprovals(activities).map((entry) => entry.requestId)).toEqual(["a-1"]);
     expect(derivePendingUserInputs(activities).map((entry) => entry.requestId)).toEqual(["q-1"]);
   });
+
+  it("preserves non-blocking isBlocking: false on pending user inputs until expired (#442)", () => {
+    const nonBlockingAsked = makeActivity({
+      id: "q-nb",
+      createdAt: "2026-10-27T00:00:01.000Z",
+      kind: "user-input.requested",
+      summary: "Question",
+      tone: "approval",
+      payload: { requestId: "q-nb-1", isBlocking: false, questions: [question] },
+    });
+    const blockingAskedLater = makeActivity({
+      id: "q-block-later",
+      createdAt: "2026-10-27T00:00:02.000Z",
+      kind: "user-input.requested",
+      summary: "Question",
+      tone: "approval",
+      payload: { requestId: "q-block-1", questions: [question] },
+    });
+    expect(derivePendingUserInputs([nonBlockingAsked])).toEqual([
+      expect.objectContaining({
+        requestId: "q-nb-1",
+        isBlocking: false,
+      }),
+    ]);
+    // Newer blocking question must sort ahead of an older optional non-blocking question.
+    expect(
+      derivePendingUserInputs([nonBlockingAsked, blockingAskedLater]).map(
+        (entry) => entry.requestId,
+      ),
+    ).toEqual(["q-block-1", "q-nb-1"]);
+    // Open non-blocking ask uses the non-blocking work-log label; expiry suppresses the ask row.
+    expect(deriveWorkLogEntries([nonBlockingAsked]).map((entry) => entry.label)).toEqual([
+      "Question while working: 1 question",
+    ]);
+    const expiredNb = expired(
+      "q-nb-exp",
+      "user-input.expired",
+      "q-nb-1",
+      "2026-10-27T00:00:03.000Z",
+    );
+    expect(derivePendingUserInputs([nonBlockingAsked, expiredNb])).toEqual([]);
+    const expiredLog = deriveWorkLogEntries([nonBlockingAsked, expiredNb]);
+    expect(expiredLog.map((entry) => entry.label)).toEqual(["Question expired"]);
+    expect(expiredLog[0]?.detail).toBe("Which?");
+  });
+
+  it("decodes Antigravity boolean and untitled enum questions against UserInputQuestion contract (#442)", async () => {
+    const { Schema } = await import("effect");
+    const { UserInputQuestion } = await import("@bibcode/contracts");
+    const booleanQuestion = {
+      id: "dryRun",
+      header: "Dry run",
+      question: "Preview without applying?",
+      options: [
+        { label: "Yes", description: "True" },
+        { label: "No", description: "False" },
+      ],
+      multiSelect: false,
+    };
+    const untitledEnumQuestion = {
+      id: "color",
+      header: "color",
+      question: "Pick a color",
+      options: [
+        { label: "red", description: "red" },
+        { label: "blue", description: "blue" },
+      ],
+      multiSelect: false,
+    };
+    expect(Schema.is(UserInputQuestion)(booleanQuestion)).toBe(true);
+    expect(Schema.is(UserInputQuestion)(untitledEnumQuestion)).toBe(true);
+  });
 });
 
 describe("derivePendingUserInputs", () => {
@@ -1996,6 +2068,178 @@ describe("malformed orchestration payload handling", () => {
         ],
       },
     ]);
+  });
+
+  it("preserves optionless blocking questions while still rejecting malformed non-empty options (#430)", () => {
+    const activities = [
+      makeActivity({
+        kind: "user-input.requested",
+        payload: {
+          requestId: "req-optionless",
+          questions: [
+            {
+              id: "freeform-empty",
+              header: "Details",
+              question: "What filename should we use?",
+              options: [],
+            },
+            {
+              id: "freeform-omitted",
+              header: "Notes",
+              question: "Any extra constraints?",
+            },
+            {
+              id: "malformed-non-empty",
+              header: "Broken",
+              question: "Broken options",
+              options: [null, { label: 42 }],
+            },
+          ],
+        },
+      }),
+    ];
+
+    expect(derivePendingUserInputs(activities)).toEqual([
+      {
+        requestId: "req-optionless",
+        createdAt: "2026-02-23T00:00:00.000Z",
+        questions: [
+          {
+            id: "freeform-empty",
+            header: "Details",
+            question: "What filename should we use?",
+            options: [],
+            multiSelect: false,
+          },
+          {
+            id: "freeform-omitted",
+            header: "Notes",
+            question: "Any extra constraints?",
+            options: [],
+            multiSelect: false,
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("renders one self-sufficient user-input receipt even across windowed reloads (#430)", () => {
+    const openOnly = deriveWorkLogEntries([
+      makeActivity({
+        id: "evt-req",
+        kind: "user-input.requested",
+        summary: "User input requested",
+        payload: {
+          requestId: "req-1",
+          questions: [
+            { id: "q1", header: "Scope", question: "Pick scope?", options: [] },
+            { id: "q2", header: "Tests", question: "Run tests?", options: [] },
+          ],
+        },
+      }),
+    ]);
+    expect(openOnly).toHaveLength(1);
+    expect(openOnly[0]).toMatchObject({
+      sourceActivityKind: "user-input.requested",
+      label: "Awaiting user input: 2 questions",
+      detail: "Pick scope?\nRun tests?",
+    });
+
+    const resolvedActivity = makeActivity({
+      id: "evt-res",
+      kind: "user-input.resolved",
+      summary: "User input submitted",
+      createdAt: "2026-02-23T00:00:05.000Z",
+      payload: {
+        requestId: "req-1",
+        disposition: "skipped",
+        answers: { q1: "Server" },
+        questions: [
+          { id: "q1", header: "Scope", question: "Pick scope?" },
+          { id: "q2", header: "Tests", question: "Run tests?" },
+        ],
+      },
+    });
+
+    // Windowed reload: only user-input.resolved is present in the latest page.
+    const resolvedAlone = deriveWorkLogEntries([resolvedActivity]);
+    expect(resolvedAlone).toHaveLength(1);
+    expect(resolvedAlone[0]).toMatchObject({
+      sourceActivityKind: "user-input.resolved",
+      label: "Answered 1 question (others skipped)",
+      detail: "Pick scope?: Server\nRun tests?: Skipped",
+    });
+
+    // Older page loads later with user-input.requested: still exactly one receipt!
+    const withOlderRequest = deriveWorkLogEntries([
+      makeActivity({
+        id: "evt-req",
+        kind: "user-input.requested",
+        summary: "User input requested",
+        createdAt: "2026-02-23T00:00:00.000Z",
+        payload: {
+          requestId: "req-1",
+          questions: [
+            { id: "q1", header: "Scope", question: "Pick scope?", options: [] },
+            { id: "q2", header: "Tests", question: "Run tests?", options: [] },
+          ],
+        },
+      }),
+      resolvedActivity,
+    ]);
+    expect(withOlderRequest).toHaveLength(1);
+    expect(withOlderRequest[0]?.sourceActivityKind).toBe("user-input.resolved");
+    expect(withOlderRequest[0]?.detail).toBe("Pick scope?: Server\nRun tests?: Skipped");
+
+    const cancelledAlone = deriveWorkLogEntries([
+      makeActivity({
+        id: "evt-cancel",
+        kind: "user-input.resolved",
+        summary: "User input cancelled",
+        payload: {
+          requestId: "req-2",
+          disposition: "cancelled",
+          answers: {},
+          questions: [{ id: "q1", header: "Mode", question: "Pick mode?" }],
+        },
+      }),
+    ]);
+    expect(cancelledAlone).toHaveLength(1);
+    expect(cancelledAlone[0]).toMatchObject({
+      label: "Cancelled clarifying question",
+      detail: "Pick mode?: Skipped",
+    });
+
+    // Legacy Claude withdrawal payload (`cancelled: true` without `disposition`) and duplicate
+    // resolved rows for the same requestId coalesce into one cancelled receipt.
+    const legacyCancelledAndDuplicate = deriveWorkLogEntries([
+      makeActivity({
+        id: "evt-legacy-cancel-1",
+        kind: "user-input.resolved",
+        summary: "User input cancelled",
+        createdAt: "2026-02-23T00:00:06.000Z",
+        payload: {
+          requestId: "req-legacy-cancel",
+          answers: {},
+          cancelled: true,
+        },
+      }),
+      makeActivity({
+        id: "evt-legacy-cancel-2",
+        kind: "user-input.resolved",
+        summary: "User input cancelled",
+        createdAt: "2026-02-23T00:00:07.000Z",
+        payload: {
+          requestId: "req-legacy-cancel",
+          answers: {},
+          cancelled: true,
+        },
+      }),
+    ]);
+    expect(legacyCancelledAndDuplicate).toHaveLength(1);
+    expect(legacyCancelledAndDuplicate[0]).toMatchObject({
+      label: "Cancelled clarifying questions",
+    });
   });
 
   it("ignores null payloads and non-stale provider response failures", () => {

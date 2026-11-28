@@ -2,6 +2,7 @@ import {
   TerminalInputError,
   WS_METHODS,
   type TerminalBeginInput,
+  type TerminalPasteStage,
   type TerminalWriteInputFrame,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
@@ -16,12 +17,15 @@ import {
 import { TerminalInputAdmissionSignal } from "../rpc/inputAdmission.ts";
 import type { RpcSession } from "../rpc/session.ts";
 
-import { terminalInputCharacterBytes } from "./terminalInput.ts";
+import { partitionTerminalInputSegments, sliceDelimiterSafeFrames } from "./terminalInput.ts";
 
 export type TerminalInputTarget = Omit<TerminalBeginInput, "attachmentSequence">;
 /** Who produced input (`userInputClaim`); `undefined` leaves it unmarked, as older clients do. */
 export type TerminalInputOrigin = TerminalWriteInputFrame["userInputClaim"];
 
+const MAX_ORDERED_WINDOW = 16;
+const MAX_BINDING_IN_FLIGHT = 8;
+const MAX_LEGACY_WRITE_LENGTH = 65_536;
 const nextAttachmentSequence = new WeakMap<RpcSession, number>();
 const encoder = new TextEncoder();
 const isTerminalInputError = Schema.is(TerminalInputError);
@@ -37,24 +41,42 @@ function describeInputFailure(error: unknown): string {
     : String(error);
 }
 
-/** UTF-8 frames preserve complete Unicode scalar values, including surrogate pairs. */
-export function splitTerminalInputFrames(data: string): string[] {
-  const frames: string[] = [];
-  let start = 0;
-  let end = 0;
-  let bytes = 0;
-  for (const character of data) {
-    const size = terminalInputCharacterBytes(character);
-    if (bytes + size > 16 * 1024) {
-      frames.push(data.slice(start, end));
-      start = end;
-      bytes = 0;
+export interface StagedTerminalInputFrame {
+  readonly data: string;
+  readonly pasteStage?: TerminalPasteStage;
+}
+
+/**
+ * Splits `data` in strict stream order into UTF-8 and delimiter-safe 16 KiB frames.
+ * Multi-frame complete bracketed pastes receive `"chunk"` / `"commit"` staging markers when
+ * `stageMultiFramePaste` is enabled.
+ */
+export function splitTerminalInputPasteFrames(
+  data: string,
+  stageMultiFramePaste: boolean,
+): StagedTerminalInputFrame[] {
+  const frames: StagedTerminalInputFrame[] = [];
+  for (const segment of partitionTerminalInputSegments(data)) {
+    const pieces = sliceDelimiterSafeFrames(segment.data);
+    if (segment.kind === "paste" && stageMultiFramePaste && pieces.length > 1) {
+      for (let index = 0; index < pieces.length; index += 1) {
+        frames.push({
+          data: pieces[index]!,
+          pasteStage: index + 1 === pieces.length ? "commit" : "chunk",
+        });
+      }
+    } else {
+      for (const piece of pieces) {
+        frames.push({ data: piece });
+      }
     }
-    end += character.length;
-    bytes += size;
   }
-  if (end > start) frames.push(data.slice(start, end));
   return frames;
+}
+
+/** UTF-8 frames preserve complete Unicode scalar values and never split paste delimiters. */
+export function splitTerminalInputFrames(data: string): string[] {
+  return splitTerminalInputPasteFrames(data, false).map((frame) => frame.data);
 }
 
 export interface OrderedTerminalInputBinding {
@@ -76,19 +98,48 @@ export function createOrderedTerminalInputBinding(
   target: TerminalInputTarget,
   context: Context.Context<never> = Context.empty(),
 ): OrderedTerminalInputBinding {
+  // Capture only the session identity fields: callers like `terminal.write` pass the entire
+  // write payload as `target`, and spreading `data` into `beginInput` would trip the 16 KiB
+  // per-frame admission cap on the first >16 KiB paste (#431).
+  const sessionTarget: TerminalInputTarget = {
+    threadId: target.threadId,
+    terminalId: target.terminalId,
+  };
   const attachmentSequence = nextAttachmentSequence.get(session) ?? 0;
   nextAttachmentSequence.set(session, attachmentSequence + 1);
   const runPromise = Effect.runPromiseWith(context);
   const controller = new AbortController();
   let stopped = false;
   let ordered = false;
+  let pasteAssembly = false;
   let inputId: string | undefined;
   let sequence = 0;
+  let nextAckedSequence = 0;
+  const ackedAhead = new Set<number>();
+  let inFlightFrames = 0;
   let pendingBytes = 0;
   let preparation: Promise<void> | undefined;
+  let orderedTail = Promise.resolve();
   let legacyTail = Promise.resolve();
+  const dispatchQueue: Array<{
+    readonly sequence: number;
+    readonly start: () => void;
+    readonly fail: (error: TerminalInputError) => void;
+  }> = [];
   const check = () => {
     if (stopped) throw inputError("Terminal input stopped. Reattach before typing again.");
+  };
+  const pumpDispatch = (): void => {
+    if (stopped) return;
+    while (
+      dispatchQueue.length > 0 &&
+      inFlightFrames < MAX_BINDING_IN_FLIGHT &&
+      dispatchQueue[0]!.sequence - nextAckedSequence < MAX_ORDERED_WINDOW
+    ) {
+      const next = dispatchQueue.shift()!;
+      inFlightFrames += 1;
+      next.start();
+    }
   };
   const run = <T extends EnvironmentUnaryRpcTag>(
     tag: T,
@@ -106,7 +157,7 @@ export function createOrderedTerminalInputBinding(
   const cancelLease = (lease: string): void => {
     void runPromise(
       requestInSession(session, environmentId, WS_METHODS.terminalCancelInput, {
-        ...target,
+        ...sessionTarget,
         inputId: lease,
       }).pipe(Effect.raceFirst(session.closed), Effect.timeout("5 seconds")),
     ).catch(() => undefined);
@@ -115,6 +166,10 @@ export function createOrderedTerminalInputBinding(
     if (stopped) return;
     stopped = true;
     controller.abort();
+    const error = inputError("Terminal input stopped. Reattach before typing again.");
+    while (dispatchQueue.length > 0) {
+      dispatchQueue.shift()!.fail(error);
+    }
     const lease = inputId;
     if (lease !== undefined) cancelLease(lease);
   };
@@ -127,6 +182,7 @@ export function createOrderedTerminalInputBinding(
       );
       check();
       ordered = config.environment.capabilities.terminalOrderedInput === true;
+      pasteAssembly = ordered && config.environment.capabilities.terminalPasteAssembly === true;
       if (ordered) {
         if (!Number.isSafeInteger(attachmentSequence)) {
           throw new TerminalInputError({
@@ -136,7 +192,7 @@ export function createOrderedTerminalInputBinding(
         }
         const lease = await run(
           WS_METHODS.terminalBeginInput,
-          { ...target, attachmentSequence },
+          { ...sessionTarget, attachmentSequence },
           false,
         );
         if (stopped) {
@@ -173,43 +229,85 @@ export function createOrderedTerminalInputBinding(
           const abort = () => dispose();
           signal.addEventListener("abort", abort, { once: true });
           const marked = origin === undefined ? {} : { userInputClaim: origin };
-          // A binding created by a write keeps that write's input as its target: frames take
-          // only the session fields from it, so one write's origin never marks another's.
-          const sessionTarget = { threadId: target.threadId, terminalId: target.terminalId };
           try {
-            await prepare();
+            // Preserve call order across prepare() before claiming ordered sequence numbers.
+            const ready = orderedTail.then(() => prepare());
+            orderedTail = ready.catch(() => undefined);
+            await ready;
             check();
-            const frames = splitTerminalInputFrames(data);
             if (ordered) {
-              await Promise.all(
-                frames.map(async (frame) => {
-                  check();
-                  const frameSequence = sequence++;
-                  const lease = inputId!;
-                  const acknowledgement = await run(WS_METHODS.terminalWriteInput, {
-                    ...sessionTarget,
-                    inputId: lease,
+              const frames = splitTerminalInputPasteFrames(data, pasteAssembly);
+              const lease = inputId!;
+              const scheduled = frames.map((frame) => {
+                const frameSequence = sequence++;
+                return new Promise<void>((resolve, reject) => {
+                  dispatchQueue.push({
                     sequence: frameSequence,
-                    data: frame,
-                    ...marked,
+                    fail: reject,
+                    start: () => {
+                      void (async () => {
+                        try {
+                          check();
+                          const acknowledgement = await run(WS_METHODS.terminalWriteInput, {
+                            ...sessionTarget,
+                            inputId: lease,
+                            sequence: frameSequence,
+                            data: frame.data,
+                            ...marked,
+                            ...(frame.pasteStage ? { pasteStage: frame.pasteStage } : {}),
+                          });
+                          check();
+                          if (
+                            acknowledgement.inputId !== lease ||
+                            acknowledgement.sequence !== frameSequence
+                          ) {
+                            throw new TerminalInputError({
+                              code: "sequence",
+                              message: "Terminal input acknowledgement did not match its frame.",
+                            });
+                          }
+                          ackedAhead.add(frameSequence);
+                          while (ackedAhead.delete(nextAckedSequence)) {
+                            nextAckedSequence += 1;
+                          }
+                          resolve();
+                        } catch (error) {
+                          reject(error);
+                        } finally {
+                          inFlightFrames -= 1;
+                          pumpDispatch();
+                        }
+                      })();
+                    },
                   });
-                  check();
+                });
+              });
+              pumpDispatch();
+              await Promise.all(scheduled);
+            } else {
+              const segments = partitionTerminalInputSegments(data);
+              const legacyFrames: string[] = [];
+              for (const segment of segments) {
+                if (segment.kind === "paste") {
                   if (
-                    acknowledgement.inputId !== lease ||
-                    acknowledgement.sequence !== frameSequence
+                    segment.data.length > MAX_LEGACY_WRITE_LENGTH ||
+                    encoder.encode(segment.data).length > MAX_LEGACY_WRITE_LENGTH
                   ) {
                     throw new TerminalInputError({
-                      code: "sequence",
-                      message: "Terminal input acknowledgement did not match its frame.",
+                      code: "capacity",
+                      message: "Terminal paste exceeds the 64 KiB limit for legacy terminal input.",
                     });
                   }
-                }),
-              );
-            } else {
+                  legacyFrames.push(segment.data);
+                } else {
+                  legacyFrames.push(...sliceDelimiterSafeFrames(segment.data));
+                }
+              }
               const write = legacyTail.then(async () => {
                 check();
-                for (const frame of frames)
+                for (const frame of legacyFrames) {
                   await run(WS_METHODS.terminalWrite, { ...sessionTarget, data: frame, ...marked });
+                }
               });
               legacyTail = write.catch(() => undefined);
               await write;

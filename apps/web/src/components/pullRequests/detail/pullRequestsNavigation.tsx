@@ -1,8 +1,28 @@
-import type { ScopedProjectRef } from "@bibcode/contracts";
+import type { ScopedProjectRef, SourceControlProviderKind } from "@bibcode/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { createContext, type ReactNode, useContext, useMemo } from "react";
 
 import type { PullRequestsDetailTab } from "../../../pullRequestsStore";
+
+/**
+ * List-row navigation for embedded Pull Requests inside a thread's right panel.
+ * Null on the full page, where rows remain router links.
+ */
+export interface PullRequestsListNavigation {
+  openRequest(target: {
+    readonly number: number;
+    readonly provider: SourceControlProviderKind;
+    readonly cwd?: string;
+  }): void;
+}
+
+export const PullRequestsListNavigationContext = createContext<PullRequestsListNavigation | null>(
+  null,
+);
+
+export function usePullRequestsListNavigation(): PullRequestsListNavigation | null {
+  return useContext(PullRequestsListNavigationContext);
+}
 
 /**
  * Where a request's detail view lives: the full page (router) or a thread's right panel.

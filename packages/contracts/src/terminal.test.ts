@@ -108,6 +108,36 @@ describe("ordered terminal input", () => {
         data: "x",
       }),
     ).toMatchObject({ inputId: "lease", sequence: 0, data: "x" });
+    expect(
+      decodeSync(TerminalWriteInputFrame, {
+        threadId: "thread",
+        terminalId: "term-1",
+        inputId: "lease",
+        sequence: 1,
+        data: "\u001b[200~chunk",
+        pasteStage: "chunk",
+      }),
+    ).toMatchObject({ inputId: "lease", sequence: 1, pasteStage: "chunk" });
+    expect(
+      decodeSync(TerminalWriteInputFrame, {
+        threadId: "thread",
+        terminalId: "term-1",
+        inputId: "lease",
+        sequence: 2,
+        data: "end\u001b[201~",
+        pasteStage: "commit",
+      }),
+    ).toMatchObject({ inputId: "lease", sequence: 2, pasteStage: "commit" });
+    expect(() =>
+      decodeSync(TerminalWriteInputFrame, {
+        threadId: "thread",
+        terminalId: "term-1",
+        inputId: "lease",
+        sequence: 3,
+        data: "x",
+        pasteStage: "invalid",
+      }),
+    ).toThrow();
     expect(decodeSync(TerminalInputAcknowledgement, { inputId: "lease", sequence: 0 })).toEqual({
       inputId: "lease",
       sequence: 0,

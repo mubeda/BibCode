@@ -47,6 +47,7 @@ export type {
 export interface ComposerInlineTokenContext {
   readonly mentionableAgentNames?: ReadonlySet<string>;
   readonly enabledDollarSkillNames?: ReadonlySet<string>;
+  readonly enabledSlashSkillNames?: ReadonlySet<string>;
 }
 
 const EMPTY_INLINE_TOKEN_NAMES: ReadonlySet<string> = new Set();
@@ -56,9 +57,14 @@ function splitPromptWithInlineTokenContext(text: string, context: ComposerInline
     text,
     [],
     context.mentionableAgentNames ?? EMPTY_INLINE_TOKEN_NAMES,
-    context.enabledDollarSkillNames === undefined
-      ? {}
-      : { enabledDollarSkillNames: context.enabledDollarSkillNames },
+    {
+      ...(context.enabledDollarSkillNames === undefined
+        ? {}
+        : { enabledDollarSkillNames: context.enabledDollarSkillNames }),
+      ...(context.enabledSlashSkillNames === undefined
+        ? {}
+        : { enabledSlashSkillNames: context.enabledSlashSkillNames }),
+    },
   );
 }
 

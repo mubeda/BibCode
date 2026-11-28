@@ -1606,7 +1606,9 @@ describe("delete entry", () => {
     expect(lease.commitDelete.mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(testState.closeFileSurfacesUnder).mock.invocationCallOrder[0]!,
     );
-    expect(testState.closeFileSurfacesUnder).toHaveBeenCalledWith(threadRef, "src/app.ts");
+    expect(testState.closeFileSurfacesUnder).toHaveBeenCalledWith(threadRef, "src/app.ts", {
+      availableSingletons: new Set(["files"]),
+    });
     expect(refresh).toHaveBeenCalled();
   });
 
@@ -1675,7 +1677,9 @@ describe("delete entry", () => {
       expect(registry.get("src/nested/b.ts")).toBeUndefined();
       expect(rejected.dispose).toHaveBeenCalledOnce();
       expect(cleaned.dispose).toHaveBeenCalledOnce();
-      expect(testState.closeFileSurfacesUnder).toHaveBeenCalledWith(threadRef, "src");
+      expect(testState.closeFileSurfacesUnder).toHaveBeenCalledWith(threadRef, "src", {
+        availableSingletons: new Set(["files"]),
+      });
       expect(refresh).toHaveBeenCalledOnce();
       expect(testState.toastAdd).not.toHaveBeenCalled();
       expect(reportError).toHaveBeenCalledWith(

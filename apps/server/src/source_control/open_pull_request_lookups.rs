@@ -12,10 +12,16 @@
 //! - Entries are keyed by (worktree path as the caller gave it, provider,
 //!   branch), so a branch change or another repository never reads them.
 //! - A successful answer, including "no open pull request", is reused for
-//!   [`OPEN_PULL_REQUEST_LOOKUP_TTL`]. A failed lookup answers with its
-//!   failure for [`OPEN_PULL_REQUEST_FAILURE_BACKOFF`] and is logged once at
-//!   `warn`, with the provider only. A cancelled lookup (its last caller left,
-//!   or shutdown) is never stored; the next caller asks the forge again.
+//!   [`OPEN_PULL_REQUEST_LOOKUP_TTL`] and clears failure-warning suppression.
+//!   A failed lookup answers with its failure for
+//!   [`OPEN_PULL_REQUEST_FAILURE_BACKOFF`] (5 s for transient errors) or
+//!   [`OPEN_PULL_REQUEST_PERSISTENT_FAILURE_BACKOFF`] (60 s for persistent
+//!   classes: `cli_missing`, `cli_too_old`, `not_authenticated`, `forbidden`,
+//!   `not_found`), and logs at `warn` with `provider`, sanitized `error_code`,
+//!   and `backoff_secs` once per failure transition until recovery,
+//!   invalidation, or a different error class. A cancelled lookup (its last
+//!   caller left, or shutdown) is never stored; the next caller asks the forge
+//!   again.
 //! - Concurrent callers for one key share one in-flight lookup. It runs in its
 //!   own task and holds one lease per waiting caller, so one caller leaving (a
 //!   stream replacing its enrichment, a cancelled RPC) does not cancel the
@@ -46,10 +52,59 @@ use super::{ProviderKind, ResolvedPullRequest, SourceControlProviderError};
 /// How long a successful lookup answers later status reads. Short, because
 /// pull requests also change outside BiBCode (merged or closed on the web).
 pub(crate) const OPEN_PULL_REQUEST_LOOKUP_TTL: Duration = Duration::from_secs(10);
-/// How long a failed lookup answers later reads with its failure (D6).
+/// How long a transient failed lookup answers later reads with its failure (D6).
 pub(crate) const OPEN_PULL_REQUEST_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+/// How long a persistent failed lookup (`cli_missing`, `cli_too_old`,
+/// `not_authenticated`, `forbidden`, `not_found`) answers later reads before retrying.
+pub(crate) const OPEN_PULL_REQUEST_PERSISTENT_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 /// Upper bound on remembered and in-flight lookups across all worktrees.
 pub(crate) const OPEN_PULL_REQUEST_LOOKUP_CAPACITY: usize = 64;
+
+fn normalize_lookup_error_code(code: &'static str) -> &'static str {
+    match code {
+        "timeout" | "not_authenticated" | "forbidden" | "cli_missing" | "cli_too_old"
+        | "host_unreachable" | "rate_limited" | "not_found" => code,
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn classify_open_pull_request_error(error: &SourceControlProviderError) -> &'static str {
+    if let Some(failure) = error.command_failure.as_deref() {
+        if failure
+            .process_failure
+            .is_some_and(crate::git::ProcessFailureFacts::timed_out)
+        {
+            return "timeout";
+        }
+        return normalize_lookup_error_code(failure.code);
+    }
+    let detail_lower = error.detail.to_lowercase();
+    if let Some(code) = crate::pull_requests::error::classify_stderr_optional(&error.detail) {
+        if code == "host_unreachable" && detail_lower.contains("timed out") {
+            return "timeout";
+        }
+        return normalize_lookup_error_code(code);
+    }
+    if detail_lower.contains("timed out") {
+        return "timeout";
+    }
+    "unknown"
+}
+
+fn is_persistent_failure_code(code: &'static str) -> bool {
+    matches!(
+        code,
+        "cli_missing" | "cli_too_old" | "not_authenticated" | "forbidden" | "not_found"
+    )
+}
+
+fn failure_backoff_for_code(code: &'static str) -> Duration {
+    if is_persistent_failure_code(code) {
+        OPEN_PULL_REQUEST_PERSISTENT_FAILURE_BACKOFF
+    } else {
+        OPEN_PULL_REQUEST_FAILURE_BACKOFF
+    }
+}
 
 pub(crate) type LookupResult = Result<Option<ResolvedPullRequest>, SourceControlProviderError>;
 
@@ -85,9 +140,22 @@ struct State {
     ttl: Duration,
     capacity: usize,
     next_flight: u64,
+    next_log_seq: u64,
     entries: HashMap<LookupKey, Entry>,
+    /// Remembers the last sanitized error code logged at `warn` per key so
+    /// repeated identical failures do not spam the log until state recovers,
+    /// invalidates, or transitions to a different error class. Bounded to
+    /// `capacity.max(OPEN_PULL_REQUEST_LOOKUP_CAPACITY) * 2` entries with
+    /// oldest-first eviction so capacity overflow does not cause WARN thrashing.
+    last_logged_errors: HashMap<LookupKey, LoggedFailureRecord>,
     /// Set by shutdown; admission checks it under the same lock.
     closed: bool,
+}
+
+struct LoggedFailureRecord {
+    canonical_cwd: PathBuf,
+    error_code: &'static str,
+    last_seen: u64,
 }
 
 struct Entry {
@@ -159,7 +227,9 @@ impl OpenPullRequestLookups {
                 ttl,
                 capacity,
                 next_flight: 0,
+                next_log_seq: 0,
                 entries: HashMap::new(),
+                last_logged_errors: HashMap::new(),
                 closed: false,
             }),
             shutdown: CancellationToken::new(),
@@ -252,11 +322,15 @@ impl OpenPullRequestLookups {
     /// outdated.
     pub(crate) fn invalidate(&self, path: &Path) -> bool {
         let mut dropped_a_waited_lookup = false;
-        self.lock().entries.retain(|key, entry| {
+        let mut state = self.lock();
+        state.entries.retain(|key, entry| {
             let keep = !(key.cwd.starts_with(path) || entry.canonical_cwd.starts_with(path));
             dropped_a_waited_lookup |= !keep
                 && matches!(&entry.slot, Slot::InFlight { lease, .. } if lease.strong_count() > 0);
             keep
+        });
+        state.last_logged_errors.retain(|key, record| {
+            !(key.cwd.starts_with(path) || record.canonical_cwd.starts_with(path))
         });
         dropped_a_waited_lookup
     }
@@ -266,7 +340,7 @@ impl OpenPullRequestLookups {
         F: FnOnce(CancellationToken) -> Fut,
         Fut: Future<Output = LookupResult> + Send + 'static,
     {
-        let (id, task, flight_cancellation, lease, sender, result) = {
+        let (id, task, flight_cancellation, lease, sender, result, stored, flight_canonical_cwd) = {
             let mut state = self.lock();
             if state.closed {
                 return Admission::Closed;
@@ -301,11 +375,12 @@ impl OpenPullRequestLookups {
                 cancellation: flight_cancellation.clone(),
             });
             let (sender, result) = watch::channel(None);
-            if state.entries.len() < state.capacity {
+            let stored = state.entries.len() < state.capacity;
+            if stored {
                 state.entries.insert(
                     key.clone(),
                     Entry {
-                        canonical_cwd,
+                        canonical_cwd: canonical_cwd.clone(),
                         slot: Slot::InFlight {
                             id,
                             lease: Arc::downgrade(&lease),
@@ -314,7 +389,16 @@ impl OpenPullRequestLookups {
                     },
                 );
             }
-            (id, task, flight_cancellation, lease, sender, result)
+            (
+                id,
+                task,
+                flight_cancellation,
+                lease,
+                sender,
+                result,
+                stored,
+                canonical_cwd,
+            )
         };
         #[cfg(test)]
         self.wait_at_admission_gate();
@@ -326,13 +410,25 @@ impl OpenPullRequestLookups {
             // True after the last lease dropped and after shutdown: the outcome is not the
             // forge's answer, so it is never remembered as a failure.
             let cancelled = flight_cancellation.is_cancelled();
-            if outcome.is_err() && !cancelled {
-                tracing::warn!(
-                    provider = ?key.provider,
-                    "open pull-request lookup failed; answering with the failure for 5 seconds"
-                );
+            if let Some((error_code, backoff, should_warn)) =
+                lookups.settle(&key, &flight_canonical_cwd, id, stored, &outcome, cancelled)
+            {
+                if should_warn {
+                    tracing::warn!(
+                        provider = ?key.provider,
+                        error_code,
+                        backoff_secs = backoff.as_secs(),
+                        "open pull-request lookup failed; backing off before retrying"
+                    );
+                } else {
+                    tracing::debug!(
+                        provider = ?key.provider,
+                        error_code,
+                        backoff_secs = backoff.as_secs(),
+                        "open pull-request lookup still failing with the same error class"
+                    );
+                }
             }
-            lookups.settle(&key, id, &outcome, cancelled);
             #[cfg(test)]
             lookups.flights_settled.notify_one();
             let _ = sender.send(Some(outcome));
@@ -340,34 +436,65 @@ impl OpenPullRequestLookups {
         Admission::Wait(lease, result)
     }
 
-    /// Stores a successful answer, or an uncancelled failure for
-    /// [`OPEN_PULL_REQUEST_FAILURE_BACKOFF`], only while this flight still owns
-    /// the key; an invalidation or a newer flight since it started means its
-    /// answer may predate a change.
-    fn settle(&self, key: &LookupKey, id: u64, outcome: &LookupResult, cancelled: bool) {
+    /// Stores a successful answer, or an uncancelled failure for its error-class
+    /// backoff, only while this flight still owns the key; an invalidation or a
+    /// newer flight since it started means its answer may predate a change.
+    /// Overflow flights (started when the cache was full) are not stored in
+    /// `entries` but still classify, log, and participate in bounded failure
+    /// warning deduplication.
+    fn settle(
+        &self,
+        key: &LookupKey,
+        canonical_cwd: &Path,
+        id: u64,
+        stored: bool,
+        outcome: &LookupResult,
+        cancelled: bool,
+    ) -> Option<(&'static str, Duration, bool)> {
         let mut state = self.lock();
         let ttl = state.ttl;
-        let Some(entry) = state.entries.get_mut(key) else {
-            return;
-        };
-        if !matches!(entry.slot, Slot::InFlight { id: current, .. } if current == id) {
-            return;
-        }
-        match outcome {
-            Ok(value) => {
-                entry.slot = Slot::Fresh {
-                    value: value.clone(),
-                    expires_at: Instant::now() + ttl,
-                };
+        if stored {
+            let entry = state.entries.get_mut(key)?;
+            if !matches!(entry.slot, Slot::InFlight { id: current, .. } if current == id) {
+                return None;
             }
-            Err(error) if !cancelled => {
-                entry.slot = Slot::Failed {
-                    error: error.clone(),
-                    expires_at: Instant::now() + OPEN_PULL_REQUEST_FAILURE_BACKOFF,
-                };
+            match outcome {
+                Ok(value) => {
+                    entry.slot = Slot::Fresh {
+                        value: value.clone(),
+                        expires_at: Instant::now() + ttl,
+                    };
+                    state.last_logged_errors.remove(key);
+                    None
+                }
+                Err(error) if !cancelled => {
+                    let error_code = classify_open_pull_request_error(error);
+                    let backoff = failure_backoff_for_code(error_code);
+                    entry.slot = Slot::Failed {
+                        error: error.clone(),
+                        expires_at: Instant::now() + backoff,
+                    };
+                    let should_warn = state.record_logged_error(key, canonical_cwd, error_code);
+                    Some((error_code, backoff, should_warn))
+                }
+                Err(_) => {
+                    state.entries.remove(key);
+                    None
+                }
             }
-            Err(_) => {
-                state.entries.remove(key);
+        } else {
+            match outcome {
+                Ok(_) => {
+                    state.last_logged_errors.remove(key);
+                    None
+                }
+                Err(error) if !cancelled => {
+                    let error_code = classify_open_pull_request_error(error);
+                    let backoff = failure_backoff_for_code(error_code);
+                    let should_warn = state.record_logged_error(key, canonical_cwd, error_code);
+                    Some((error_code, backoff, should_warn))
+                }
+                Err(_) => None,
             }
         }
     }
@@ -378,6 +505,48 @@ impl OpenPullRequestLookups {
 }
 
 impl State {
+    fn record_logged_error(
+        &mut self,
+        key: &LookupKey,
+        canonical_cwd: &Path,
+        error_code: &'static str,
+    ) -> bool {
+        let seq = self.next_log_seq;
+        self.next_log_seq = self.next_log_seq.wrapping_add(1);
+        if let Some(record) = self.last_logged_errors.get_mut(key) {
+            record.last_seen = seq;
+            if record.error_code == error_code {
+                return false;
+            }
+            record.error_code = error_code;
+            return true;
+        }
+        let max_records = self
+            .capacity
+            .max(OPEN_PULL_REQUEST_LOOKUP_CAPACITY)
+            .saturating_mul(2);
+        while self.last_logged_errors.len() >= max_records {
+            let Some(oldest_key) = self
+                .last_logged_errors
+                .iter()
+                .min_by_key(|(_, record)| record.last_seen)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.last_logged_errors.remove(&oldest_key);
+        }
+        self.last_logged_errors.insert(
+            key.clone(),
+            LoggedFailureRecord {
+                canonical_cwd: canonical_cwd.to_path_buf(),
+                error_code,
+                last_seen: seq,
+            },
+        );
+        true
+    }
+
     fn make_room(&mut self, now: Instant) {
         if self.entries.len() < self.capacity {
             return;
@@ -1010,5 +1179,263 @@ mod tests {
         // The newest answers survive eviction.
         resolve(&lookups, key("/repo", "four"), &loader).await;
         assert_eq!(loader.runs(), 4);
+    }
+
+    fn gitlab_failure_with(code: Option<&'static str>, detail: &str) -> SourceControlProviderError {
+        SourceControlProviderError {
+            provider: ProviderKind::Gitlab,
+            cwd: "/work/example-group/sample-project".into(),
+            command: Some("glab".into()),
+            detail: detail.into(),
+            command_failure: code.map(|code| {
+                Box::new(crate::source_control::ProviderCommandFailure {
+                    code,
+                    host_detail: None,
+                    process_failure: None,
+                })
+            }),
+            ..failure()
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_gitlab_lookups_log_sanitized_error_codes_without_repository_identity() {
+        let Some(child) = crate::test_support::in_own_process(
+            "source_control::open_pull_request_lookups::tests::failed_gitlab_lookups_log_sanitized_error_codes_without_repository_identity",
+        ) else {
+            return;
+        };
+        let log = CapturedLog::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let cases = [
+            (
+                "branch-timeout",
+                gitlab_failure_with(
+                    Some("timeout"),
+                    "glab timed out reaching https://gitlab.example.test/example-group/sample-project",
+                ),
+                "timeout",
+            ),
+            (
+                "branch-auth",
+                gitlab_failure_with(
+                    Some("not_authenticated"),
+                    "no GitLab instances have been authenticated with glab for gitlab.example.test",
+                ),
+                "not_authenticated",
+            ),
+            (
+                "branch-missing",
+                gitlab_failure_with(
+                    Some("cli_missing"),
+                    "glab not found in /work/sample-project",
+                ),
+                "cli_missing",
+            ),
+            (
+                "branch-unreachable",
+                gitlab_failure_with(
+                    None,
+                    "dial tcp: lookup gitlab.example.test: no such host for example-group/sample-project",
+                ),
+                "host_unreachable",
+            ),
+        ];
+
+        for (branch, err, _) in &cases {
+            let mut lookup_key = key("/work/example-group/sample-project", branch);
+            lookup_key.provider = ProviderKind::Gitlab;
+            let loader = Loader::answering(Err(err.clone()));
+            resolve(&lookups, lookup_key, &loader).await;
+        }
+
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).expect("UTF-8 log");
+        for (_, _, expected_code) in &cases {
+            assert!(
+                text.contains(&format!("error_code=\"{expected_code}\"")),
+                "expected error_code=\"{expected_code}\" in:\n{text}"
+            );
+        }
+        assert!(text.contains("provider=Gitlab"), "{text}");
+        assert!(!text.contains("gitlab.example.test"), "{text}");
+        assert!(!text.contains("example-group"), "{text}");
+        assert!(!text.contains("sample-project"), "{text}");
+        child.complete();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_failures_deduplicate_warns_use_longer_backoff_and_reset_on_recovery() {
+        let Some(child) = crate::test_support::in_own_process(
+            "source_control::open_pull_request_lookups::tests::persistent_failures_deduplicate_warns_use_longer_backoff_and_reset_on_recovery",
+        ) else {
+            return;
+        };
+        let log = CapturedLog::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let lookups = Arc::new(OpenPullRequestLookups::default());
+        let mut lookup_key = key("/work/example-group/sample-project", "main");
+        lookup_key.provider = ProviderKind::Gitlab;
+
+        let missing = Loader::answering(Err(gitlab_failure_with(
+            Some("cli_missing"),
+            "glab is not installed",
+        )));
+        resolve(&lookups, lookup_key.clone(), &missing).await;
+        assert_eq!(missing.runs(), 1);
+
+        // Persistent failures stay backed off well past the 5s transient window.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        resolve(&lookups, lookup_key.clone(), &missing).await;
+        assert_eq!(
+            missing.runs(),
+            1,
+            "persistent failure must stay backed off past 5s"
+        );
+
+        // After the persistent backoff window expires, a repeated identical error class retries
+        // without emitting a duplicate WARN line.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        resolve(&lookups, lookup_key.clone(), &missing).await;
+        assert_eq!(missing.runs(), 2);
+        {
+            let text = String::from_utf8(log.0.lock().unwrap().clone()).expect("UTF-8 log");
+            assert_eq!(
+                text.lines().filter(|line| line.contains("WARN")).count(),
+                1,
+                "duplicate persistent failure must not emit a second WARN:\n{text}"
+            );
+        }
+
+        // Changing the error class emits a fresh WARN once the backoff expires.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let unauth = Loader::answering(Err(gitlab_failure_with(
+            Some("not_authenticated"),
+            "not logged in",
+        )));
+        resolve(&lookups, lookup_key.clone(), &unauth).await;
+        assert_eq!(unauth.runs(), 1);
+        {
+            let text = String::from_utf8(log.0.lock().unwrap().clone()).expect("UTF-8 log");
+            assert_eq!(
+                text.lines().filter(|line| line.contains("WARN")).count(),
+                2,
+                "error class transition must log a fresh WARN:\n{text}"
+            );
+            assert!(text.contains("error_code=\"not_authenticated\""), "{text}");
+        }
+
+        // Recovery caches Ok(None) for 10s and resets duplicate-WARN suppression.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let recovered = Loader::answering(Ok(None));
+        assert_eq!(
+            resolve(&lookups, lookup_key.clone(), &recovered).await,
+            Some(Ok(None))
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            resolve(&lookups, lookup_key.clone(), &recovered).await,
+            Some(Ok(None))
+        );
+        assert_eq!(recovered.runs(), 1, "Ok(None) stays cached for 10s");
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        resolve(&lookups, lookup_key, &unauth).await;
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).expect("UTF-8 log");
+        assert_eq!(
+            text.lines().filter(|line| line.contains("WARN")).count(),
+            3,
+            "recovery must reset duplicate-WARN suppression:\n{text}"
+        );
+        child.complete();
+    }
+
+    #[test]
+    fn error_classification_enforces_allowlist_and_avoids_host_and_json_misclassification() {
+        let stale_host =
+            gitlab_failure_with(None, "dial tcp: lookup stale.example.test: no such host");
+        assert_eq!(
+            classify_open_pull_request_error(&stale_host),
+            "host_unreachable"
+        );
+
+        let invalid_json_with_forbidden = gitlab_failure_with(
+            Some("invalid_response"),
+            "invalid type: string \"forbidden\", expected a sequence",
+        );
+        assert_eq!(
+            classify_open_pull_request_error(&invalid_json_with_forbidden),
+            "unknown"
+        );
+
+        let stale_head = gitlab_failure_with(Some("stale_head"), "stale");
+        assert_eq!(classify_open_pull_request_error(&stale_head), "unknown");
+    }
+
+    #[tokio::test]
+    async fn overflow_failures_still_warn_once_and_deduplicate_under_capacity_pressure() {
+        let Some(child) = crate::test_support::in_own_process(
+            "source_control::open_pull_request_lookups::tests::overflow_failures_still_warn_once_and_deduplicate_under_capacity_pressure",
+        ) else {
+            return;
+        };
+        let log = CapturedLog::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let lookups = Arc::new(OpenPullRequestLookups::with_limits(
+            OPEN_PULL_REQUEST_LOOKUP_TTL,
+            1,
+        ));
+        let pinned = Loader::gated(Ok(None));
+        let waiter = spawn_resolve(&lookups, key("/repo", "pinned"), &pinned);
+        wait_for_runs(&pinned, 1).await;
+
+        let overflow_err = Loader::answering(Err(gitlab_failure_with(
+            Some("not_authenticated"),
+            "not logged in",
+        )));
+        let mut overflow_key = key("/repo", "overflow");
+        overflow_key.provider = ProviderKind::Gitlab;
+        resolve(&lookups, overflow_key.clone(), &overflow_err).await;
+        resolve(&lookups, overflow_key, &overflow_err).await;
+        assert_eq!(overflow_err.runs(), 2);
+
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).expect("UTF-8 log");
+        assert_eq!(
+            text.lines().filter(|line| line.contains("WARN")).count(),
+            1,
+            "overflow failure must log once and suppress identical repeats:\n{text}"
+        );
+        assert!(text.contains("error_code=\"not_authenticated\""), "{text}");
+
+        pinned.release.notify_one();
+        let _ = bounded(waiter).await;
+        child.complete();
     }
 }

@@ -7,6 +7,7 @@ export function makeTestExecutionEnvironmentCapabilities(
   return {
     repositoryIdentity: false,
     terminalOrderedInput: false,
+    terminalPasteAssembly: false,
     terminalSizeOwnership: false,
     terminalUserInputClaim: false,
     terminalSizeHandOver: false,

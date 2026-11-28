@@ -177,6 +177,61 @@ async fn pending_question_count_follows_each_request_state() {
 }
 
 #[tokio::test]
+async fn non_blocking_user_input_keeps_pending_count_zero_and_expires_on_session_end() {
+    let (engine, thread_id) = engine().await;
+    session(&engine, &thread_id, "running", AT).await;
+    activity(
+        &engine,
+        &thread_id,
+        "user-input.requested",
+        json!({
+            "requestId": "q-async-1",
+            "isBlocking": false,
+            "questions": []
+        }),
+    )
+    .await;
+    assert_eq!(
+        thread(&engine, &thread_id).await.pending_user_input_count,
+        0,
+        "non-blocking questions must not mark a running thread as awaiting input"
+    );
+    assert!(
+        !engine
+            .repositories()
+            .thread_blocks_new_turn(thread_id.clone())
+            .await
+            .expect("thread_blocks_new_turn"),
+        "non-blocking questions must not block new turns or queue promotion"
+    );
+
+    // Stopping the session still expires the non-blocking request so no stale card survives.
+    session(&engine, &thread_id, "ready", AT).await;
+    assert!(
+        engine
+            .repositories()
+            .user_input_request_is_open(thread_id.clone(), "q-async-1".to_owned())
+            .await
+            .expect("open before expiry")
+    );
+    let expired = engine
+        .expire_requests_of_settled_sessions(&crate::orchestration::StartupProcessOwnership::new(
+            [],
+            [],
+        ))
+        .await
+        .expect("startup expiry");
+    assert_eq!(expired, 1);
+    assert!(
+        !engine
+            .repositories()
+            .user_input_request_is_open(thread_id.clone(), "q-async-1".to_owned())
+            .await
+            .expect("closed after expiry")
+    );
+}
+
+#[tokio::test]
 async fn pending_question_count_is_not_recounted_on_streamed_text() {
     let (engine, thread_id) = engine().await;
     session(&engine, &thread_id, "running", AT).await;

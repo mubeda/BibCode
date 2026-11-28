@@ -182,4 +182,103 @@ describe("createTerminalTranscript", () => {
     expect(transcript.snapshot()).toBe("xy");
     expect(transcript.byteLength()).toBe(2);
   });
+
+  it("preserves active DEC ?2004h bracketed paste mode across overflow eviction and clear", () => {
+    const transcript = createTerminalTranscript(32);
+    // Chunk-split multi-parameter DECSET enabling ?2004h
+    transcript.append("\u001b[?1049;");
+    transcript.append("2004;1004h");
+    transcript.append("x".repeat(64));
+
+    const snap = transcript.snapshot();
+    expect(snap.endsWith("\u001b[?2004h")).toBe(true);
+    expect(snap).toContain("x".repeat(32));
+
+    // Preserving modes on clear keeps ?2004h for a running terminal.
+    transcript.clear({ preserveModes: true });
+    expect(transcript.snapshot()).toBe("\u001b[?2004h");
+
+    // DECSTR soft reset turns ?2004h off.
+    transcript.append("\u001b[!p");
+    transcript.append("y".repeat(64));
+    expect(transcript.snapshot()).toBe("y".repeat(32));
+
+    // Re-enable, then RIS (\x1bc) turns ?2004h off.
+    transcript.append("\u001b[?02004h");
+    transcript.append("z".repeat(64));
+    expect(transcript.snapshot().endsWith("\u001b[?2004h")).toBe(true);
+    transcript.append("\u001bc");
+    transcript.append("w".repeat(64));
+    expect(transcript.snapshot()).toBe("w".repeat(32));
+
+    // Re-enable, then ?2004l turns ?2004h off.
+    transcript.append("\u001b[?2004h");
+    transcript.append("a".repeat(64));
+    expect(transcript.snapshot().endsWith("\u001b[?2004h")).toBe(true);
+    transcript.append("\u001b[?2004l");
+    transcript.append("b".repeat(64));
+    expect(transcript.snapshot()).toBe("b".repeat(32));
+  });
+
+  it("matches xterm on C1 CSI, colon subparameters, parameterized DECSTR, and mid-sequence replay boundaries", () => {
+    // C1 CSI (`\u009b?2004h`)
+    const c1 = createTerminalTranscript(32);
+    c1.append("\u009b?2004h");
+    c1.append("a".repeat(64));
+    expect(c1.snapshot().endsWith("\u001b[?2004h")).toBe(true);
+
+    // Colon subparameter before `;2004h` (`\x1b[?1:2;2004h`) + parameterized DECSTR (`\x1b[0!p`)
+    const sub = createTerminalTranscript(32);
+    sub.append("\u001b[?1:2;2004h");
+    sub.append("b".repeat(64));
+    expect(sub.snapshot().endsWith("\u001b[?2004h")).toBe(true);
+    sub.append("\u001b[0!p");
+    sub.append("c".repeat(64));
+    expect(sub.snapshot()).toBe("c".repeat(32));
+
+    // Snapshot halfway through `\x1b[?2004l` places `?2004h` BEFORE the unfinished `\x1b[?20`
+    // so the next live delta `"04l"` completes `\x1b[?2004l` cleanly.
+    const midDisable = createTerminalTranscript(32);
+    midDisable.append("\u001b[?2004h");
+    midDisable.append("d".repeat(64));
+    midDisable.append("\u001b[?20");
+    const snap = midDisable.snapshot();
+    expect(snap.endsWith("\u001b[?2004h\u001b[?20")).toBe(true);
+
+    // Clear halfway through `\x1b[?2004h` preserves the unfinished `\x1b[?20` prefix so live
+    // `"04h"` completes the transition.
+    const midEnableClear = createTerminalTranscript(32);
+    midEnableClear.append("\u001b[?20");
+    midEnableClear.clear({ preserveModes: true });
+    expect(midEnableClear.snapshot()).toBe("\u001b[?20");
+
+    // Long (>128 chars) unfinished OSC title after history eviction inserts `?2004h` at the exact
+    // sequence boundary without appending a duplicate truncated OSC opener.
+    const longOscPayload = "t".repeat(200);
+    const longOsc = `\u001b]0;${longOscPayload}`;
+    const longWithMode = createTerminalTranscript(512);
+    longWithMode.append("\u001b[?2004h");
+    longWithMode.append("x".repeat(400));
+    longWithMode.append(longOsc);
+    const longSnap = longWithMode.snapshot();
+    expect(longSnap.endsWith(`\u001b[?2004h${longOsc}`)).toBe(true);
+    expect(longSnap.split("\u001b]0;")).toHaveLength(2);
+
+    // Without `?2004h`, a long unfinished OSC after eviction is returned verbatim with no duplication.
+    const longWithoutMode = createTerminalTranscript(512);
+    longWithoutMode.append("x".repeat(400));
+    longWithoutMode.append(longOsc);
+    const longNoModeSnap = longWithoutMode.snapshot();
+    expect(longNoModeSnap.endsWith(longOsc)).toBe(true);
+    expect(longNoModeSnap.split("\u001b]0;")).toHaveLength(2);
+
+    // Unfinished OSC larger than the entire transcript buffer restores `?2004h` at the start
+    // without appending a truncated duplicate OSC opener.
+    const oversizedOsc = createTerminalTranscript(64);
+    oversizedOsc.append("\u001b[?2004h");
+    oversizedOsc.append(longOsc);
+    const oversizedSnap = oversizedOsc.snapshot();
+    expect(oversizedSnap.startsWith("\u001b[?2004h")).toBe(true);
+    expect(oversizedSnap).not.toContain("\u001b]0;");
+  });
 });

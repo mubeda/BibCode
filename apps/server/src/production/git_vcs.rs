@@ -947,27 +947,39 @@ impl GitVcsRpcServices {
                             &mut lookup,
                         ) => found,
                     };
-                    status.remote.pr = match found {
-                        Ok(Some(pull_request)) => {
+                    match found {
+                        Ok(Some(Ok(pull_request))) => {
                             self.broadcaster.record_pull_request(
                                 &cwd,
                                 ref_name.as_deref(),
                                 pull_request.clone(),
                             );
-                            pull_request
+                            status.remote.pr = pull_request;
+                            status.remote.pr_lookup_error = None;
                         }
-                        Ok(None) => {
-                            // The inner lookup runs under a token nothing cancels: a failure.
-                            // Subscribers show the cleared request too, as after a late lookup.
+                        Ok(Some(Err(error_code))) => {
                             if !refresh_cancelled
-                                && self
-                                    .broadcaster
-                                    .note_failed_pull_request_lookup(&cwd, ref_name.as_deref())
+                                && self.broadcaster.note_failed_pull_request_lookup_with_error(
+                                    &cwd,
+                                    ref_name.as_deref(),
+                                    error_code,
+                                )
                             {
                                 self.broadcaster.notify_pull_request_change(&cwd).await;
                             }
-                            self.broadcaster
-                                .known_pull_request(&cwd, ref_name.as_deref())
+                            let (pr, lookup_error) = self
+                                .broadcaster
+                                .known_pull_request_state(&cwd, ref_name.as_deref());
+                            status.remote.pr = pr;
+                            status.remote.pr_lookup_error =
+                                lookup_error.or_else(|| Some(error_code.to_owned()));
+                        }
+                        Ok(None) => {
+                            let (pr, lookup_error) = self
+                                .broadcaster
+                                .known_pull_request_state(&cwd, ref_name.as_deref());
+                            status.remote.pr = pr;
+                            status.remote.pr_lookup_error = lookup_error;
                         }
                         Err(_) => {
                             // Only subscribers need the late answer, so the lookup keeps its
@@ -976,25 +988,35 @@ impl GitVcsRpcServices {
                             let late_cwd = cwd.clone();
                             let late_ref = ref_name.clone();
                             self.broadcaster.spawn_for_subscribers(&cwd, async move {
-                                if let Some(pull_request) = lookup.await {
-                                    broadcaster.record_pull_request(
-                                        &late_cwd,
-                                        late_ref.as_deref(),
-                                        pull_request,
-                                    );
-                                    broadcaster.notify_pull_request_change(&late_cwd).await;
-                                } else if broadcaster
-                                    .note_failed_pull_request_lookup(&late_cwd, late_ref.as_deref())
-                                {
-                                    // Republished so the subscriber shows the cleared request;
-                                    // its own lookup then answers from the failure backoff.
-                                    broadcaster.notify_pull_request_change(&late_cwd).await;
+                                match lookup.await {
+                                    Some(Ok(pull_request)) => {
+                                        broadcaster.record_pull_request(
+                                            &late_cwd,
+                                            late_ref.as_deref(),
+                                            pull_request,
+                                        );
+                                        broadcaster.notify_pull_request_change(&late_cwd).await;
+                                    }
+                                    Some(Err(error_code))
+                                        if broadcaster
+                                            .note_failed_pull_request_lookup_with_error(
+                                                &late_cwd,
+                                                late_ref.as_deref(),
+                                                error_code,
+                                            ) =>
+                                    {
+                                        broadcaster.notify_pull_request_change(&late_cwd).await;
+                                    }
+                                    Some(Err(_)) | None => {}
                                 }
                             });
-                            self.broadcaster
-                                .known_pull_request(&cwd, ref_name.as_deref())
+                            let (pr, lookup_error) = self
+                                .broadcaster
+                                .known_pull_request_state(&cwd, ref_name.as_deref());
+                            status.remote.pr = pr;
+                            status.remote.pr_lookup_error = lookup_error;
                         }
-                    };
+                    }
                     status
                 })
                 .await
@@ -1568,16 +1590,17 @@ impl GitVcsRpcServices {
                     }, if enrichment.is_some() => {
                         let finished = enrichment.take().expect("lookup in flight");
                         match found {
-                            Ok(Some(pull_request)) => broadcaster.record_pull_request(
+                            Ok(Some(Ok(pull_request))) => broadcaster.record_pull_request(
                                 &cwd,
                                 finished.ref_name.as_deref(),
                                 pull_request,
                             ),
                             // A lookup cancelled through its own token is not a failure.
-                            Ok(None) if !finished.cancellation.is_cancelled() => {
-                                broadcaster.note_failed_pull_request_lookup(
+                            Ok(Some(Err(error_code))) if !finished.cancellation.is_cancelled() => {
+                                broadcaster.note_failed_pull_request_lookup_with_error(
                                     &cwd,
                                     finished.ref_name.as_deref(),
+                                    error_code,
                                 );
                             }
                             _ => {}
@@ -1621,8 +1644,12 @@ impl GitVcsRpcServices {
                             remote: Some(remote),
                         } = &mut value
                         {
-                            remote.pr = broadcaster
-                                .known_pull_request(&cwd, publication.local.ref_name.as_deref());
+                            let (pr, lookup_error) = broadcaster.known_pull_request_state(
+                                &cwd,
+                                publication.local.ref_name.as_deref(),
+                            );
+                            remote.pr = pr;
+                            remote.pr_lookup_error = lookup_error;
                         }
                         if !shown
                             .send(&sender, &broadcaster, &publication.fence, value)
@@ -3552,7 +3579,7 @@ async fn finish_fenced_enrichment<T>(
 /// The pull-request lookup a status stream has in flight, and the branch it is for.
 struct StatusStreamEnrichment {
     cancellation: CancellationToken,
-    task: tokio::task::JoinHandle<Option<Option<ChangeRequest>>>,
+    task: tokio::task::JoinHandle<Option<Result<Option<ChangeRequest>, &'static str>>>,
     ref_name: Option<String>,
     /// The newest status whose publication asked for a lookup while this one ran.
     look_again: Option<VcsStatusLocalResult>,
@@ -3626,12 +3653,14 @@ impl ShownStatus {
         else {
             return true;
         };
-        let known = broadcaster.known_pull_request(cwd, ref_name.as_deref());
-        if known == remote.pr {
+        let (known_pr, known_error) =
+            broadcaster.known_pull_request_state(cwd, ref_name.as_deref());
+        if known_pr == remote.pr && known_error == remote.pr_lookup_error {
             return true;
         }
         let remote = VcsStatusRemoteResult {
-            pr: known,
+            pr: known_pr,
+            pr_lookup_error: known_error,
             ..remote.clone()
         };
         self.send(
@@ -3651,17 +3680,17 @@ async fn lookup_open_pull_request(
     cwd: &std::path::Path,
     local: &VcsStatusLocalResult,
     cancellation: &CancellationToken,
-) -> Option<Option<ChangeRequest>> {
+) -> Option<Result<Option<ChangeRequest>, &'static str>> {
     let Some(reference) = local.ref_name.as_deref() else {
-        return Some(None);
+        return Some(Ok(None));
     };
     let provider = local_provider_kind(local);
     if provider == ProviderKind::Unknown {
-        return Some(None);
+        return Some(Ok(None));
     }
     // Shared with the status stream and other refreshes for a few seconds;
     // see `PullRequestService::resolve_current_optional_shared`.
-    let pull_request = pull_requests
+    match pull_requests
         .resolve_current_optional_shared(
             ResolvePullRequestInput {
                 cwd: cwd.to_path_buf(),
@@ -3671,9 +3700,8 @@ async fn lookup_open_pull_request(
             cancellation,
         )
         .await
-        .ok()?;
-    Some(
-        pull_request
+    {
+        Ok(pull_request) => Some(Ok(pull_request
             .filter(|pull_request| pull_request.state == ChangeRequestState::Open)
             .map(|pull_request| ChangeRequest {
                 number: pull_request.number,
@@ -3682,8 +3710,12 @@ async fn lookup_open_pull_request(
                 base_ref: pull_request.base_branch,
                 head_ref: pull_request.head_branch,
                 state: "open".to_owned(),
-            }),
-    )
+            }))),
+        Err(_) if cancellation.is_cancelled() => None,
+        Err(error) => Some(Err(
+            crate::source_control::classify_open_pull_request_error(&error),
+        )),
+    }
 }
 
 async fn local_branch_names(
@@ -4408,6 +4440,7 @@ mod mutation_ownership_tests {
                         behind_count: 0,
                         ahead_of_default_count: Some(1),
                         pr: None,
+                        pr_lookup_error: None,
                     }),
                 },
             )

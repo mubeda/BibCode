@@ -157,12 +157,21 @@ export type TerminalBeginInput = Schema.Codec.Encoded<typeof TerminalBeginInput>
 export const TerminalInputLease = Schema.Struct({ inputId: TrimmedNonEmptyStringSchema });
 export type TerminalInputLease = typeof TerminalInputLease.Type;
 
+export const TerminalPasteStage = Schema.Literals(["chunk", "commit"]);
+export type TerminalPasteStage = typeof TerminalPasteStage.Type;
+
 export const TerminalWriteInputFrame = Schema.Struct({
   ...TerminalSessionInput.fields,
   inputId: TrimmedNonEmptyStringSchema,
   sequence: TerminalInputSequence,
   data: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(16_384)),
   userInputClaim: TerminalUserInputClaim,
+  /**
+   * Optional multi-frame bracketed-paste staging marker sent only to servers advertising
+   * `terminalPasteAssembly` (#431). `"chunk"` stages into the lease's bounded paste buffer;
+   * `"commit"` writes the assembled paste atomically to the PTY.
+   */
+  pasteStage: Schema.optional(TerminalPasteStage),
 });
 export type TerminalWriteInputFrame = typeof TerminalWriteInputFrame.Type;
 

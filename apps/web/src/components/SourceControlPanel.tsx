@@ -1049,8 +1049,9 @@ export default function SourceControlPanel({
     useRightPanelStore.getState().openPullRequest(threadRef, {
       number: pr.number,
       provider: status?.sourceControlProvider?.kind ?? "unknown",
+      ...(gitCwd ? { cwd: gitCwd } : {}),
     });
-  }, [status, threadRef]);
+  }, [gitCwd, status, threadRef]);
 
   const onPrimaryAction = useCallback(() => {
     if (quickAction.kind === "open_pr") return openPr();
@@ -1802,7 +1803,10 @@ export default function SourceControlPanel({
                 providerKind: request.provider,
               })
             )
-              useRightPanelStore.getState().openPullRequest(threadRef, request);
+              useRightPanelStore.getState().openPullRequest(threadRef, {
+                ...request,
+                ...(gitCwd ? { cwd: gitCwd } : {}),
+              });
           }}
         />
       ) : null}

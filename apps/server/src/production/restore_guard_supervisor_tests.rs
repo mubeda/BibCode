@@ -457,8 +457,9 @@ impl ProviderDriver for RestartingDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
-        self.0.answer(request_id, answers)
+        self.0.answer(request_id, answers, disposition)
     }
     fn set_mode(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async {

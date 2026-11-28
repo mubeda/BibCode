@@ -550,6 +550,33 @@ pub(crate) struct TerminalSessionIdentity {
     process: Arc<dyn PtyProcess>,
 }
 
+const LEGACY_DELIMITER_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+struct LegacyDelimiterFence {
+    owner: String,
+    prefix: String,
+    deadline: tokio::time::Instant,
+}
+
+/// Returns the longest proper prefix (1..=5 bytes) of `\x1b[200~` or `\x1b[201~` at the end
+/// of `prev` followed by `data`, so legacy ordered clients that split a delimiter across 16 KiB
+/// frames cannot have another lease interleave between the fragments (#431).
+fn trailing_paste_delimiter_prefix(prev: &str, data: &str) -> Option<&'static str> {
+    const PREFIXES: [&str; 6] = ["\x1b[200", "\x1b[201", "\x1b[20", "\x1b[2", "\x1b[", "\x1b"];
+    let tail_start = data.len().saturating_sub(6);
+    let mut combined = String::with_capacity(prev.len() + data.len() - tail_start);
+    combined.push_str(prev);
+    let mut start = tail_start;
+    while start < data.len() && !data.is_char_boundary(start) {
+        start += 1;
+    }
+    combined.push_str(&data[start..]);
+    PREFIXES
+        .into_iter()
+        .find(|prefix| combined.ends_with(prefix))
+}
+
 impl TerminalSessionIdentity {
     pub(super) fn input_key(&self) -> (String, String) {
         self.key.clone()
@@ -557,6 +584,19 @@ impl TerminalSessionIdentity {
 
     pub(super) fn input_cancellation(&self) -> CancellationToken {
         self.generation.cancellation.clone()
+    }
+
+    pub(super) fn release_delimiter_fence(&self, owner: &str) {
+        let mut fence = self
+            .generation
+            .legacy_delimiter_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fence.as_ref().is_some_and(|current| current.owner == owner) {
+            *fence = None;
+            drop(fence);
+            self.generation.legacy_delimiter_changed.notify_waiters();
+        }
     }
 
     /// Queues one ordered input frame for the process, under the publication lock and
@@ -567,15 +607,51 @@ impl TerminalSessionIdentity {
         &self,
         data: &str,
         origin: TerminalInputOrigin<'_>,
+        owner: &str,
+        track_legacy_delimiter: bool,
         cancelled: &CancellationToken,
         connection_closed: &CancellationToken,
     ) -> Result<super::writer::PendingWrite, TerminalError> {
-        let _publication = tokio::select! {
-            biased;
-            () = cancelled.cancelled() => return Err(TerminalError::PublicationCancelled),
-            () = connection_closed.cancelled() => return Err(TerminalError::PublicationCancelled),
-            () = self.generation.cancellation.cancelled() => return Err(TerminalError::PublicationCancelled),
-            guard = self.generation.publication.lock() => guard,
+        let _publication = loop {
+            let publication = tokio::select! {
+                biased;
+                () = cancelled.cancelled() => return Err(TerminalError::PublicationCancelled),
+                () = connection_closed.cancelled() => return Err(TerminalError::PublicationCancelled),
+                () = self.generation.cancellation.cancelled() => return Err(TerminalError::PublicationCancelled),
+                guard = self.generation.publication.lock() => guard,
+            };
+            let notified = self.generation.legacy_delimiter_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let wait_until = {
+                let mut fence = self
+                    .generation
+                    .legacy_delimiter_fence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if fence
+                    .as_ref()
+                    .is_some_and(|current| current.deadline <= tokio::time::Instant::now())
+                {
+                    *fence = None;
+                }
+                match fence.as_ref() {
+                    Some(current) if current.owner != owner => Some(current.deadline),
+                    _ => None,
+                }
+            };
+            let Some(deadline) = wait_until else {
+                break publication;
+            };
+            drop(publication);
+            tokio::select! {
+                biased;
+                () = cancelled.cancelled() => return Err(TerminalError::PublicationCancelled),
+                () = connection_closed.cancelled() => return Err(TerminalError::PublicationCancelled),
+                () = self.generation.cancellation.cancelled() => return Err(TerminalError::PublicationCancelled),
+                () = &mut notified => {}
+                () = tokio::time::sleep_until(deadline) => {}
+            }
         };
         let mut session = self.session.lock().await;
         if cancelled.is_cancelled()
@@ -599,7 +675,40 @@ impl TerminalSessionIdentity {
         }
         session.note_input(origin);
         drop(session);
-        let pending = self.generation.writer.enqueue(&self.process, data, true)?;
+        let guard_cancelled = cancelled.clone();
+        let guard_connection = connection_closed.clone();
+        let guard_generation = self.generation.cancellation.clone();
+        let guard: super::writer::WriteGuard = Box::new(move || {
+            !guard_cancelled.is_cancelled()
+                && !guard_connection.is_cancelled()
+                && !guard_generation.is_cancelled()
+        });
+        let pending = self
+            .generation
+            .writer
+            .enqueue_guarded(&self.process, data, true, guard)?;
+        if track_legacy_delimiter {
+            let mut fence = self
+                .generation
+                .legacy_delimiter_fence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = fence
+                .as_ref()
+                .filter(|current| current.owner == owner)
+                .map_or("", |current| current.prefix.as_str());
+            if let Some(next_prefix) = trailing_paste_delimiter_prefix(prev, data) {
+                *fence = Some(LegacyDelimiterFence {
+                    owner: owner.to_owned(),
+                    prefix: next_prefix.to_owned(),
+                    deadline: tokio::time::Instant::now() + LEGACY_DELIMITER_FENCE_TIMEOUT,
+                });
+            } else if fence.as_ref().is_some_and(|current| current.owner == owner) {
+                *fence = None;
+                drop(fence);
+                self.generation.legacy_delimiter_changed.notify_waiters();
+            }
+        }
         self.generation
             .activity_wake
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1392,6 +1501,9 @@ struct SessionGeneration {
     /// The process's input queue: unary and ordered writes are enqueued under `publication`
     /// and written by the writer's own thread, outside it.
     writer: super::writer::TerminalWriter,
+    /// Serializes competing leases while a legacy ordered client's frame ends mid-delimiter (#431).
+    legacy_delimiter_fence: std::sync::Mutex<Option<LegacyDelimiterFence>>,
+    legacy_delimiter_changed: tokio::sync::Notify,
     output_started: std::sync::atomic::AtomicBool,
     output_stop: CancellationToken,
     output_completed: CancellationToken,
@@ -1449,6 +1561,8 @@ impl SessionGeneration {
             publication: Mutex::new(()),
             startup: Arc::new(Mutex::new(())),
             writer: super::writer::TerminalWriter::default(),
+            legacy_delimiter_fence: std::sync::Mutex::new(None),
+            legacy_delimiter_changed: tokio::sync::Notify::new(),
             output_started: std::sync::atomic::AtomicBool::new(false),
             output_stop: CancellationToken::new(),
             output_completed: CancellationToken::new(),
@@ -1469,6 +1583,11 @@ impl SessionGeneration {
         self.invalidated
             .store(true, std::sync::atomic::Ordering::Release);
         self.cancellation.cancel();
+        *self
+            .legacy_delimiter_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.legacy_delimiter_changed.notify_waiters();
         // Close, exit, restart and shutdown all end here: the input writer's thread and its
         // hold on the process go now, not after its idle timeout.
         self.writer.stop();
@@ -2077,7 +2196,9 @@ impl Session {
             worktree_path: self.worktree_path.clone(),
             status: self.status,
             pid: self.pid,
-            history: self.history.snapshot(),
+            history: self
+                .history
+                .snapshot_for_replay(self.status == TerminalStatus::Running),
             exit_code: self.exit_code,
             exit_signal: self.exit_signal,
             console_theme: self.console_theme,
@@ -8431,6 +8552,24 @@ mod tests {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn ordered_staged_write(
+        manager: &TerminalManager,
+        connection: uuid::Uuid,
+        thread_id: &str,
+        terminal_id: &str,
+        input_id: &str,
+        sequence: u64,
+        data: &str,
+        paste_stage: crate::terminal::TerminalPasteStage,
+    ) -> Result<crate::terminal::input::TerminalInputAcknowledgement, TerminalError> {
+        manager
+            .prepare_input_write(connection, thread_id, terminal_id, input_id, sequence, data)?
+            .with_paste_stage(Some(paste_stage))
+            .write()
+            .await
+    }
+
     async fn ordered_input_fixture() -> (
         tempfile::TempDir,
         Arc<HistoryTestBackend>,
@@ -8991,6 +9130,1021 @@ mod tests {
         );
         assert!(later.await.is_err());
         assert!(backend.latest().writes().is_empty());
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn staged_paste_assembles_over_256k_across_two_leases_atomically_without_deadlock() {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        let (root, backend, manager, connection, closed, first_id) = ordered_input_fixture().await;
+        let first_process = backend.latest();
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "other",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("other terminal");
+        let second_process = backend.latest();
+        let second = manager
+            .begin_input(connection, closed, "thread", "other", 0, None)
+            .await
+            .expect("second lease");
+
+        // 20 frames * 16 KiB = 320 KiB per lease (closer in frame 20 > 16 frames and > 256 KiB).
+        let make_frames = |ch: &str| -> Vec<String> {
+            let mut frames = Vec::with_capacity(20);
+            frames.push(format!("\x1b[200~{}", ch.repeat(16 * 1024 - 6)));
+            for _ in 1..19 {
+                frames.push(ch.repeat(16 * 1024));
+            }
+            frames.push(format!("{}\x1b[201~", ch.repeat(16 * 1024 - 6)));
+            frames
+        };
+        let frames_a = make_frames("a");
+        let frames_b = make_frames("b");
+        let expected_a = frames_a.concat();
+        let expected_b = frames_b.concat();
+
+        let send_all = |terminal_id: &'static str, input_id: String, frames: Vec<String>| {
+            let manager = manager.clone();
+            async move {
+                let last = frames.len() - 1;
+                for (seq, chunk) in frames.into_iter().enumerate() {
+                    let stage = if seq == last { Commit } else { Chunk };
+                    ordered_staged_write(
+                        &manager,
+                        connection,
+                        "thread",
+                        terminal_id,
+                        &input_id,
+                        seq as u64,
+                        &chunk,
+                        stage,
+                    )
+                    .await
+                    .expect("staged frame succeeds");
+                }
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                send_all("term", first_id, frames_a),
+                send_all("other", second.input_id, frames_b),
+            );
+        })
+        .await
+        .expect("two >256 KiB staged pastes sharing one connection must not deadlock");
+
+        assert_eq!(first_process.writes(), [expected_a]);
+        assert_eq!(second_process.writes(), [expected_b]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn staged_paste_discards_unpublished_bytes_on_cancel_disconnect_interruption_and_overflow()
+     {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        // 1. Cancel after chunk -> ZERO PTY writes.
+        {
+            let (_root, backend, manager, connection, _closed, input_id) =
+                ordered_input_fixture().await;
+            ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "\x1b[200~part1",
+                Chunk,
+            )
+            .await
+            .expect("chunk staged");
+            manager
+                .cancel_input(connection, "thread", "term", &input_id)
+                .expect("cancel");
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+
+        // 2. Disconnect after chunk -> ZERO PTY writes.
+        {
+            let (_root, backend, manager, connection, closed, input_id) =
+                ordered_input_fixture().await;
+            ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "\x1b[200~part1",
+                Chunk,
+            )
+            .await
+            .expect("chunk staged");
+            closed.cancel();
+            assert!(
+                ordered_staged_write(
+                    &manager,
+                    connection,
+                    "thread",
+                    "term",
+                    &input_id,
+                    1,
+                    "part2\x1b[201~",
+                    Commit,
+                )
+                .await
+                .is_err()
+            );
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+
+        // 3. Interrupted by non-staged frame -> sequence error, ZERO PTY writes.
+        {
+            let (_root, backend, manager, connection, _closed, input_id) =
+                ordered_input_fixture().await;
+            ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "\x1b[200~part1",
+                Chunk,
+            )
+            .await
+            .expect("chunk staged");
+            let err = ordered_write(&manager, connection, "thread", "term", &input_id, 1, "\r")
+                .await
+                .expect_err("non-staged frame interrupts open paste");
+            assert!(matches!(err, TerminalError::Input(e) if e.code == "sequence"));
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+
+        // 4. Overflow > 1 MiB -> capacity error, ZERO PTY writes, permits released for reattach.
+        {
+            let (_root, backend, manager, connection, closed, input_id) =
+                ordered_input_fixture().await;
+            let first_chunk = format!("\x1b[200~{}", "x".repeat(16 * 1024 - 6));
+            let full_chunk = "x".repeat(16 * 1024);
+            // 64 * 16 KiB = exactly 1 MiB; frame 64 pushes over 1 MiB.
+            for seq in 0..64u64 {
+                let payload = if seq == 0 {
+                    first_chunk.as_str()
+                } else {
+                    full_chunk.as_str()
+                };
+                ordered_staged_write(
+                    &manager, connection, "thread", "term", &input_id, seq, payload, Chunk,
+                )
+                .await
+                .expect("within 1 MiB");
+            }
+            let err = ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                64,
+                "overflow\x1b[201~",
+                Commit,
+            )
+            .await
+            .expect_err("overflow past 1 MiB");
+            assert!(matches!(err, TerminalError::Input(e) if e.code == "capacity"));
+            assert!(backend.latest().writes().is_empty());
+
+            // Next attachment succeeds cleanly with freed permits.
+            let fresh = manager
+                .begin_input(connection, closed, "thread", "term", 1, None)
+                .await
+                .expect("reattach succeeds after overflow");
+            ordered_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &fresh.input_id,
+                0,
+                "ok",
+            )
+            .await
+            .expect("fresh write succeeds");
+            assert_eq!(backend.latest().writes(), ["ok"]);
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn staged_paste_deadline_discards_unclosed_prefix_and_frees_next_attachment() {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        let (_root, backend, manager, connection, closed, input_id) = ordered_input_fixture().await;
+        ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            0,
+            "\x1b[200~unclosed multi-line\rpayload",
+            Chunk,
+        )
+        .await
+        .expect("chunk staged");
+
+        // Advance past the 10-second staged-paste deadline.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+
+        // Late continuation must fail cleanly without ever writing the unclosed prefix.
+        let err = ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            1,
+            "tail\x1b[201~",
+            Commit,
+        )
+        .await
+        .expect_err("expired paste rejects late continuation");
+        assert!(
+            matches!(err, TerminalError::Input(e) if e.code == "sequence" || e.code == "closed")
+        );
+        assert!(backend.latest().writes().is_empty());
+
+        // Next attachment works cleanly with zero leaked permits.
+        let fresh = manager
+            .begin_input(connection, closed, "thread", "term", 1, None)
+            .await
+            .expect("reattach succeeds");
+        ordered_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &fresh.input_id,
+            0,
+            "hi",
+        )
+        .await
+        .expect("fresh write succeeds");
+        assert_eq!(backend.latest().writes(), ["hi"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn staged_paste_pty_small_chunk_reader_submits_only_on_explicit_enter() {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        // Simulates a TUI reading stdin in tiny 64-byte chunks, buffering bracketed paste
+        // (`\x1b[200~...\x1b[201~`) without submitting mid-paste `\r`, and submitting once on
+        // explicit `\r` outside bracketed paste.
+        let parse_small_chunks = |writes: &[String]| -> Vec<String> {
+            let mut in_paste = false;
+            let mut buffer = String::new();
+            let mut pending_esc = String::new();
+            let mut submitted = Vec::new();
+            for write in writes {
+                for chunk in write.as_bytes().chunks(64) {
+                    let s = std::str::from_utf8(chunk).expect("ascii test payload");
+                    pending_esc.push_str(s);
+                    let mut i = 0;
+                    let bytes = pending_esc.as_bytes();
+                    while i < bytes.len() {
+                        if bytes[i] == 0x1b {
+                            let rem = &pending_esc[i..];
+                            if rem.starts_with("\x1b[200~") {
+                                in_paste = true;
+                                i += 6;
+                                continue;
+                            }
+                            if rem.starts_with("\x1b[201~") {
+                                in_paste = false;
+                                i += 6;
+                                continue;
+                            }
+                            if "\x1b[200~".starts_with(rem) || "\x1b[201~".starts_with(rem) {
+                                break;
+                            }
+                        }
+                        let ch = pending_esc[i..].chars().next().unwrap();
+                        if ch == '\r' && !in_paste {
+                            submitted.push(std::mem::take(&mut buffer));
+                        } else {
+                            buffer.push(ch);
+                        }
+                        i += ch.len_utf8();
+                    }
+                    pending_esc.drain(..i);
+                }
+            }
+            submitted
+        };
+
+        let (_root, backend, manager, connection, _closed, input_id) =
+            ordered_input_fixture().await;
+        // 1. Short multi-line bracketed paste -> zero submissions before Enter.
+        let short_body = "short line 1\rshort line 2\rshort line 3";
+        ordered_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            0,
+            &format!("\x1b[200~{short_body}\x1b[201~"),
+        )
+        .await
+        .expect("short paste");
+        assert!(parse_small_chunks(&backend.latest().writes()).is_empty());
+
+        // 2. >16 KiB (32 KiB) multi-line staged paste -> atomic single PTY write, zero early submits.
+        let long_body = "alpha\rbeta\rgamma\r".repeat(1_500); // ~25.5 KiB
+        let full_long = format!("\x1b[200~{long_body}\x1b[201~");
+        let split_at = 16 * 1024;
+        ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            1,
+            &full_long[..split_at],
+            Chunk,
+        )
+        .await
+        .expect("chunk 0");
+        assert_eq!(
+            backend.latest().writes().len(),
+            1,
+            "chunk must not write to PTY"
+        );
+        ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &input_id,
+            2,
+            &full_long[split_at..],
+            Commit,
+        )
+        .await
+        .expect("commit");
+        assert_eq!(
+            backend.latest().writes().len(),
+            2,
+            "commit must deliver the entire >16 KiB paste in one contiguous PTY write"
+        );
+        assert!(parse_small_chunks(&backend.latest().writes()).is_empty());
+
+        // 3. Explicit Enter submits exactly ONE complete combined prompt.
+        ordered_write(&manager, connection, "thread", "term", &input_id, 3, "\r")
+            .await
+            .expect("explicit enter");
+        let submitted = parse_small_chunks(&backend.latest().writes());
+        assert_eq!(submitted, [format!("{short_body}{long_body}")]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_staged_commit_queued_behind_blocked_write_never_reaches_pty() {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        #[derive(Debug)]
+        struct BlockingPty {
+            block_first: std::sync::atomic::AtomicBool,
+            first_started: Arc<tokio::sync::Notify>,
+            release_first: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            writes: std::sync::Mutex<Vec<String>>,
+            output: broadcast::Sender<String>,
+            exit: tokio::sync::watch::Sender<Option<PtyExit>>,
+        }
+
+        impl PtyProcess for BlockingPty {
+            fn pid(&self) -> u32 {
+                4242
+            }
+
+            fn process_identity(&self) -> Option<crate::diagnostics::ProcessIdentity> {
+                Some(crate::diagnostics::ProcessIdentity {
+                    pid: 4242,
+                    started_at: 0,
+                })
+            }
+
+            fn write(&self, data: &str) -> Result<(), String> {
+                if self
+                    .block_first
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    self.first_started.notify_one();
+                    let (lock, condvar) = &*self.release_first;
+                    let mut released = lock.lock().expect("release lock");
+                    while !*released {
+                        released = condvar.wait(released).expect("condvar wait");
+                    }
+                }
+                self.writes
+                    .lock()
+                    .expect("writes lock")
+                    .push(data.to_owned());
+                Ok(())
+            }
+
+            fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn kill(&self) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn subscribe_output(&self) -> broadcast::Receiver<String> {
+                self.output.subscribe()
+            }
+
+            fn subscribe_exit(&self) -> tokio::sync::watch::Receiver<Option<PtyExit>> {
+                self.exit.subscribe()
+            }
+        }
+
+        #[derive(Debug)]
+        struct BlockingBackend(Arc<BlockingPty>);
+
+        impl PtyBackend for BlockingBackend {
+            fn spawn(&self, _input: &PtySpawnInput) -> Result<Arc<dyn PtyProcess>, String> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let (output, _) = broadcast::channel(16);
+        let (exit, _) = tokio::sync::watch::channel(None);
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let pty = Arc::new(BlockingPty {
+            block_first: std::sync::atomic::AtomicBool::new(true),
+            first_started: first_started.clone(),
+            release_first: release_first.clone(),
+            writes: std::sync::Mutex::new(Vec::new()),
+            output,
+            exit,
+        });
+        let root = tempfile::tempdir().expect("root");
+        let manager = TerminalManager::new(
+            Arc::new(BlockingBackend(pty.clone())),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("open");
+
+        // Block the writer thread on an earlier unary write.
+        let blocker = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.write("thread", "term", "earlier").await })
+        };
+        first_started.notified().await;
+
+        let connection = uuid::Uuid::new_v4();
+        let closed = CancellationToken::new();
+        let lease = manager
+            .begin_input(connection, closed, "thread", "term", 0, None)
+            .await
+            .expect("begin");
+        ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &lease.input_id,
+            0,
+            "\x1b[200~secret ",
+            Chunk,
+        )
+        .await
+        .expect("chunk");
+
+        // Queue the commit behind the blocked earlier write, then cancel the lease.
+        let commit_task = {
+            let manager = manager.clone();
+            let input_id = lease.input_id.clone();
+            tokio::spawn(async move {
+                ordered_staged_write(
+                    &manager,
+                    connection,
+                    "thread",
+                    "term",
+                    &input_id,
+                    1,
+                    "paste\x1b[201~",
+                    Commit,
+                )
+                .await
+            })
+        };
+        // Give the commit task a chance to enqueue on the writer thread behind "earlier".
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        manager
+            .cancel_input(connection, "thread", "term", &lease.input_id)
+            .expect("cancel");
+
+        // Release the blocked writer thread and verify ZERO paste bytes reached the PTY.
+        {
+            let (lock, condvar) = &*release_first;
+            *lock.lock().expect("release lock") = true;
+            condvar.notify_all();
+        }
+        blocker.await.expect("blocker join").expect("earlier write");
+        assert!(commit_task.await.expect("commit join").is_err());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(pty.writes.lock().expect("writes").as_slice(), ["earlier"]);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_staged_paste_envelopes_are_rejected_with_zero_pty_writes() {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+
+        // 1. Orphan commit with no staged prefix
+        {
+            let (_root, backend, manager, connection, _closed, input_id) =
+                ordered_input_fixture().await;
+            let err = ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "\x1b[200~solo\x1b[201~",
+                Commit,
+            )
+            .await
+            .expect_err("orphan commit must fail");
+            assert!(matches!(err, TerminalError::Input(e) if e.code == "sequence"));
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+
+        // 2. First chunk missing opener
+        {
+            let (_root, backend, manager, connection, _closed, input_id) =
+                ordered_input_fixture().await;
+            let err = ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "missing opener",
+                Chunk,
+            )
+            .await
+            .expect_err("chunk without opener must fail");
+            assert!(matches!(err, TerminalError::Input(e) if e.code == "sequence"));
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+
+        // 3. Commit missing closing delimiter
+        {
+            let (_root, backend, manager, connection, _closed, input_id) =
+                ordered_input_fixture().await;
+            ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "\x1b[200~unclosed",
+                Chunk,
+            )
+            .await
+            .expect("chunk");
+            let err = ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                1,
+                " still unclosed",
+                Commit,
+            )
+            .await
+            .expect_err("unclosed commit must fail");
+            assert!(matches!(err, TerminalError::Input(e) if e.code == "sequence"));
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+
+        // 4. Commit containing an embedded closing delimiter inside body
+        {
+            let (_root, backend, manager, connection, _closed, input_id) =
+                ordered_input_fixture().await;
+            ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                0,
+                "\x1b[200~a\x1b[201~smuggled\r",
+                Chunk,
+            )
+            .await
+            .expect("chunk");
+            let err = ordered_staged_write(
+                &manager,
+                connection,
+                "thread",
+                "term",
+                &input_id,
+                1,
+                "tail\x1b[201~",
+                Commit,
+            )
+            .await
+            .expect_err("embedded closer must fail");
+            assert!(matches!(err, TerminalError::Input(e) if e.code == "sequence"));
+            assert!(backend.latest().writes().is_empty());
+            manager.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_ordered_frames_splitting_paste_delimiter_serialize_competing_leases() {
+        let (_root, backend, manager, connection_a, _closed_a, lease_a) =
+            ordered_input_fixture().await;
+        let connection_b = uuid::Uuid::new_v4();
+        let lease_b = manager
+            .begin_input(
+                connection_b,
+                CancellationToken::new(),
+                "thread",
+                "term",
+                0,
+                None,
+            )
+            .await
+            .expect("second lease");
+
+        // Lease A sends a legacy (non-staged) frame ending mid-delimiter `\x1b[20`.
+        ordered_write(
+            &manager,
+            connection_a,
+            "thread",
+            "term",
+            &lease_a,
+            0,
+            "pre\x1b[20",
+        )
+        .await
+        .expect("legacy prefix acknowledges immediately");
+
+        // Competing Lease B tries to write while Lease A holds the partial-delimiter fence.
+        let competing = {
+            let manager = manager.clone();
+            let input_id = lease_b.input_id.clone();
+            tokio::spawn(async move {
+                ordered_write(
+                    &manager,
+                    connection_b,
+                    "thread",
+                    "term",
+                    &input_id,
+                    0,
+                    "competing",
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !competing.is_finished(),
+            "competing lease must wait until split delimiter finishes"
+        );
+
+        // Lease A completes the delimiter; competing Lease B proceeds afterward without interleaving.
+        ordered_write(
+            &manager,
+            connection_a,
+            "thread",
+            "term",
+            &lease_a,
+            1,
+            "0~body\x1b[201~",
+        )
+        .await
+        .expect("delimiter completion");
+        tokio::time::timeout(Duration::from_secs(2), competing)
+            .await
+            .expect("competing completes in time")
+            .expect("join")
+            .expect("competing write succeeds");
+        assert_eq!(
+            backend.latest().writes(),
+            ["pre\x1b[20", "0~body\x1b[201~", "competing"]
+        );
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_portable_pty_small_chunk_reader_submits_multiline_staged_paste_only_on_enter() {
+        use crate::terminal::TerminalPasteStage::{Chunk, Commit};
+        use crate::terminal::pty::PortablePtyBackend;
+
+        let python_ok = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !python_ok {
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("root");
+        let script = root.path().join("small_chunk_reader.py");
+        std::fs::write(
+            &script,
+            r#"import os, sys, termios, tty, hashlib
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+START = b"\x1b[200~"
+END = b"\x1b[201~"
+in_paste = False
+buf = bytearray()
+pending = bytearray()
+sys.stdout.write("READY\n")
+sys.stdout.flush()
+while True:
+    chunk = os.read(fd, 64)
+    if not chunk:
+        break
+    pending.extend(chunk)
+    i = 0
+    while i < len(pending):
+        if pending[i] == 0x1b:
+            rem = bytes(pending[i:])
+            if rem.startswith(START):
+                in_paste = True
+                i += len(START)
+                continue
+            if rem.startswith(END):
+                in_paste = False
+                i += len(END)
+                sys.stdout.write("PASTE_DONE\n")
+                sys.stdout.flush()
+                continue
+            if START.startswith(rem) or END.startswith(rem):
+                break
+        b = pending[i]
+        if b == 0x0d and not in_paste:
+            digest = hashlib.sha256(bytes(buf)).hexdigest()[:16]
+            sys.stdout.write(f"SUBMIT:{len(buf)}:{digest}\n")
+            sys.stdout.flush()
+            buf.clear()
+            i += 1
+            break
+        buf.append(b)
+        i += 1
+    del pending[:i]
+"#,
+        )
+        .expect("write reader script");
+
+        let manager = TerminalManager::new(
+            Arc::new(PortablePtyBackend),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let mut open = TerminalOpenInput::new("thread", "term", root.path().to_path_buf(), 80, 24);
+        open.command = Some(TerminalLaunchCommand {
+            executable: "python3".to_owned(),
+            args: vec!["-u".to_owned(), script.to_string_lossy().into_owned()],
+            label: None,
+            env: None,
+            activity: None,
+        });
+        manager.open(open).await.expect("open real pty");
+
+        let mut attachment = manager
+            .attach(TerminalAttachInput::existing("thread", "term"))
+            .await
+            .expect("attach");
+        let mut output = attachment.initial.history.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output.contains("READY") {
+                if let Ok(TerminalEvent::Output { data, .. }) = attachment.events.recv().await {
+                    output.push_str(&data);
+                }
+            }
+        })
+        .await
+        .expect("reader ready");
+
+        let connection = uuid::Uuid::new_v4();
+        let lease = manager
+            .begin_input(
+                connection,
+                CancellationToken::new(),
+                "thread",
+                "term",
+                0,
+                None,
+            )
+            .await
+            .expect("begin");
+
+        let long_body = "line-one\rline-two\rline-three\r".repeat(750); // ~21.7 KiB > 16 KiB
+        let full_envelope = format!("\x1b[200~{long_body}\x1b[201~");
+        let split_at = 16 * 1024;
+        ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &lease.input_id,
+            0,
+            &full_envelope[..split_at],
+            Chunk,
+        )
+        .await
+        .expect("chunk");
+        ordered_staged_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &lease.input_id,
+            1,
+            &full_envelope[split_at..],
+            Commit,
+        )
+        .await
+        .expect("commit");
+
+        // Wait for PASTE_DONE from the real PTY child and prove ZERO SUBMIT occurred before Enter.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output.contains("PASTE_DONE") {
+                if let Ok(TerminalEvent::Output { data, .. }) = attachment.events.recv().await {
+                    output.push_str(&data);
+                }
+            }
+        })
+        .await
+        .expect("paste done observed on real PTY");
+        assert!(
+            !output.contains("SUBMIT:"),
+            "no submission may occur before explicit Enter: {output:?}"
+        );
+
+        // Now send explicit Enter and verify EXACTLY ONE submission with exact byte count & hash.
+        ordered_write(
+            &manager,
+            connection,
+            "thread",
+            "term",
+            &lease.input_id,
+            2,
+            "\r",
+        )
+        .await
+        .expect("explicit enter");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output.contains("SUBMIT:") {
+                if let Ok(TerminalEvent::Output { data, .. }) = attachment.events.recv().await {
+                    output.push_str(&data);
+                }
+            }
+        })
+        .await
+        .expect("submission observed after Enter");
+
+        let submits: Vec<&str> = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("SUBMIT:"))
+            .collect();
+        assert_eq!(
+            submits.len(),
+            1,
+            "expected exactly one submission: {submits:?}"
+        );
+        assert!(
+            submits[0].starts_with(&format!("SUBMIT:{}:", long_body.len())),
+            "expected full byte length {}, got {}",
+            long_body.len(),
+            submits[0]
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn running_terminal_snapshot_restores_bracketed_paste_mode_after_clear_and_exited_omits_it()
+     {
+        let root = tempfile::tempdir().expect("root");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread",
+                "term",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("open");
+        let process = backend.latest();
+        process.emit("\x1b[?2004hready\r\n");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snap = manager
+                    .attach(TerminalAttachInput::existing("thread", "term"))
+                    .await
+                    .expect("attach")
+                    .initial;
+                if snap.history.contains("ready") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("output observed");
+
+        manager.clear("thread", "term").await.expect("clear");
+        let cleared_running = manager
+            .attach(TerminalAttachInput::existing("thread", "term"))
+            .await
+            .expect("attach after clear")
+            .initial;
+        assert_eq!(cleared_running.status, TerminalStatus::Running);
+        assert!(
+            cleared_running.history.ends_with("\x1b[?2004h"),
+            "running terminal must restore ?2004h after clear: {:?}",
+            cleared_running.history
+        );
+
+        process.exit(0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snap = manager
+                    .attach(TerminalAttachInput::existing("thread", "term"))
+                    .await
+                    .expect("attach exited")
+                    .initial;
+                if snap.status == TerminalStatus::Exited {
+                    assert!(
+                        !snap.history.ends_with("\x1b[?2004h"),
+                        "exited terminal must not inject ?2004h: {:?}",
+                        snap.history
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exit observed");
         manager.shutdown().await;
     }
 
@@ -13948,5 +15102,131 @@ mod tests {
         assert_eq!(normalize_child_command_name("[]"), None);
         assert_eq!(terminal_label("custom"), "custom");
         assert_eq!(terminal_label("term-"), "term-");
+    }
+
+    #[tokio::test]
+    async fn enqueue_input_rechecks_legacy_delimiter_fence_after_waiting_on_publication() {
+        let root = tempfile::tempdir().expect("root");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-fence",
+                "term-fence",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("open");
+
+        let session = manager
+            .require_session("thread-fence", "term-fence")
+            .await
+            .expect("session");
+        let lease = {
+            let current = session.lock().await;
+            TerminalSessionIdentity {
+                key: ("thread-fence".to_owned(), "term-fence".to_owned()),
+                session: session.clone(),
+                generation: current.generation.clone(),
+                process: current.process.clone().expect("running process"),
+            }
+        };
+        // Hold the publication lock so both owner A (splitting a legacy bracketed paste
+        // delimiter) and owner B (an independent write) queue on publication with no fence yet.
+        let held_publication = lease.generation.publication.lock().await;
+        let lease_a = lease.clone();
+        let lease_b = lease.clone();
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let conn_a = CancellationToken::new();
+        let conn_b = CancellationToken::new();
+
+        // Pin and poll both enqueue futures to Pending while holding `publication`, guaranteeing
+        // both have registered as waiters on `publication` before any fence exists.
+        let mut fut_a = Box::pin(async move {
+            lease_a
+                .enqueue_input(
+                    "\x1b[200",
+                    TerminalInputOrigin::User("\x1b[200"),
+                    "owner-a",
+                    true,
+                    &cancel_a,
+                    &conn_a,
+                )
+                .await
+                .expect("owner-a partial delimiter chunk")
+                .wait()
+                .await
+                .expect("owner-a write completes");
+        });
+        let mut fut_b = Box::pin(async move {
+            lease_b
+                .enqueue_input(
+                    "interloper",
+                    TerminalInputOrigin::User("interloper"),
+                    "owner-b",
+                    true,
+                    &cancel_b,
+                    &conn_b,
+                )
+                .await
+                .expect("owner-b queued after fence clears")
+                .wait()
+                .await
+                .expect("owner-b write completes");
+        });
+        let noop_waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(noop_waker);
+        assert!(fut_a.as_mut().poll(&mut cx).is_pending());
+        assert!(fut_b.as_mut().poll(&mut cx).is_pending());
+
+        let task_a = tokio::spawn(fut_a);
+        let task_b = tokio::spawn(fut_b);
+        tokio::task::yield_now().await;
+
+        drop(held_publication);
+        task_a.await.expect("task_a");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !task_b.is_finished(),
+            "owner-b must recheck the fence under publication and wait until owner-a completes the delimiter"
+        );
+
+        // Owner A completes the bracketed-paste delimiter; only then may owner B write.
+        let cancel_close = CancellationToken::new();
+        let conn_close = CancellationToken::new();
+        lease
+            .enqueue_input(
+                "~payload",
+                TerminalInputOrigin::User("~payload"),
+                "owner-a",
+                true,
+                &cancel_close,
+                &conn_close,
+            )
+            .await
+            .expect("owner-a delimiter completion chunk")
+            .wait()
+            .await
+            .expect("owner-a close write completes");
+
+        tokio::time::timeout(Duration::from_secs(2), task_b)
+            .await
+            .expect("owner-b finishes after delimiter completes")
+            .expect("task_b");
+
+        assert_eq!(
+            backend.latest().writes(),
+            ["\x1b[200", "~payload", "interloper"]
+        );
+        manager.shutdown().await;
     }
 }

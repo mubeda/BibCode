@@ -258,6 +258,7 @@ where
                 cursor::IncomingEvent::Barrier(ack) => {
                     let _ = ack.send(());
                 }
+                cursor::IncomingEvent::ResponseObserved { .. } => {}
                 cursor::IncomingEvent::Closed { .. } => {
                     let mut state = collector
                         .lock()

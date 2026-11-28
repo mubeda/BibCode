@@ -378,6 +378,7 @@ fn public_repository_api_inventory_is_explicit() {
         "can_promote_queued_provider_turn",
         "claim_provider_turn",
         "clear_checkpoint_turn_conflict",
+        "clear_streaming_assistant_messages_of_deleted_threads",
         "consume_auth_pairing_link",
         "complete_auth_pairing_offer",
         "confirm_pending_auth_session",

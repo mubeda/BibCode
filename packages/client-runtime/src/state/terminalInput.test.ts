@@ -700,4 +700,49 @@ describe("createTerminalInputSchedulerRegistry", () => {
       JSON.stringify(["env", "thread", "term"]),
     );
   });
+
+  it("never splits bracketed-paste delimiters across 16 KiB frame boundaries and keeps complete envelopes intact", async () => {
+    const start = "\u001b[200~";
+    const end = "\u001b[201~";
+    const sent: string[] = [];
+    const scheduler = createTerminalInputScheduler({
+      maxFrameBytes: 16 * 1024,
+      send: async (data) => {
+        sent.push(data);
+        return { ok: true };
+      },
+    });
+    const prefix = "a".repeat(16 * 1024 - 3);
+    const body = "line1\rline2\r".repeat(2_000);
+    const payload = `${prefix}${start}${body}${end}\r`;
+    scheduler.enqueue(payload);
+    await flush();
+    await flush();
+    await flush();
+    expect(sent.join("")).toBe(payload);
+    // Prefix stays outside the paste, the complete envelope stays intact for downstream staging,
+    // and Enter after the closer stays a separate frame after the paste.
+    expect(sent).toEqual([prefix, `${start}${body}${end}`, "\r"]);
+  });
+
+  it("handles two adjacent bracketed pastes in one enqueue in strict stream order", async () => {
+    const start = "\u001b[200~";
+    const end = "\u001b[201~";
+    const sent: string[] = [];
+    const scheduler = createTerminalInputScheduler({
+      maxFrameBytes: 16 * 1024,
+      send: async (data) => {
+        sent.push(data);
+        return { ok: true };
+      },
+    });
+    const p1 = `${start}${"1".repeat(18_000)}${end}`;
+    const p2 = `${start}${"2".repeat(18_000)}${end}`;
+    scheduler.enqueue(`pre${p1}${p2}\r`);
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+    expect(sent).toEqual(["pre", p1, p2, "\r"]);
+  });
 });

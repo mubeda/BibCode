@@ -29,7 +29,11 @@ snapshots. Other providers leave it absent until their adapter implements an
 equivalent status source; clients keep the control visible but disabled.
 
 `supportsTurnSteer` is also inventory-owned: Codex and Claude advertise native
-steering; Cursor, Grok, and OpenCode omit it. The server checks the same driver
+steering unconditionally; Antigravity advertises it when the installed `agy`
+CLI version is `>= 1.5.0` (steering sends a second concurrent ACP
+`session/prompt` without `session/cancel`, refused while a permission approval
+or clarifying question is pending or before the running prompt's first update
+arrives); Cursor, Grok, and OpenCode omit it. The server checks the same driver
 capability when admitting a steer of the oldest queued message.
 
 `supportsConversationRewind` comes from the same driver capability: `true`
@@ -219,14 +223,14 @@ No identity or label is inferred from a description.
 Each driver translates between the common orchestration model and its native
 protocol:
 
-| Provider    | Native integration                             | Steer                 | Checkpoint revert       | Activity support                                                                           |
-| ----------- | ---------------------------------------------- | --------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
-| Codex       | Codex App Server JSON-RPC                      | `turn/steer`          | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
-| Claude      | Claude stream-JSON CLI and authenticated hooks | Stream-JSON user line | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
-| Cursor      | Agent Client Protocol                          | Unsupported           | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
-| Antigravity | `agy acp`, Agent Client Protocol               | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
-| Grok        | Agent Client Protocol                          | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
-| OpenCode    | OpenCode server/events API                     | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Provider    | Native integration                             | Steer                                        | Checkpoint revert       | Activity support                                                                           |
+| ----------- | ---------------------------------------------- | -------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
+| Codex       | Codex App Server JSON-RPC                      | `turn/steer`                                 | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
+| Claude      | Claude stream-JSON CLI and authenticated hooks | Stream-JSON user line                        | Files only, with notice | Structured chat and managed-terminal observation when required capabilities are available. |
+| Cursor      | Agent Client Protocol                          | Unsupported                                  | Files only, with notice | Normal chat only in activity protocol v2.                                                  |
+| Antigravity | `agy acp`, Agent Client Protocol               | Concurrent `session/prompt` (`agy >= 1.5.0`) | Files only, with notice | No structured Activity observation.                                                        |
+| Grok        | Agent Client Protocol                          | Unsupported                                  | Files only, with notice | No structured Activity observation.                                                        |
+| OpenCode    | OpenCode server/events API                     | Unsupported                                  | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
 
 Codex, Cursor, and Grok keep the provider's JSON-RPC request ID for their wire
 response. BiBCode gives each approval or question an opaque request ID scoped
@@ -425,9 +429,13 @@ window, and the thread offers to compact it.
 
 A failed `turn.completed` can also carry `providerReason`, the provider's own
 name for the failure (Claude's `terminal_reason`, Codex's `codexErrorInfo`
-variant, OpenCode's error name), which the shared failed-turn projection
-records in the Profiler as `provider.turn-failed` for every provider, once per
-turn. A `context_limit` failure may add two facts the adapter reads from the
+variant, OpenCode's error name), or BiBCode's sanitized `errorReason` (for
+example ACP transport variants `connection_closed`, `line_too_long`,
+`read_failure`, `write_failure`, `invalid_message`, and `unknown_response`,
+carried through stream-end `session.exited` settlement as well). The shared
+failed-turn projection records `providerReason`, falling back to `errorReason`,
+in the Profiler as `provider.turn-failed` for every provider, once per turn. A
+`context_limit` failure may add two facts the adapter reads from the
 provider, never inferred from text by the engine: `beforeOutput: true` when
 the provider refused the turn's input before any assistant text, tool call or
 compaction, and `compactable: false` when the provider said compacting cannot
@@ -554,9 +562,13 @@ Idle suspension must never stop work the provider still runs:
   starts itself), the session is also projected `running` with that turn unless
   it already reads so. Antigravity and Cursor are projected the same way: each
   announces a prompt as it writes it and ends every announced turn, an unsent
-  one included, with `turn.completed`, while its delivery is accepted only when
-  ACP answers the prompt, at the end of the turn, too late to mark it running.
-  Such a late acceptance publishes nothing. OpenCode and Grok announce a turn before BiBCode
+  one included, with `turn.completed`. Cursor's delivery is accepted only when
+  ACP answers the prompt at the end of the turn (too late to mark it running, so
+  that late acceptance publishes nothing). Antigravity's delivery is accepted as
+  soon as the CLI proves it took the prompt (first turn `session/update`,
+  `session/request_permission`, or `session/prompt` completion), so a running
+  turn releases the per-thread outbox slot for mid-turn steering (`agy >= 1.5.0`)
+  while keeping unanswered cancel timeouts `Ambiguous`. OpenCode and Grok announce a turn before BiBCode
   sends it, so their announcement does not change the projection: a send that
   fails reports no completion (OpenCode settles a turn whose request it never
   accepted, a 4xx refusal or a connection that never opened, with a `cancelled`

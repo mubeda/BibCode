@@ -17,8 +17,326 @@ const DEFAULT_BYTE_LIMIT: usize = 1_048_576;
 /// The cut a released client applies to an attach snapshot: `DEFAULT_MAX_TERMINAL_BUFFER_BYTES`
 /// in `packages/client-runtime/src/state/terminalTranscript.ts` (pinned by a test). A history
 /// retaining more replays only its last this-many bytes in that client.
-#[cfg(unix)]
 const CLIENT_TRANSCRIPT_CUT_BYTES: usize = 512 * 1024;
+
+const BRACKETED_PASTE_ENABLE_SEQUENCE: &str = "\x1b[?2004h";
+const MAX_PENDING_ESCAPE_BYTES: usize = 128;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ModeParseState {
+    #[default]
+    Ground,
+    Esc,
+    EscIntermediate,
+    Osc,
+    StringSeq,
+    StringEsc,
+    CsiStart,
+    CsiParams,
+    CsiBang,
+    CsiDecPrivate {
+        current_param: u32,
+        in_subparam: bool,
+        has_2004: bool,
+    },
+    CsiIgnore,
+}
+
+/// Streaming VT state machine aligned with xterm.js tracking DEC private mode `?2004h`/`?2004l`
+/// (bracketed paste) across arbitrary chunk boundaries, including Unicode C1 CSI (`\u{009b}`),
+/// multi-parameter DECSET/DECRST with colon subparameters (`\x1b[?1:2;2004h`), RIS (`\x1bc`),
+/// and parameterized DECSTR (`\x1b[0!p` / `\x1b[!p`). Tracks any unfinished control sequence at
+/// the end of the stream so mode restoration is inserted at a parser-safe boundary (#431).
+#[derive(Clone, Debug, Default)]
+struct BracketedPasteModeTracker {
+    state: ModeParseState,
+    enabled: bool,
+    pending_byte_len: usize,
+    pending_seq: String,
+    pending_truncated: bool,
+}
+
+impl BracketedPasteModeTracker {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn pending_byte_len(&self) -> usize {
+        if self.state == ModeParseState::Ground {
+            0
+        } else {
+            self.pending_byte_len
+        }
+    }
+
+    fn complete_pending_sequence(&self) -> Option<&str> {
+        if self.state == ModeParseState::Ground || self.pending_truncated {
+            None
+        } else {
+            Some(&self.pending_seq)
+        }
+    }
+
+    fn feed(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.step(ch);
+        }
+    }
+
+    fn enter_ground(&mut self) {
+        self.state = ModeParseState::Ground;
+        self.pending_byte_len = 0;
+        self.pending_seq.clear();
+        self.pending_truncated = false;
+    }
+
+    fn begin_pending(&mut self, ch: char) {
+        self.pending_byte_len = ch.len_utf8();
+        self.pending_seq.clear();
+        self.pending_seq.push(ch);
+        self.pending_truncated = false;
+    }
+
+    fn append_pending(&mut self, ch: char) {
+        let len = ch.len_utf8();
+        self.pending_byte_len += len;
+        if !self.pending_truncated && self.pending_seq.len() + len <= MAX_PENDING_ESCAPE_BYTES {
+            self.pending_seq.push(ch);
+        } else {
+            self.pending_truncated = true;
+        }
+    }
+
+    fn step(&mut self, ch: char) {
+        // Anywhere transitions per VT500 / xterm.js EscapeSequenceParser.
+        match ch {
+            '\x18' | '\x1a' | '\u{009c}' => {
+                self.enter_ground();
+                return;
+            }
+            '\u{009b}' => {
+                self.begin_pending(ch);
+                self.state = ModeParseState::CsiStart;
+                return;
+            }
+            '\u{009d}' => {
+                self.begin_pending(ch);
+                self.state = ModeParseState::Osc;
+                return;
+            }
+            '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
+                self.begin_pending(ch);
+                self.state = ModeParseState::StringSeq;
+                return;
+            }
+            _ => {}
+        }
+
+        let code = ch as u32;
+        match self.state {
+            ModeParseState::Ground => {
+                if ch == '\x1b' {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+            }
+            ModeParseState::Esc => self.step_esc(ch),
+            ModeParseState::EscIntermediate => {
+                if ch == '\x1b' {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                } else if (0x20..=0x2f).contains(&code) {
+                    self.append_pending(ch);
+                } else {
+                    self.enter_ground();
+                }
+            }
+            ModeParseState::Osc => match ch {
+                '\x07' => self.enter_ground(),
+                '\x1b' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::StringEsc;
+                }
+                _ => self.append_pending(ch),
+            },
+            ModeParseState::StringSeq => match ch {
+                '\x1b' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::StringEsc;
+                }
+                _ => self.append_pending(ch),
+            },
+            ModeParseState::StringEsc => match ch {
+                '\\' => self.enter_ground(),
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                other => {
+                    self.begin_pending('\x1b');
+                    self.step_esc(other);
+                }
+            },
+            ModeParseState::CsiStart => match ch {
+                '?' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiDecPrivate {
+                        current_param: 0,
+                        in_subparam: false,
+                        has_2004: false,
+                    };
+                }
+                '!' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiBang;
+                }
+                '0'..='9' | ';' | ':' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiParams;
+                }
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ if code >= 0x20 => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiIgnore;
+                }
+                _ => self.append_pending(ch),
+            },
+            ModeParseState::CsiParams => match ch {
+                '0'..='9' | ';' | ':' => self.append_pending(ch),
+                '!' => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiBang;
+                }
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ if code >= 0x20 => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiIgnore;
+                }
+                _ => self.append_pending(ch),
+            },
+            ModeParseState::CsiBang => match ch {
+                'p' => {
+                    // DECSTR (`\x1b[!p` or `\x1b[0!p`) resets DEC private modes including ?2004.
+                    self.enabled = false;
+                    self.enter_ground();
+                }
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ if code >= 0x20 => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiIgnore;
+                }
+                _ => self.append_pending(ch),
+            },
+            ModeParseState::CsiDecPrivate {
+                mut current_param,
+                mut in_subparam,
+                mut has_2004,
+            } => match ch {
+                '0'..='9' => {
+                    self.append_pending(ch);
+                    if !in_subparam {
+                        current_param = current_param
+                            .saturating_mul(10)
+                            .saturating_add(code - u32::from(b'0'));
+                    }
+                    self.state = ModeParseState::CsiDecPrivate {
+                        current_param,
+                        in_subparam,
+                        has_2004,
+                    };
+                }
+                ':' => {
+                    self.append_pending(ch);
+                    in_subparam = true;
+                    self.state = ModeParseState::CsiDecPrivate {
+                        current_param,
+                        in_subparam,
+                        has_2004,
+                    };
+                }
+                ';' => {
+                    self.append_pending(ch);
+                    if current_param == 2004 {
+                        has_2004 = true;
+                    }
+                    self.state = ModeParseState::CsiDecPrivate {
+                        current_param: 0,
+                        in_subparam: false,
+                        has_2004,
+                    };
+                }
+                'h' | 'l' => {
+                    if has_2004 || current_param == 2004 {
+                        self.enabled = ch == 'h';
+                    }
+                    self.enter_ground();
+                }
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ if code >= 0x20 => {
+                    self.append_pending(ch);
+                    self.state = ModeParseState::CsiIgnore;
+                }
+                _ => self.append_pending(ch),
+            },
+            ModeParseState::CsiIgnore => match ch {
+                '\x1b' => {
+                    self.begin_pending(ch);
+                    self.state = ModeParseState::Esc;
+                }
+                _ if (0x40..=0x7e).contains(&code) => self.enter_ground(),
+                _ => self.append_pending(ch),
+            },
+        }
+    }
+
+    fn step_esc(&mut self, ch: char) {
+        let code = ch as u32;
+        match ch {
+            'c' => {
+                // RIS (`\x1bc`)
+                self.enabled = false;
+                self.enter_ground();
+            }
+            '[' => {
+                self.append_pending(ch);
+                self.state = ModeParseState::CsiStart;
+            }
+            ']' => {
+                self.append_pending(ch);
+                self.state = ModeParseState::Osc;
+            }
+            'P' | '_' | '^' | 'X' => {
+                self.append_pending(ch);
+                self.state = ModeParseState::StringSeq;
+            }
+            '\x1b' => {
+                self.begin_pending(ch);
+                self.state = ModeParseState::Esc;
+            }
+            _ if (0x20..=0x2f).contains(&code) => {
+                self.append_pending(ch);
+                self.state = ModeParseState::EscIntermediate;
+            }
+            _ => self.enter_ground(),
+        }
+    }
+}
 
 /// Why replaying a history may not rebuild the program's screen (#348).
 #[cfg(unix)]
@@ -60,6 +378,8 @@ pub(crate) struct TerminalHistory {
     /// Unique to this history in the process: a restarted or reopened terminal gets a new
     /// history whose offsets start again at 0, so a cursor names its history too.
     epoch: u64,
+    /// Cross-platform DEC `?2004h`/`?2004l` state across evicted or cleared prefixes (#431).
+    bracketed_paste: BracketedPasteModeTracker,
 }
 
 /// Hands out history epochs. It starts at a random value, so another server lifetime (a
@@ -186,6 +506,7 @@ impl TerminalHistory {
             byte_limit,
             total_bytes_written: 0,
             epoch: NEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            bracketed_paste: BracketedPasteModeTracker::default(),
         }
     }
 
@@ -207,9 +528,14 @@ impl TerminalHistory {
     }
 
     /// Whether output before the retained bytes is gone: evicted by a limit, or cleared.
-    #[cfg(unix)]
     pub(crate) fn has_discarded_prefix(&self) -> bool {
         self.total_bytes_written > self.total_bytes as u64
+    }
+
+    /// Whether the program currently has DEC `?2004h` (bracketed paste mode) enabled.
+    #[cfg(test)]
+    pub(crate) fn bracketed_paste_enabled(&self) -> bool {
+        self.bracketed_paste.is_enabled()
     }
 
     /// Whether a client replaying this history misses output, and why. O(1): counters only.
@@ -358,6 +684,7 @@ impl TerminalHistory {
 
     pub(crate) fn push(&mut self, data: &str) {
         self.total_bytes_written += data.len() as u64;
+        self.bracketed_paste.feed(data);
         if self.line_limit == 0 || self.byte_limit == 0 {
             self.clear();
             return;
@@ -385,6 +712,55 @@ impl TerminalHistory {
         for chunk in &self.chunks {
             snapshot.push_str(chunk.retained());
         }
+        snapshot
+    }
+
+    /// Snapshot for replaying into a terminal renderer. For a running session whose active
+    /// `?2004h` sequence may have been evicted, cleared, or truncated past the client's 512 KiB
+    /// buffer cap, inserts `\x1b[?2004h` at a parser-safe boundary BEFORE any trailing unfinished
+    /// control sequence (and preserves that unfinished prefix across clears) so the next live
+    /// delta completes it identically to an uninterrupted terminal (#431).
+    pub(crate) fn snapshot_for_replay(&self, running: bool) -> String {
+        let mut snapshot = self.snapshot();
+        if !running {
+            return snapshot;
+        }
+        let lossy = self.has_discarded_prefix() || self.total_bytes > CLIENT_TRANSCRIPT_CUT_BYTES;
+        if !lossy {
+            return snapshot;
+        }
+        let restore = if self.bracketed_paste.is_enabled() {
+            BRACKETED_PASTE_ENABLE_SEQUENCE
+        } else {
+            ""
+        };
+        let pending_len = self.bracketed_paste.pending_byte_len();
+        if pending_len > 0 {
+            // When the entire unfinished control sequence is still retained at the tail of
+            // `snapshot` (even if longer than MAX_PENDING_ESCAPE_BYTES, e.g. a 200+ char OSC),
+            // insert `?2004h` at its exact boundary without duplicating or truncating it.
+            if let Some(split) = snapshot.len().checked_sub(pending_len)
+                && snapshot.is_char_boundary(split)
+            {
+                if !restore.is_empty() {
+                    snapshot.insert_str(split, restore);
+                }
+                return snapshot;
+            }
+            // Otherwise the sequence opener was cleared or evicted: replay it only if untruncated
+            // (replacing any retained suffix of the same sequence so nothing is duplicated).
+            if let Some(pending) = self.bracketed_paste.complete_pending_sequence() {
+                let mut rebuilt = String::with_capacity(restore.len() + pending.len());
+                rebuilt.push_str(restore);
+                rebuilt.push_str(pending);
+                return rebuilt;
+            }
+            if !restore.is_empty() {
+                snapshot.insert_str(0, restore);
+            }
+            return snapshot;
+        }
+        snapshot.push_str(restore);
         snapshot
     }
 
@@ -482,8 +858,8 @@ fn byte_index_after_nth_newline(data: &str, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::{CLIENT_TRANSCRIPT_CUT_BYTES, LossyReplay};
-    use super::{HistoryCursor, TerminalHistory};
+    use super::LossyReplay;
+    use super::{CLIENT_TRANSCRIPT_CUT_BYTES, HistoryCursor, TerminalHistory};
 
     fn legacy_push(history: &mut String, data: &str, line_limit: usize) {
         history.push_str(data);
@@ -928,5 +1304,114 @@ mod tests {
         }
         let plain = crate::send_requests::service::plain_tail(&history.tail(24).text, true, 100);
         assert_eq!(plain.text, "reddone");
+    }
+
+    #[test]
+    fn bracketed_paste_mode_survives_eviction_clear_and_over_client_cut_while_respecting_resets() {
+        let mut history = TerminalHistory::with_byte_limit(4, 64);
+        // Chunk-split multi-parameter DECSET enabling ?2004h, plus OSC strings (BEL and ST).
+        history.push("\x1b[?1049;");
+        history.push("2004;1004h");
+        history.push("\x1b]0;title [?2004l ignored\x07");
+        history.push("\x1b]2;st title [?2004l\x1b\\");
+        history.push("1\n2\n3\n4\n5\n6\n");
+        assert!(history.bracketed_paste_enabled());
+        assert!(history.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+        // Exited sessions must not inject ?2004h.
+        assert!(!history.snapshot_for_replay(false).ends_with("\x1b[?2004h"));
+
+        // Clear keeps ?2004h active for a running session.
+        history.clear();
+        assert_eq!(history.snapshot_for_replay(true), "\x1b[?2004h");
+        assert_eq!(history.snapshot_for_replay(false), "");
+
+        // DECRQM query (?2004$p) must NOT disable ?2004h.
+        history.push("\x1b[?2004$p");
+        assert!(history.bracketed_paste_enabled());
+
+        // DECSTR (\x1b[!p) disables ?2004h.
+        history.push("\x1b[!p");
+        assert!(!history.bracketed_paste_enabled());
+        assert!(!history.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+
+        // Re-enable with leading zero (?02004h), then RIS (\x1bc) disables it.
+        history.push("\x1b[?02004h");
+        assert!(history.bracketed_paste_enabled());
+        history.push("\x1bc");
+        assert!(!history.bracketed_paste_enabled());
+
+        // Re-enable, then DECRST (?2004l) disables it.
+        history.push("\x1b[?2004h");
+        assert!(history.bracketed_paste_enabled());
+        history.push("\x1b[?1000;2004l");
+        assert!(!history.bracketed_paste_enabled());
+
+        // Over-512 KiB retained history (no server eviction yet) appends ?2004h at the end so
+        // clients applying the 512 KiB suffix cut still enable bracketed paste on replay.
+        let mut large = TerminalHistory::with_byte_limit(100_000, 1024 * 1024);
+        large.push("\x1b[?2004h");
+        large.push(&"x".repeat(CLIENT_TRANSCRIPT_CUT_BYTES + 1024));
+        assert!(!large.has_discarded_prefix());
+        assert!(large.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+
+        // Xterm parser parity: C1 CSI (`\u{009b}?2004h`), colon subparameter (`\x1b[?1:2;2004h`),
+        // parameterized DECSTR (`\x1b[0!p`), and mid-sequence replay / clear boundaries.
+        let mut c1 = TerminalHistory::with_byte_limit(4, 32);
+        c1.push("\u{009b}?2004h");
+        c1.push(&"a".repeat(64));
+        assert!(c1.bracketed_paste_enabled());
+        assert!(c1.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+
+        let mut subparam = TerminalHistory::with_byte_limit(4, 32);
+        subparam.push("\x1b[?1:2;2004h");
+        subparam.push(&"b".repeat(64));
+        assert!(subparam.bracketed_paste_enabled());
+        assert!(subparam.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+        subparam.push("\x1b[0!p");
+        subparam.push(&"c".repeat(64));
+        assert!(!subparam.bracketed_paste_enabled());
+        assert!(!subparam.snapshot_for_replay(true).ends_with("\x1b[?2004h"));
+
+        let mut mid_disable = TerminalHistory::with_byte_limit(4, 32);
+        mid_disable.push("\x1b[?2004h");
+        mid_disable.push(&"d".repeat(64));
+        mid_disable.push("\x1b[?20");
+        assert!(
+            mid_disable
+                .snapshot_for_replay(true)
+                .ends_with("\x1b[?2004h\x1b[?20")
+        );
+
+        let mut mid_enable_clear = TerminalHistory::with_byte_limit(4, 32);
+        mid_enable_clear.push("\x1b[?20");
+        mid_enable_clear.clear();
+        assert_eq!(mid_enable_clear.snapshot_for_replay(true), "\x1b[?20");
+
+        // Long (>128 byte) unfinished OSC sequence after eviction inserts `?2004h` at the exact
+        // sequence boundary without duplicating or truncating the OSC opener.
+        let long_osc = format!("\x1b]0;{}", "t".repeat(200));
+        let mut long_with_mode = TerminalHistory::with_byte_limit(100, 512);
+        long_with_mode.push("\x1b[?2004h");
+        long_with_mode.push(&"x".repeat(400));
+        long_with_mode.push(&long_osc);
+        let long_snap = long_with_mode.snapshot_for_replay(true);
+        assert!(long_snap.ends_with(&format!("\x1b[?2004h{long_osc}")));
+        assert_eq!(long_snap.matches("\x1b]0;").count(), 1);
+
+        let mut long_without_mode = TerminalHistory::with_byte_limit(100, 512);
+        long_without_mode.push(&"x".repeat(400));
+        long_without_mode.push(&long_osc);
+        let long_no_mode_snap = long_without_mode.snapshot_for_replay(true);
+        assert!(long_no_mode_snap.ends_with(&long_osc));
+        assert_eq!(long_no_mode_snap.matches("\x1b]0;").count(), 1);
+
+        // Unfinished OSC larger than the entire history byte limit restores `?2004h` at the start
+        // without appending a truncated duplicate OSC opener.
+        let mut oversized_osc = TerminalHistory::with_byte_limit(100, 64);
+        oversized_osc.push("\x1b[?2004h");
+        oversized_osc.push(&long_osc);
+        let oversized_snap = oversized_osc.snapshot_for_replay(true);
+        assert!(oversized_snap.starts_with("\x1b[?2004h"));
+        assert!(!oversized_snap.contains("\x1b]0;"));
     }
 }

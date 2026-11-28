@@ -20,8 +20,21 @@ vi.mock("~/connection/currentEnvironmentPresentation", () => ({
 }));
 
 vi.mock("../ui/sidebar", () => ({
-  SidebarContent: (props: { children?: ReactNode }) => <div>{props.children}</div>,
-  SidebarFooter: (props: { children?: ReactNode }) => <footer>{props.children}</footer>,
+  SidebarHeader: (props: { children?: ReactNode; className?: string }) => (
+    <header data-slot="sidebar-header" className={props.className}>
+      {props.children}
+    </header>
+  ),
+  SidebarContent: (props: { children?: ReactNode; className?: string }) => (
+    <div data-slot="sidebar-content" className={props.className}>
+      {props.children}
+    </div>
+  ),
+  SidebarFooter: (props: { children?: ReactNode; className?: string }) => (
+    <footer data-slot="sidebar-footer" className={props.className}>
+      {props.children}
+    </footer>
+  ),
   SidebarGroup: (props: { children?: ReactNode }) => <div>{props.children}</div>,
   SidebarMenu: (props: { children?: ReactNode }) => <div>{props.children}</div>,
   SidebarMenuButton: (props: { children?: ReactNode }) => <button>{props.children}</button>,
@@ -100,15 +113,36 @@ describe("settings navigation", () => {
     );
   });
 
-  it("omits Connect footer controls on desktop and retains them in browser mode", () => {
+  it("pins Back in SidebarHeader above SidebarContent and preserves browser-only Connect footer", () => {
     h.policy = createEnvironmentPresentationPolicy({ surface: "desktop", platform: "windows" });
     const desktopMarkup = renderToStaticMarkup(<SettingsSidebarNav pathname="/settings/general" />);
+    const desktopHeaderMatch = desktopMarkup.match(
+      /<header data-slot="sidebar-header"[^>]*>([\s\S]*?)<\/header>/,
+    );
+    expect(desktopHeaderMatch?.[1]).toContain("Back");
+    expect(desktopMarkup.indexOf('data-slot="sidebar-header"')).toBeLessThan(
+      desktopMarkup.indexOf('data-slot="sidebar-content"'),
+    );
+    expect(desktopMarkup.indexOf("Back")).toBeLessThan(desktopMarkup.indexOf("General"));
+    expect(desktopMarkup).not.toContain('data-slot="sidebar-footer"');
     expect(desktopMarkup).not.toContain("BiBCode Connect sign in");
     expect(desktopMarkup).not.toContain("BiBCode Connect avatar");
 
     h.policy = createEnvironmentPresentationPolicy({ surface: "browser", platform: "unknown" });
     const browserMarkup = renderToStaticMarkup(<SettingsSidebarNav pathname="/settings/general" />);
-    expect(browserMarkup).toContain("BiBCode Connect sign in");
-    expect(browserMarkup).toContain("BiBCode Connect avatar");
+    const browserHeaderMatch = browserMarkup.match(
+      /<header data-slot="sidebar-header"[^>]*>([\s\S]*?)<\/header>/,
+    );
+    const browserFooterMatch = browserMarkup.match(
+      /<footer data-slot="sidebar-footer"[^>]*>([\s\S]*?)<\/footer>/,
+    );
+    expect(browserHeaderMatch?.[1]).toContain("Back");
+    expect(browserHeaderMatch?.[1]).not.toContain("BiBCode Connect sign in");
+    expect(browserFooterMatch?.[1]).toContain("BiBCode Connect sign in");
+    expect(browserFooterMatch?.[1]).toContain("BiBCode Connect avatar");
+    expect(browserFooterMatch?.[1]).not.toContain("Back");
+    expect(browserMarkup.indexOf('data-slot="sidebar-content"')).toBeLessThan(
+      browserMarkup.indexOf('data-slot="sidebar-footer"'),
+    );
   });
 });

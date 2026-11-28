@@ -2810,21 +2810,89 @@ impl ClaudeProviderRuntime {
         request_id: &str,
         answers: Value,
     ) -> Option<ResolvedUserInput> {
+        self.resolve_user_input_request_internal(request_id, answers, None)
+    }
+
+    /// Settles a pending question with an explicit response disposition (#430).
+    pub fn resolve_user_input_request_with_disposition(
+        &mut self,
+        request_id: &str,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+    ) -> Option<ResolvedUserInput> {
+        self.resolve_user_input_request_internal(request_id, answers, Some(disposition))
+    }
+
+    fn resolve_user_input_request_internal(
+        &mut self,
+        request_id: &str,
+        answers: Value,
+        disposition: Option<crate::provider::UserInputResponseDisposition>,
+    ) -> Option<ResolvedUserInput> {
         let pending = self.pending_user_inputs.remove(request_id)?;
+        let pending_questions = pending
+            .raw
+            .get("questions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let answers =
+            if disposition == Some(crate::provider::UserInputResponseDisposition::Cancelled) {
+                json!({})
+            } else {
+                answers
+            };
+        let mut wire_answers = answers.as_object().cloned().unwrap_or_default();
+        if let Some(disp) = disposition {
+            if disp.is_skip_or_cancel()
+                && !crate::provider::has_non_empty_user_input_answer(&answers)
+            {
+                wire_answers.clear();
+            }
+            for question in &pending_questions {
+                if let Some(key) = question
+                    .get("id")
+                    .or_else(|| question.get("question"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    wire_answers
+                        .entry(key.to_owned())
+                        .or_insert_with(|| Value::String(String::new()));
+                }
+            }
+        }
         let updated_input = json!({
             "questions": pending
                 .original_input
                 .get("questions")
                 .cloned()
                 .unwrap_or_else(|| json!([])),
-            "answers": answers.clone(),
+            "answers": Value::Object(wire_answers),
         });
+        let resolved_payload = match disposition {
+            Some(disp) => {
+                let recorded_answers = if disp.is_skip_or_cancel()
+                    && !crate::provider::has_non_empty_user_input_answer(&answers)
+                {
+                    json!({})
+                } else {
+                    answers
+                };
+                crate::provider::build_user_input_resolved_payload(
+                    recorded_answers,
+                    disp,
+                    &pending_questions,
+                )
+            }
+            None => json!({ "answers": answers }),
+        };
         let events = vec![self.event(
             "user-input.resolved",
             pending.turn_id,
             Some(request_id.to_owned()),
             Some(json!({ "providerItemId": pending.provider_item_id })),
-            json!({ "answers": answers }),
+            resolved_payload,
         )];
         Some(ResolvedUserInput {
             updated_input,
@@ -2845,12 +2913,26 @@ impl ClaudeProviderRuntime {
             )];
         }
         if let Some(pending) = self.pending_user_inputs.remove(request_id) {
+            let pending_questions = pending
+                .raw
+                .get("questions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut payload = crate::provider::build_user_input_resolved_payload(
+                json!({}),
+                crate::provider::UserInputResponseDisposition::Cancelled,
+                &pending_questions,
+            );
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("cancelled".to_owned(), json!(true));
+            }
             return vec![self.event(
                 "user-input.resolved",
                 pending.turn_id,
                 Some(request_id.to_owned()),
                 Some(json!({ "providerItemId": pending.provider_item_id })),
-                json!({ "answers": {}, "cancelled": true }),
+                payload,
             )];
         }
         Vec::new()
@@ -7698,6 +7780,74 @@ mod code_review_auto_decline_tests {
                 .collect::<Vec<_>>(),
             ["request.opened"]
         );
+    }
+
+    #[test]
+    fn resolve_user_input_request_with_disposition_handles_partial_skip_and_receipt_metadata() {
+        let mut runtime =
+            ClaudeProviderRuntime::new("thread-claude-q".to_owned(), "session".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "Help".to_owned(),
+        });
+        let ask_input = UserInputRequestInput {
+            tool_name: "AskUserQuestion".to_owned(),
+            tool_use_id: "tool-ask-1".to_owned(),
+            input: json!({
+                "questions": [
+                    {
+                        "question": "Which target?",
+                        "header": "Target",
+                        "options": [{ "label": "Web", "description": "Web app" }],
+                        "multiSelect": false
+                    },
+                    {
+                        "question": "Any notes?",
+                        "header": "Notes",
+                        "options": [],
+                        "multiSelect": false
+                    }
+                ]
+            }),
+        };
+
+        // Partial submit keeps answered pick, supplies "" for skipped question, and embeds receipt metadata.
+        runtime.open_user_input_request(ask_input.clone(), "req-partial");
+        let partial = runtime
+            .resolve_user_input_request_with_disposition(
+                "req-partial",
+                json!({ "Which target?": "Web" }),
+                crate::provider::UserInputResponseDisposition::Answered,
+            )
+            .expect("partial resolution");
+        assert_eq!(
+            partial.updated_input["answers"],
+            json!({ "Which target?": "Web", "Any notes?": "" })
+        );
+        assert_eq!(partial.events[0].payload["disposition"], json!("answered"));
+        assert_eq!(
+            partial.events[0].payload["questions"],
+            json!([
+                { "id": "Which target?", "header": "Target", "question": "Which target?" },
+                { "id": "Any notes?", "header": "Notes", "question": "Any notes?" }
+            ])
+        );
+
+        // Skip-all maps every question to "" and records disposition "skipped" with empty answers map.
+        runtime.open_user_input_request(ask_input, "req-skip");
+        let skipped = runtime
+            .resolve_user_input_request_with_disposition(
+                "req-skip",
+                json!({}),
+                crate::provider::UserInputResponseDisposition::Skipped,
+            )
+            .expect("skipped resolution");
+        assert_eq!(
+            skipped.updated_input["answers"],
+            json!({ "Which target?": "", "Any notes?": "" })
+        );
+        assert_eq!(skipped.events[0].payload["disposition"], json!("skipped"));
+        assert_eq!(skipped.events[0].payload["answers"], json!({}));
     }
 }
 

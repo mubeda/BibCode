@@ -26,11 +26,12 @@ use uuid::Uuid;
 
 use super::acp::{
     AcpJsonRpcConnection, AcpProtocolError, IncomingEvent, JsonRpcErrorShape, acp_error_class,
-    acp_turn_state,
+    acp_error_reason, acp_turn_state,
 };
 use crate::provider::{
-    OptionRefusal, RefusedOption, model_unavailable_refusal, option_needs_value_refusal,
-    option_without_id_refusal, unsupported_option_refusal,
+    ANTIGRAVITY_MIN_STEER_VERSION, OptionRefusal, RefusedOption, model_unavailable_refusal,
+    option_needs_value_refusal, option_without_id_refusal, parse_semver_triple,
+    unsupported_option_refusal,
 };
 
 const PROVIDER: &str = "antigravity";
@@ -77,7 +78,7 @@ pub struct AntigravityRuntimeEvent {
     pub payload: Value,
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum AntigravityRuntimeError {
     #[error(transparent)]
     Protocol(#[from] AcpProtocolError),
@@ -119,6 +120,19 @@ pub enum AntigravityRuntimeError {
     UnsupportedOption(RefusedOption),
     #[error("Antigravity config update acknowledgement omitted configOptions")]
     MalformedConfigAcknowledgement,
+    /// Steering could not be applied to the running turn (for example, CLI version `< 1.5.0`,
+    /// pending approval/question, or no turn update yet); the message returns to the queue.
+    #[error("{detail}")]
+    SteerUnavailable { detail: String },
+    /// Antigravity reported an account or model quota/usage limit during the turn (#429).
+    #[error("{message}")]
+    UsageLimitReached {
+        message: String,
+        resets_at: Option<String>,
+    },
+    /// The supplied answer could not be converted into the elicitation schema's required type.
+    #[error("{detail}")]
+    InvalidUserInputAnswer { detail: String },
 }
 
 impl AntigravityRuntimeError {
@@ -137,7 +151,73 @@ impl AntigravityRuntimeError {
             Self::MissingProviderSessionId
             | Self::PendingRequestNotFound { .. }
             | Self::MalformedConfigAcknowledgement => "runtime_error",
+            Self::SteerUnavailable { .. } => "steer_unavailable",
+            Self::UsageLimitReached { .. } => "provider_error",
+            Self::InvalidUserInputAnswer { .. } => "validation_error",
         }
+    }
+
+    /// The sanitized failure reason a log line or turn completion event may carry without raw text.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Protocol(error) => acp_error_reason(error),
+            Self::SignInRequired => "sign_in_required",
+            Self::AccountDisabled { .. } => "account_disabled",
+            Self::UnsupportedVersion { .. } => "unsupported_version",
+            Self::ModeUnavailable { .. } => "mode_unavailable",
+            Self::ControlTimedOut => "control_timeout",
+            Self::SessionMismatch => "session_mismatch",
+            Self::UnsupportedOption(_) => "unsupported_option",
+            Self::MissingProviderSessionId => "missing_provider_session_id",
+            Self::PendingRequestNotFound { .. } => "pending_request_not_found",
+            Self::MalformedConfigAcknowledgement => "malformed_config_acknowledgement",
+            Self::SteerUnavailable { .. } => "steer_unavailable",
+            Self::UsageLimitReached { .. } => "usage_limit",
+            Self::InvalidUserInputAnswer { .. } => "invalid_user_input_answer",
+        }
+    }
+
+    /// The sanitized message written into `turn.completed` `errorMessage`: transport errors use
+    /// fixed static descriptions so raw uncorrelated response IDs, paths, or tokens never leak.
+    #[must_use]
+    pub fn turn_error_message(&self) -> String {
+        match self {
+            Self::Protocol(error) if !matches!(error, AcpProtocolError::RemoteRequest { .. }) => {
+                antigravity_transport_message(acp_error_reason(error))
+            }
+            _ => self.to_string(),
+        }
+    }
+}
+
+/// Fixed user-readable description for a sanitized ACP transport failure reason (no em dashes, no
+/// raw stderr, paths, tokens, or uncorrelated response IDs).
+pub(crate) fn antigravity_transport_message(reason: &str) -> String {
+    match reason {
+        "line_too_long" => {
+            "Antigravity sent a message longer than BiBCode accepts (transport_error: line_too_long)"
+                .to_owned()
+        }
+        "connection_closed" => {
+            "Antigravity connection closed unexpectedly (transport_error: connection_closed)"
+                .to_owned()
+        }
+        "read_failure" => {
+            "Antigravity output read failed (transport_error: read_failure)".to_owned()
+        }
+        "write_failure" => {
+            "Antigravity input write failed (transport_error: write_failure)".to_owned()
+        }
+        "invalid_message" => {
+            "Antigravity sent an invalid protocol message (transport_error: invalid_message)"
+                .to_owned()
+        }
+        "unknown_response" => {
+            "Antigravity sent an uncorrelated protocol response (transport_error: unknown_response)"
+                .to_owned()
+        }
+        _ => format!("Antigravity connection failed (transport_error: {reason})"),
     }
 }
 
@@ -162,11 +242,24 @@ fn unsupported_version_message(version: Option<&str>) -> String {
 #[derive(Debug)]
 pub struct AntigravityPromptReceipt {
     pub turn_id: String,
+    accepted: oneshot::Receiver<Result<(), AntigravityRuntimeError>>,
     completion: oneshot::Receiver<Result<(), AntigravityRuntimeError>>,
 }
 
 impl AntigravityPromptReceipt {
-    /// Resolves when the CLI answers the prompt, that is when the turn ends.
+    /// Resolves as soon as the CLI proves it accepted the prompt (first turn update, permission
+    /// request, superseded-prompt completion, or the prompt's own completion), or fails if the
+    /// prompt errors before any such signal arrives.
+    pub async fn accepted(self) -> Result<(), AntigravityRuntimeError> {
+        self.accepted.await.unwrap_or_else(|_| {
+            Err(AcpProtocolError::Closed {
+                reason: "Antigravity prompt acceptance task ended without an outcome".to_owned(),
+            }
+            .into())
+        })
+    }
+
+    /// Resolves when the CLI answers the prompt, that is when the prompt finishes.
     pub async fn completion(self) -> Result<(), AntigravityRuntimeError> {
         self.completion.await.unwrap_or_else(|_| {
             Err(AcpProtocolError::Closed {
@@ -196,19 +289,92 @@ struct RuntimeInner {
     legacy_models: AtomicBool,
     /// The start failed because the connection to the child broke, not on a refusal.
     start_lost_connection: AtomicBool,
+    /// True once the runtime was closed or abandoned and cannot serve further turns.
+    retired: AtomicBool,
     /// Google's message, when the CLI wrote on its error output that the account is disabled.
     account_disabled: std::sync::Mutex<Option<String>>,
     abandoned_turns: Mutex<HashSet<String>>,
     events_tx: mpsc::UnboundedSender<AntigravityRuntimeEvent>,
     events_rx: Mutex<mpsc::UnboundedReceiver<AntigravityRuntimeEvent>>,
     abandon: Notify,
+    clock: std::sync::Mutex<Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuotaLimitNotice {
+    message: String,
+    resets_at: Option<String>,
+}
+
+impl QuotaLimitNotice {
+    fn merge(first: Option<Self>, second: Option<Self>) -> Option<Self> {
+        match (first, second) {
+            (Some(a), Some(b)) => {
+                if a.resets_at.is_some() {
+                    Some(a)
+                } else if b.resets_at.is_some() {
+                    Some(b)
+                } else {
+                    Some(a)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+}
+
+struct PreviousPrompt {
+    seq: u64,
+    wire_id: Option<String>,
+    had_update: bool,
+    /// True once stdout delivered the JSON-RPC response for `wire_id`, observed in exact wire
+    /// order before any subsequent `session/update` notifications.
+    wire_ended: bool,
+    settled: Option<Result<Value, AntigravityRuntimeError>>,
+    quota_notice: Option<QuotaLimitNotice>,
+    quota_published: Option<QuotaLimitNotice>,
+}
+
+impl PreviousPrompt {
+    fn unpublished_quota_notice(&self) -> Option<QuotaLimitNotice> {
+        let settled_notice = match &self.settled {
+            Some(Err(AntigravityRuntimeError::UsageLimitReached { message, resets_at })) => {
+                Some(QuotaLimitNotice {
+                    message: message.clone(),
+                    resets_at: resets_at.clone(),
+                })
+            }
+            _ => None,
+        };
+        QuotaLimitNotice::merge(self.quota_notice.clone(), settled_notice)
+            .filter(|notice| self.quota_published.as_ref() != Some(notice))
+    }
 }
 
 struct Gate {
     /// `None` until the open call and every update queued before its answer are handled, so a
     /// replayed history is dropped and no request during the open is answered.
     session_id: Option<String>,
+    agent_version: Option<(u64, u64, u64)>,
     active_turn: Option<String>,
+    active_prompt_seq: u64,
+    active_prompt_wire_id: Option<String>,
+    next_prompt_seq: u64,
+    /// True once the currently running prompt has produced at least one turn update.
+    active_turn_has_update: bool,
+    /// Classified quota notice intercepted from an `agent_message_chunk` on `active_prompt_seq` (#429).
+    active_prompt_quota_notice: Option<QuotaLimitNotice>,
+    /// Last quota notice already published via `runtime.warning` for `active_prompt_seq` (#429).
+    active_prompt_quota_published: Option<QuotaLimitNotice>,
+    /// Non-none while a concurrent steer prompt is being written to the CLI.
+    steer_in_flight: Option<u64>,
+    /// Superseded prompt retained until the steered prompt's disposition is known, so a rejected
+    /// steer never drops Prompt 1's completion or fails a still-running Prompt 1.
+    previous_prompt: Option<PreviousPrompt>,
+    /// Acceptance channel for the current active prompt (`active_prompt_seq`).
+    pending_accept: Option<(u64, oneshot::Sender<Result<(), AntigravityRuntimeError>>)>,
     cancelled_turn: Option<String>,
     runtime_mode: String,
     interaction_mode: String,
@@ -222,7 +388,67 @@ struct Gate {
     pending: HashMap<String, PendingRequest>,
 }
 
+struct ClearedActiveTurn {
+    pending: Vec<(String, PendingRequest)>,
+    quota_notice: Option<QuotaLimitNotice>,
+    quota_published: Option<QuotaLimitNotice>,
+    prev_unpublished_notice: Option<QuotaLimitNotice>,
+}
+
 impl Gate {
+    fn allocate_prompt_seq(&mut self) -> u64 {
+        self.next_prompt_seq = self.next_prompt_seq.saturating_add(1);
+        self.next_prompt_seq
+    }
+
+    fn clear_active_turn(&mut self, turn_id: &str) -> ClearedActiveTurn {
+        let (quota_notice, quota_published, prev_unpublished_notice) =
+            if self.active_turn.as_deref() == Some(turn_id) {
+                self.active_turn = None;
+                self.active_prompt_seq = 0;
+                self.active_prompt_wire_id = None;
+                self.active_turn_has_update = false;
+                self.steer_in_flight = None;
+                let prev_unpublished_notice = self
+                    .previous_prompt
+                    .take()
+                    .and_then(|prev| prev.unpublished_quota_notice());
+                (
+                    self.active_prompt_quota_notice.take(),
+                    self.active_prompt_quota_published.take(),
+                    prev_unpublished_notice,
+                )
+            } else {
+                (None, None, None)
+            };
+        ClearedActiveTurn {
+            pending: self.take_pending(turn_id),
+            quota_notice,
+            quota_published,
+            prev_unpublished_notice,
+        }
+    }
+
+    fn resolve_pending_accept(&mut self, outcome: Result<(), AntigravityRuntimeError>) {
+        if let Some((_, tx)) = self.pending_accept.take() {
+            let _ = tx.send(outcome);
+        }
+    }
+
+    fn resolve_pending_accept_for(
+        &mut self,
+        seq: u64,
+        outcome: Result<(), AntigravityRuntimeError>,
+    ) {
+        if self
+            .pending_accept
+            .as_ref()
+            .is_some_and(|(pending_seq, _)| *pending_seq == seq)
+            && let Some((_, tx)) = self.pending_accept.take()
+        {
+            let _ = tx.send(outcome);
+        }
+    }
     fn mode_target(&self) -> &'static str {
         mode_for(&self.runtime_mode, &self.interaction_mode)
     }
@@ -247,14 +473,63 @@ impl Gate {
     }
 }
 
+#[derive(Clone)]
+struct CompanionOtherFieldSpec {
+    id: String,
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+}
+
+enum ElicitationFieldKind {
+    String {
+        value_by_label: Vec<(String, Value)>,
+        enum_restricted: bool,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+        other_field: Option<CompanionOtherFieldSpec>,
+    },
+    MultiSelect {
+        value_by_label: Vec<(String, Value)>,
+        enum_restricted: bool,
+        min_items: Option<usize>,
+        max_items: Option<usize>,
+        other_field: Option<CompanionOtherFieldSpec>,
+    },
+    Boolean,
+    Integer {
+        minimum: Option<i64>,
+        maximum: Option<i64>,
+    },
+    Number {
+        minimum: Option<f64>,
+        maximum: Option<f64>,
+    },
+}
+
+struct ElicitationFieldSpec {
+    id: String,
+    required: bool,
+    kind: ElicitationFieldKind,
+}
+
+enum PendingRequestKind {
+    Permission {
+        request_type: &'static str,
+        allow_once: Option<String>,
+        allow_always: Option<String>,
+        reject_once: Option<String>,
+    },
+    Elicitation {
+        fields: Vec<ElicitationFieldSpec>,
+        question_summaries: Vec<Value>,
+    },
+}
+
 struct PendingRequest {
     /// The id exactly as the CLI sent it: numeric 1 and string "1" are different requests.
     wire_id: Value,
     turn_id: String,
-    request_type: &'static str,
-    allow_once: Option<String>,
-    allow_always: Option<String>,
-    reject_once: Option<String>,
+    kind: PendingRequestKind,
 }
 
 impl AntigravitySessionRuntime {
@@ -266,7 +541,17 @@ impl AntigravitySessionRuntime {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let gate = Gate {
             session_id: None,
+            agent_version: None,
             active_turn: None,
+            active_prompt_seq: 0,
+            active_prompt_wire_id: None,
+            next_prompt_seq: 0,
+            active_turn_has_update: false,
+            active_prompt_quota_notice: None,
+            active_prompt_quota_published: None,
+            steer_in_flight: None,
+            previous_prompt: None,
+            pending_accept: None,
             cancelled_turn: None,
             runtime_mode: options.runtime_mode.clone(),
             interaction_mode: options.interaction_mode.clone(),
@@ -284,11 +569,13 @@ impl AntigravitySessionRuntime {
                 config_options: Mutex::new(Vec::new()),
                 legacy_models: AtomicBool::new(false),
                 start_lost_connection: AtomicBool::new(false),
+                retired: AtomicBool::new(false),
                 account_disabled: std::sync::Mutex::new(None),
                 abandoned_turns: Mutex::new(HashSet::new()),
                 events_tx,
                 events_rx: Mutex::new(events_rx),
                 abandon: Notify::new(),
+                clock: std::sync::Mutex::new(Arc::new(time::OffsetDateTime::now_utc)),
             }),
         };
         let reader = runtime.clone();
@@ -344,7 +631,21 @@ impl AntigravitySessionRuntime {
     /// Closes the connection: the writer task ends and the CLI's stdin closes. The readers, and
     /// this runtime's reader task, end when the CLI's output closes.
     pub fn close(&self) {
+        self.inner.retired.store(true, Ordering::SeqCst);
         self.inner.connection.shutdown();
+    }
+
+    /// Whether this runtime was closed or abandoned and cannot serve further turns.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.inner.retired.load(Ordering::SeqCst)
+    }
+
+    /// Whether the underlying ACP transport has closed (so stream-end settlement is imminent or
+    /// running and no new prompts may start on this connection).
+    #[must_use]
+    pub fn is_transport_closed(&self) -> bool {
+        self.inner.connection.is_closed()
     }
 
     /// Whether a failed start lost its connection, so the child is exiting or gone.
@@ -358,7 +659,11 @@ impl AntigravitySessionRuntime {
                 "initialize",
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
-                    "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false }, "terminal": false },
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        "terminal": false,
+                        "elicitation": { "form": {} },
+                    },
                     // This server, at its own version.
                     "clientInfo": { "name": "bibcode-rust", "version": env!("CARGO_PKG_VERSION") },
                 }),
@@ -367,9 +672,10 @@ impl AntigravitySessionRuntime {
         {
             Ok(initialized) => initialized,
             // No working `agy acp`: the command is unknown, or the child exited before answering.
-            Err(AntigravityRuntimeError::Protocol(
-                AcpProtocolError::RemoteRequest { code: -32601, .. },
-            )) => return Err(AntigravityRuntimeError::UnsupportedVersion { version: None }),
+            Err(AntigravityRuntimeError::Protocol(AcpProtocolError::RemoteRequest {
+                code: -32601,
+                ..
+            })) => return Err(AntigravityRuntimeError::UnsupportedVersion { version: None }),
             Err(AntigravityRuntimeError::Protocol(
                 AcpProtocolError::Closed { .. }
                 | AcpProtocolError::WriteFailure { .. }
@@ -400,6 +706,7 @@ impl AntigravitySessionRuntime {
                 version: Some(format!("{major}.{minor}.{patch}")),
             });
         }
+        self.inner.gate.lock().await.agent_version = Some(version);
         let capabilities = initialized.get("agentCapabilities");
         let session_capabilities = capabilities.and_then(|capabilities| {
             capabilities
@@ -755,17 +1062,36 @@ impl AntigravitySessionRuntime {
         input: Option<&str>,
         attachments: Vec<Value>,
     ) -> Result<AntigravityPromptReceipt, AntigravityRuntimeError> {
+        if self.inner.retired.load(Ordering::SeqCst) {
+            return Err(AntigravityRuntimeError::Protocol(
+                AcpProtocolError::Closed {
+                    reason: "Antigravity session retired".to_owned(),
+                },
+            ));
+        }
         let session_id = self.provider_session_id().await?;
         let turn_id = format!("turn-{}", Uuid::new_v4());
+        let (accepted_tx, accepted) = oneshot::channel();
         // A mode change landing during the confirmation gets one more confirmation; a second
         // one sends no prompt.
         let mut attempts = 0;
+        let prompt_seq;
         loop {
             {
                 let mut gate = self.inner.gate.lock().await;
                 if !gate.mode_unconfirmed {
+                    let seq = gate.allocate_prompt_seq();
                     gate.active_turn = Some(turn_id.clone());
+                    gate.active_prompt_seq = seq;
+                    gate.active_prompt_wire_id = None;
+                    gate.active_turn_has_update = false;
+                    gate.active_prompt_quota_notice = None;
+                    gate.active_prompt_quota_published = None;
+                    gate.steer_in_flight = None;
+                    gate.previous_prompt = None;
+                    gate.pending_accept = Some((seq, accepted_tx));
                     gate.cancelled_turn = None;
+                    prompt_seq = seq;
                     break;
                 }
                 if attempts == 2 {
@@ -788,32 +1114,286 @@ impl AntigravitySessionRuntime {
             .await
         {
             Ok(request) => request,
-            Err(error) => return Err(self.end_unsent_turn(&turn_id, error).await),
+            Err(error) => return Err(self.end_unsent_turn(&turn_id, prompt_seq, error).await),
         };
+        {
+            let mut gate = self.inner.gate.lock().await;
+            if gate.active_prompt_seq == prompt_seq {
+                gate.active_prompt_wire_id = request.correlation_id().map(str::to_owned);
+            }
+        }
         let completion = match request.written().await {
-            Ok(()) => self.track_prompt_response(turn_id.clone(), request.response()),
+            Ok(()) => {
+                self.track_prompt_response(turn_id.clone(), prompt_seq, false, request.response())
+            }
             Err(failure) if failure.is_definitely_not_sent() => {
-                return Err(self.end_unsent_turn(&turn_id, failure.into_error()).await);
+                return Err(self
+                    .end_unsent_turn(&turn_id, prompt_seq, failure.into_error())
+                    .await);
             }
             Err(failure) => self.track_prompt_response(
                 turn_id.clone(),
+                prompt_seq,
+                false,
                 std::future::ready(Err(failure.into_error())),
             ),
         };
         Ok(AntigravityPromptReceipt {
             turn_id,
+            accepted,
             completion,
         })
+    }
+
+    /// Steers the currently running Antigravity turn by sending a second concurrent ACP
+    /// `session/prompt` on the same session without ever sending `session/cancel` (#434).
+    ///
+    /// Refuses steering (leaving the follow-up queued) if the installed `agy` CLI version is
+    /// `< 1.5.0`, the expected turn is no longer active or was cancelled, any permission/question
+    /// is pending, or the running prompt has not yet produced its first update.
+    pub async fn steer_turn(
+        &self,
+        input: Option<&str>,
+        attachments: Vec<Value>,
+        expected_turn_id: &str,
+    ) -> Result<AntigravityPromptReceipt, AntigravityRuntimeError> {
+        let prompt = crate::provider::attachments::prompt_parts(input, attachments);
+        let (accepted_tx, accepted) = oneshot::channel();
+        let connection = self.inner.connection.clone();
+        // Serialize the eligibility check and queueing `session/prompt` under `gate` so neither a
+        // permission request nor an explicit Stop can overtake the steer enqueue.
+        let (mut request, prev_seq, prev_has_update, new_seq) = {
+            let mut gate = self.inner.gate.lock().await;
+            if self.inner.retired.load(Ordering::SeqCst) || connection.is_closed() {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "The Antigravity session ended before the steer could be sent."
+                        .to_owned(),
+                });
+            }
+            if !gate
+                .agent_version
+                .is_some_and(|version| version >= ANTIGRAVITY_MIN_STEER_VERSION)
+            {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Antigravity CLI 1.5.0 or later is required to steer a running turn."
+                        .to_owned(),
+                });
+            }
+            let Some(session_id) = gate.session_id.clone() else {
+                return Err(AntigravityRuntimeError::MissingProviderSessionId);
+            };
+            if gate.active_turn.as_deref() != Some(expected_turn_id)
+                || gate.cancelled_turn.as_deref() == Some(expected_turn_id)
+            {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "The running turn ended before the steer could be sent.".to_owned(),
+                });
+            }
+            if !gate.pending.is_empty() {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Respond to the pending approval or question before steering."
+                        .to_owned(),
+                });
+            }
+            if !gate.active_turn_has_update {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Wait for the running turn to start responding before steering."
+                        .to_owned(),
+                });
+            }
+            if gate.mode_unconfirmed {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Wait for the mode update to finish before steering.".to_owned(),
+                });
+            }
+            if gate.steer_in_flight.is_some() || gate.previous_prompt.is_some() {
+                return Err(AntigravityRuntimeError::SteerUnavailable {
+                    detail: "Another steer is already in progress.".to_owned(),
+                });
+            }
+            let request = connection
+                .start_request(
+                    "session/prompt",
+                    json!({ "sessionId": session_id, "prompt": prompt }),
+                )
+                .await
+                .map_err(classify)?;
+            let prev_seq = gate.active_prompt_seq;
+            let prev_wire_id = gate.active_prompt_wire_id.take();
+            let prev_has_update = gate.active_turn_has_update;
+            let prev_quota_notice = gate.active_prompt_quota_notice.take();
+            let prev_quota_published = gate.active_prompt_quota_published.take();
+            let new_seq = gate.allocate_prompt_seq();
+            let new_wire_id = request.correlation_id().map(str::to_owned);
+            gate.previous_prompt = Some(PreviousPrompt {
+                seq: prev_seq,
+                wire_id: prev_wire_id,
+                had_update: prev_has_update,
+                wire_ended: false,
+                settled: None,
+                quota_notice: prev_quota_notice,
+                quota_published: prev_quota_published,
+            });
+            gate.active_prompt_seq = new_seq;
+            gate.active_prompt_wire_id = new_wire_id;
+            gate.active_turn_has_update = false;
+            gate.steer_in_flight = Some(new_seq);
+            gate.pending_accept = Some((new_seq, accepted_tx));
+            (request, prev_seq, prev_has_update, new_seq)
+        };
+
+        let turn_id = expected_turn_id.to_owned();
+        let completion = match request.written().await {
+            Ok(()) => {
+                self.commit_written_steer(new_seq).await;
+                self.track_prompt_response(turn_id.clone(), new_seq, true, request.response())
+            }
+            Err(failure) if failure.is_definitely_not_sent() => {
+                self.rollback_unsent_steer(&turn_id, prev_seq, prev_has_update, new_seq)
+                    .await;
+                return Err(classify(failure.into_error()));
+            }
+            Err(failure) => {
+                self.commit_written_steer(new_seq).await;
+                self.track_prompt_response(
+                    turn_id.clone(),
+                    new_seq,
+                    true,
+                    std::future::ready(Err(failure.into_error())),
+                )
+            }
+        };
+        Ok(AntigravityPromptReceipt {
+            turn_id,
+            accepted,
+            completion,
+        })
+    }
+
+    async fn rollback_unsent_steer(
+        &self,
+        turn_id: &str,
+        prev_seq: u64,
+        prev_has_update: bool,
+        new_seq: u64,
+    ) {
+        enum RollbackOutcome {
+            None,
+            PublishRestoredNotice(QuotaLimitNotice),
+            SettlePrevious {
+                pending: Vec<(String, PendingRequest)>,
+                quota_notice: Option<QuotaLimitNotice>,
+                quota_published: Option<QuotaLimitNotice>,
+                delivery_accepted: bool,
+                prev_result: Result<Value, AntigravityRuntimeError>,
+            },
+        }
+        let outcome = {
+            let mut gate = self.inner.gate.lock().await;
+            if gate.steer_in_flight == Some(new_seq) {
+                gate.steer_in_flight = None;
+            }
+            let prev = gate.previous_prompt.take();
+            if gate.active_prompt_seq == new_seq {
+                gate.pending_accept = None;
+                match prev {
+                    Some(PreviousPrompt {
+                        seq,
+                        had_update,
+                        settled: Some(prev_result),
+                        quota_notice,
+                        quota_published,
+                        ..
+                    }) if seq == prev_seq => {
+                        let cleared = gate.clear_active_turn(turn_id);
+                        RollbackOutcome::SettlePrevious {
+                            pending: cleared.pending,
+                            quota_notice,
+                            quota_published,
+                            delivery_accepted: had_update,
+                            prev_result,
+                        }
+                    }
+                    other => {
+                        gate.active_prompt_seq = prev_seq;
+                        gate.active_prompt_wire_id = other.as_ref().and_then(|p| p.wire_id.clone());
+                        gate.active_turn_has_update = prev_has_update;
+                        let (restored_notice, restored_published) = match other {
+                            Some(p) => (p.quota_notice, p.quota_published),
+                            None => (None, None),
+                        };
+                        let publish = restored_notice
+                            .as_ref()
+                            .filter(|notice| restored_published.as_ref() != Some(*notice))
+                            .cloned();
+                        gate.active_prompt_quota_notice = restored_notice;
+                        gate.active_prompt_quota_published = publish.clone().or(restored_published);
+                        match publish {
+                            Some(notice) => RollbackOutcome::PublishRestoredNotice(notice),
+                            None => RollbackOutcome::None,
+                        }
+                    }
+                }
+            } else {
+                RollbackOutcome::None
+            }
+        };
+        match outcome {
+            RollbackOutcome::None => {}
+            RollbackOutcome::PublishRestoredNotice(notice) => {
+                self.emit_usage_limit_warning(turn_id, &notice);
+            }
+            RollbackOutcome::SettlePrevious {
+                pending,
+                quota_notice,
+                quota_published,
+                delivery_accepted,
+                prev_result,
+            } => {
+                self.cancel_pending_requests(pending).await;
+                let _ = self
+                    .emit_prompt_completion(
+                        turn_id.to_owned(),
+                        prev_result,
+                        quota_notice,
+                        quota_published,
+                        None,
+                        delivery_accepted,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn commit_written_steer(&self, new_seq: u64) {
+        let mut gate = self.inner.gate.lock().await;
+        if gate.steer_in_flight == Some(new_seq) {
+            gate.steer_in_flight = None;
+        }
     }
 
     /// A prompt that never reached the CLI: its turn is no longer active and ends as failed.
     async fn end_unsent_turn(
         &self,
         turn_id: &str,
+        prompt_seq: u64,
         error: AcpProtocolError,
     ) -> AntigravityRuntimeError {
-        let error = classify(error);
-        self.finish_turn(turn_id).await;
+        let error = self.classify(error);
+        let error_class = error.class();
+        let error_reason = error.reason();
+        tracing::warn!(
+            provider = PROVIDER,
+            error_class,
+            error_reason,
+            "antigravity turn failed before prompt delivery"
+        );
+        let pending = {
+            let mut gate = self.inner.gate.lock().await;
+            gate.resolve_pending_accept_for(prompt_seq, Err(error.clone()));
+            gate.clear_active_turn(turn_id).pending
+        };
+        self.cancel_pending_requests(pending).await;
         self.emit(
             "turn.completed",
             Some(turn_id.to_owned()),
@@ -821,81 +1401,368 @@ impl AntigravitySessionRuntime {
             json!({
                 "state": "failed",
                 "stopReason": "error",
-                "errorMessage": error.to_string(),
-                "errorClass": error.class(),
+                "errorMessage": error.turn_error_message(),
+                "errorClass": error_class,
+                "errorReason": error_reason,
             }),
         );
         error
     }
 
-    /// Clears the turn if it is still the active one and closes the approvals it left open.
-    async fn finish_turn(&self, turn_id: &str) {
-        let pending = {
-            let mut gate = self.inner.gate.lock().await;
-            if gate.active_turn.as_deref() == Some(turn_id) {
-                gate.active_turn = None;
-            }
-            gate.take_pending(turn_id)
-        };
+    async fn cancel_pending_requests(&self, pending: Vec<(String, PendingRequest)>) {
+        let live_connection = !self.inner.connection.is_closed();
         for (request_id, pending) in pending {
-            self.emit(
-                "request.resolved",
-                Some(pending.turn_id),
-                Some(request_id),
-                json!({ "requestType": pending.request_type, "decision": "cancel" }),
-            );
+            match pending.kind {
+                PendingRequestKind::Permission { request_type, .. } => {
+                    self.emit(
+                        "request.resolved",
+                        Some(pending.turn_id),
+                        Some(request_id),
+                        json!({ "requestType": request_type, "decision": "cancel" }),
+                    );
+                }
+                PendingRequestKind::Elicitation { .. } => {
+                    if live_connection {
+                        let _ = self
+                            .inner
+                            .connection
+                            .respond(pending.wire_id, json!({ "action": "cancel" }))
+                            .await;
+                    }
+                    self.emit(
+                        "user-input.expired",
+                        Some(pending.turn_id),
+                        Some(request_id),
+                        json!({ "reason": "turn_completed" }),
+                    );
+                }
+            }
+        }
+    }
+
+    fn now_utc(&self) -> time::OffsetDateTime {
+        let clock = self
+            .inner
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        clock()
+    }
+
+    fn classify(&self, error: AcpProtocolError) -> AntigravityRuntimeError {
+        classify_with_clock(error, self.now_utc())
+    }
+
+    fn emit_usage_limit_warning(&self, turn_id: &str, notice: &QuotaLimitNotice) {
+        let mut payload = json!({
+            "usageLimit": true,
+            "message": notice.message,
+        });
+        if let Some(resets_at) = &notice.resets_at {
+            payload["resetsAt"] = json!(resets_at);
+        }
+        self.emit("runtime.warning", Some(turn_id.to_owned()), None, payload);
+    }
+
+    async fn emit_prompt_completion(
+        &self,
+        turn_id: String,
+        result: Result<Value, AntigravityRuntimeError>,
+        chunk_quota_notice: Option<QuotaLimitNotice>,
+        published_quota_notice: Option<QuotaLimitNotice>,
+        cancelled_prev_notice: Option<QuotaLimitNotice>,
+        delivery_accepted: bool,
+    ) -> Result<(), AntigravityRuntimeError> {
+        let abandoned = self.inner.abandoned_turns.lock().await.remove(&turn_id);
+        let emit_quota = |notice: QuotaLimitNotice, ensure_warning: bool| {
+            let error = AntigravityRuntimeError::UsageLimitReached {
+                message: notice.message.clone(),
+                resets_at: notice.resets_at.clone(),
+            };
+            if !abandoned {
+                if ensure_warning && published_quota_notice.as_ref() != Some(&notice) {
+                    self.emit_usage_limit_warning(&turn_id, &notice);
+                }
+                tracing::warn!(
+                    provider = PROVIDER,
+                    error_class = error.class(),
+                    error_reason = error.reason(),
+                    has_reset_time = notice.resets_at.is_some(),
+                    "antigravity turn hit usage limit"
+                );
+                let mut payload = json!({
+                    "state": "failed",
+                    "stopReason": "usage_limit",
+                    "errorMessage": notice.message,
+                    "errorClass": error.class(),
+                    "errorReason": error.reason(),
+                });
+                if let Some(resets_at) = notice.resets_at {
+                    payload["resetsAt"] = json!(resets_at);
+                }
+                self.emit("turn.completed", Some(turn_id.clone()), None, payload);
+            }
+            Err(error)
+        };
+        match result {
+            Ok(response) => {
+                let stop_reason = response
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("end_turn");
+                if stop_reason == "cancelled" {
+                    let cancelled_notice = chunk_quota_notice
+                        .filter(|notice| published_quota_notice.as_ref() != Some(notice))
+                        .or(cancelled_prev_notice);
+                    if !abandoned && let Some(notice) = cancelled_notice {
+                        self.emit_usage_limit_warning(&turn_id, &notice);
+                    }
+                } else if let Some(notice) = chunk_quota_notice {
+                    return emit_quota(notice, true);
+                }
+                let (state, failure_message) = acp_turn_state(stop_reason);
+                let mut payload = json!({ "state": state, "stopReason": stop_reason });
+                if let Some(message) = failure_message {
+                    payload["errorMessage"] = json!(message);
+                }
+                if !abandoned {
+                    self.emit("turn.completed", Some(turn_id), None, payload);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let prompt_quota_notice = match &error {
+                    AntigravityRuntimeError::UsageLimitReached { message, resets_at } => {
+                        Some(QuotaLimitNotice {
+                            message: message.clone(),
+                            resets_at: resets_at.clone(),
+                        })
+                    }
+                    _ => None,
+                };
+                let had_chunk_notice = chunk_quota_notice.is_some();
+                if let Some(notice) =
+                    QuotaLimitNotice::merge(chunk_quota_notice, prompt_quota_notice)
+                {
+                    // Publish a timeline warning whenever a chunk notice arrived OR delivery was
+                    // already accepted (e.g. via `usage_update`), so the notice persists in turn
+                    // history; when the prompt rejected before any update, the failed delivery
+                    // card is the single visible notice.
+                    let ensure_warning =
+                        had_chunk_notice || published_quota_notice.is_some() || delivery_accepted;
+                    return emit_quota(notice, ensure_warning);
+                }
+                let error_class = error.class();
+                let error_reason = error.reason();
+                if !abandoned {
+                    tracing::warn!(
+                        provider = PROVIDER,
+                        error_class,
+                        error_reason,
+                        "antigravity turn failed"
+                    );
+                    self.emit(
+                        "turn.completed",
+                        Some(turn_id),
+                        None,
+                        json!({
+                            "state": "failed",
+                            "stopReason": "error",
+                            "errorMessage": error.turn_error_message(),
+                            "errorClass": error_class,
+                            "errorReason": error_reason,
+                        }),
+                    );
+                }
+                Err(error)
+            }
         }
     }
 
     fn track_prompt_response<F>(
         &self,
         turn_id: String,
+        prompt_seq: u64,
+        is_steer: bool,
         response: F,
     ) -> oneshot::Receiver<Result<(), AntigravityRuntimeError>>
     where
         F: Future<Output = Result<Value, AcpProtocolError>> + Send + 'static,
     {
+        enum Resolution {
+            Superseded(Result<(), AntigravityRuntimeError>),
+            SteerRejectedKeepPrevious {
+                steer_error: AntigravityRuntimeError,
+                publish_restored_notice: Option<QuotaLimitNotice>,
+            },
+            SteerRejectedSettlePrevious {
+                steer_error: AntigravityRuntimeError,
+                pending: Vec<(String, PendingRequest)>,
+                quota_notice: Option<QuotaLimitNotice>,
+                quota_published: Option<QuotaLimitNotice>,
+                delivery_accepted: bool,
+                prev_result: Result<Value, AntigravityRuntimeError>,
+            },
+            CompleteTurn {
+                pending: Vec<(String, PendingRequest)>,
+                quota_notice: Option<QuotaLimitNotice>,
+                quota_published: Option<QuotaLimitNotice>,
+                cancelled_prev_notice: Option<QuotaLimitNotice>,
+                delivery_accepted: bool,
+                result: Result<Value, AntigravityRuntimeError>,
+            },
+        }
+
         let runtime = self.clone();
         let (completion_tx, completion) = oneshot::channel();
         tokio::spawn(async move {
-            let result = response.await;
+            let raw_result = response.await;
             // Chunks the agent wrote before its answer may still wait in the incoming queue.
             let _ = runtime.inner.connection.barrier().await;
-            runtime.finish_turn(&turn_id).await;
-            // An abandoned turn already completed as cancelled.
-            let abandoned = runtime.inner.abandoned_turns.lock().await.remove(&turn_id);
-            let outcome = match result {
-                Ok(response) => {
-                    let stop_reason = response
-                        .get("stopReason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("end_turn");
-                    let (state, failure_message) = acp_turn_state(stop_reason);
-                    let mut payload = json!({ "state": state, "stopReason": stop_reason });
-                    if let Some(message) = failure_message {
-                        payload["errorMessage"] = json!(message);
+            // Classify once so the delivery acceptance error and turn completion error share the
+            // exact same timestamp and message even across a wall-clock second boundary (#429).
+            let result = raw_result.map_err(|error| runtime.classify(error));
+            // Check ownership and perform the terminal state transition under ONE lock so a
+            // concurrent steer cannot slip between them.
+            let resolution = {
+                let mut gate = runtime.inner.gate.lock().await;
+                if let Some(prev) = gate
+                    .previous_prompt
+                    .as_mut()
+                    .filter(|prev| prev.seq == prompt_seq)
+                {
+                    let outcome = match &result {
+                        Ok(_) => Ok(()),
+                        Err(error) => Err(error.clone()),
+                    };
+                    prev.settled = Some(result);
+                    Resolution::Superseded(outcome)
+                } else if gate.active_turn.as_deref() == Some(turn_id.as_str())
+                    && gate.active_prompt_seq == prompt_seq
+                {
+                    let steer_rejection = is_steer
+                        .then(|| result.as_ref().err().cloned())
+                        .flatten()
+                        .filter(|error| {
+                            matches!(
+                                error,
+                                AntigravityRuntimeError::SignInRequired
+                                    | AntigravityRuntimeError::AccountDisabled { .. }
+                                    | AntigravityRuntimeError::UsageLimitReached { .. }
+                                    | AntigravityRuntimeError::Protocol(
+                                        AcpProtocolError::RemoteRequest { .. }
+                                    )
+                            )
+                        });
+                    if let Some(steer_error) = steer_rejection
+                        && let Some(prev) = gate.previous_prompt.take()
+                    {
+                        gate.resolve_pending_accept_for(prompt_seq, Err(steer_error.clone()));
+                        if let Some(prev_result) = prev.settled {
+                            let cleared = gate.clear_active_turn(&turn_id);
+                            Resolution::SteerRejectedSettlePrevious {
+                                steer_error,
+                                pending: cleared.pending,
+                                quota_notice: prev.quota_notice,
+                                quota_published: prev.quota_published,
+                                delivery_accepted: prev.had_update,
+                                prev_result,
+                            }
+                        } else {
+                            gate.active_prompt_seq = prev.seq;
+                            gate.active_prompt_wire_id = prev.wire_id;
+                            gate.active_turn_has_update = prev.had_update;
+                            let publish_restored_notice = prev
+                                .quota_notice
+                                .as_ref()
+                                .filter(|notice| prev.quota_published.as_ref() != Some(*notice))
+                                .cloned();
+                            gate.active_prompt_quota_notice = prev.quota_notice;
+                            gate.active_prompt_quota_published =
+                                publish_restored_notice.clone().or(prev.quota_published);
+                            gate.steer_in_flight = None;
+                            Resolution::SteerRejectedKeepPrevious {
+                                steer_error,
+                                publish_restored_notice,
+                            }
+                        }
+                    } else {
+                        let accept_outcome = match &result {
+                            Ok(_) => Ok(()),
+                            Err(error) => Err(error.clone()),
+                        };
+                        let delivery_accepted = gate.active_turn_has_update;
+                        gate.resolve_pending_accept_for(prompt_seq, accept_outcome);
+                        let cleared = gate.clear_active_turn(&turn_id);
+                        Resolution::CompleteTurn {
+                            pending: cleared.pending,
+                            quota_notice: cleared.quota_notice,
+                            quota_published: cleared.quota_published,
+                            cancelled_prev_notice: cleared.prev_unpublished_notice,
+                            delivery_accepted,
+                            result,
+                        }
                     }
-                    if !abandoned {
-                        runtime.emit("turn.completed", Some(turn_id), None, payload);
-                    }
-                    Ok(())
+                } else {
+                    let outcome = match result {
+                        Ok(_) => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    Resolution::Superseded(outcome)
                 }
-                Err(error) => {
-                    let error = classify(error);
-                    if !abandoned {
-                        runtime.emit(
-                            "turn.completed",
-                            Some(turn_id),
-                            None,
-                            json!({
-                                "state": "failed",
-                                "stopReason": "error",
-                                "errorMessage": error.to_string(),
-                                "errorClass": error.class(),
-                            }),
-                        );
+            };
+            let outcome = match resolution {
+                Resolution::Superseded(outcome) => outcome,
+                Resolution::SteerRejectedKeepPrevious {
+                    steer_error,
+                    publish_restored_notice,
+                } => {
+                    if let Some(notice) = publish_restored_notice {
+                        runtime.emit_usage_limit_warning(&turn_id, &notice);
                     }
-                    Err(error)
+                    Err(steer_error)
+                }
+                Resolution::SteerRejectedSettlePrevious {
+                    steer_error,
+                    pending,
+                    quota_notice,
+                    quota_published,
+                    delivery_accepted,
+                    prev_result,
+                } => {
+                    runtime.cancel_pending_requests(pending).await;
+                    let _ = runtime
+                        .emit_prompt_completion(
+                            turn_id,
+                            prev_result,
+                            quota_notice,
+                            quota_published,
+                            None,
+                            delivery_accepted,
+                        )
+                        .await;
+                    Err(steer_error)
+                }
+                Resolution::CompleteTurn {
+                    pending,
+                    quota_notice,
+                    quota_published,
+                    cancelled_prev_notice,
+                    delivery_accepted,
+                    result,
+                } => {
+                    runtime.cancel_pending_requests(pending).await;
+                    runtime
+                        .emit_prompt_completion(
+                            turn_id,
+                            result,
+                            quota_notice,
+                            quota_published,
+                            cancelled_prev_notice,
+                            delivery_accepted,
+                        )
+                        .await
                 }
             };
             let _ = completion_tx.send(outcome);
@@ -923,20 +1790,37 @@ impl AntigravitySessionRuntime {
             // From here no request of this turn is answered with anything but `cancelled`.
             gate.cancelled_turn = Some(turn_id.clone());
             for (request_id, pending) in gate.take_pending(&turn_id) {
-                let _ = self
-                    .inner
-                    .connection
-                    .respond(
-                        pending.wire_id,
-                        json!({ "outcome": { "outcome": "cancelled" } }),
-                    )
-                    .await;
-                self.emit(
-                    "request.resolved",
-                    Some(pending.turn_id),
-                    Some(request_id),
-                    json!({ "requestType": pending.request_type, "decision": "cancel" }),
-                );
+                match pending.kind {
+                    PendingRequestKind::Permission { request_type, .. } => {
+                        let _ = self
+                            .inner
+                            .connection
+                            .respond(
+                                pending.wire_id,
+                                json!({ "outcome": { "outcome": "cancelled" } }),
+                            )
+                            .await;
+                        self.emit(
+                            "request.resolved",
+                            Some(pending.turn_id),
+                            Some(request_id),
+                            json!({ "requestType": request_type, "decision": "cancel" }),
+                        );
+                    }
+                    PendingRequestKind::Elicitation { .. } => {
+                        let _ = self
+                            .inner
+                            .connection
+                            .respond(pending.wire_id, json!({ "action": "cancel" }))
+                            .await;
+                        self.emit(
+                            "user-input.expired",
+                            Some(pending.turn_id),
+                            Some(request_id),
+                            json!({ "reason": "turn_cancelled" }),
+                        );
+                    }
+                }
             }
             let session_id = gate
                 .session_id
@@ -953,23 +1837,45 @@ impl AntigravitySessionRuntime {
         let grace = self.inner.options.cancel_grace;
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
-            {
+            let unpublished_prev_notice = {
                 let mut gate = runtime.inner.gate.lock().await;
                 if gate.active_turn.as_deref() != Some(turn_id.as_str()) {
                     return;
                 }
                 gate.active_turn = None;
+                gate.active_prompt_seq = 0;
+                gate.active_turn_has_update = false;
+                gate.active_prompt_quota_notice = None;
+                gate.active_prompt_quota_published = None;
+                gate.steer_in_flight = None;
+                let unpublished_prev_notice = gate
+                    .previous_prompt
+                    .take()
+                    .and_then(|prev| prev.unpublished_quota_notice());
+                // An unacknowledged prompt whose cancel grace expired remains ambiguous.
+                gate.resolve_pending_accept(Err(AntigravityRuntimeError::Protocol(
+                    AcpProtocolError::Closed {
+                        reason: "Antigravity did not end the cancelled turn".to_owned(),
+                    },
+                )));
                 runtime
                     .inner
                     .abandoned_turns
                     .lock()
                     .await
                     .insert(turn_id.clone());
-            }
+                unpublished_prev_notice
+            };
             tracing::warn!(
                 provider = PROVIDER,
                 "the provider did not end a cancelled turn; stopping its process"
             );
+            // Mark unavailable for new prompts before publishing cancellation so no prompt slips
+            // in between turn settlement and driver shutdown.
+            runtime.inner.retired.store(true, Ordering::SeqCst);
+            if let Some(notice) = unpublished_prev_notice {
+                runtime.emit_usage_limit_warning(&turn_id, &notice);
+            }
             runtime.emit(
                 "turn.completed",
                 Some(turn_id),
@@ -992,15 +1898,28 @@ impl AntigravitySessionRuntime {
         decision: &str,
     ) -> Result<(), AntigravityRuntimeError> {
         let mut gate = self.inner.gate.lock().await;
-        let pending = gate.pending.remove(request_id).ok_or_else(|| {
-            AntigravityRuntimeError::PendingRequestNotFound {
+        if !matches!(
+            gate.pending.get(request_id).map(|entry| &entry.kind),
+            Some(PendingRequestKind::Permission { .. })
+        ) {
+            return Err(AntigravityRuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
-            }
-        })?;
+            });
+        }
+        let pending = gate.pending.remove(request_id).expect("checked above");
+        let PendingRequestKind::Permission {
+            request_type,
+            allow_once,
+            allow_always,
+            reject_once,
+        } = pending.kind
+        else {
+            unreachable!("checked above");
+        };
         let selected = match decision {
-            "acceptForSession" => pending.allow_always.or(pending.allow_once),
-            "accept" => pending.allow_once,
-            "decline" => pending.reject_once,
+            "acceptForSession" => allow_always.or(allow_once),
+            "accept" => allow_once,
+            "decline" => reject_once,
             _ => None,
         };
         let outcome = selected.map_or_else(
@@ -1017,7 +1936,70 @@ impl AntigravitySessionRuntime {
             "request.resolved",
             Some(pending.turn_id),
             Some(request_id.to_owned()),
-            json!({ "requestType": pending.request_type, "decision": decision }),
+            json!({ "requestType": request_type, "decision": decision }),
+        );
+        Ok(())
+    }
+
+    pub async fn respond_to_user_input_with_disposition(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+    ) -> Result<(), AntigravityRuntimeError> {
+        let mut gate = self.inner.gate.lock().await;
+        let (wire_response, resolved_answers, resolved_disposition) = {
+            let Some(PendingRequest {
+                kind: PendingRequestKind::Elicitation { fields, .. },
+                ..
+            }) = gate.pending.get(request_id)
+            else {
+                return Err(AntigravityRuntimeError::PendingRequestNotFound {
+                    request_id: request_id.to_owned(),
+                });
+            };
+            match disposition {
+                crate::provider::UserInputResponseDisposition::Cancelled => {
+                    (json!({ "action": "cancel" }), json!({}), "cancelled")
+                }
+                crate::provider::UserInputResponseDisposition::Skipped
+                    if !crate::provider::has_non_empty_user_input_answer(&answers) =>
+                {
+                    (json!({ "action": "decline" }), json!({}), "skipped")
+                }
+                crate::provider::UserInputResponseDisposition::Answered
+                | crate::provider::UserInputResponseDisposition::Skipped => {
+                    let content = build_elicitation_content(fields, &answers)?;
+                    (
+                        json!({ "action": "accept", "content": Value::Object(content) }),
+                        answers,
+                        disposition.as_str(),
+                    )
+                }
+            }
+        };
+        let pending = gate.pending.remove(request_id).expect("checked above");
+        let PendingRequestKind::Elicitation {
+            question_summaries, ..
+        } = pending.kind
+        else {
+            unreachable!("checked above");
+        };
+        self.inner
+            .connection
+            .respond(pending.wire_id, wire_response)
+            .await
+            .map_err(classify)?;
+        drop(gate);
+        self.emit(
+            "user-input.resolved",
+            Some(pending.turn_id),
+            Some(request_id.to_owned()),
+            json!({
+                "answers": resolved_answers,
+                "disposition": resolved_disposition,
+                "questions": question_summaries,
+            }),
         );
         Ok(())
     }
@@ -1036,6 +2018,23 @@ impl AntigravitySessionRuntime {
             .keys()
             .cloned()
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_agent_version_for_test(&self, version: Option<(u64, u64, u64)>) {
+        self.inner.gate.lock().await.agent_version = version;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_clock_for_test(
+        &self,
+        clock: impl Fn() -> time::OffsetDateTime + Send + Sync + 'static,
+    ) {
+        *self
+            .inner
+            .clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(clock);
     }
 
     async fn handle_incoming(&self, event: IncomingEvent) {
@@ -1074,10 +2073,27 @@ impl AntigravitySessionRuntime {
                 );
             }
             IncomingEvent::Closed { reason } => {
-                self.emit("session.exited", None, None, json!({ "reason": reason }));
+                let error_reason = acp_error_reason(&AcpProtocolError::Closed { reason });
+                self.emit(
+                    "session.exited",
+                    None,
+                    None,
+                    json!({
+                        "reason": antigravity_transport_message(error_reason),
+                        "errorReason": error_reason,
+                    }),
+                );
             }
             IncomingEvent::Barrier(reached) => {
                 let _ = reached.send(());
+            }
+            IncomingEvent::ResponseObserved { correlation_id } => {
+                let mut gate = self.inner.gate.lock().await;
+                if let Some(prev) = gate.previous_prompt.as_mut()
+                    && prev.wire_id.as_deref() == Some(correlation_id.as_str())
+                {
+                    prev.wire_ended = true;
+                }
             }
         }
     }
@@ -1122,6 +2138,25 @@ impl AntigravitySessionRuntime {
         if has_active_turn && turn_id.is_none() {
             return;
         }
+        let is_handled_turn_update = matches!(
+            kind,
+            Some(
+                "agent_message_chunk" | "tool_call" | "tool_call_update" | "usage_update" | "plan"
+            )
+        );
+        if is_handled_turn_update && turn_id.is_some() {
+            let mut gate = self.inner.gate.lock().await;
+            if gate.active_turn.as_deref() == turn_id.as_deref()
+                && gate
+                    .previous_prompt
+                    .as_ref()
+                    .is_none_or(|prev| prev.wire_ended || prev.settled.is_some())
+            {
+                gate.previous_prompt = None;
+                gate.active_turn_has_update = true;
+                gate.resolve_pending_accept(Ok(()));
+            }
+        }
         match kind {
             Some("agent_message_chunk") => {
                 let content = update.get("content");
@@ -1136,6 +2171,47 @@ impl AntigravitySessionRuntime {
                     .and_then(|content| content.get("text"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if let Some(active_turn_id) = turn_id.as_deref()
+                    && let Some(notice) = classify_quota_chunk(delta, self.now_utc())
+                {
+                    let to_publish = {
+                        let mut gate = self.inner.gate.lock().await;
+                        if gate.active_turn.as_deref() != Some(active_turn_id) {
+                            None
+                        } else if let Some(prev) = gate
+                            .previous_prompt
+                            .as_mut()
+                            .filter(|prev| !prev.wire_ended && prev.settled.is_none())
+                        {
+                            // This chunk belongs to the superseded prompt before its wire response:
+                            // retain it on `prev` so a healthy steer prompt settles cleanly, and
+                            // restore/publish it only if the steer is rejected.
+                            prev.quota_notice =
+                                QuotaLimitNotice::merge(prev.quota_notice.take(), Some(notice));
+                            None
+                        } else {
+                            let merged = QuotaLimitNotice::merge(
+                                gate.active_prompt_quota_notice.take(),
+                                Some(notice),
+                            );
+                            let publish = merged
+                                .as_ref()
+                                .filter(|next| {
+                                    gate.active_prompt_quota_published.as_ref() != Some(*next)
+                                })
+                                .cloned();
+                            gate.active_prompt_quota_notice = merged;
+                            if let Some(published) = &publish {
+                                gate.active_prompt_quota_published = Some(published.clone());
+                            }
+                            publish
+                        }
+                    };
+                    if let Some(notice) = to_publish {
+                        self.emit_usage_limit_warning(active_turn_id, &notice);
+                    }
+                    return;
+                }
                 self.emit(
                     "content.delta",
                     turn_id,
@@ -1219,8 +2295,7 @@ impl AntigravitySessionRuntime {
         params: Value,
     ) -> Result<(), AntigravityRuntimeError> {
         let connection = &self.inner.connection;
-        if method != "session/request_permission" {
-            // No elicitation or other client method is offered (D-A7).
+        if method != "session/request_permission" && method != "elicitation/create" {
             tracing::debug!(provider = PROVIDER, "answered an unknown ACP request");
             connection
                 .respond_error(
@@ -1247,7 +2322,8 @@ impl AntigravitySessionRuntime {
             // outstanding request, which stays bound to its own operation.
             tracing::warn!(
                 provider = PROVIDER,
-                "refused a permission request reusing an outstanding id"
+                method = request_label(method),
+                "refused an ACP request reusing an outstanding id"
             );
             connection
                 .respond_error(
@@ -1270,11 +2346,103 @@ impl AntigravitySessionRuntime {
         let Some(turn_id) = turn_id.filter(|_| open_session) else {
             // Not this session's running turn: during the open, between turns, after a cancel,
             // or another session. Refused, never approved and never shown.
-            connection
-                .respond(wire_id, json!({ "outcome": { "outcome": "cancelled" } }))
-                .await?;
+            let cancel_reply = if method == "elicitation/create" {
+                json!({ "action": "cancel" })
+            } else {
+                json!({ "outcome": { "outcome": "cancelled" } })
+            };
+            drop(gate);
+            connection.respond(wire_id, cancel_reply).await?;
             return Ok(());
         };
+        if method == "elicitation/create" {
+            let mode = params.get("mode").and_then(Value::as_str);
+            if mode != Some("form") {
+                drop(gate);
+                connection
+                    .respond_error(
+                        wire_id,
+                        JsonRpcErrorShape {
+                            code: -32602,
+                            message: "Unsupported elicitation mode: only form mode is supported"
+                                .to_owned(),
+                            data: None,
+                        },
+                    )
+                    .await?;
+                return Ok(());
+            }
+            if gate.code_review && mode_for(&gate.runtime_mode, &gate.interaction_mode) == "auto" {
+                drop(gate);
+                connection
+                    .respond(wire_id, json!({ "action": "decline" }))
+                    .await?;
+                return Ok(());
+            }
+            let parsed = match parse_elicitation_form(&params) {
+                Ok(parsed) => parsed,
+                Err(ElicitationParseError::SecretRequested) => {
+                    drop(gate);
+                    connection
+                        .respond(wire_id, json!({ "action": "decline" }))
+                        .await?;
+                    self.emit(
+                        "runtime.warning",
+                        Some(turn_id),
+                        None,
+                        json!({
+                            "message": "Antigravity requested a secret input, which BiBCode declined to avoid storing secrets in thread history.",
+                        }),
+                    );
+                    return Ok(());
+                }
+                Err(ElicitationParseError::InvalidSchema(message)) => {
+                    drop(gate);
+                    connection
+                        .respond_error(
+                            wire_id,
+                            JsonRpcErrorShape {
+                                code: -32602,
+                                message,
+                                data: None,
+                            },
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let request_id = format!("elicitation:{}", Uuid::new_v4());
+            let question_summaries =
+                crate::provider::compact_user_input_question_summaries(&parsed.questions);
+            gate.pending.insert(
+                request_id.clone(),
+                PendingRequest {
+                    wire_id,
+                    turn_id: turn_id.clone(),
+                    kind: PendingRequestKind::Elicitation {
+                        fields: parsed.fields,
+                        question_summaries,
+                    },
+                },
+            );
+            if gate
+                .previous_prompt
+                .as_ref()
+                .is_none_or(|prev| prev.wire_ended || prev.settled.is_some())
+            {
+                gate.previous_prompt = None;
+                gate.active_turn_has_update = true;
+                gate.resolve_pending_accept(Ok(()));
+            }
+            // Emitted under the gate, so a cancel cannot resolve the request before it opens.
+            self.emit(
+                "user-input.requested",
+                Some(turn_id),
+                Some(request_id),
+                json!({ "questions": parsed.questions }),
+            );
+            return Ok(());
+        }
         if gate.code_review && mode_for(&gate.runtime_mode, &gate.interaction_mode) == "auto" {
             drop(gate);
             connection
@@ -1308,12 +2476,26 @@ impl AntigravitySessionRuntime {
             PendingRequest {
                 wire_id,
                 turn_id: turn_id.clone(),
-                request_type,
-                allow_once,
-                allow_always: find_option_id(&options, "allow_always"),
-                reject_once: find_option_id(&options, "reject_once"),
+                kind: PendingRequestKind::Permission {
+                    request_type,
+                    allow_once,
+                    allow_always: find_option_id(&options, "allow_always"),
+                    reject_once: find_option_id(&options, "reject_once"),
+                },
             },
         );
+        // The CLI proved it accepted the prompt by opening an approval for it —
+        // only once any previous prompt has finished on the wire, so an approval
+        // belonging to Prompt 1 cannot acknowledge an unconfirmed concurrent steer.
+        if gate
+            .previous_prompt
+            .as_ref()
+            .is_none_or(|prev| prev.wire_ended || prev.settled.is_some())
+        {
+            gate.previous_prompt = None;
+            gate.active_turn_has_update = true;
+            gate.resolve_pending_accept(Ok(()));
+        }
         // Emitted under the gate, so a cancel cannot resolve the request before it opens.
         self.emit(
             "request.opened",
@@ -1386,9 +2568,16 @@ fn account_disabled_notice(message: &str) -> Option<String> {
 }
 
 /// One classifier for every request: `-32000` "Authentication required" is the sign-in error,
-/// and Google's notice that the account is disabled is its own error, whatever its code; any
-/// other error passes through.
+/// Google's notice that the account is disabled is its own error, and quota-limit prompt errors
+/// classify into `UsageLimitReached`; any other error passes through.
 fn classify(error: AcpProtocolError) -> AntigravityRuntimeError {
+    classify_with_clock(error, time::OffsetDateTime::now_utc())
+}
+
+fn classify_with_clock(
+    error: AcpProtocolError,
+    now: time::OffsetDateTime,
+) -> AntigravityRuntimeError {
     if let AcpProtocolError::RemoteRequest { message, .. } = &error
         && let Some(google_message) = account_disabled_notice(message)
     {
@@ -1403,9 +2592,440 @@ fn classify(error: AcpProtocolError) -> AntigravityRuntimeError {
             .to_ascii_lowercase()
             .contains("authentication required") =>
         {
-            AntigravityRuntimeError::SignInRequired
+            return AntigravityRuntimeError::SignInRequired;
         }
-        _ => AntigravityRuntimeError::Protocol(error),
+        _ => {}
+    }
+    if let Some(notice) = classify_quota_prompt_error(&error, now) {
+        return AntigravityRuntimeError::UsageLimitReached {
+            message: notice.message,
+            resets_at: notice.resets_at,
+        };
+    }
+    AntigravityRuntimeError::Protocol(error)
+}
+
+const QUOTA_CHUNK_MAX_CHARS: usize = 2_048;
+const QUOTA_ERROR_SCAN_MAX_BYTES: usize = 8 * 1024;
+const MAX_RESET_DURATION_SECS: u64 = 365 * 24 * 3600;
+const MAX_RESET_DURATION_MILLIS: u128 = (MAX_RESET_DURATION_SECS as u128) * 1_000;
+
+const PROMPT_ERROR_QUOTA_PHRASES: &[&str] = &[
+    "individual quota reached",
+    "exhausted your quota on this model",
+    "exhausted your capacity on this model",
+    "resource_exhausted",
+    "exceeded your current quota",
+    "quota exceeded for",
+    "usage limit reached",
+];
+
+fn is_filesystem_quota_text(lower: &str) -> bool {
+    const FILESYSTEM_QUOTA_MARKERS: &[&str] = &[
+        "disk quota",
+        "edquot",
+        "filesystem",
+        "file system",
+        "no space left on device",
+    ];
+    FILESYSTEM_QUOTA_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn contains_phrase_boundary(text: &str, phrase: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(phrase) {
+        let abs = start + pos;
+        let end = abs + phrase.len();
+        let prev_ok = abs == 0
+            || text[..abs]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        let next_ok = end == text.len()
+            || text[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        if prev_ok && next_ok {
+            return true;
+        }
+        // Advance past the current char boundary to continue searching.
+        let step = text[abs..].chars().next().map_or(1, char::len_utf8);
+        start = abs + step;
+    }
+    false
+}
+
+fn matches_prompt_quota_allowlist(lower: &str) -> bool {
+    PROMPT_ERROR_QUOTA_PHRASES
+        .iter()
+        .any(|phrase| contains_phrase_boundary(lower, phrase))
+}
+
+fn starts_with_phrase_boundary(text: &str, phrase: &str) -> bool {
+    text.strip_prefix(phrase).is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+    })
+}
+
+/// Classifies a single short ACP `agent_message_chunk` starting directly with `⚠` (`U+26A0`)
+/// against the anchored quota notice allowlist (#429). Ordinary prose, indented warnings,
+/// multi-line chunks, >2,048-char chunks, chunks without leading `⚠`, and filesystem/disk quota
+/// strings never match.
+fn classify_quota_chunk(text: &str, now: time::OffsetDateTime) -> Option<QuotaLimitNotice> {
+    if text.contains('\n') || text.contains('\r') {
+        return None;
+    }
+    if text.chars().count() > QUOTA_CHUNK_MAX_CHARS {
+        return None;
+    }
+    let after_warning = text.strip_prefix('\u{26A0}')?;
+    let body = after_warning
+        .strip_prefix('\u{FE0F}')
+        .unwrap_or(after_warning)
+        .trim_start_matches([' ', '\t']);
+    let body_lower = body.to_ascii_lowercase();
+    if is_filesystem_quota_text(&body_lower) {
+        return None;
+    }
+    let matches_allowlist = starts_with_phrase_boundary(&body_lower, "individual quota reached")
+        || starts_with_phrase_boundary(&body_lower, "you have exhausted your quota on this model")
+        || starts_with_phrase_boundary(
+            &body_lower,
+            "you have exhausted your capacity on this model",
+        )
+        || body_lower
+            .strip_prefix("agent executor error:")
+            .is_some_and(matches_prompt_quota_allowlist);
+    if !matches_allowlist {
+        return None;
+    }
+    let duration = parse_reset_duration(body);
+    Some(format_usage_limit_notice(duration, now))
+}
+
+/// Classifies a `session/prompt` JSON-RPC error against the tight quota error allowlist (#429).
+/// Non-prompt ACP control errors, bare HTTP 429 errors without an explicit quota phrase, and
+/// filesystem/disk quota errors never match.
+fn classify_quota_prompt_error(
+    error: &AcpProtocolError,
+    now: time::OffsetDateTime,
+) -> Option<QuotaLimitNotice> {
+    let AcpProtocolError::RemoteRequest {
+        method,
+        message,
+        data,
+        ..
+    } = error
+    else {
+        return None;
+    };
+    if method != "session/prompt" {
+        return None;
+    }
+    let mut message_buf = String::new();
+    push_bounded(&mut message_buf, message, QUOTA_ERROR_SCAN_MAX_BYTES);
+    let mut data_buf = String::new();
+    if let Some(data) = data {
+        collect_error_data_text(data, &mut data_buf, QUOTA_ERROR_SCAN_MAX_BYTES, 0);
+    }
+    let message_lower = message_buf.to_ascii_lowercase();
+    let data_lower = data_buf.to_ascii_lowercase();
+    if is_filesystem_quota_text(&message_lower) || is_filesystem_quota_text(&data_lower) {
+        return None;
+    }
+    if !matches_prompt_quota_allowlist(&message_lower)
+        && !matches_prompt_quota_allowlist(&data_lower)
+    {
+        return None;
+    }
+    let duration = parse_reset_duration(&message_buf).or_else(|| parse_reset_duration(&data_buf));
+    Some(format_usage_limit_notice(duration, now))
+}
+
+fn push_bounded(out: &mut String, part: &str, max_bytes: usize) {
+    if part.is_empty() || out.len() >= max_bytes {
+        return;
+    }
+    if !out.is_empty() && out.len() < max_bytes {
+        out.push(' ');
+    }
+    let remaining = max_bytes.saturating_sub(out.len());
+    if part.len() <= remaining {
+        out.push_str(part);
+    } else {
+        let mut end = remaining;
+        while end > 0 && !part.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&part[..end]);
+    }
+}
+
+fn collect_error_data_text(value: &Value, out: &mut String, max_bytes: usize, depth: usize) {
+    if depth >= 4 || out.len() >= max_bytes {
+        return;
+    }
+    match value {
+        Value::String(text) => push_bounded(out, text, max_bytes),
+        Value::Array(items) => {
+            for item in items {
+                collect_error_data_text(item, out, max_bytes, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            for (key, entry) in map {
+                if matches!(
+                    key.as_str(),
+                    "code"
+                        | "errno"
+                        | "message"
+                        | "detail"
+                        | "details"
+                        | "error"
+                        | "reason"
+                        | "status"
+                ) {
+                    collect_error_data_text(entry, out, max_bytes, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parses a relative reset duration following `Resets in`, `reset after`, or `retry in` in either
+/// Go duration syntax (`2h30m0s`, `45m`) or unit words (`4 hours, 5 minutes`).
+fn parse_reset_duration(text: &str) -> Option<Duration> {
+    const INTRODUCERS: &[&str] = &["resets in", "reset after", "retry in"];
+    let lower = text.to_ascii_lowercase();
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    for introducer in INTRODUCERS {
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(introducer) {
+            let abs = start + pos;
+            let after = abs + introducer.len();
+            // Ensure the introducer is not glued inside a longer word.
+            let prev_ok = abs == 0 || !lower.as_bytes()[abs - 1].is_ascii_alphabetic();
+            let next_ok = after == lower.len() || !lower.as_bytes()[after].is_ascii_alphabetic();
+            if prev_ok && next_ok {
+                matches.push((abs, after));
+            }
+            start = after;
+        }
+    }
+    matches.sort_unstable_by_key(|(pos, _)| *pos);
+    for (_, after) in matches {
+        if let Some(duration) = parse_duration_expression(&lower[after..]) {
+            return Some(duration);
+        }
+    }
+    None
+}
+
+fn parse_duration_expression(input: &str) -> Option<Duration> {
+    let mut rest =
+        input.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ':' || c == '~');
+    for filler in ["approximately ", "about "] {
+        if let Some(stripped) = rest.strip_prefix(filler) {
+            rest = stripped.trim_start();
+            break;
+        }
+    }
+
+    let mut total_millis: u128 = 0;
+    let mut components = 0usize;
+
+    loop {
+        if components > 0 {
+            let trimmed = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+            let trimmed = if let Some(after_and) = trimmed.strip_prefix("and")
+                && after_and.starts_with(|c: char| c.is_ascii_whitespace())
+            {
+                after_and.trim_start()
+            } else {
+                trimmed
+            };
+            rest = trimmed;
+        }
+
+        let num_end = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_digit() || *b == b'.')
+            .count();
+        if num_end == 0 {
+            break;
+        }
+        let num_str = &rest[..num_end];
+        if !num_str.bytes().any(|b| b.is_ascii_digit()) {
+            break;
+        }
+        let Ok(value) = num_str.parse::<f64>() else {
+            break;
+        };
+        if !value.is_finite() || value < 0.0 {
+            break;
+        }
+        let after_num = rest[num_end..].trim_start_matches([' ', '\t']);
+        let Some((unit_millis, unit_len)) = parse_duration_unit(after_num) else {
+            break;
+        };
+        let added = (value * unit_millis).round();
+        if !added.is_finite() || added < 0.0 {
+            break;
+        }
+        total_millis = total_millis.saturating_add(added as u128);
+        components += 1;
+        rest = &after_num[unit_len..];
+    }
+
+    if components == 0 || total_millis == 0 {
+        return None;
+    }
+    let clamped_millis = u64::try_from(total_millis.min(MAX_RESET_DURATION_MILLIS))
+        .unwrap_or(MAX_RESET_DURATION_SECS * 1_000);
+    Some(Duration::from_millis(clamped_millis))
+}
+
+fn parse_duration_unit(text: &str) -> Option<(f64, usize)> {
+    // Longest units first so `ms`/`milliseconds` match before `m`, and `minutes` before `min`/`m`.
+    const UNITS: &[(&str, f64)] = &[
+        ("milliseconds", 1.0),
+        ("millisecond", 1.0),
+        ("msecs", 1.0),
+        ("msec", 1.0),
+        ("ms", 1.0),
+        ("seconds", 1_000.0),
+        ("second", 1_000.0),
+        ("secs", 1_000.0),
+        ("sec", 1_000.0),
+        ("minutes", 60_000.0),
+        ("minute", 60_000.0),
+        ("mins", 60_000.0),
+        ("min", 60_000.0),
+        ("hours", 3_600_000.0),
+        ("hour", 3_600_000.0),
+        ("hrs", 3_600_000.0),
+        ("hr", 3_600_000.0),
+        ("days", 86_400_000.0),
+        ("day", 86_400_000.0),
+        ("s", 1_000.0),
+        ("m", 60_000.0),
+        ("h", 3_600_000.0),
+        ("d", 86_400_000.0),
+    ];
+    for &(token, millis) in UNITS {
+        if let Some(after) = text.strip_prefix(token) {
+            let boundary_ok = after
+                .as_bytes()
+                .first()
+                .is_none_or(|b| !b.is_ascii_alphabetic());
+            if boundary_ok {
+                return Some((millis, token.len()));
+            }
+        }
+    }
+    None
+}
+
+fn format_relative_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!("{seconds}s"));
+    }
+    parts.join(" ")
+}
+
+fn format_usage_limit_notice(
+    duration: Option<Duration>,
+    now: time::OffsetDateTime,
+) -> QuotaLimitNotice {
+    let Some(duration) = duration else {
+        return QuotaLimitNotice {
+            message: "Antigravity usage limit reached. Try again later or switch models."
+                .to_owned(),
+            resets_at: None,
+        };
+    };
+    let duration_millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+    let resets_at_dt =
+        (now + time::Duration::milliseconds(duration_millis)).to_offset(time::UtcOffset::UTC);
+    let resets_at_iso = if resets_at_dt.millisecond() == 0 {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            resets_at_dt.year(),
+            u8::from(resets_at_dt.month()),
+            resets_at_dt.day(),
+            resets_at_dt.hour(),
+            resets_at_dt.minute(),
+            resets_at_dt.second(),
+        )
+    } else {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            resets_at_dt.year(),
+            u8::from(resets_at_dt.month()),
+            resets_at_dt.day(),
+            resets_at_dt.hour(),
+            resets_at_dt.minute(),
+            resets_at_dt.second(),
+            resets_at_dt.millisecond(),
+        )
+    };
+    // Round both the relative wait and the absolute UTC display time up independently so neither
+    // is ever earlier than the real reset instant (even when `now` has sub-second milliseconds).
+    let display_secs = u64::try_from(duration.as_millis().div_ceil(1_000))
+        .unwrap_or(MAX_RESET_DURATION_SECS)
+        .min(MAX_RESET_DURATION_SECS);
+    let display_dt = if resets_at_dt.nanosecond() > 0 {
+        resets_at_dt.replace_nanosecond(0).unwrap_or(resets_at_dt) + time::Duration::seconds(1)
+    } else {
+        resets_at_dt
+    };
+    let absolute_display = if display_dt.second() == 0 {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+            display_dt.year(),
+            u8::from(display_dt.month()),
+            display_dt.day(),
+            display_dt.hour(),
+            display_dt.minute(),
+        )
+    } else {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            display_dt.year(),
+            u8::from(display_dt.month()),
+            display_dt.day(),
+            display_dt.hour(),
+            display_dt.minute(),
+            display_dt.second(),
+        )
+    };
+    let relative = format_relative_duration(Duration::from_secs(display_secs));
+    QuotaLimitNotice {
+        message: format!(
+            "Antigravity usage limit reached. Resets at {absolute_display} (in {relative})."
+        ),
+        resets_at: Some(resets_at_iso),
     }
 }
 
@@ -1460,11 +3080,800 @@ fn current_mode(options: &[Value]) -> Option<&str> {
 
 /// A fixed name for a request method from the CLI, safe to log.
 fn request_label(method: &str) -> &'static str {
-    if method == "session/request_permission" {
-        "session/request_permission"
-    } else {
-        "unknown"
+    match method {
+        "session/request_permission" => "session/request_permission",
+        "elicitation/create" => "elicitation/create",
+        _ => "unknown",
     }
+}
+
+struct ParsedElicitationForm {
+    questions: Vec<Value>,
+    fields: Vec<ElicitationFieldSpec>,
+}
+
+enum ElicitationParseError {
+    SecretRequested,
+    InvalidSchema(String),
+}
+
+fn non_empty_trimmed(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+fn value_as_display_label(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }
+        Value::Number(num) => Some(num.to_string()),
+        Value::Bool(flag) => Some(if *flag { "Yes" } else { "No" }.to_owned()),
+        _ => None,
+    }
+}
+
+fn disambiguate_option_labels(
+    raw_entries: Vec<(String, String, Value)>,
+) -> (Vec<Value>, Vec<(String, Value)>) {
+    let mut counts = HashMap::<String, usize>::new();
+    for (label, _, _) in &raw_entries {
+        *counts.entry(label.clone()).or_insert(0) += 1;
+    }
+    let mut used = HashSet::<String>::new();
+    let mut options = Vec::with_capacity(raw_entries.len());
+    let mut value_by_label = Vec::with_capacity(raw_entries.len());
+    for (index, (base_label, raw_description, const_val)) in raw_entries.into_iter().enumerate() {
+        let mut label = if counts.get(&base_label).copied().unwrap_or(0) > 1 {
+            if let Some(const_display) = value_as_display_label(&const_val)
+                && const_display != base_label
+            {
+                format!("{base_label} ({const_display})")
+            } else {
+                format!("{base_label} ({})", index + 1)
+            }
+        } else {
+            base_label.clone()
+        };
+        if !used.insert(label.clone()) {
+            let mut suffix = index + 1;
+            loop {
+                let candidate = format!("{base_label} ({suffix})");
+                if used.insert(candidate.clone()) {
+                    label = candidate;
+                    break;
+                }
+                suffix += 1;
+            }
+        }
+        let description = if raw_description.is_empty() {
+            label.clone()
+        } else {
+            raw_description
+        };
+        options.push(json!({
+            "label": label,
+            "description": description,
+        }));
+        value_by_label.push((label, const_val));
+    }
+    (options, value_by_label)
+}
+
+fn extract_titled_options(entries: &[Value]) -> (Vec<Value>, Vec<(String, Value)>) {
+    let mut raw = Vec::new();
+    for entry in entries {
+        let Some(const_val) = entry.get("const") else {
+            continue;
+        };
+        let Some(label) =
+            non_empty_trimmed(entry.get("title")).or_else(|| value_as_display_label(const_val))
+        else {
+            continue;
+        };
+        let description = non_empty_trimmed(entry.get("description")).unwrap_or_default();
+        raw.push((label, description, const_val.clone()));
+    }
+    disambiguate_option_labels(raw)
+}
+
+fn extract_enum_options(
+    enum_values: &[Value],
+    enum_names: Option<&[Value]>,
+) -> (Vec<Value>, Vec<(String, Value)>) {
+    let mut raw = Vec::new();
+    for (index, val) in enum_values.iter().enumerate() {
+        let Some(label) = enum_names
+            .and_then(|names| names.get(index))
+            .and_then(|name| non_empty_trimmed(Some(name)))
+            .or_else(|| value_as_display_label(val))
+        else {
+            continue;
+        };
+        raw.push((label, String::new(), val.clone()));
+    }
+    disambiguate_option_labels(raw)
+}
+
+fn property_has_selectable_options(prop_obj: &serde_json::Map<String, Value>) -> bool {
+    match prop_obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string")
+    {
+        "array" => prop_obj
+            .get("items")
+            .and_then(Value::as_object)
+            .is_some_and(|items| {
+                items
+                    .get("anyOf")
+                    .or_else(|| items.get("oneOf"))
+                    .or_else(|| items.get("enum"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| !arr.is_empty())
+            }),
+        "string" => prop_obj
+            .get("oneOf")
+            .or_else(|| prop_obj.get("anyOf"))
+            .or_else(|| prop_obj.get("enum"))
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty()),
+        _ => false,
+    }
+}
+
+fn is_companion_other_property(
+    field_key: &str,
+    prop_obj: &serde_json::Map<String, Value>,
+    properties: &serde_json::Map<String, Value>,
+    required_fields: &HashSet<String>,
+) -> Option<(String, CompanionOtherFieldSpec)> {
+    let base_key = field_key.strip_suffix("_other")?;
+    if base_key.is_empty() || required_fields.contains(field_key) {
+        return None;
+    }
+    let base_obj = properties.get(base_key)?.as_object()?;
+    if !property_has_selectable_options(base_obj) {
+        return None;
+    }
+    let prop_type = prop_obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string");
+    if prop_type != "string"
+        || prop_obj.get("format").and_then(Value::as_str) == Some("password")
+        || prop_obj.get("writeOnly").and_then(Value::as_bool) == Some(true)
+        || prop_obj.get("oneOf").is_some()
+        || prop_obj.get("anyOf").is_some()
+        || prop_obj.get("enum").is_some()
+    {
+        return None;
+    }
+    let title_is_other =
+        non_empty_trimmed(prop_obj.get("title")).is_some_and(|t| t.eq_ignore_ascii_case("other"));
+    let desc_mentions_other = non_empty_trimmed(prop_obj.get("description")).is_some_and(|d| {
+        let lower = d.to_ascii_lowercase();
+        lower.contains("free-form") || lower.contains("other")
+    });
+    if !title_is_other && !desc_mentions_other {
+        return None;
+    }
+    Some((
+        base_key.to_owned(),
+        CompanionOtherFieldSpec {
+            id: field_key.to_owned(),
+            min_length: prop_obj
+                .get("minLength")
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok()),
+            max_length: prop_obj
+                .get("maxLength")
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok()),
+        },
+    ))
+}
+
+fn parse_elicitation_form(params: &Value) -> Result<ParsedElicitationForm, ElicitationParseError> {
+    let Some(schema) = params.get("requestedSchema").and_then(Value::as_object) else {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: expected an object".to_owned(),
+        ));
+    };
+    if let Some(schema_type) = schema.get("type").and_then(Value::as_str)
+        && schema_type != "object"
+    {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: root type must be object".to_owned(),
+        ));
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: missing properties".to_owned(),
+        ));
+    };
+    if properties.is_empty() {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: properties must not be empty".to_owned(),
+        ));
+    }
+
+    let required_fields: HashSet<String> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    // Antigravity's `ask_question` emits companion `<field>_other` optional free-form string
+    // properties alongside `oneOf`/`anyOf` choice fields. Fold those into the parent choice
+    // question so BiBCode's built-in custom-answer input routes cleanly without duplicate pages.
+    let mut companion_others: HashMap<String, CompanionOtherFieldSpec> = HashMap::new();
+    let mut skipped_companion_keys: HashSet<String> = HashSet::new();
+    for (field_key, property) in properties {
+        let Some(prop_obj) = property.as_object() else {
+            continue;
+        };
+        if let Some((base_key, spec)) =
+            is_companion_other_property(field_key.trim(), prop_obj, properties, &required_fields)
+        {
+            skipped_companion_keys.insert(field_key.clone());
+            companion_others.insert(base_key, spec);
+        }
+    }
+
+    let prompt_message = non_empty_trimmed(params.get("message"));
+    let total_fields = properties
+        .keys()
+        .filter(|key| !key.trim().is_empty() && !skipped_companion_keys.contains(*key))
+        .count();
+    let mut questions = Vec::with_capacity(total_fields);
+    let mut fields = Vec::with_capacity(total_fields);
+
+    for (field_key, property) in properties {
+        if skipped_companion_keys.contains(field_key) {
+            continue;
+        }
+        let field_id = field_key.trim();
+        if field_id.is_empty() {
+            continue;
+        }
+        let Some(prop_obj) = property.as_object() else {
+            return Err(ElicitationParseError::InvalidSchema(format!(
+                "Invalid elicitation property schema for '{field_id}'"
+            )));
+        };
+        if prop_obj.get("format").and_then(Value::as_str) == Some("password")
+            || prop_obj.get("writeOnly").and_then(Value::as_bool) == Some(true)
+        {
+            return Err(ElicitationParseError::SecretRequested);
+        }
+
+        let prop_type = prop_obj
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("string");
+        let title = non_empty_trimmed(prop_obj.get("title"));
+        let description = non_empty_trimmed(prop_obj.get("description"));
+        let question_index = questions.len() + 1;
+
+        let (header, question_text) = match (title, description) {
+            (Some(title), Some(description)) => (title, description),
+            (Some(title), None) => {
+                let title_is_prompt = title.ends_with('?') || title.chars().count() > 28;
+                if title_is_prompt {
+                    let header = if total_fields == 1 {
+                        "Question".to_owned()
+                    } else {
+                        format!("Question {question_index}")
+                    };
+                    (header, title)
+                } else if total_fields == 1 {
+                    let question = prompt_message.clone().unwrap_or_else(|| title.clone());
+                    (title, question)
+                } else {
+                    (title.clone(), title)
+                }
+            }
+            (None, Some(description)) => (field_id.to_owned(), description),
+            (None, None) => {
+                let question = if total_fields == 1 {
+                    prompt_message
+                        .clone()
+                        .unwrap_or_else(|| field_id.to_owned())
+                } else {
+                    field_id.to_owned()
+                };
+                (field_id.to_owned(), question)
+            }
+        };
+
+        let other_field = companion_others.remove(field_id);
+        let (options, multi_select, field_kind) = match prop_type {
+            "array" => {
+                let items = prop_obj.get("items").and_then(Value::as_object);
+                if let Some(items_obj) = items {
+                    if items_obj.get("format").and_then(Value::as_str) == Some("password")
+                        || items_obj.get("writeOnly").and_then(Value::as_bool) == Some(true)
+                    {
+                        return Err(ElicitationParseError::SecretRequested);
+                    }
+                    if matches!(
+                        items_obj.get("type").and_then(Value::as_str),
+                        Some("object" | "array")
+                    ) {
+                        return Err(ElicitationParseError::InvalidSchema(format!(
+                            "Invalid elicitation array items type for '{field_id}'"
+                        )));
+                    }
+                }
+                let (options, value_by_label, enum_restricted) = if let Some(titled) = items
+                    .and_then(|obj| obj.get("anyOf").or_else(|| obj.get("oneOf")))
+                    .and_then(Value::as_array)
+                {
+                    let (opts, map) = extract_titled_options(titled);
+                    (opts, map, true)
+                } else if let Some(enum_values) = items
+                    .and_then(|obj| obj.get("enum"))
+                    .and_then(Value::as_array)
+                {
+                    let enum_names = items
+                        .and_then(|obj| obj.get("enumNames"))
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice);
+                    let (opts, map) = extract_enum_options(enum_values, enum_names);
+                    (opts, map, true)
+                } else {
+                    (Vec::new(), Vec::new(), false)
+                };
+                let min_items = prop_obj
+                    .get("minItems")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok());
+                let max_items = prop_obj
+                    .get("maxItems")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok());
+                (
+                    options,
+                    true,
+                    ElicitationFieldKind::MultiSelect {
+                        value_by_label,
+                        enum_restricted,
+                        min_items,
+                        max_items,
+                        other_field,
+                    },
+                )
+            }
+            "boolean" => (
+                vec![
+                    json!({ "label": "Yes", "description": "True" }),
+                    json!({ "label": "No", "description": "False" }),
+                ],
+                false,
+                ElicitationFieldKind::Boolean,
+            ),
+            "integer" => (
+                Vec::new(),
+                false,
+                ElicitationFieldKind::Integer {
+                    minimum: parse_integer_min_bound(prop_obj.get("minimum")),
+                    maximum: parse_integer_max_bound(prop_obj.get("maximum")),
+                },
+            ),
+            "number" => (
+                Vec::new(),
+                false,
+                ElicitationFieldKind::Number {
+                    minimum: prop_obj.get("minimum").and_then(Value::as_f64),
+                    maximum: prop_obj.get("maximum").and_then(Value::as_f64),
+                },
+            ),
+            _ => {
+                let (options, value_by_label, enum_restricted) = if let Some(titled) = prop_obj
+                    .get("oneOf")
+                    .or_else(|| prop_obj.get("anyOf"))
+                    .and_then(Value::as_array)
+                {
+                    let (opts, map) = extract_titled_options(titled);
+                    (opts, map, true)
+                } else if let Some(enum_values) = prop_obj.get("enum").and_then(Value::as_array) {
+                    let enum_names = prop_obj
+                        .get("enumNames")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice);
+                    let (opts, map) = extract_enum_options(enum_values, enum_names);
+                    (opts, map, true)
+                } else {
+                    (Vec::new(), Vec::new(), false)
+                };
+                let min_length = prop_obj
+                    .get("minLength")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok());
+                let max_length = prop_obj
+                    .get("maxLength")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok());
+                (
+                    options,
+                    false,
+                    ElicitationFieldKind::String {
+                        value_by_label,
+                        enum_restricted,
+                        min_length,
+                        max_length,
+                        other_field,
+                    },
+                )
+            }
+        };
+
+        questions.push(json!({
+            "id": field_id,
+            "header": header,
+            "question": question_text,
+            "options": options,
+            "multiSelect": multi_select,
+        }));
+        fields.push(ElicitationFieldSpec {
+            id: field_id.to_owned(),
+            required: required_fields.contains(field_id),
+            kind: field_kind,
+        });
+    }
+
+    if questions.is_empty() {
+        return Err(ElicitationParseError::InvalidSchema(
+            "Invalid elicitation requestedSchema: no valid properties".to_owned(),
+        ));
+    }
+
+    Ok(ParsedElicitationForm { questions, fields })
+}
+
+fn parse_integer_min_bound(value: Option<&Value>) -> Option<i64> {
+    let num = value?.as_number()?;
+    if let Some(int) = num.as_i64() {
+        return Some(int);
+    }
+    if let Some(uint) = num.as_u64() {
+        return Some(i64::try_from(uint).unwrap_or(i64::MAX));
+    }
+    num.as_f64()
+        .filter(|v| v.is_finite())
+        .map(|v| v.ceil().clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+}
+
+fn parse_integer_max_bound(value: Option<&Value>) -> Option<i64> {
+    let num = value?.as_number()?;
+    if let Some(int) = num.as_i64() {
+        return Some(int);
+    }
+    if let Some(uint) = num.as_u64() {
+        return Some(i64::try_from(uint).unwrap_or(i64::MAX));
+    }
+    num.as_f64()
+        .filter(|v| v.is_finite())
+        .map(|v| v.floor().clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+}
+
+fn find_option_wire_value(
+    value_by_label: &[(String, Value)],
+    raw: &str,
+    match_raw_wire_value: bool,
+) -> Option<Value> {
+    if let Some((_, wire_val)) = value_by_label.iter().find(|(label, _)| label == raw) {
+        return Some(wire_val.clone());
+    }
+    if !match_raw_wire_value {
+        return None;
+    }
+    value_by_label
+        .iter()
+        .find(|(_, val)| val.as_str() == Some(raw))
+        .map(|(_, wire_val)| wire_val.clone())
+}
+
+fn validate_string_length(
+    field_id: &str,
+    value: &str,
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+) -> Result<(), AntigravityRuntimeError> {
+    let char_len = value.chars().count();
+    if let Some(min) = min_length
+        && char_len < min
+    {
+        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+            detail: format!("Answer for '{field_id}' must be at least {min} characters."),
+        });
+    }
+    if let Some(max) = max_length
+        && char_len > max
+    {
+        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+            detail: format!("Answer for '{field_id}' must be at most {max} characters."),
+        });
+    }
+    Ok(())
+}
+
+fn build_elicitation_content(
+    fields: &[ElicitationFieldSpec],
+    answers: &Value,
+) -> Result<serde_json::Map<String, Value>, AntigravityRuntimeError> {
+    let Some(answer_map) = answers.as_object() else {
+        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+            detail: "User input answers must be a JSON object.".to_owned(),
+        });
+    };
+    let mut content = serde_json::Map::new();
+    for field in fields {
+        let Some(raw) = answer_map.get(&field.id) else {
+            continue;
+        };
+        match &field.kind {
+            ElicitationFieldKind::String {
+                value_by_label,
+                enum_restricted,
+                min_length,
+                max_length,
+                other_field,
+            } => {
+                let text = match raw {
+                    Value::String(s) => s.trim(),
+                    Value::Array(arr) => arr
+                        .iter()
+                        .find_map(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default(),
+                    _ => "",
+                };
+                if !text.is_empty() {
+                    if let Some(matched) =
+                        find_option_wire_value(value_by_label, text, other_field.is_none())
+                    {
+                        if let Some(str_val) = matched.as_str() {
+                            validate_string_length(&field.id, str_val, *min_length, *max_length)?;
+                        }
+                        content.insert(field.id.clone(), matched);
+                    } else if let Some(other) = other_field {
+                        validate_string_length(
+                            &other.id,
+                            text,
+                            other.min_length,
+                            other.max_length,
+                        )?;
+                        content.insert(other.id.clone(), Value::String(text.to_owned()));
+                    } else if *enum_restricted {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Select one of the listed options for '{}'.", field.id),
+                        });
+                    } else {
+                        validate_string_length(&field.id, text, *min_length, *max_length)?;
+                        content.insert(field.id.clone(), Value::String(text.to_owned()));
+                    }
+                }
+            }
+            ElicitationFieldKind::MultiSelect {
+                value_by_label,
+                enum_restricted,
+                min_items,
+                max_items,
+                other_field,
+            } => {
+                let raw_items: Vec<&str> = match raw {
+                    Value::Array(arr) => arr
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .collect(),
+                    Value::String(s) if !s.trim().is_empty() => vec![s.trim()],
+                    _ => Vec::new(),
+                };
+                if !raw_items.is_empty() {
+                    let mut items = Vec::with_capacity(raw_items.len());
+                    let mut custom_items: Vec<&str> = Vec::new();
+                    for entry in raw_items {
+                        if let Some(matched) =
+                            find_option_wire_value(value_by_label, entry, other_field.is_none())
+                        {
+                            items.push(matched);
+                        } else if other_field.is_some() {
+                            custom_items.push(entry);
+                        } else if *enum_restricted {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!(
+                                    "Select one of the listed options for '{}'.",
+                                    field.id
+                                ),
+                            });
+                        } else {
+                            items.push(Value::String(entry.to_owned()));
+                        }
+                    }
+                    if !custom_items.is_empty()
+                        && let Some(other) = other_field
+                    {
+                        let joined = custom_items.join(", ");
+                        validate_string_length(
+                            &other.id,
+                            &joined,
+                            other.min_length,
+                            other.max_length,
+                        )?;
+                        content.insert(other.id.clone(), Value::String(joined));
+                    }
+                    if !items.is_empty() {
+                        if let Some(min) = min_items
+                            && items.len() < *min
+                        {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!(
+                                    "Select at least {min} option(s) for '{}'.",
+                                    field.id
+                                ),
+                            });
+                        }
+                        if let Some(max) = max_items
+                            && items.len() > *max
+                        {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!(
+                                    "Select at most {max} option(s) for '{}'.",
+                                    field.id
+                                ),
+                            });
+                        }
+                        content.insert(field.id.clone(), Value::Array(items));
+                    } else if field.required
+                        && let Some(min) = min_items
+                        && *min > 0
+                    {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Select at least {min} option(s) for '{}'.", field.id),
+                        });
+                    }
+                }
+            }
+            ElicitationFieldKind::Boolean => {
+                let parsed = match raw {
+                    Value::Bool(flag) => Some(*flag),
+                    Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                        "" => None,
+                        "yes" | "true" | "1" => Some(true),
+                        "no" | "false" | "0" => Some(false),
+                        _ => {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!("Answer for '{}' must be Yes or No.", field.id),
+                            });
+                        }
+                    },
+                    _ => {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Answer for '{}' must be Yes or No.", field.id),
+                        });
+                    }
+                };
+                if let Some(flag) = parsed {
+                    content.insert(field.id.clone(), Value::Bool(flag));
+                }
+            }
+            ElicitationFieldKind::Integer { minimum, maximum } => {
+                let parsed = match raw {
+                    Value::Number(num) => num.as_i64().ok_or_else(|| {
+                        AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Answer for '{}' must be a whole number.", field.id),
+                        }
+                    })?,
+                    Value::String(s) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        trimmed.parse::<i64>().map_err(|_| {
+                            AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!(
+                                    "Answer for '{}' must be a whole number.",
+                                    field.id
+                                ),
+                            }
+                        })?
+                    }
+                    _ => {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Answer for '{}' must be a whole number.", field.id),
+                        });
+                    }
+                };
+                if let Some(min) = minimum
+                    && parsed < *min
+                {
+                    return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                        detail: format!("Answer for '{}' must be at least {min}.", field.id),
+                    });
+                }
+                if let Some(max) = maximum
+                    && parsed > *max
+                {
+                    return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                        detail: format!("Answer for '{}' must be at most {max}.", field.id),
+                    });
+                }
+                content.insert(field.id.clone(), json!(parsed));
+            }
+            ElicitationFieldKind::Number { minimum, maximum } => {
+                let parsed = match raw {
+                    Value::Number(num) => {
+                        num.as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+                            AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!("Answer for '{}' must be a number.", field.id),
+                            }
+                        })?
+                    }
+                    Value::String(s) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let val = trimmed.parse::<f64>().map_err(|_| {
+                            AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!("Answer for '{}' must be a number.", field.id),
+                            }
+                        })?;
+                        if !val.is_finite() {
+                            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                                detail: format!("Answer for '{}' must be a number.", field.id),
+                            });
+                        }
+                        val
+                    }
+                    _ => {
+                        return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                            detail: format!("Answer for '{}' must be a number.", field.id),
+                        });
+                    }
+                };
+                if let Some(min) = minimum
+                    && parsed < *min
+                {
+                    return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                        detail: format!("Answer for '{}' must be at least {min}.", field.id),
+                    });
+                }
+                if let Some(max) = maximum
+                    && parsed > *max
+                {
+                    return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                        detail: format!("Answer for '{}' must be at most {max}.", field.id),
+                    });
+                }
+                content.insert(field.id.clone(), json!(parsed));
+            }
+        }
+    }
+    for field in fields {
+        if field.required && !content.contains_key(&field.id) {
+            return Err(AntigravityRuntimeError::InvalidUserInputAnswer {
+                detail: format!(
+                    "Answer for required field '{}' is missing. Fill it in or cancel the form.",
+                    field.id
+                ),
+            });
+        }
+    }
+    Ok(content)
 }
 
 fn option_id(descriptor: &Value) -> &str {
@@ -1494,15 +3903,7 @@ fn find_option_id(options: &[Value], kind: &str) -> Option<String> {
 
 /// The first `major.minor.patch` in `text`.
 fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
-    text.split(|character: char| !(character.is_ascii_digit() || character == '.'))
-        .find_map(|token| {
-            let mut parts = token.split('.');
-            Some((
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-            ))
-        })
+    parse_semver_triple(text)
 }
 
 /// A `model` and a `thought_level` option without a category, as the inventory's catalog test

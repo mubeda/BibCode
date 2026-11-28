@@ -914,6 +914,273 @@ describe("ComposerPromptEditor inline token nodes", () => {
     }
   });
 
+  it("renders slash-invoked and command-registered skills as darkened chips, keeps non-skill commands plain, and preserves /name on edit", async () => {
+    harness.useRealEffects = true;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const editorRef = createRef<ComposerPromptEditorHandle>();
+    const onChange = vi.fn();
+    const slashAndDollarSkills: ReadonlyArray<ServerProviderSkill> = [
+      {
+        name: "docs",
+        displayName: "Docs",
+        description: "Look up documentation",
+        path: "/skills/docs/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+      {
+        name: "review-branch",
+        displayName: "Review Branch",
+        description: "Registered both as a command and a slash skill",
+        path: "/skills/review-branch/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+      {
+        name: "refactor",
+        displayName: "Refactor",
+        description: "Refactor code",
+        path: "/skills/refactor/SKILL.md",
+        enabled: true,
+        invocation: "dollar",
+      },
+    ];
+    const source = "/docs /review-branch @src/main.ts /plan apps/web/src /foo $refactor ";
+    const renderMounted = (nextValue: string, nextCursor: number) => (
+      <ComposerPromptEditor
+        value={nextValue}
+        cursor={nextCursor}
+        terminalContexts={[]}
+        skills={slashAndDollarSkills}
+        agents={[]}
+        disabled={false}
+        placeholder="Ask anything"
+        onRemoveTerminalContext={vi.fn()}
+        onChange={onChange}
+        onPaste={vi.fn()}
+        editorRef={editorRef}
+      />
+    );
+
+    try {
+      await act(async () => root.render(renderMounted(source, source.length)));
+      const skillChips = Array.from(
+        container.querySelectorAll<HTMLElement>('[data-composer-skill-chip="true"]'),
+      );
+      const mentionChips = Array.from(
+        container.querySelectorAll<HTMLElement>('[data-composer-mention-chip="true"]'),
+      );
+
+      // /docs, /review-branch (command-registered slash skill), and $refactor become chips;
+      // /plan (non-skill command), apps/web/src (path), and /foo (unknown) remain plain text.
+      expect(skillChips.map((chip) => chip.textContent)).toEqual([
+        "Docs",
+        "Review Branch",
+        "Refactor",
+      ]);
+      expect(mentionChips).toHaveLength(1);
+      for (const chip of skillChips) {
+        expect(chip.className).toContain("text-fuchsia-950");
+        expect(chip.className).toContain("bg-fuchsia-900/12");
+        expect(chip.className).toContain("border-fuchsia-800/25");
+        expect(chip.className).toContain("dark:bg-fuchsia-950/70");
+        expect(chip.className).toContain("dark:text-fuchsia-400");
+        expect(chip.className).toContain("dark:border-fuchsia-400/30");
+      }
+
+      // Serialized text preserves exact / vs $ trigger prefixes.
+      const initialSnapshot = editorRef.current?.readSnapshot();
+      expect(initialSnapshot?.value).toBe(source);
+
+      // Typing after a slash skill preserves exact collapsed & expanded cursor offsets and submits `/docs <edited text>`.
+      await act(async () => root.render(renderMounted("/docs ", 2)));
+      onChange.mockClear();
+      const editor = lastEditor();
+      await act(async () => {
+        editor.update(
+          () => {
+            $paragraph().append($createTextNode("check API"));
+          },
+          { discrete: true },
+        );
+      });
+      const editedSnapshot = editorRef.current?.readSnapshot();
+      expect(editedSnapshot?.value).toBe("/docs check API");
+      expect(onChange).toHaveBeenCalled();
+      expect(onChange.mock.calls.at(-1)?.[0]).toBe("/docs check API");
+
+      // JSON export/import round-trips the slash prefix rather than reverting to `$`.
+      const serialized = editor.getEditorState().toJSON();
+      const roundTripJson = JSON.stringify(serialized);
+      expect(roundTripJson).toContain('"skillPrefix":"/"');
+      const parsedState = editor.parseEditorState(roundTripJson);
+      expect(parsedState.read(() => $getRoot().getTextContent())).toBe("/docs check API");
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      harness.useRealEffects = false;
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("reconciles pasted slash skills, preserves Shift+Arrow selection across chips, and keeps selection on metadata refresh", async () => {
+    harness.useRealEffects = true;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const editorRef = createRef<ComposerPromptEditorHandle>();
+    const onChange = vi.fn();
+    const slashSkills: ReadonlyArray<ServerProviderSkill> = [
+      {
+        name: "docs",
+        displayName: "Docs",
+        path: "/skills/docs/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+      {
+        name: "3d-render",
+        displayName: "3D Render",
+        path: "/skills/3d-render/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+      {
+        name: "build.docs",
+        displayName: "Build Docs",
+        path: "/skills/build.docs/SKILL.md",
+        enabled: true,
+        invocation: "slash",
+      },
+    ];
+    const renderMounted = (
+      nextValue: string,
+      nextCursor: number,
+      nextSkills: ReadonlyArray<ServerProviderSkill> = slashSkills,
+    ) => (
+      <ComposerPromptEditor
+        value={nextValue}
+        cursor={nextCursor}
+        terminalContexts={[]}
+        skills={nextSkills}
+        agents={[]}
+        disabled={false}
+        placeholder="Ask anything"
+        onRemoveTerminalContext={vi.fn()}
+        onChange={onChange}
+        onPaste={vi.fn()}
+        editorRef={editorRef}
+      />
+    );
+
+    try {
+      // 1. Direct text insertion / paste of `/docs tail` reconciles into a chip so focusAtEnd() appends at EOF.
+      await act(async () => root.render(renderMounted("", 0)));
+      const editor = lastEditor();
+      await act(async () => {
+        editor.update(
+          () => {
+            const p = $paragraph();
+            const textNode = $createTextNode("/docs tail");
+            p.append(textNode);
+            textNode.select(10, 10);
+          },
+          { discrete: true },
+        );
+      });
+      await act(async () => {
+        await flushMicrotasks();
+        await flushMicrotasks();
+      });
+      expect(container.querySelectorAll('[data-composer-skill-chip="true"]')).toHaveLength(1);
+      expect(editorRef.current?.readSnapshot()).toMatchObject({
+        value: "/docs tail",
+        cursor: 6,
+        expandedCursor: 10,
+      });
+      await act(async () => {
+        editorRef.current?.focusAtEnd();
+      });
+      await act(async () => {
+        editor.update(
+          () => {
+            const selection = $getSelection();
+            if ($isRangeSelection(selection)) {
+              selection.insertText("!");
+            }
+          },
+          { discrete: true },
+        );
+      });
+      expect(readRootText(editor)).toBe("/docs tail!");
+
+      // 2. Leading-digit and dotted slash skill names chip cleanly.
+      await act(async () => root.render(renderMounted("/3d-render /build.docs ", 4)));
+      expect(
+        Array.from(container.querySelectorAll('[data-composer-skill-chip="true"]')).map(
+          (node) => node.textContent,
+        ),
+      ).toEqual(["3D Render", "Build Docs"]);
+
+      // 3. Shift+Left immediately after `/docs` extends the selection across the chip instead of collapsing it.
+      await act(async () => root.render(renderMounted("/docs tail", 1)));
+      await act(async () => {
+        const shiftLeft = {
+          shiftKey: true,
+          preventDefault: vi.fn(),
+          stopPropagation: vi.fn(),
+        } as unknown as KeyboardEvent;
+        expect(editor.dispatchCommand(KEY_ARROW_LEFT_COMMAND, shiftLeft)).toBe(true);
+      });
+      const afterShiftLeft = editor.getEditorState().read(() => {
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection)) return null;
+        return {
+          collapsed: selection.isCollapsed(),
+          text: selection.getTextContent(),
+        };
+      });
+      expect(afterShiftLeft).toEqual({ collapsed: false, text: "/docs" });
+
+      // 4. Skill metadata refresh preserves an active non-collapsed selection (`tail`).
+      await act(async () => {
+        setRangeSelection(editor, () => {
+          const tail = $paragraph().getLastChild();
+          if (!tail) throw new Error("expected trailing text node");
+          return {
+            anchor: { key: tail.getKey(), offset: 1, type: "text" },
+            focus: { key: tail.getKey(), offset: 5, type: "text" },
+          };
+        });
+      });
+      const renamedSkills: ReadonlyArray<ServerProviderSkill> = slashSkills.map((skill) =>
+        skill.name === "docs" ? { ...skill, displayName: "API Docs" } : skill,
+      );
+      await act(async () => root.render(renderMounted("/docs tail", 1, renamedSkills)));
+      const afterRefresh = editor.getEditorState().read(() => {
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection)) return null;
+        return {
+          collapsed: selection.isCollapsed(),
+          text: selection.getTextContent(),
+        };
+      });
+      expect(afterRefresh).toEqual({ collapsed: false, text: "tail" });
+      expect(container.querySelector('[data-composer-skill-chip="true"]')?.textContent).toBe(
+        "API Docs",
+      );
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      harness.useRealEffects = false;
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
   it("leaves focus where it is when skills arrive while the composer is unfocused", async () => {
     harness.useRealEffects = true;
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;

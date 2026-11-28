@@ -77,21 +77,27 @@ impl PullRequestsOperationError {
     }
 }
 
+pub(crate) fn classify_process_error(error: &ProcessError, stderr: &str) -> &'static str {
+    match error {
+        ProcessError::Spawn { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            "cli_missing"
+        }
+        ProcessError::Timeout { .. } | ProcessError::Cancelled { .. } => "timeout",
+        ProcessError::OutputLimit { .. } => "output_limit",
+        ProcessError::NonZeroExit { stdout, .. } => classify_stderr_optional(stderr)
+            .or_else(|| classify_stderr_optional(stdout))
+            .unwrap_or("host_rejected"),
+        _ => "host_rejected",
+    }
+}
+
 pub fn from_process_error(
     operation: &str,
     cli: &str,
     error: &ProcessError,
     stderr: &str,
 ) -> PullRequestsOperationError {
-    let code = match error {
-        ProcessError::Spawn { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
-            "cli_missing"
-        }
-        ProcessError::Timeout { .. } | ProcessError::Cancelled { .. } => "timeout",
-        ProcessError::OutputLimit { .. } => "output_limit",
-        ProcessError::NonZeroExit { .. } => classify_stderr(stderr),
-        _ => "host_rejected",
-    };
+    let code = classify_process_error(error, stderr);
     let mut result = PullRequestsOperationError::new(operation, code);
     if code == "cli_missing" {
         result.message = format!("`{cli}` is not installed on this environment");
@@ -113,31 +119,48 @@ pub fn from_process_error(
     result
 }
 
-fn classify_stderr(stderr: &str) -> &'static str {
+pub(crate) fn classify_stderr_optional(stderr: &str) -> Option<&'static str> {
     let lower = stderr.to_lowercase();
     for (needles, code) in [
         (
-            &["not logged in", "authentication", "401"][..],
+            &[
+                "not logged in",
+                "authentication",
+                "authenticated with glab",
+                "no token found",
+                "unauthorized",
+                "az login",
+                "az devops login",
+                "401",
+            ][..],
             "not_authenticated",
         ),
         (&["rate limit", "429"][..], "rate_limited"),
         (&["could not resolve", "404", "not found"][..], "not_found"),
         (&["403", "forbidden", "permission"][..], "forbidden"),
         (
+            &[
+                "dial tcp",
+                "no such host",
+                "connection refused",
+                "could not reach",
+                "failed to connect",
+                "name or service not known",
+            ][..],
+            "host_unreachable",
+        ),
+        (
             &["head sha", "expected head", "sha does not match", "stale"][..],
             "stale_head",
         ),
         (&["unknown flag", "unknown command"][..], "cli_too_old"),
-        (
-            &["dial tcp", "no such host", "connection refused", "timeout"][..],
-            "host_unreachable",
-        ),
+        (&["timeout"][..], "host_unreachable"),
     ] {
         if needles.iter().any(|needle| lower.contains(needle)) {
-            return code;
+            return Some(code);
         }
     }
-    "host_rejected"
+    None
 }
 
 #[cfg(test)]

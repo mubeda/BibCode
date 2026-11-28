@@ -12,6 +12,7 @@ import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsActor } from "../shared/PullRequestsActor";
 import { PullRequestsLabelChip } from "../shared/PullRequestsLabelChip";
 import { PullRequestsStateIcon } from "../shared/PullRequestsStateIcon";
+import { usePullRequestsListNavigation } from "../detail/pullRequestsNavigation";
 import { useMergeRequestHoverPrefetch } from "../useMergeRequestHoverPrefetch";
 import { rowStateIcon, rowTimeLabel } from "./pullRequestsList.logic";
 const REVIEW_LABELS = {
@@ -37,6 +38,7 @@ export const PullRequestsRow = memo(function PullRequestsRow({
   context,
   scope,
 }: PullRequestsRowProps) {
+  const listNavigation = usePullRequestsListNavigation();
   const hoverPrefetch = useMergeRequestHoverPrefetch({
     enabled: scope !== undefined && context.provider === "gitlab",
     environmentId: scope?.environmentId ?? projectRef.environmentId,
@@ -56,15 +58,32 @@ export const PullRequestsRow = memo(function PullRequestsRow({
       <PullRequestsStateIcon state={rowStateIcon(row)} />
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-center gap-2">
-          <Link
-            className="min-w-0 truncate text-sm font-medium underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
-            title={row.title}
-            to="/project/$environmentId/$projectId/pull-requests/$number"
-            params={{ ...projectRef, number: String(row.number) }}
-            search={{ tab: "conversation" }}
-          >
-            {row.title}
-          </Link>
+          {listNavigation !== null ? (
+            <button
+              type="button"
+              className="min-w-0 truncate text-left text-sm font-medium underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+              title={row.title}
+              onClick={() =>
+                listNavigation.openRequest({
+                  number: row.number,
+                  provider: context.provider,
+                  ...(scope?.cwd ? { cwd: scope.cwd } : {}),
+                })
+              }
+            >
+              {row.title}
+            </button>
+          ) : (
+            <Link
+              className="min-w-0 truncate text-sm font-medium underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+              title={row.title}
+              to="/project/$environmentId/$projectId/pull-requests/$number"
+              params={{ ...projectRef, number: String(row.number) }}
+              search={{ tab: "conversation" }}
+            >
+              {row.title}
+            </Link>
+          )}
           {row.isDraft ? (
             <span className="rounded border border-border px-1 text-xs text-muted-foreground">
               Draft

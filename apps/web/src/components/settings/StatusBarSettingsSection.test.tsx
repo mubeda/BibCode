@@ -102,15 +102,14 @@ describe("StatusBarSettingsSection", () => {
     expect(h.updateSettings).toHaveBeenCalledTimes(2);
   });
 
-  it("defaults Antigravity usage on and keeps it out of the status bar item list", () => {
+  it("omits Show Antigravity usage while keeping Claude, Codex, and Resource Manager switches (#429)", () => {
     const markup = render();
-    const antigravity = control("switch", "Show Antigravity usage");
-    expect(antigravity.props.checked).toBe(true);
-    expect(markup).not.toContain("turn the provider on in Settings, Providers");
-    expect(markup).toContain("Covers the default Antigravity provider only.");
-    invoke(antigravity, "onCheckedChange", false);
-    // Its own flag: an older client resets the whole item list when it meets an unknown literal.
-    expect(h.updateSettings).toHaveBeenCalledWith({ showAntigravityUsage: false });
+    expect(markup).not.toContain("Show Antigravity usage");
+    expect(markup).not.toContain("Covers the default Antigravity provider only.");
+    expect(h.controls.some((entry) => entry.label === "Show Antigravity usage")).toBe(false);
+    expect(control("switch", "Show Claude usage").props.checked).toBe(true);
+    expect(control("switch", "Show Codex usage").props.checked).toBe(true);
+    expect(control("switch", "Show Resource Manager").props.checked).toBe(true);
     expect(DEFAULT_UNIFIED_SETTINGS.statusBarItems).not.toContain("antigravity");
   });
 

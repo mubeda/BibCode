@@ -282,6 +282,8 @@ struct PendingRequest {
     accept_for_session_option_id: Option<String>,
     reject_option_id: Option<String>,
     kind: PendingRequestKind,
+    questions: Vec<Value>,
+    option_mappings: HashMap<String, Vec<(Option<String>, String)>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1216,8 +1218,9 @@ impl CursorSessionRuntime {
                 };
                 json!({ "outcome": outcome })
             }
-            PendingRequestKind::UserInput | PendingRequestKind::CursorQuestion => {
-                json!({ "outcome": "cancelled" })
+            PendingRequestKind::UserInput => json!({ "outcome": "cancelled" }),
+            PendingRequestKind::CursorQuestion => {
+                json!({ "outcome": { "outcome": "cancelled" } })
             }
         };
         self.inner
@@ -1245,6 +1248,26 @@ impl CursorSessionRuntime {
         request_id: &str,
         answers: Value,
     ) -> Result<(), CursorRuntimeError> {
+        self.respond_to_user_input_internal(request_id, answers, None)
+            .await
+    }
+
+    pub async fn respond_to_user_input_with_disposition(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+    ) -> Result<(), CursorRuntimeError> {
+        self.respond_to_user_input_internal(request_id, answers, Some(disposition))
+            .await
+    }
+
+    async fn respond_to_user_input_internal(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: Option<crate::provider::UserInputResponseDisposition>,
+    ) -> Result<(), CursorRuntimeError> {
         let pending = self
             .inner
             .pending_requests
@@ -1254,23 +1277,136 @@ impl CursorSessionRuntime {
             .ok_or_else(|| CursorRuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
             })?;
-        let response = if pending.kind == PendingRequestKind::CursorQuestion {
-            json!({ "answers": answers })
+        let answers =
+            if disposition == Some(crate::provider::UserInputResponseDisposition::Cancelled) {
+                json!({})
+            } else {
+                answers
+            };
+        let is_cancelled =
+            disposition == Some(crate::provider::UserInputResponseDisposition::Cancelled);
+        let skip_all = !is_cancelled
+            && disposition.is_some_and(|disp| {
+                disp.is_skip_or_cancel()
+                    && !crate::provider::has_non_empty_user_input_answer(&answers)
+            });
+        // Resolve human-readable label for receipts, and provider option ID for Cursor's wire
+        // `selectedOptionIds` payload (`cursor/ask_question` expects option IDs when present).
+        let resolve_cursor_label = |question_id: &str, raw: &str| -> String {
+            let trimmed = raw.trim();
+            if let Some(options) = pending.option_mappings.get(question_id)
+                && let Some((_, label)) = options
+                    .iter()
+                    .find(|(id, label)| label == trimmed || id.as_deref() == Some(trimmed))
+            {
+                return label.clone();
+            }
+            raw.to_owned()
+        };
+        let resolve_cursor_option_id = |question_id: &str, raw: &str| -> String {
+            let trimmed = raw.trim();
+            if let Some(options) = pending.option_mappings.get(question_id)
+                && let Some((id, label)) = options
+                    .iter()
+                    .find(|(id, label)| label == trimmed || id.as_deref() == Some(trimmed))
+            {
+                return id.clone().unwrap_or_else(|| label.clone());
+            }
+            raw.to_owned()
+        };
+        let (response, recorded_answers) = if pending.kind == PendingRequestKind::CursorQuestion {
+            if is_cancelled {
+                (json!({ "outcome": { "outcome": "cancelled" } }), json!({}))
+            } else if skip_all {
+                (json!({ "outcome": { "outcome": "skipped" } }), json!({}))
+            } else {
+                let mut recorded_map = serde_json::Map::new();
+                let mut wire_answers = Vec::new();
+                for (key, value) in answers.as_object().cloned().unwrap_or_default() {
+                    match value {
+                        Value::String(string) if !string.trim().is_empty() => {
+                            let label = resolve_cursor_label(&key, &string);
+                            let option_id = resolve_cursor_option_id(&key, &string);
+                            recorded_map.insert(key.clone(), Value::String(label));
+                            wire_answers.push(json!({
+                                "questionId": key,
+                                "selectedOptionIds": [option_id],
+                            }));
+                        }
+                        Value::Array(array) => {
+                            let mut labels = Vec::new();
+                            let mut option_ids = Vec::new();
+                            for item in array {
+                                if let Value::String(text) = item
+                                    && !text.trim().is_empty()
+                                {
+                                    labels.push(Value::String(resolve_cursor_label(&key, &text)));
+                                    option_ids
+                                        .push(Value::String(resolve_cursor_option_id(&key, &text)));
+                                }
+                            }
+                            if !labels.is_empty() {
+                                recorded_map.insert(key.clone(), Value::Array(labels));
+                                wire_answers.push(json!({
+                                    "questionId": key,
+                                    "selectedOptionIds": option_ids,
+                                }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                (
+                    json!({
+                        "outcome": {
+                            "outcome": "answered",
+                            "answers": wire_answers,
+                        }
+                    }),
+                    Value::Object(recorded_map),
+                )
+            }
+        } else if is_cancelled {
+            (json!({ "outcome": "cancelled" }), json!({}))
+        } else if skip_all {
+            (json!({ "outcome": "skipped" }), json!({}))
         } else {
             let mut normalized = serde_json::Map::new();
             let answer_map = answers.as_object().cloned().unwrap_or_default();
             for (key, value) in answer_map {
                 let values = match value {
-                    Value::String(string) => vec![Value::String(string)],
-                    Value::Array(array) => array,
+                    Value::String(string) if !string.trim().is_empty() => {
+                        vec![Value::String(string)]
+                    }
+                    Value::Array(array) => array
+                        .into_iter()
+                        .filter(|entry| entry.as_str().is_none_or(|text| !text.trim().is_empty()))
+                        .collect(),
                     _ => Vec::new(),
                 };
                 normalized.insert(key, Value::Array(values));
             }
-            json!({
-                "outcome": "accepted",
-                "answers": normalized,
-            })
+            if disposition.is_some() {
+                for question in &pending.questions {
+                    if let Some(key) = question
+                        .get("id")
+                        .or_else(|| question.get("question"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        normalized
+                            .entry(key.to_owned())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                    }
+                }
+            }
+            (
+                json!({
+                    "outcome": "accepted",
+                    "answers": normalized,
+                }),
+                answers,
+            )
         };
         self.inner
             .connection
@@ -1279,11 +1415,19 @@ impl CursorSessionRuntime {
             .clone()
             .respond(pending.wire_id, response)
             .await?;
+        let resolved_payload = match disposition {
+            Some(disp) => crate::provider::build_user_input_resolved_payload(
+                recorded_answers,
+                disp,
+                &pending.questions,
+            ),
+            None => json!({ "answers": recorded_answers }),
+        };
         self.emit(
             "user-input.resolved",
             pending.turn_id,
             Some(request_id.to_owned()),
-            json!({ "answers": answers }),
+            resolved_payload,
         )
         .await;
         Ok(())
@@ -1403,6 +1547,7 @@ impl CursorSessionRuntime {
             IncomingEvent::Barrier(reached) => {
                 let _ = reached.send(());
             }
+            IncomingEvent::ResponseObserved { .. } => {}
         }
     }
 
@@ -1584,12 +1729,13 @@ impl CursorSessionRuntime {
             "cursor/ask_question" => {
                 if self.should_auto_decline_code_review().await {
                     connection
-                        .respond(wire_id, json!({ "outcome": "cancelled" }))
+                        .respond(wire_id, json!({ "outcome": { "outcome": "cancelled" } }))
                         .await?;
                     return Ok(());
                 }
                 let request_id = request_scope.user_input_id(&correlation_id);
                 let turn_id = self.inner.active_turn_id.lock().await.clone();
+                let mut option_mappings = HashMap::new();
                 let questions = params
                     .get("questions")
                     .and_then(Value::as_array)
@@ -1597,6 +1743,12 @@ impl CursorSessionRuntime {
                     .unwrap_or_default()
                     .into_iter()
                     .map(|question| {
+                        let question_id = question
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let mut mapped_options = Vec::new();
                         let options = question
                             .get("options")
                             .and_then(Value::as_array)
@@ -1608,19 +1760,36 @@ impl CursorSessionRuntime {
                                     .get("label")
                                     .and_then(Value::as_str)
                                     .unwrap_or_default();
-                                json!({ "label": label, "description": label })
+                                let description = option
+                                    .get("description")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .unwrap_or(label);
+                                let option_id = option
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_owned);
+                                mapped_options.push((option_id, label.to_owned()));
+                                json!({ "label": label, "description": description })
                             })
                             .collect::<Vec<_>>();
+                        if !question_id.is_empty() && !mapped_options.is_empty() {
+                            option_mappings.insert(question_id.clone(), mapped_options);
+                        }
                         json!({
                             "id": question.get("id").cloned().unwrap_or(Value::String(String::new())),
-                            "header": "Question",
+                            "header": question
+                                .get("header")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .unwrap_or("Question"),
                             "question": question.get("prompt").cloned().unwrap_or(Value::String(String::new())),
                             "multiSelect": question.get("allowMultiple").and_then(Value::as_bool).unwrap_or(false),
-                            "options": if options.is_empty() {
-                                vec![json!({ "label": "OK", "description": "Continue" })]
-                            } else {
-                                options
-                            },
+                            "options": options,
                         })
                     })
                     .collect::<Vec<_>>();
@@ -1633,6 +1802,8 @@ impl CursorSessionRuntime {
                         accept_for_session_option_id: None,
                         reject_option_id: None,
                         kind: PendingRequestKind::CursorQuestion,
+                        questions: questions.clone(),
+                        option_mappings,
                     },
                 );
                 self.emit(
@@ -1703,6 +1874,8 @@ impl CursorSessionRuntime {
                         accept_for_session_option_id: find_option_id(&options, "allow_always"),
                         reject_option_id: find_option_id(&options, "reject_once"),
                         kind: PendingRequestKind::Permission,
+                        questions: Vec::new(),
+                        option_mappings: HashMap::new(),
                     },
                 );
                 let detail = params
@@ -1739,6 +1912,17 @@ impl CursorSessionRuntime {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                let normalized_questions = questions
+                    .into_iter()
+                    .map(|question| {
+                        json!({
+                            "id": question.get("id").cloned().unwrap_or_else(|| question.get("question").cloned().unwrap_or(Value::String(String::new()))),
+                            "header": question.get("question").cloned().unwrap_or(Value::String(String::new())),
+                            "question": question.get("question").cloned().unwrap_or(Value::String(String::new())),
+                            "options": question.get("options").cloned().unwrap_or(Value::Array(Vec::new())),
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 self.inner.pending_requests.lock().await.insert(
                     request_id.clone(),
                     PendingRequest {
@@ -1748,6 +1932,8 @@ impl CursorSessionRuntime {
                         accept_for_session_option_id: None,
                         reject_option_id: None,
                         kind: PendingRequestKind::UserInput,
+                        questions: normalized_questions.clone(),
+                        option_mappings: HashMap::new(),
                     },
                 );
                 self.emit(
@@ -1755,14 +1941,7 @@ impl CursorSessionRuntime {
                     turn_id,
                     Some(request_id),
                     json!({
-                        "questions": questions.into_iter().map(|question| {
-                            json!({
-                                "id": question.get("id").cloned().unwrap_or_else(|| question.get("question").cloned().unwrap_or(Value::String(String::new()))),
-                                "header": question.get("question").cloned().unwrap_or(Value::String(String::new())),
-                                "question": question.get("question").cloned().unwrap_or(Value::String(String::new())),
-                                "options": question.get("options").cloned().unwrap_or(Value::Array(Vec::new())),
-                            })
-                        }).collect::<Vec<_>>(),
+                        "questions": normalized_questions,
                     }),
                 )
                 .await;
@@ -1843,8 +2022,10 @@ async fn refuse_late_request(
     method: &str,
 ) -> Result<(), AcpProtocolError> {
     let refusal = match method {
-        "session/request_permission" => json!({ "outcome": { "outcome": "cancelled" } }),
-        "cursor/ask_question" | "_x.ai/ask_user_question" | "x.ai/ask_user_question" => {
+        "session/request_permission" | "cursor/ask_question" => {
+            json!({ "outcome": { "outcome": "cancelled" } })
+        }
+        "_x.ai/ask_user_question" | "x.ai/ask_user_question" => {
             json!({ "outcome": "cancelled" })
         }
         "cursor/create_plan" => json!({ "accepted": false }),
@@ -2267,7 +2448,7 @@ mod tests {
             answers,
             [
                 (json!(81), json!({ "outcome": { "outcome": "cancelled" } })),
-                (json!(82), json!({ "outcome": "cancelled" })),
+                (json!(82), json!({ "outcome": { "outcome": "cancelled" } })),
                 (json!(83), json!({ "accepted": false })),
             ]
         );
@@ -3640,10 +3821,22 @@ mod tests {
         }
 
         // All three interactive question methods cancel immediately without opening a card.
-        for (wire_id, method) in [
-            (4, "cursor/ask_question"),
-            (5, "_x.ai/ask_user_question"),
-            (6, "x.ai/ask_user_question"),
+        for (wire_id, method, expected_result) in [
+            (
+                4,
+                "cursor/ask_question",
+                json!({ "outcome": { "outcome": "cancelled" } }),
+            ),
+            (
+                5,
+                "_x.ai/ask_user_question",
+                json!({ "outcome": "cancelled" }),
+            ),
+            (
+                6,
+                "x.ai/ask_user_question",
+                json!({ "outcome": "cancelled" }),
+            ),
         ] {
             send_incoming_request(
                 &runtime,
@@ -3657,7 +3850,7 @@ mod tests {
                 json!({
                     "jsonrpc": "2.0",
                     "id": wire_id,
-                    "result": { "outcome": "cancelled" }
+                    "result": expected_result
                 })
             );
             assert_no_pending_event(&runtime).await;

@@ -72,6 +72,7 @@ import Sidebar, {
   PROJECT_HEADER_ACTION_PADDING,
 } from "./Sidebar";
 import { resolveProjectExpanded, setProjectExpanded, type UiState } from "../uiStateStore";
+import { selectThreadRightPanelState, useRightPanelStore } from "../rightPanelStore";
 import { WORKSPACE_CARD_STATUS } from "./Sidebar.logic";
 
 const decodeStatusSummary = Schema.decodeUnknownSync(VcsStatusSummary);
@@ -3670,8 +3671,16 @@ staticDescribe("new thread entry points", () => {
     expect(idleHeader.props["aria-current"]).toBeUndefined();
   });
 
-  it("navigates idempotently to one project-scoped Git Manager", () => {
+  it("opens Git Manager in the current eligible chat's right panel, and falls back to standalone route when no eligible thread exists", () => {
     baseScenario();
+    // Make current active thread older than threadIdle to prove current-but-older stays selected.
+    h.state.threads = [
+      { ...threadDefault, updatedAt: iso(20) },
+      { ...threadActive, updatedAt: iso(120) },
+      { ...threadIdle, updatedAt: iso(5) },
+      makeThread("newest-panel", { kind: "panel", updatedAt: iso(1) }),
+      makeThread("newest-archived", { archivedAt: iso(1), updatedAt: iso(1) }),
+    ];
     render(<Sidebar />);
     const gitManager = mustFindProps(byTestId("git-manager-button"), "Git Manager button");
     const firstClick = mouseEvent();
@@ -3680,14 +3689,34 @@ staticDescribe("new thread entry points", () => {
     invoke(gitManager, "onClick", firstClick);
     invoke(gitManager, "onClick", secondClick);
 
-    const navigation = {
-      to: "/project/$environmentId/$projectId/git",
-      params: { environmentId: ENV_MAIN, projectId: projectA.id },
-    };
-    expect(h.spies.navigate).toHaveBeenNthCalledWith(1, navigation);
-    expect(h.spies.navigate).toHaveBeenNthCalledWith(2, navigation);
+    const activePanel = selectThreadRightPanelState(
+      useRightPanelStore.getState().byThreadKey,
+      scopeThreadRef(ENV_MAIN, threadActive.id),
+    );
+    expect(activePanel.isOpen).toBe(true);
+    expect(activePanel.activeSurfaceId).toBe("gitManager");
+    // Already on thread-active, so zero full-page route navigations are issued.
+    expect(h.spies.navigate).not.toHaveBeenCalled();
     expect(firstClick.preventDefault).toHaveBeenCalled();
     expect(secondClick.stopPropagation).toHaveBeenCalled();
+
+    // Zero eligible host threads (only panel + archived) -> falls back to standalone project route.
+    h.state.captures = [];
+    h.state.routeParams = {};
+    h.state.threads = [
+      makeThread("only-panel", { kind: "panel", updatedAt: iso(1) }),
+      makeThread("only-archived", { archivedAt: iso(1), updatedAt: iso(1) }),
+    ];
+    render(<Sidebar />);
+    invoke(
+      mustFindProps(byTestId("git-manager-button"), "Git Manager button"),
+      "onClick",
+      mouseEvent(),
+    );
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/git",
+      params: { environmentId: ENV_MAIN, projectId: projectA.id },
+    });
   });
   it("highlights the project header while its Pull Requests route is open", () => {
     baseScenario();
@@ -3711,7 +3740,7 @@ staticDescribe("new thread entry points", () => {
     expect(idleHeader.props["aria-current"]).toBeUndefined();
   });
 
-  it("navigates idempotently to one project-scoped Pull Requests", () => {
+  it("opens Pull Requests in the host chat's right panel and falls back to standalone route when no eligible thread exists", () => {
     baseScenario();
     render(<Sidebar />);
     const pullRequests = mustFindProps(byTestId("pull-requests-button"), "Pull Requests button");
@@ -3721,14 +3750,30 @@ staticDescribe("new thread entry points", () => {
     invoke(pullRequests, "onClick", firstClick);
     invoke(pullRequests, "onClick", secondClick);
 
-    const navigation = {
-      to: "/project/$environmentId/$projectId/pull-requests",
-      params: { environmentId: ENV_MAIN, projectId: projectA.id },
-    };
-    expect(h.spies.navigate).toHaveBeenNthCalledWith(1, navigation);
-    expect(h.spies.navigate).toHaveBeenNthCalledWith(2, navigation);
+    const activePanel = selectThreadRightPanelState(
+      useRightPanelStore.getState().byThreadKey,
+      scopeThreadRef(ENV_MAIN, threadActive.id),
+    );
+    expect(activePanel.isOpen).toBe(true);
+    expect(activePanel.activeSurfaceId).toBe("pullRequest");
+    expect(h.spies.navigate).not.toHaveBeenCalled();
     expect(firstClick.preventDefault).toHaveBeenCalled();
     expect(secondClick.stopPropagation).toHaveBeenCalled();
+
+    // Fallback when zero eligible host threads exist.
+    h.state.captures = [];
+    h.state.routeParams = {};
+    h.state.threads = [];
+    render(<Sidebar />);
+    invoke(
+      mustFindProps(byTestId("pull-requests-button"), "Pull Requests button"),
+      "onClick",
+      mouseEvent(),
+    );
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pull-requests",
+      params: { environmentId: ENV_MAIN, projectId: projectA.id },
+    });
   });
   it("shows a project row's actions without hover", () => {
     baseScenario();
@@ -3756,7 +3801,7 @@ staticDescribe("new thread entry points", () => {
     ).toBeDefined();
   });
 
-  it("puts a labelled Pipelines button after Pull Requests and opens the project's list", () => {
+  it("puts a labelled Pipelines button after Pull Requests and opens Pipelines in the host chat's right panel", () => {
     baseScenario();
     const markup = render(<Sidebar />);
     expect(markup.indexOf('data-testid="pipelines-button"')).toBeGreaterThan(
@@ -3766,12 +3811,30 @@ staticDescribe("new thread entry points", () => {
     const pipelines = mustFindProps(byAriaLabel("Pipelines for Repo A"), "Pipelines button");
     const click = mouseEvent();
     invoke(pipelines, "onClick", click);
+    const activePanel = selectThreadRightPanelState(
+      useRightPanelStore.getState().byThreadKey,
+      scopeThreadRef(ENV_MAIN, threadActive.id),
+    );
+    expect(activePanel.isOpen).toBe(true);
+    expect(activePanel.activeSurfaceId).toBe("pipelines");
+    expect(h.spies.navigate).not.toHaveBeenCalled();
+    expect(click.preventDefault).toHaveBeenCalled();
+    expect(click.stopPropagation).toHaveBeenCalled();
+
+    // Fallback when zero eligible host threads exist.
+    h.state.captures = [];
+    h.state.routeParams = {};
+    h.state.threads = [];
+    render(<Sidebar />);
+    invoke(
+      mustFindProps(byAriaLabel("Pipelines for Repo A"), "Pipelines button"),
+      "onClick",
+      mouseEvent(),
+    );
     expect(h.spies.navigate).toHaveBeenCalledWith({
       to: "/project/$environmentId/$projectId/pipelines",
       params: { environmentId: ENV_MAIN, projectId: projectA.id },
     });
-    expect(click.preventDefault).toHaveBeenCalled();
-    expect(click.stopPropagation).toHaveBeenCalled();
   });
 
   it("hides the Pipelines button when disabled in settings, keeping Pull Requests", () => {
@@ -3837,9 +3900,15 @@ staticDescribe("grouped and remote projects", () => {
 
     expect(h.spies.contextMenuShow).toHaveBeenCalled();
     expect(h.spies.navigate).toHaveBeenCalledWith({
-      to: "/project/$environmentId/$projectId/git",
-      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+      to: "/$environmentId/$threadId",
+      params: { environmentId: ENV_REMOTE, threadId: ThreadId.make("thread-remote") },
     });
+    expect(
+      selectThreadRightPanelState(
+        useRightPanelStore.getState().byThreadKey,
+        scopeThreadRef(ENV_REMOTE, ThreadId.make("thread-remote")),
+      ).activeSurfaceId,
+    ).toBe("gitManager");
   });
 
   it("opens the chosen grouped-project member's Pull Requests", async () => {
@@ -3856,9 +3925,15 @@ staticDescribe("grouped and remote projects", () => {
 
     expect(h.spies.contextMenuShow).toHaveBeenCalled();
     expect(h.spies.navigate).toHaveBeenCalledWith({
-      to: "/project/$environmentId/$projectId/pull-requests",
-      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+      to: "/$environmentId/$threadId",
+      params: { environmentId: ENV_REMOTE, threadId: ThreadId.make("thread-remote") },
     });
+    expect(
+      selectThreadRightPanelState(
+        useRightPanelStore.getState().byThreadKey,
+        scopeThreadRef(ENV_REMOTE, ThreadId.make("thread-remote")),
+      ).activeSurfaceId,
+    ).toBe("pullRequest");
   });
 
   it("puts one Pull Requests button on the repository row, not its environment rows", () => {
@@ -3899,9 +3974,15 @@ staticDescribe("grouped and remote projects", () => {
     expect(click.stopPropagation).toHaveBeenCalled();
     expect(h.spies.contextMenuShow).toHaveBeenCalled();
     expect(h.spies.navigate).toHaveBeenCalledWith({
-      to: "/project/$environmentId/$projectId/pull-requests",
-      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+      to: "/$environmentId/$threadId",
+      params: { environmentId: ENV_REMOTE, threadId: ThreadId.make("thread-remote") },
     });
+    expect(
+      selectThreadRightPanelState(
+        useRightPanelStore.getState().byThreadKey,
+        scopeThreadRef(ENV_REMOTE, ThreadId.make("thread-remote")),
+      ).activeSurfaceId,
+    ).toBe("pullRequest");
   });
 
   it("opens the one connected environment from the repository row without asking", async () => {
@@ -3929,9 +4010,15 @@ staticDescribe("grouped and remote projects", () => {
 
     expect(h.spies.contextMenuShow).not.toHaveBeenCalled();
     expect(h.spies.navigate).toHaveBeenCalledWith({
-      to: "/project/$environmentId/$projectId/pull-requests",
-      params: { environmentId: ENV_MAIN, projectId: ProjectId.make("project-a") },
+      to: "/$environmentId/$threadId",
+      params: { environmentId: ENV_MAIN, threadId: threadDefault.id },
     });
+    expect(
+      selectThreadRightPanelState(
+        useRightPanelStore.getState().byThreadKey,
+        scopeThreadRef(ENV_MAIN, threadDefault.id),
+      ).activeSurfaceId,
+    ).toBe("pullRequest");
   });
 
   it("shows the repository row's actions without hover", () => {
@@ -4063,9 +4150,15 @@ staticDescribe("grouped and remote projects", () => {
     expect(click.stopPropagation).toHaveBeenCalled();
     expect(h.spies.contextMenuShow).toHaveBeenCalled();
     expect(h.spies.navigate).toHaveBeenCalledWith({
-      to: "/project/$environmentId/$projectId/pipelines",
-      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+      to: "/$environmentId/$threadId",
+      params: { environmentId: ENV_REMOTE, threadId: ThreadId.make("thread-remote") },
     });
+    expect(
+      selectThreadRightPanelState(
+        useRightPanelStore.getState().byThreadKey,
+        scopeThreadRef(ENV_REMOTE, ThreadId.make("thread-remote")),
+      ).activeSurfaceId,
+    ).toBe("pipelines");
   });
 
   it("opens the chosen grouped-project member's Pipelines", async () => {
@@ -4083,9 +4176,15 @@ staticDescribe("grouped and remote projects", () => {
     await flush();
     expect(h.spies.contextMenuShow).toHaveBeenCalled();
     expect(h.spies.navigate).toHaveBeenCalledWith({
-      to: "/project/$environmentId/$projectId/pipelines",
-      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+      to: "/$environmentId/$threadId",
+      params: { environmentId: ENV_REMOTE, threadId: ThreadId.make("thread-remote") },
     });
+    expect(
+      selectThreadRightPanelState(
+        useRightPanelStore.getState().byThreadKey,
+        scopeThreadRef(ENV_REMOTE, ThreadId.make("thread-remote")),
+      ).activeSurfaceId,
+    ).toBe("pipelines");
   });
 
   it("hides the repository row's Pipelines button when disabled in settings", () => {

@@ -306,16 +306,40 @@ async fn bounded_send(request: reqwest::RequestBuilder) -> Result<(), String> {
 }
 
 /// The questions of an OpenCode 1 question request, as BiBCode shows them.
+/// Preserves the header as the question ID when unique and non-empty, and disambiguates repeated
+/// or empty headers by index so distinct questions never overwrite each other in drafts/receipts.
 fn v1_questions(request: &Value) -> Vec<Value> {
+    let mut used_ids = HashSet::new();
     request
         .get("questions")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .map(|question| {
+        .enumerate()
+        .map(|(index, question)| {
+            let header = question
+                .get("header")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let id = if !header.is_empty() && used_ids.insert(header.to_owned()) {
+                header.to_owned()
+            } else {
+                let base = if header.is_empty() {
+                    format!("q{index}")
+                } else {
+                    format!("{header}_{index}")
+                };
+                let mut candidate = base.clone();
+                let mut suffix = 1usize;
+                while !used_ids.insert(candidate.clone()) {
+                    candidate = format!("{base}_{suffix}");
+                    suffix += 1;
+                }
+                candidate
+            };
             json!({
-                "id": question.get("header").cloned().unwrap_or(Value::String(String::new())),
+                "id": id,
                 "header": question.get("header").cloned().unwrap_or(Value::String(String::new())),
                 "question": question.get("question").cloned().unwrap_or(Value::String(String::new())),
                 "options": question.get("options").cloned().unwrap_or(Value::Array(Vec::new())),
@@ -481,6 +505,7 @@ struct RuntimeInner {
     /// snapshot calling the exited session live.
     events_sealed: AtomicBool,
     pending_questions: Mutex<HashMap<String, PendingQuestion>>,
+    v1_question_sync: Mutex<V1QuestionSync>,
     pending_permissions: Mutex<HashMap<String, Option<String>>>,
     event_pump: Mutex<Option<JoinHandle<()>>>,
     reconciliation_hint_tx: mpsc::Sender<()>,
@@ -510,6 +535,102 @@ struct RuntimeInner {
 /// OpenCode 2 session state: the root-turn translator, the asks waiting for an answer (keyed by
 /// request or form id, with the turn and the session that asked), and the model and agent last
 /// sent to the session.
+#[derive(Clone, Debug)]
+struct SettledOutcome {
+    disposition: crate::provider::UserInputResponseDisposition,
+    /// Provider-confirmed answers when explicitly supplied by SSE (`None` on dismiss/cancel or
+    /// events that omit an answer payload; `Some({})` when an explicit empty answer was recorded).
+    answers: Option<Value>,
+}
+
+fn resolve_settled_user_input_outcome(
+    sent_ok: bool,
+    is_skip_or_cancel_only: bool,
+    caller_answers: Value,
+    expected_sse_answers: &Value,
+    caller_disposition: Option<crate::provider::UserInputResponseDisposition>,
+    sse_outcome: Option<SettledOutcome>,
+) -> (Value, Option<crate::provider::UserInputResponseDisposition>) {
+    let Some(outcome) = sse_outcome else {
+        return (
+            if is_skip_or_cancel_only {
+                json!({})
+            } else {
+                caller_answers
+            },
+            caller_disposition,
+        );
+    };
+    if outcome.disposition.is_skip_or_cancel() {
+        let final_disposition = if sent_ok && is_skip_or_cancel_only {
+            caller_disposition.or(Some(outcome.disposition))
+        } else {
+            Some(outcome.disposition)
+        };
+        return (json!({}), final_disposition);
+    }
+    if is_skip_or_cancel_only {
+        return (
+            outcome.answers.unwrap_or_else(|| json!({})),
+            Some(outcome.disposition),
+        );
+    }
+    match outcome.answers {
+        Some(ref confirmed) if confirmed == expected_sse_answers => {
+            (caller_answers, caller_disposition)
+        }
+        Some(confirmed) => (confirmed, Some(outcome.disposition)),
+        None => (
+            caller_answers,
+            caller_disposition.or(Some(outcome.disposition)),
+        ),
+    }
+}
+
+/// Normalizes OpenCode v1 `question.replied` SSE answers (`string[][]` ordered by question index,
+/// or an already-keyed object) into a question-ID-keyed object for `user-input.resolved` receipts.
+fn parse_v1_sse_question_answers(raw: &Value, questions: &[Value]) -> Value {
+    if raw.is_object() {
+        return raw.clone();
+    }
+    let Some(entries) = raw.as_array() else {
+        return json!({});
+    };
+    let mut map = serde_json::Map::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let values: Vec<Value> = match entry {
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(|text| Value::String(text.to_owned()))
+                })
+                .collect(),
+            Value::String(text) if !text.trim().is_empty() => {
+                vec![Value::String(text.trim().to_owned())]
+            }
+            _ => Vec::new(),
+        };
+        if values.is_empty() {
+            continue;
+        }
+        let key = questions
+            .get(index)
+            .and_then(|question| {
+                question
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| question.get("header").and_then(Value::as_str))
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("q{index}"));
+        map.insert(key, Value::Array(values));
+    }
+    Value::Object(map)
+}
+
 #[derive(Default)]
 struct V2State {
     translator: Option<V2TurnTranslator>,
@@ -520,8 +641,8 @@ struct V2State {
     /// the resolution carries BiBCode's decision and is reported once.
     answering: HashSet<String>,
     /// Asks OpenCode settled while BiBCode's reply was in flight: the reply succeeded even if its
-    /// HTTP response was lost.
-    settled_while_answering: HashSet<String>,
+    /// HTTP response was lost, carrying the provider-confirmed SSE outcome for forms.
+    settled_while_answering: HashMap<String, Option<SettledOutcome>>,
     synced_model: Option<(String, String, Option<String>)>,
     synced_agent: bool,
     /// The runtime mode whose permission rules the session has.
@@ -633,6 +754,38 @@ struct V2PendingForm {
     turn_id: Option<String>,
     session_id: String,
     fields: Vec<FormField>,
+    questions: Vec<Value>,
+}
+
+#[derive(Default)]
+struct V1QuestionSync {
+    answering: HashSet<String>,
+    settled_while_answering: HashMap<String, SettledOutcome>,
+    /// Bounded record of v1 questions confirmed settled by HTTP reply/reject or SSE, consulted
+    /// under lock by recovery so a racing `/question` list cannot reopen a settled prompt.
+    recently_settled: std::collections::VecDeque<String>,
+}
+
+impl V1QuestionSync {
+    fn mark_settled(&mut self, request_id: &str) {
+        if self
+            .recently_settled
+            .iter()
+            .any(|entry| entry == request_id)
+        {
+            return;
+        }
+        if self.recently_settled.len() >= 256 {
+            self.recently_settled.pop_front();
+        }
+        self.recently_settled.push_back(request_id.to_owned());
+    }
+
+    fn is_recently_settled(&self, request_id: &str) -> bool {
+        self.recently_settled
+            .iter()
+            .any(|entry| entry == request_id)
+    }
 }
 
 struct RuntimeOwnerState {
@@ -959,6 +1112,7 @@ impl OpenCodeSessionRuntime {
                 event_counter: Mutex::new(0),
                 events_sealed: AtomicBool::new(false),
                 pending_questions: Mutex::new(HashMap::new()),
+                v1_question_sync: Mutex::new(V1QuestionSync::default()),
                 pending_permissions: Mutex::new(HashMap::new()),
                 event_pump: Mutex::new(None),
                 reconciliation_hint_tx,
@@ -2023,7 +2177,7 @@ impl OpenCodeSessionRuntime {
             let pending = {
                 let mut v2 = self.inner.v2.lock().await;
                 v2.answering.remove(request_id);
-                if !v2.settled_while_answering.remove(request_id) {
+                if v2.settled_while_answering.remove(request_id).is_none() {
                     sent?;
                 }
                 v2.permissions.remove(request_id)
@@ -2114,15 +2268,48 @@ impl OpenCodeSessionRuntime {
         request_id: &str,
         answers: Value,
     ) -> Result<(), OpenCodeRuntimeError> {
+        self.respond_to_user_input_internal(request_id, answers, None)
+            .await
+    }
+
+    pub async fn respond_to_user_input_with_disposition(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+    ) -> Result<(), OpenCodeRuntimeError> {
+        self.respond_to_user_input_internal(request_id, answers, Some(disposition))
+            .await
+    }
+
+    async fn respond_to_user_input_internal(
+        &self,
+        request_id: &str,
+        answers: Value,
+        disposition: Option<crate::provider::UserInputResponseDisposition>,
+    ) -> Result<(), OpenCodeRuntimeError> {
+        let answers =
+            if disposition == Some(crate::provider::UserInputResponseDisposition::Cancelled) {
+                json!({})
+            } else {
+                answers
+            };
+        let is_skip_or_cancel_only = disposition.is_some_and(|disp| {
+            disp.is_skip_or_cancel() && !crate::provider::has_non_empty_user_input_answer(&answers)
+        });
         if self.is_v2() {
-            // The form stays pending until OpenCode accepts the answer, so a failed reply can be
-            // retried.
+            // The form stays pending until OpenCode accepts the answer or dismiss, so a failed
+            // HTTP reply before settlement can be retried, while a lost HTTP reply after SSE
+            // settlement emits exactly one confirmed receipt and blocks duplicate submission.
             let (session_id, answer) = {
                 let mut v2 = self.inner.v2.lock().await;
                 let form = v2
                     .forms
                     .get(request_id)
                     .ok_or_else(|| OpenCodeRuntimeError::UnknownQuestion(request_id.to_owned()))?;
+                if v2.answering.contains(request_id) {
+                    return Err(OpenCodeRuntimeError::UnknownQuestion(request_id.to_owned()));
+                }
                 let pending = (
                     form.session_id.clone(),
                     v2::form_answer(&form.fields, &answers),
@@ -2131,85 +2318,196 @@ impl OpenCodeSessionRuntime {
                 pending
             };
             let sent = async {
-                let response = self
-                    .inner
-                    .client
-                    .post(self.v2_url(
-                        &["session", &session_id, "form", request_id, "reply"],
-                        false,
-                    )?)
-                    .json(&json!({ "answer": answer }))
-                    .send()
+                let request = if is_skip_or_cancel_only {
+                    self.inner
+                        .client
+                        .delete(self.v2_url(&["session", &session_id, "form", request_id], false)?)
+                } else {
+                    self.inner
+                        .client
+                        .post(self.v2_url(
+                            &["session", &session_id, "form", request_id, "reply"],
+                            false,
+                        )?)
+                        .json(&json!({ "answer": answer }))
+                };
+                let response = tokio::time::timeout(SIDE_REQUEST_TIMEOUT, request.send())
                     .await
+                    .map_err(|_| {
+                        OpenCodeRuntimeError::Http(format!(
+                            "form {} timed out",
+                            if is_skip_or_cancel_only {
+                                "dismiss"
+                            } else {
+                                "reply"
+                            }
+                        ))
+                    })?
                     .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?;
                 if !response.status().is_success() {
                     return Err(OpenCodeRuntimeError::Http(format!(
-                        "form reply returned HTTP {}",
+                        "form {} returned HTTP {}",
+                        if is_skip_or_cancel_only {
+                            "dismiss"
+                        } else {
+                            "reply"
+                        },
                         response.status()
                     )));
                 }
                 Ok(())
             }
             .await;
-            let pending = {
+            let (pending, sse_outcome, sent_ok) = {
                 let mut v2 = self.inner.v2.lock().await;
                 v2.answering.remove(request_id);
-                if !v2.settled_while_answering.remove(request_id) {
+                let settled = v2.settled_while_answering.remove(request_id);
+                let sent_ok = sent.is_ok();
+                if settled.is_none() {
                     sent?;
                 }
-                v2.forms.remove(request_id)
+                (v2.forms.remove(request_id), settled.flatten(), sent_ok)
             };
             let Some(form) = pending else {
                 return Ok(());
+            };
+            let (recorded_answers, final_disposition) = resolve_settled_user_input_outcome(
+                sent_ok,
+                is_skip_or_cancel_only,
+                answers,
+                &answer,
+                disposition,
+                sse_outcome,
+            );
+            let resolved_payload = match final_disposition {
+                Some(disp) => crate::provider::build_user_input_resolved_payload(
+                    recorded_answers,
+                    disp,
+                    &form.questions,
+                ),
+                None => json!({ "answers": recorded_answers }),
             };
             self.emit(
                 "user-input.resolved",
                 form.turn_id,
                 Some(request_id.to_owned()),
-                json!({ "answers": answers }),
+                resolved_payload,
             )
             .await;
             return Ok(());
         }
-        let pending = self
-            .inner
-            .pending_questions
-            .lock()
-            .await
-            .remove(request_id)
-            .ok_or_else(|| OpenCodeRuntimeError::UnknownQuestion(request_id.to_owned()))?;
-        let normalized = pending
-            .questions
+        // OpenCode v1: keep the question pending until HTTP succeeds or SSE confirms settlement.
+        let pending_questions_snapshot = {
+            let pending_map = self.inner.pending_questions.lock().await;
+            let pending = pending_map
+                .get(request_id)
+                .ok_or_else(|| OpenCodeRuntimeError::UnknownQuestion(request_id.to_owned()))?;
+            let mut sync = self.inner.v1_question_sync.lock().await;
+            if sync.answering.contains(request_id) {
+                return Err(OpenCodeRuntimeError::UnknownQuestion(request_id.to_owned()));
+            }
+            sync.answering.insert(request_id.to_owned());
+            pending.questions.clone()
+        };
+        let normalized = pending_questions_snapshot
             .iter()
             .map(|question| {
-                let key = question
-                    .get("header")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let value = answers
-                    .get(key)
+                let id_key = question.get("id").and_then(Value::as_str);
+                let header_key = question.get("header").and_then(Value::as_str);
+                let value = id_key
+                    .and_then(|key| answers.get(key))
+                    .or_else(|| header_key.and_then(|key| answers.get(key)))
                     .cloned()
                     .unwrap_or(Value::Array(Vec::new()));
                 let values = match value {
-                    Value::String(string) => vec![Value::String(string)],
-                    Value::Array(array) => array,
+                    Value::String(string) if !string.trim().is_empty() => {
+                        vec![Value::String(string)]
+                    }
+                    Value::Array(array) => array
+                        .into_iter()
+                        .filter(|entry| entry.as_str().is_none_or(|text| !text.trim().is_empty()))
+                        .collect(),
                     _ => Vec::new(),
                 };
                 Value::Array(values)
             })
             .collect::<Vec<_>>();
-        self.inner
-            .client
-            .post(self.request_url(&format!("/question/{request_id}/reply"))?)
-            .json(&json!({ "answers": normalized }))
-            .send()
-            .await
-            .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?;
+        let sent = async {
+            let request = if is_skip_or_cancel_only {
+                self.inner
+                    .client
+                    .post(self.request_url(&format!("/question/{request_id}/reject"))?)
+            } else {
+                self.inner
+                    .client
+                    .post(self.request_url(&format!("/question/{request_id}/reply"))?)
+                    .json(&json!({ "answers": normalized }))
+            };
+            let response = tokio::time::timeout(SIDE_REQUEST_TIMEOUT, request.send())
+                .await
+                .map_err(|_| {
+                    OpenCodeRuntimeError::Http(format!(
+                        "question {} timed out",
+                        if is_skip_or_cancel_only {
+                            "reject"
+                        } else {
+                            "reply"
+                        }
+                    ))
+                })?
+                .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(OpenCodeRuntimeError::Http(format!(
+                    "question {} returned HTTP {}",
+                    if is_skip_or_cancel_only {
+                        "reject"
+                    } else {
+                        "reply"
+                    },
+                    response.status()
+                )));
+            }
+            Ok(())
+        }
+        .await;
+        let (pending, sse_outcome, sent_ok) = {
+            let mut pending_map = self.inner.pending_questions.lock().await;
+            let mut sync = self.inner.v1_question_sync.lock().await;
+            sync.answering.remove(request_id);
+            let settled = sync.settled_while_answering.remove(request_id);
+            let sent_ok = sent.is_ok();
+            if settled.is_none() {
+                sent?;
+            }
+            sync.mark_settled(request_id);
+            (pending_map.remove(request_id), settled, sent_ok)
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let expected_sse_answers =
+            parse_v1_sse_question_answers(&Value::Array(normalized), &pending.questions);
+        let (recorded_answers, final_disposition) = resolve_settled_user_input_outcome(
+            sent_ok,
+            is_skip_or_cancel_only,
+            answers,
+            &expected_sse_answers,
+            disposition,
+            sse_outcome,
+        );
+        let resolved_payload = match final_disposition {
+            Some(disp) => crate::provider::build_user_input_resolved_payload(
+                recorded_answers,
+                disp,
+                &pending.questions,
+            ),
+            None => json!({ "answers": recorded_answers }),
+        };
         self.emit(
             "user-input.resolved",
             pending.turn_id,
             Some(request_id.to_owned()),
-            json!({ "answers": answers }),
+            resolved_payload,
         )
         .await;
         Ok(())
@@ -3072,30 +3370,63 @@ impl OpenCodeSessionRuntime {
                         })
                 } else {
                     let mut pending = self.inner.pending_questions.lock().await;
+                    let mut sync = self.inner.v1_question_sync.lock().await;
                     let auto_settled = self
                         .record_provider_settlement_for_auto_decline(
                             AutoDeclineKind::V1Question,
                             &request_id,
                         )
                         .await;
-                    pending
-                        .remove(&request_id)
-                        .map(|question| {
-                            (
-                                "user-input.resolved",
-                                question.turn_id,
-                                json!({ "answers": {} }),
-                            )
+                    sync.mark_settled(&request_id);
+                    let disposition = if event_type == "question.rejected" {
+                        crate::provider::UserInputResponseDisposition::Skipped
+                    } else {
+                        crate::provider::UserInputResponseDisposition::Answered
+                    };
+                    let sse_answers = if event_type == "question.rejected" {
+                        None
+                    } else {
+                        properties.get("answers").map(|raw| {
+                            let pending_questions = pending
+                                .get(&request_id)
+                                .map(|question| question.questions.as_slice())
+                                .unwrap_or(&[]);
+                            parse_v1_sse_question_answers(raw, pending_questions)
                         })
-                        .or_else(|| {
-                            auto_settled.then(|| {
+                    };
+                    if sync.answering.contains(&request_id) {
+                        sync.settled_while_answering.insert(
+                            request_id.clone(),
+                            SettledOutcome {
+                                disposition,
+                                answers: sse_answers,
+                            },
+                        );
+                        None
+                    } else {
+                        pending
+                            .remove(&request_id)
+                            .map(|question| {
                                 (
                                     "user-input.resolved",
-                                    turn_id.clone(),
-                                    json!({ "answers": {} }),
+                                    question.turn_id,
+                                    crate::provider::build_user_input_resolved_payload(
+                                        sse_answers.unwrap_or_else(|| json!({})),
+                                        disposition,
+                                        &question.questions,
+                                    ),
                                 )
                             })
-                        })
+                            .or_else(|| {
+                                auto_settled.then(|| {
+                                    (
+                                        "user-input.resolved",
+                                        turn_id.clone(),
+                                        json!({ "answers": {} }),
+                                    )
+                                })
+                            })
+                    }
                 };
                 if let Some((event_type, turn_id, payload)) = resolved {
                     self.emit(event_type, turn_id, Some(request_id), payload)
@@ -3292,7 +3623,7 @@ impl OpenCodeSessionRuntime {
                             &request_id,
                         );
                         let pending = if v2.answering.contains(&request_id) {
-                            v2.settled_while_answering.insert(request_id.clone());
+                            v2.settled_while_answering.insert(request_id.clone(), None);
                             None
                         } else {
                             v2.permissions.remove(&request_id)
@@ -3346,6 +3677,7 @@ impl OpenCodeSessionRuntime {
                                 turn_id: turn_id.clone(),
                                 session_id,
                                 fields,
+                                questions: questions.clone(),
                             },
                         );
                     }
@@ -3376,7 +3708,20 @@ impl OpenCodeSessionRuntime {
                     self.spawn_v2_cancel_unanswerable_form(form_id, session_id, turn_id)
                         .await;
                 }
-                V2Output::FormSettled { form_id } => {
+                V2Output::FormSettled {
+                    form_id,
+                    cancelled,
+                    answers,
+                } => {
+                    let disposition = if cancelled {
+                        crate::provider::UserInputResponseDisposition::Cancelled
+                    } else {
+                        crate::provider::UserInputResponseDisposition::Answered
+                    };
+                    let outcome = SettledOutcome {
+                        disposition,
+                        answers: if cancelled { None } else { answers },
+                    };
                     let (pending, auto_settled) = {
                         let mut v2 = self.inner.v2.lock().await;
                         let was_in_flight = v2
@@ -3390,7 +3735,8 @@ impl OpenCodeSessionRuntime {
                             &form_id,
                         );
                         let pending = if v2.answering.contains(&form_id) {
-                            v2.settled_while_answering.insert(form_id.clone());
+                            v2.settled_while_answering
+                                .insert(form_id.clone(), Some(outcome.clone()));
                             None
                         } else {
                             v2.forms.remove(&form_id)
@@ -3402,7 +3748,11 @@ impl OpenCodeSessionRuntime {
                             "user-input.resolved",
                             form.turn_id,
                             Some(form_id),
-                            json!({ "answers": {} }),
+                            crate::provider::build_user_input_resolved_payload(
+                                outcome.answers.unwrap_or_else(|| json!({})),
+                                outcome.disposition,
+                                &form.questions,
+                            ),
                         )
                         .await;
                     } else if auto_settled {
@@ -3770,6 +4120,7 @@ impl OpenCodeSessionRuntime {
                         turn_id: None,
                         session_id: session_id.clone(),
                         fields,
+                        questions: questions.clone(),
                     },
                 );
                 recovered.push((
@@ -4429,9 +4780,14 @@ impl OpenCodeSessionRuntime {
                 continue;
             }
             let mut pending = self.inner.pending_questions.lock().await;
-            if pending.contains_key(&request_id) || settled(&request_id).await {
+            let sync = self.inner.v1_question_sync.lock().await;
+            if pending.contains_key(&request_id)
+                || sync.is_recently_settled(&request_id)
+                || settled(&request_id).await
+            {
                 continue;
             }
+            drop(sync);
             let questions = v1_questions(&request);
             pending.insert(
                 request_id.clone(),
@@ -10247,5 +10603,334 @@ mod code_review_auto_decline_tests {
         );
         assert!(children_calls.load(Ordering::SeqCst) >= 2);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn v1_user_input_handles_reject_partial_and_both_settlement_race_orderings() {
+        use axum::{Router, extract::Path as AxumPath, http::StatusCode, routing::post};
+        use std::sync::atomic::AtomicUsize;
+
+        let reply_calls = Arc::new(AtomicUsize::new(0));
+        let reject_calls = Arc::new(AtomicUsize::new(0));
+        let fail_first_reply = Arc::new(AtomicBool::new(true));
+        let lost_reply_after_sse = Arc::new(AtomicBool::new(false));
+        let sse_trigger = Arc::new(tokio::sync::Notify::new());
+        let sse_done = Arc::new(tokio::sync::Notify::new());
+        let last_reply_body = Arc::new(Mutex::new(Value::Null));
+
+        let r_calls = Arc::clone(&reply_calls);
+        let j_calls = Arc::clone(&reject_calls);
+        let f_first = Arc::clone(&fail_first_reply);
+        let l_after = Arc::clone(&lost_reply_after_sse);
+        let s_trig = Arc::clone(&sse_trigger);
+        let s_done = Arc::clone(&sse_done);
+        let l_body = Arc::clone(&last_reply_body);
+
+        let app = Router::new()
+            .route(
+                "/question/{id}/reply",
+                post(
+                    move |AxumPath(_id): AxumPath<String>, axum::Json(body): axum::Json<Value>| {
+                        let r_calls = Arc::clone(&r_calls);
+                        let f_first = Arc::clone(&f_first);
+                        let l_after = Arc::clone(&l_after);
+                        let s_trig = Arc::clone(&s_trig);
+                        let s_done = Arc::clone(&s_done);
+                        let l_body = Arc::clone(&l_body);
+                        async move {
+                            r_calls.fetch_add(1, Ordering::SeqCst);
+                            *l_body.lock().await = body;
+                            if f_first.swap(false, Ordering::SeqCst) {
+                                return StatusCode::INTERNAL_SERVER_ERROR;
+                            }
+                            if l_after.swap(false, Ordering::SeqCst) {
+                                s_trig.notify_one();
+                                s_done.notified().await;
+                                return StatusCode::INTERNAL_SERVER_ERROR;
+                            }
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/question/{id}/reject",
+                post(move |AxumPath(_id): AxumPath<String>| {
+                    let j_calls = Arc::clone(&j_calls);
+                    async move {
+                        j_calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let runtime = OpenCodeSessionRuntime::new(
+            &format!("http://{addr}"),
+            "oc-v1-q-430",
+            "/tmp/oc-v1",
+            None,
+        );
+
+        // 1. Pre-settlement HTTP 500 keeps request pending & retryable with ZERO user-input.resolved.
+        runtime
+            .handle_sse_event(
+                "ses-1",
+                json!({
+                    "type": "question.asked",
+                    "properties": {
+                        "id": "q-retry",
+                        "sessionID": "ses-1",
+                        "questions": [
+                            { "header": "Scope", "question": "Which scope?", "options": [{ "label": "Workspace", "description": "Repo" }] },
+                            { "header": "Notes", "question": "Any notes?", "options": [] }
+                        ]
+                    }
+                }),
+            )
+            .await;
+        let _asked = runtime.next_event().await.expect("asked");
+        let err = runtime
+            .respond_to_user_input_with_disposition(
+                "q-retry",
+                json!({ "Scope": "Workspace" }),
+                crate::provider::UserInputResponseDisposition::Answered,
+            )
+            .await;
+        assert!(err.is_err(), "pre-settlement HTTP 500 must fail");
+        assert!(
+            timeout(Duration::from_millis(40), runtime.next_event())
+                .await
+                .is_err(),
+            "zero user-input.resolved may be emitted on pre-settlement failure"
+        );
+        // Retry succeeds and emits one resolved receipt with partial answer.
+        runtime
+            .respond_to_user_input_with_disposition(
+                "q-retry",
+                json!({ "Scope": "Workspace" }),
+                crate::provider::UserInputResponseDisposition::Answered,
+            )
+            .await
+            .expect("retry succeeds");
+        assert_eq!(
+            *last_reply_body.lock().await,
+            json!({ "answers": [["Workspace"], []] })
+        );
+        let resolved = runtime.next_event().await.expect("resolved");
+        assert_eq!(resolved.event_type, "user-input.resolved");
+        assert_eq!(resolved.payload["disposition"], json!("answered"));
+        assert_eq!(
+            resolved.payload["questions"].as_array().map(Vec::len),
+            Some(2)
+        );
+
+        // 2. HTTP 500 AFTER SSE settlement emits EXACTLY ONE confirmed receipt and blocks duplicate submission.
+        runtime
+            .handle_sse_event(
+                "ses-1",
+                json!({
+                    "type": "question.asked",
+                    "properties": {
+                        "id": "q-race",
+                        "sessionID": "ses-1",
+                        "questions": [{ "header": "Scope", "question": "Which scope?", "options": [] }]
+                    }
+                }),
+            )
+            .await;
+        let _asked2 = runtime.next_event().await.expect("asked2");
+        lost_reply_after_sse.store(true, Ordering::SeqCst);
+        let rt_clone = runtime.clone();
+        let sse_task = tokio::spawn(async move {
+            sse_trigger.notified().await;
+            rt_clone
+                .handle_sse_event(
+                    "ses-1",
+                    json!({
+                        "type": "question.replied",
+                        "properties": { "id": "q-race", "sessionID": "ses-1" }
+                    }),
+                )
+                .await;
+            sse_done.notify_one();
+        });
+        runtime
+            .respond_to_user_input_with_disposition(
+                "q-race",
+                json!({ "Scope": "Workspace" }),
+                crate::provider::UserInputResponseDisposition::Answered,
+            )
+            .await
+            .expect("SSE-confirmed settlement succeeds even if HTTP reply returns 500");
+        sse_task.await.expect("sse task");
+        let resolved_race = runtime.next_event().await.expect("resolved race");
+        assert_eq!(resolved_race.event_type, "user-input.resolved");
+        assert_eq!(
+            resolved_race.payload["answers"],
+            json!({ "Scope": "Workspace" })
+        );
+        assert!(
+            timeout(Duration::from_millis(40), runtime.next_event())
+                .await
+                .is_err(),
+            "must emit exactly one receipt"
+        );
+        assert!(
+            runtime
+                .respond_to_user_input_with_disposition(
+                    "q-race",
+                    json!({ "Scope": "Workspace" }),
+                    crate::provider::UserInputResponseDisposition::Answered,
+                )
+                .await
+                .is_err(),
+            "duplicate submission must be blocked after settlement"
+        );
+
+        // 3. Skip-all / Close routes to POST /question/{id}/reject.
+        runtime
+            .handle_sse_event(
+                "ses-1",
+                json!({
+                    "type": "question.asked",
+                    "properties": {
+                        "id": "q-skip",
+                        "sessionID": "ses-1",
+                        "questions": [{ "header": "Scope", "question": "Which scope?", "options": [] }]
+                    }
+                }),
+            )
+            .await;
+        let _asked3 = runtime.next_event().await.expect("asked3");
+        runtime
+            .respond_to_user_input_with_disposition(
+                "q-skip",
+                json!({}),
+                crate::provider::UserInputResponseDisposition::Skipped,
+            )
+            .await
+            .expect("reject succeeds");
+        assert_eq!(reject_calls.load(Ordering::SeqCst), 1);
+        let resolved_skip = runtime.next_event().await.expect("resolved skip");
+        assert_eq!(resolved_skip.payload["disposition"], json!("skipped"));
+        assert_eq!(resolved_skip.payload["answers"], json!({}));
+
+        // 4. External client reply via `question.replied` SSE with ordered `string[][]` answers.
+        runtime
+            .handle_sse_event(
+                "ses-1",
+                json!({
+                    "type": "question.asked",
+                    "properties": {
+                        "id": "q-ext",
+                        "sessionID": "ses-1",
+                        "questions": [
+                            { "header": "Scope", "question": "Which scope?", "options": [] },
+                            { "header": "Target", "question": "Which target?", "options": [] }
+                        ]
+                    }
+                }),
+            )
+            .await;
+        let _asked4 = runtime.next_event().await.expect("asked4");
+        runtime
+            .handle_sse_event(
+                "ses-1",
+                json!({
+                    "type": "question.replied",
+                    "properties": {
+                        "requestID": "q-ext",
+                        "sessionID": "ses-1",
+                        "answers": [["Workspace"], ["macOS", "Linux"]]
+                    }
+                }),
+            )
+            .await;
+        let resolved_ext = runtime.next_event().await.expect("resolved external");
+        assert_eq!(resolved_ext.payload["disposition"], json!("answered"));
+        assert_eq!(
+            resolved_ext.payload["answers"],
+            json!({ "Scope": ["Workspace"], "Target": ["macOS", "Linux"] })
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn v1_questions_disambiguates_duplicate_headers_and_sse_settlement_respects_competing_races() {
+        let questions = v1_questions(&json!({
+            "questions": [
+                { "header": "Target", "question": "Primary target?", "options": [] },
+                { "header": "Target", "question": "Secondary target?", "options": [] }
+            ]
+        }));
+        assert_eq!(questions[0]["id"], json!("Target"));
+        assert_eq!(questions[1]["id"], json!("Target_1"));
+        let parsed = parse_v1_sse_question_answers(&json!([["macOS"], ["Linux"]]), &questions);
+        assert_eq!(
+            parsed,
+            json!({ "Target": ["macOS"], "Target_1": ["Linux"] })
+        );
+
+        // Competing v1 rejection wins over a local answer even when HTTP returned 200.
+        let (ans, disp) = resolve_settled_user_input_outcome(
+            true,
+            false,
+            json!({ "Target": "macOS" }),
+            &json!({ "Target": ["macOS"] }),
+            Some(crate::provider::UserInputResponseDisposition::Answered),
+            Some(SettledOutcome {
+                disposition: crate::provider::UserInputResponseDisposition::Skipped,
+                answers: None,
+            }),
+        );
+        assert_eq!(ans, json!({}));
+        assert_eq!(
+            disp,
+            Some(crate::provider::UserInputResponseDisposition::Skipped)
+        );
+
+        // Competing explicit empty answer (`[[]]` / `{}`) is preserved instead of substituting local answers.
+        let (ans, disp) = resolve_settled_user_input_outcome(
+            false,
+            false,
+            json!({ "Target": "macOS" }),
+            &json!({ "Target": ["macOS"] }),
+            Some(crate::provider::UserInputResponseDisposition::Answered),
+            Some(SettledOutcome {
+                disposition: crate::provider::UserInputResponseDisposition::Answered,
+                answers: Some(json!({})),
+            }),
+        );
+        assert_eq!(ans, json!({}));
+        assert_eq!(
+            disp,
+            Some(crate::provider::UserInputResponseDisposition::Answered)
+        );
+
+        // Failed local Skip while another client cancelled records Cancelled, not Skipped.
+        let (ans, disp) = resolve_settled_user_input_outcome(
+            false,
+            true,
+            json!({}),
+            &json!({}),
+            Some(crate::provider::UserInputResponseDisposition::Skipped),
+            Some(SettledOutcome {
+                disposition: crate::provider::UserInputResponseDisposition::Cancelled,
+                answers: None,
+            }),
+        );
+        assert_eq!(ans, json!({}));
+        assert_eq!(
+            disp,
+            Some(crate::provider::UserInputResponseDisposition::Cancelled)
+        );
     }
 }

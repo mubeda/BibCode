@@ -72,6 +72,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   /** The server reports update progress, `bootId` and `updater.activeWork`. */
   remoteUpdateProgress: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalOrderedInput: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `terminal.writeInput` accepts optional `pasteStage` (`"chunk"` | `"commit"`) to assemble multi-frame bracketed pastes atomically before writing to the PTY (#431). */
+  terminalPasteAssembly: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   terminalSizeOwnership: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Terminal writes and input frames accept `userInputClaim` (#348). */
   terminalUserInputClaim: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),

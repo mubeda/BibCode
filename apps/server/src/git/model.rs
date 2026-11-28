@@ -151,6 +151,9 @@ pub struct VcsStatusRemoteResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ahead_of_default_count: Option<u64>,
     pub pr: Option<ChangeRequest>,
+    /// Sanitized error code when the open pull-request lookup failed; omitted on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_lookup_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

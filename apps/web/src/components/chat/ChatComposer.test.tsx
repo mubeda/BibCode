@@ -1352,21 +1352,17 @@ describe("ChatComposer rendering", () => {
     expect(editorProps()["placeholder"]).toBe("Resolve this approval request to continue");
   });
 
-  it("renders the pending user input panel and custom answer editor", () => {
+  it("renders the pending user input panel while keeping the main composer decoupled (#430 D9)", () => {
+    seedPrompt("normal draft");
     const { markup } = renderComposer({
       pendingUserInputs: [makePendingUserInput()],
       activePendingProgress: makePendingProgress({ customAnswer: "my answer" }),
     });
 
     expect(markup).toContain('data-mock="ComposerPendingUserInputPanel"');
-    expect(markup).not.toContain('data-mock="ContextWindowMeter"');
-    expect(editorProps()["value"]).toBe("my answer");
-    expect(editorProps()["placeholder"]).toBe(
-      "Type your own answer, or leave this blank to use the selected option",
-    );
-    // Terminal contexts are suppressed while questions are pending.
-    expect(editorProps()["terminalContexts"]).toEqual([]);
-    expect(captureByLabel("Button", "Attach files")["disabled"]).toBe(true);
+    expect(editorProps()["value"]).toBe("normal draft");
+    expect(editorProps()["placeholder"]).toContain("Ask anything");
+    expect(captureByLabel("Button", "Attach files")["disabled"]).toBe(false);
   });
 
   it("renders the plan follow-up banner with the extracted plan title", () => {
@@ -2338,6 +2334,67 @@ describe("ChatComposer menu selection", () => {
     onSelect(items[0]!);
 
     expect(draftOf(threadRef)?.prompt).toBe("/docs ");
+    // `/docs` renders as a 1-slot skill chip + trailing space => collapsed cursor 2.
+    expect(setStateValues(STATE.cursor)).toContain(2);
+  });
+
+  it("collapses cursor for command-registered slash skills while keeping non-skill commands plain", () => {
+    const antigravityId = ProviderInstanceId.make("antigravity");
+    const provider: ServerProvider = {
+      ...codexProvider,
+      instanceId: antigravityId,
+      driver: ProviderDriverKind.make("antigravity"),
+      slashCommands: [
+        { name: "plan", description: "Plan mode" },
+        { name: "review-branch", description: "Registered skill command" },
+      ],
+      skills: [
+        {
+          name: "review-branch",
+          description: "Review local branch",
+          path: "/ws/.agents/skills/review-branch/SKILL.md",
+          scope: "project",
+          enabled: true,
+          invocation: "slash",
+        },
+      ],
+      agents: [],
+    };
+    const renderOverlap = () =>
+      renderComposer({
+        providerBindingInstanceId: antigravityId,
+        providerStatuses: [codexProvider, provider],
+        activeProjectDefaultModelSelection: {
+          instanceId: antigravityId,
+          model: "gpt-5.4",
+        },
+      });
+
+    // Selecting the command-registered skill `/review-branch` collapses cursor to 2 (chip + space).
+    seedPrompt("/rev");
+    renderOverlap();
+    setEditorSnapshot("/rev", 4);
+    const skillMenu = findCapture("ComposerCommandMenu");
+    const skillItems = skillMenu["items"] as Array<Record<string, unknown>>;
+    (skillMenu["onSelect"] as (item: Record<string, unknown>) => void)(
+      skillItems.find((item) => item["id"] === "provider-command:antigravity:review-branch")!,
+    );
+    expect(draftOf(threadRef)?.prompt).toBe("/review-branch ");
+    expect(setStateValues(STATE.cursor)).toContain(2);
+
+    // Selecting the non-skill slash command `/plan` keeps plain-text cursor length (6).
+    h.captures.length = 0;
+    h.setStateCalls.length = 0;
+    seedPrompt("/pl");
+    renderOverlap();
+    setEditorSnapshot("/pl", 3);
+    const cmdMenu = findCapture("ComposerCommandMenu");
+    const cmdItems = cmdMenu["items"] as Array<Record<string, unknown>>;
+    (cmdMenu["onSelect"] as (item: Record<string, unknown>) => void)(
+      cmdItems.find((item) => item["id"] === "provider-command:antigravity:plan")!,
+    );
+    expect(draftOf(threadRef)?.prompt).toBe("/plan ");
+    expect(setStateValues(STATE.cursor)).toContain("/plan ".length);
   });
 
   describe("Antigravity slash skills and commands", () => {
@@ -2494,7 +2551,7 @@ describe("ChatComposer menu selection", () => {
     expect(draftOf(threadRef)?.prompt).toBe("@code-reviewer ");
   });
 
-  it("routes custom answers through the pending input callback instead of the store", () => {
+  it("writes menu selections to the composer draft instead of hijacking pending user input (#430 D9)", () => {
     seedPrompt("$ref");
     const { spies } = renderComposer({
       pendingUserInputs: [makePendingUserInput()],
@@ -2508,14 +2565,8 @@ describe("ChatComposer menu selection", () => {
 
     onSelect(items[0]!);
 
-    expect(spies.onChangeActivePendingUserInputCustomAnswer).toHaveBeenCalledWith(
-      "q1",
-      "$refactor ",
-      expect.any(Number),
-      expect.any(Number),
-      false,
-    );
-    expect(draftOf(threadRef)?.prompt).toBe("$ref");
+    expect(spies.onChangeActivePendingUserInputCustomAnswer).not.toHaveBeenCalled();
+    expect(draftOf(threadRef)?.prompt).toBe("$refactor ");
   });
 
   it("records menu highlight changes with the current search key", () => {
@@ -2637,7 +2688,7 @@ describe("ChatComposer command keys", () => {
     [":plan", "plan"],
     [":default", "default"],
   ] as const)(
-    "executes a pending standalone %s through Enter without advancing the answer",
+    "executes standalone %s through Enter while a question card is open without touching question state (#430 D9)",
     (actionText, expectedInteractionMode) => {
       seedPrompt(actionText);
       const { spies } = renderComposer({
@@ -2649,13 +2700,8 @@ describe("ChatComposer command keys", () => {
 
       expect(onKey("Enter", keyEvent())).toBe(true);
       expect(spies.onSend).not.toHaveBeenCalled();
-      expect(spies.onChangeActivePendingUserInputCustomAnswer).toHaveBeenCalledWith(
-        "q1",
-        "",
-        0,
-        0,
-        false,
-      );
+      expect(spies.onChangeActivePendingUserInputCustomAnswer).not.toHaveBeenCalled();
+      expect(draftOf(threadRef)?.prompt ?? "").toBe("");
       if (expectedInteractionMode === null) {
         expect(setStateValues(STATE.modelPickerOpen)).toContain(true);
         expect(spies.handleInteractionModeChange).not.toHaveBeenCalled();
@@ -2859,7 +2905,7 @@ describe("ChatComposer prompt changes", () => {
     expect(draftOf(threadRef)?.terminalContexts.map((entry) => entry.id)).toEqual(["ctx-first"]);
   });
 
-  it("routes edits to the pending input callback while a question is active", () => {
+  it("writes main composer edits to the draft while a question card is open (#430 D9)", () => {
     const { spies } = renderComposer({
       pendingUserInputs: [makePendingUserInput()],
       activePendingProgress: makePendingProgress(),
@@ -2868,14 +2914,8 @@ describe("ChatComposer prompt changes", () => {
 
     onChange("typed", 5, 5, false, []);
 
-    expect(spies.onChangeActivePendingUserInputCustomAnswer).toHaveBeenCalledWith(
-      "q1",
-      "typed",
-      5,
-      5,
-      false,
-    );
-    expect(draftOf(threadRef)?.prompt ?? "").toBe("");
+    expect(spies.onChangeActivePendingUserInputCustomAnswer).not.toHaveBeenCalled();
+    expect(draftOf(threadRef)?.prompt).toBe("typed");
   });
 });
 
@@ -2965,7 +3005,7 @@ describe("ChatComposer paste and drag", () => {
     expect(spies.focusComposer).not.toHaveBeenCalled();
   });
 
-  it("rejects attachments while plan questions are pending", () => {
+  it("allows composer attachments while a clarifying-question card is open (#430 D9)", () => {
     renderComposer({
       pendingUserInputs: [makePendingUserInput()],
       activePendingProgress: makePendingProgress(),
@@ -2974,11 +3014,8 @@ describe("ChatComposer paste and drag", () => {
 
     onPaste(pasteEvent([imageFile()]));
 
-    expect(h.toastAdd).toHaveBeenCalledWith({
-      type: "error",
-      title: "Attach files after answering plan questions.",
-    });
-    expect(draftOf(threadRef)?.attachments ?? []).toEqual([]);
+    expect(h.toastAdd).not.toHaveBeenCalled();
+    expect(draftOf(threadRef)?.attachments).toHaveLength(1);
   });
 
   it("does nothing without an active thread", () => {
@@ -3222,7 +3259,7 @@ describe("ChatComposer submit", () => {
     [":plan", "plan"],
     [":default", "default"],
   ] as const)(
-    "executes a pending standalone %s from the submit button without advancing",
+    "executes standalone %s from the submit button without touching question state (#430 D9)",
     (actionText, expectedInteractionMode) => {
       seedPrompt(actionText);
       const { spies } = renderComposer({
@@ -3236,13 +3273,8 @@ describe("ChatComposer submit", () => {
 
       expect(event.preventDefault).toHaveBeenCalledTimes(1);
       expect(spies.onSend).not.toHaveBeenCalled();
-      expect(spies.onChangeActivePendingUserInputCustomAnswer).toHaveBeenCalledWith(
-        "q1",
-        "",
-        0,
-        0,
-        false,
-      );
+      expect(spies.onChangeActivePendingUserInputCustomAnswer).not.toHaveBeenCalled();
+      expect(draftOf(threadRef)?.prompt ?? "").toBe("");
       if (expectedInteractionMode === null) {
         expect(setStateValues(STATE.modelPickerOpen)).toContain(true);
         expect(spies.handleInteractionModeChange).not.toHaveBeenCalled();
@@ -3299,7 +3331,6 @@ describe("ChatComposer imperative handle", () => {
     const blockedStates: Array<Partial<ChatComposerProps>> = [
       { isConnecting: true },
       { activePendingApproval: pendingApproval, pendingApprovals: [pendingApproval] },
-      { pendingUserInputs: [makePendingUserInput()] },
     ];
     for (const overrides of blockedStates) {
       const { handle } = renderComposer(overrides);
@@ -3791,8 +3822,9 @@ describe("ChatComposer mobile", () => {
     expect(markup).toContain('data-prop-showdetail="true"');
   });
 
-  it("renders the collapsed pending question controls with a custom answer button", () => {
+  it("renders the clarifying-question card alongside the collapsed mobile composer row (#430 D9)", () => {
     h.isMobile = true;
+    seedPrompt("draft note");
     const { markup } = renderComposer({
       pendingUserInputs: [makePendingUserInput()],
       activePendingProgress: makePendingProgress({
@@ -3801,16 +3833,12 @@ describe("ChatComposer mobile", () => {
       }),
     });
 
-    expect(markup).toContain('data-chat-composer-mobile-pending-compact="true"');
-    expect(markup).toContain("typed answer");
-    expect(markup).toContain('data-mock="ComposerPrimaryActions"');
-
-    const write = hostByLabel("Write custom answer");
-    (write["onClick"] as () => void)();
-    expect(setStateValues(STATE.focused)).toContain(true);
+    expect(markup).toContain('data-chat-composer-collapsed-controls="true"');
+    expect(markup).toContain('data-mock="ComposerPendingUserInputPanel"');
+    expect(markup).toContain("draft note");
   });
 
-  it("shows floating pending answer actions while expanded on mobile", () => {
+  it("keeps the expanded mobile editor decoupled from pending clarifying questions (#430 D9)", () => {
     h.isMobile = true;
     h.stateSeeds.set(STATE.focused, true);
     const { markup } = renderComposer({
@@ -3818,8 +3846,8 @@ describe("ChatComposer mobile", () => {
       activePendingProgress: makePendingProgress(),
     });
 
-    expect(markup).toContain('data-chat-composer-mobile-pending-actions="true"');
-    expect(editorProps()["className"]).toBe("max-sm:pb-11");
+    expect(markup).toContain('data-mock="ComposerPendingUserInputPanel"');
+    expect(markup).not.toContain('data-chat-composer-mobile-pending-actions="true"');
   });
 
   it("expands on focus capture and collapses after blur", () => {
@@ -3905,21 +3933,14 @@ describe("ChatComposer effects", () => {
     expect(props.composerElementContextsRef.current.map((entry) => entry.id)).toEqual(["el-sync"]);
   });
 
-  it("adopts the pending custom answer and skips redundant re-syncs", () => {
+  it("keeps the composer prompt independent of pending question custom answers (#430 D9)", () => {
+    seedPrompt("composer text");
     const { props } = renderComposer({
       pendingUserInputs: [makePendingUserInput()],
       activePendingProgress: makePendingProgress({ customAnswer: "draft answer" }),
     });
 
-    expect(props.promptRef.current).toBe("draft answer");
-    expect(setStateValues(STATE.highlightedItemId)).toContain(null);
-
-    const callsBefore = h.setStateCalls.length;
-    reflushExecutedEffects();
-    // The second pass hits the "nothing changed" early return for the pending
-    // input sync (other effects may still re-fire their setters).
-    expect(props.promptRef.current).toBe("draft answer");
-    expect(h.setStateCalls.length).toBeGreaterThanOrEqual(callsBefore);
+    expect(props.promptRef.current).toBe("composer text");
   });
 
   it("clears persisted attachments when the draft has no images", async () => {

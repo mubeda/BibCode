@@ -10,6 +10,8 @@ import { act, useContext, useImperativeHandle, type Ref } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { usePullRequestsStore } from "../../pullRequestsStore";
+import { PullRequestsListNavigationContext } from "./detail/pullRequestsNavigation";
+import { PullRequestsRow } from "./list/PullRequestsRow";
 import { PullRequestsContextRefresh } from "./pullRequestsContextRefresh";
 import { context } from "./testFixtures";
 const h = vi.hoisted(() => ({
@@ -32,7 +34,11 @@ const h = vi.hoisted(() => ({
   refresh: vi.fn(),
   revalidate: vi.fn(),
   listRefresh: vi.fn(),
+  navigate: vi.fn(),
   listProps: null as Record<string, unknown> | null,
+  listNavigation: null as {
+    openRequest: (target: { number: number; provider: "github" | "gitlab" }) => void;
+  } | null,
   detailProps: null as Record<string, unknown> | null,
   detailPipelineLink: null as unknown,
   besideProps: null as Record<string, unknown> | null,
@@ -75,7 +81,7 @@ vi.mock("@tanstack/react-router", () => ({
   Link: ({ to, children }: { to: string; children: React.ReactNode }) => (
     <a href={to}>{children}</a>
   ),
-  useNavigate: () => vi.fn(),
+  useNavigate: () => h.navigate,
   useLocation: () => ({ hash: "" }),
 }));
 vi.mock("./list/PullRequestsListView", () => ({
@@ -84,8 +90,37 @@ vi.mock("./list/PullRequestsListView", () => ({
   ) => {
     h.listProps = props;
     h.contextRefresh = useContext(PullRequestsContextRefresh);
+    h.listNavigation = useContext(PullRequestsListNavigationContext);
     useImperativeHandle(props.ref, () => ({ refresh: h.listRefresh }));
-    return <div>List content</div>;
+    return (
+      <div>
+        <div>List content</div>
+        <PullRequestsRow
+          row={{
+            number: 42,
+            title: "Fix embedded PR row",
+            state: "open",
+            isDraft: false,
+            author: { login: "alice", name: "Alice", isBot: false },
+            labels: [],
+            commentCount: 0,
+            reviewDecision: null,
+            approvals: null,
+            unresolvedThreads: null,
+            checksSummary: null,
+            createdAt: "2026-10-01T00:00:00.000Z",
+            updatedAt: "2026-10-02T00:00:00.000Z",
+            closedAt: null,
+            mergedAt: null,
+            headBranch: "feat/embedded",
+            baseBranch: "main",
+            url: "https://example.test/pr/42",
+          }}
+          projectRef={props.projectRef as ScopedProjectRef}
+          context={props.context as Extract<PullRequestsContext, { status: "available" }>}
+        />
+      </div>
+    );
   },
 }));
 vi.mock("./detail/PullRequestsDetailView", async () => {
@@ -148,6 +183,8 @@ beforeEach(() => {
   h.catalogData = { worktrees: [] };
   h.catalogError = null;
   h.listProps = null;
+  h.listNavigation = null;
+  h.navigate.mockClear();
   h.besideProps = null;
   h.dialogProps = null;
   h.getContext.mockClear();
@@ -505,4 +542,28 @@ it("resets the available subtree when Rescan changes repository identity", async
   await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
   expect(container.textContent).toContain("other/repo");
   expect(container.querySelector('[role="dialog"]')).toBeNull();
+});
+
+it("keeps PullRequestsRow selection inside embedded mode without router navigation while standalone mode uses links", async () => {
+  const onSelectRequest = vi.fn();
+  await act(async () =>
+    root.render(
+      <PullRequestsPanel projectRef={ref} mode="embedded" onSelectRequest={onSelectRequest} />,
+    ),
+  );
+  const embeddedRowButton = button("Fix embedded PR row");
+  expect(embeddedRowButton.tagName).toBe("BUTTON");
+  await act(async () => embeddedRowButton.click());
+  expect(onSelectRequest).toHaveBeenCalledWith({
+    number: 42,
+    provider: "github",
+    cwd: "Z:\\opaque\\main",
+  });
+  expect(h.navigate).not.toHaveBeenCalled();
+
+  await act(async () => root.render(<PullRequestsPanel projectRef={ref} />));
+  const standaloneLink = [...container.querySelectorAll("a")].find(
+    (anchor) => anchor.textContent?.trim() === "Fix embedded PR row",
+  );
+  expect(standaloneLink).toBeDefined();
 });

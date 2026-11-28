@@ -648,48 +648,65 @@ because the forge CLI (`gh pr list`, `glab mr list`, `az repos pr list`) or
 Bitbucket request takes hundreds of milliseconds to seconds while local status
 takes tens. Entries are keyed by worktree path, provider, and branch, so a
 branch change or another repository never reads them. A successful answer,
-including no open request, is reused for 10 seconds; a failed or cancelled
-lookup is never reused. Concurrent callers for one key, such as a unary refresh
-and the stream enrichment of the publication it causes, share one provider run
-that holds a lease per waiting caller: a stream replacing its enrichment does
-not cancel a waiting refresh, and the last caller leaving cancels the run.
-Creating a request through the service, every finished Git Manager or VCS
-mutation (pushes included), and every reported local change such as a terminal
-command exiting forget that worktree's entries; a run in flight across such an
-invalidation still answers its waiters but is not stored. At most 64 entries
-are held.
+including no open request, is reused for 10 seconds and clears failure-warning
+suppression. A failed lookup is remembered for 5 seconds on transient errors or
+60 seconds on persistent classes (`cli_missing`, `cli_too_old`,
+`not_authenticated`, `forbidden`, `not_found`) so repeated status reads do not
+re-run a failing forge CLI on every poll; it emits a `warn` log carrying only
+`provider`, sanitized `error_code` (allowlisted to `timeout`,
+`not_authenticated`, `forbidden`, `cli_missing`, `cli_too_old`,
+`host_unreachable`, `rate_limited`, `not_found`, or `unknown`), and
+`backoff_secs` once per failure transition until recovery, invalidation, or a
+different error class. A cancelled lookup (its last caller left, or shutdown) is
+never stored. Concurrent callers for one key, such as a unary refresh and the
+stream enrichment of the publication it causes, share one provider run that
+holds a lease per waiting caller: a stream replacing its enrichment does not
+cancel a waiting refresh, and the last caller leaving cancels the run. Creating
+a request through the service, every finished Git Manager or VCS mutation
+(pushes included), and every reported local change such as a terminal command
+exiting forget that worktree's entries and reset warning suppression; a run in
+flight across such an invalidation still answers its waiters but is not stored.
+At most 64 entries are held; when full, expired and abandoned entries are
+evicted first, then the entry closest to expiring, and a lookup with no cache
+room still runs uncoalesced and unstored while keeping deduplicated failure
+warnings.
 
-The broadcaster's cached remote for a worktree owns the open request known for
-its current branch. A remote read never finds a request, so a newer remote or
-snapshot for the same branch keeps the cached one, and a branch change clears
-it with the rest of the remote. A lookup that ends with an open request or with
-none open records its answer there. A failed or cancelled lookup records
-nothing, so the known request stays. Each status stream folds what it sent the
-way the client reducer does. A snapshot or remote update is sent with the
-request known for its branch, so a publication queued before a lookup answered
-does not briefly show an older request. After every event it sends, the stream compares
-the request its subscriber shows with the known one and sends a remote update
-when they differ. That send uses the fence of the newest event the subscriber
-received, so an answer that arrives across an epoch change waits for the next
-event that passes its fence and is delivered once. An event for the same branch
-leaves the stream's lookup running, so repeated events cannot keep a slow
-forge from answering. Any event for the same branch that arrives meanwhile,
-a local update included, asks for one more lookup when the running one ends,
-because it may follow an invalidation that made the running answer outdated.
-That lookup reads the cache unless the invalidation dropped it. A branch change
-stops the lookup.
+The broadcaster's cached remote for a worktree owns both the open request and
+the optional sanitized `prLookupError` code known for its current branch. A
+remote read never finds a request, so a newer remote or snapshot for the same
+branch keeps the cached request and lookup error, and a branch change clears
+both with the rest of the remote. A lookup that ends with an open request or
+with none open records its answer there and clears `prLookupError`. A failed
+lookup preserves the last known request and records the sanitized
+`prLookupError` code so callers and status subscribers can surface why the
+lookup failed without leaking raw stderr, tokens, or remote addresses; a
+cancelled lookup records nothing. Each status stream folds what it sent the way
+the client reducer does. A snapshot or remote update is sent with the request
+and `prLookupError` known for its branch, so a publication queued before a
+lookup answered does not briefly show stale state. After every event it sends,
+the stream compares the request and `prLookupError` its subscriber shows with the
+known state and sends a remote update when either differs. That send uses the
+fence of the newest event the subscriber received, so an answer that arrives
+across an epoch change waits for the next event that passes its fence and is
+delivered once. An event for the same branch leaves the stream's lookup running,
+so repeated events cannot keep a slow forge from answering. Any event for the
+same branch that arrives meanwhile, a local update included, asks for one more
+lookup when the running one ends, because it may follow an invalidation that
+made the running answer outdated. That lookup reads the cache unless the
+invalidation dropped it. A branch change stops the lookup.
 
 When nothing current is held, `vcs.refreshStatus` waits for the lookup for at
 most `REFRESH_PULL_REQUEST_LOOKUP_BOUND` (2 seconds). At the bound it answers
-with the known request for the same branch. Only status subscribers need the
-late answer, so the lookup keeps its lease in a task of the worktree's status
-lifecycle. The broadcaster cancels that task when the last status subscriber
-leaves, even while a Git Manager signal subscription keeps the worktree's
-entry, and at shutdown. A workspace loss ends every status stream, so it ends
-the task too. With no status subscriber the lookup is dropped at the bound. When the lookup ends with an answer, that task
-records it and calls `notify_pull_request_change`, so each stream publishes it
-without starting the forge CLI again. The passive summary, the
-pre-creation existence check in `git.runStackedAction`, and
+with the known request and `prLookupError` for the same branch. Only status
+subscribers need the late answer, so the lookup keeps its lease in a task of the
+worktree's status lifecycle. The broadcaster cancels that task when the last
+status subscriber leaves, even while a Git Manager signal subscription keeps the
+worktree's entry, and at shutdown. A workspace loss ends every status stream, so
+it ends the task too. With no status subscriber the lookup is dropped at the
+bound. When the late lookup ends with an answer or a new failure error code,
+that task records it and calls `notify_pull_request_change`, so each stream
+publishes the update without starting the forge CLI again. The passive summary,
+the pre-creation existence check in `git.runStackedAction`, and
 `gitManager.listPullRequests` keep asking the hosting service directly.
 
 A physical observation starts with one
@@ -3299,12 +3316,30 @@ no temporary sort that would spill large payloads to a temporary file.
 The shell carries what the left panel's agent status reads (#187):
 
 - **`hasPendingApprovals`** comes from `projection_pending_approvals`.
-- **`hasPendingUserInput`** is the thread's count of open questions. A question
+- **`hasPendingUserInput`** is the thread's count of open blocking questions. A question
   is open while the newest record for its request is the ask itself, or a
-  refused answer that the provider did not call stale. That rule is one shared
-  SQL fragment, `open_user_input_requests_sql`, which the queue head also uses.
+  refused answer that the provider did not call stale. That rule is shared via
+  `open_user_input_requests_sql` (all open questions, used for expiry on stop,
+  session-end, and startup recovery) and `open_blocking_user_input_requests_sql`
+  (excluding non-blocking `isBlocking: false` asks such as Codex async
+  clarifying questions, used for `pending_user_input_count`, `hasPendingUserInput`,
+  and queued-turn promotion so a running turn with an optional question stays in
+  `Working` and remains steerable).
   The count is recomputed only when a request's state changes, not on every
-  thread event.
+  thread event. `thread.user-input.respond` carries an optional backward-compatible
+  `disposition` (`"answered" | "skipped" | "cancelled"`, defaulting to `"answered"`
+  for older answers-only callers such as MCP `answer_question`). Providers map
+  skip/cancel outcomes explicitly (Antigravity ACP `elicitation/create` form mode
+  maps answers to `action: "accept"` with schema-coerced `content`, empty skips to
+  `action: "decline"`, and cancels to `action: "cancel"`; Cursor `outcome: "skipped"`,
+  OpenCode v1 `POST /question/{id}/reject` and v2 session-scoped
+  `DELETE /api/session/{sid}/form/{id}`, empty entries for Claude/Codex/Grok) and
+  persist self-sufficient `user-input.resolved` receipt metadata (`answers`,
+  `disposition`, and compact `questions` summaries) so windowed history reloads
+  render receipts even when `user-input.requested` is on an older unloaded page.
+  Codex `serverRequest/resolved`, Codex `turn/completed`, and Antigravity turn
+  completion/cancellation emit `user-input.expired` for unsettled prompts so
+  non-blocking and interrupted questions clear cleanly.
 - **`lastActivityAt`** is the time of the thread's latest provider progress:
   either an event the engine attributes to the provider, or a session update to
   `starting` or `running`. Titles, modes, archiving and BiBCode's own
@@ -3656,8 +3691,12 @@ accepted attempt. Unfrozen fresh starts remain outside this recovery policy. The
 settled turn retains its partial assistant text and ends as error.
 
 `ThreadTurnSteer` validates the queued head, a running session with an active
-turn, and the driver-owned capability shared with inventory. It atomically
-moves the row to pending/steer, clears its hold, and emits
+turn, and the driver-owned steering capability (for Antigravity, admission also
+requires that no pending approval/question is open and that the running start
+delivery has already received its first update, while provider inventory
+advertises `supportsTurnSteer` for Antigravity only when `agy >= 1.5.0` and the
+runtime enforces the same version floor). It atomically moves the row to
+pending/steer, clears its hold, and emits
 `thread.turn-steer-requested { turnId }` plus a complete nested delivery update.
 It creates no turn-start event or pending turn and never changes session state.
 The requested turn ID remains durable in that event; delivery rechecks it against
@@ -5294,16 +5333,34 @@ in [Missing-workspace runtime guard](#missing-workspace-runtime-guard).
 
 ## Ordered terminal input
 
-Current servers advertise `terminalOrderedInput`. The client negotiates from
-the actual RPC session's initial configuration; an omitted/false capability
-keeps the serialized `terminal.write` path. A failure on the ordered path does
-not retry through the legacy method.
+Current servers advertise `terminalOrderedInput` and `terminalPasteAssembly`.
+The client negotiates from the actual RPC session's initial configuration; an
+omitted/false `terminalOrderedInput` capability keeps the serialized
+`terminal.write` path (which sends complete bracketed-paste envelopes up to
+64 KiB in a single write instead of slicing at 16 KiB, and fails cleanly above
+64 KiB rather than emitting a partial unclosed envelope). A failure on the
+ordered path does not retry through the legacy method.
 
-| Method                 | Input                                                                 | Successful result                                          |
-| ---------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `terminal.beginInput`  | Thread, terminal, and a monotonically increasing `attachmentSequence` | An opaque `inputId`                                        |
-| `terminal.writeInput`  | Thread, terminal, `inputId`, zero-based frame `sequence`, and `data`  | The matching `inputId` and `sequence`, after the PTY write |
-| `terminal.cancelInput` | Thread, terminal, and `inputId`                                       | Null; unknown/already removed leases are harmless          |
+| Method                 | Input                                                                                       | Successful result                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `terminal.beginInput`  | Thread, terminal, and a monotonically increasing `attachmentSequence`                       | An opaque `inputId`                                                                       |
+| `terminal.writeInput`  | Thread, terminal, `inputId`, zero-based frame `sequence`, `data`, and optional `pasteStage` | The matching `inputId` and `sequence`, after the PTY write (or after staging a `"chunk"`) |
+| `terminal.cancelInput` | Thread, terminal, and `inputId`                                                             | Null; unknown/already removed leases are harmless                                         |
+
+When `terminalPasteAssembly` is advertised, multi-frame bracketed pastes
+(`\x1b[200~...\x1b[201~` spanning more than one 16 KiB frame) carry
+`pasteStage: "chunk"` on intermediate frames and `pasteStage: "commit"` on the
+final frame, while client framing never splits either 6-byte delimiter across
+frame boundaries. Intermediate `"chunk"` frames append into the lease's bounded
+1 MiB staged paste buffer and acknowledge immediately so per-connection frame
+and 256 KiB byte permits are released before later frames arrive; `"commit"`
+writes the complete assembled envelope atomically to `TerminalWriter::enqueue`
+and acknowledges after PTY delivery. Ordinary frames without `pasteStage` keep
+their per-frame PTY-delivery acknowledgement unchanged. Cancelling,
+disconnecting, losing workspace admission, interrupting an open staged paste
+with a non-staged frame, exceeding 1 MiB, or letting an unclosed staged paste
+expire discards the unpublished staged buffer with zero PTY writes and fails
+the lease.
 
 All three use `terminal:operate`. The server binds each lease to the physical
 RPC connection and captured terminal process generation. Reconnecting with the
@@ -5564,36 +5621,17 @@ boolean `force`. Omitting `force`, or sending `false`, uses the normal refresh
 throttle; `force: true` starts an explicit fetch even inside that interval.
 The default preserves compatibility for older clients.
 
-Antigravity reports its account quota as several groups (one per model family,
-each with a 5-hour and a weekly window), carried in the snapshot's optional
-`windowGroups`. Its snapshot appears in a response only when the request names
-`antigravity`: both `server.getProviderUsage` (optional `providers` input) and
-`server.refreshProviderUsage` answer a request that omits the list, and the
-usage nested in the Codex reset result, with Claude and Codex alone, so an older
-client never receives a provider it cannot decode. The status bar asks for
-Antigravity in its own request and read, with its own pending state, and stops
-polling a server whose answer has no Antigravity entry. The server runs one
-Antigravity attempt at a time as a task no caller owns: every request that
-arrives while it runs (forced or not) waits for that attempt, the result is
-committed once even when every caller went away, and a cancelled caller never
-stops the CLI. Automatic refreshes run the CLI at most once per five minutes,
-counted from the end of an attempt that ran the usage command; a result that
-ran nothing (instance off, CLI missing, version not confirmed) starts no
-cooldown. A forced refresh bypasses the cooldown. The global 30-second throttle
-covers Claude and Codex only, also inside a request that names Antigravity too.
-The CLI runs only when the default Antigravity instance is on, with that
-instance's environment including its stored secrets, and only after
-`--version` of the same resolved executable proves CLI 1.1.11 or newer; both
-runs get a null stdin. The service owns each attempt: one 20-second deadline
-covers the settings read, both runs and their cleanup, cancels through the
-supervisor so no descendant survives, and stops the task before another attempt
-may start; runtime shutdown closes admission and drains a running attempt
-before process ownership is frozen. The cooldown starts only when the usage
-command was spawned. An executable replaced at its resolved path between the
-version probe and the usage run is not detected: the configured binary is
-trusted as the chat provider trusts it. Antigravity data older than 30 minutes, including data
-retained on an error, is dropped and reads as out of date. The design is in
-`docs/plans/2026-11-21-antigravity-usage-design.md`.
+Antigravity does not poll account quota via `agy -p "/usage"` or a usage-only
+`agy --version` probe (#429). `server.getProviderUsage` and
+`server.refreshProviderUsage` answer an omitted provider list with Claude and
+Codex alone. If an older client explicitly names `antigravity` in `providers`
+(including with `force: true`), the server returns an `unavailable` snapshot for
+Antigravity without spawning `agy` and without consuming the 30-second
+Claude/Codex refresh throttle when no other provider was requested. Antigravity
+quota limits and reset times are classified in-band from the active `agy acp`
+chat session (`session/update` `agent_message_chunk` notices and
+`session/prompt` quota errors) and surfaced as a single in-chat usage-limit
+notice per turn.
 
 Forced refresh changes admission only. It does not authorize credential
 mutation or account management: provider usage fetchers remain observers of

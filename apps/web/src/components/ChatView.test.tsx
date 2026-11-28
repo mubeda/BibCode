@@ -1005,7 +1005,12 @@ function makeEnvironmentPresentation(
     environment: {
       label: "Local",
       platform: { os: "linux" as const, arch: "x64" as const },
-      capabilities: { activityProtocolVersion: 2 as const, worktreeCatalog: true },
+      capabilities: {
+        activityProtocolVersion: 2 as const,
+        worktreeCatalog: true,
+        pipelinesReads: true,
+        pullRequestsReads: true,
+      },
     },
   };
   return {
@@ -4675,18 +4680,34 @@ describe("ChatView", () => {
       expect(rightPanel["diffAvailable"]).toBe(true);
       expect(rightPanel["sourceControlAvailable"]).toBe(true);
       expect(rightPanel["filesAvailable"]).toBe(true);
+      expect(rightPanel["gitManagerAvailable"]).toBe(true);
+      expect(rightPanel["pipelinesAvailable"]).toBe(true);
+      expect(rightPanel["pullRequestAvailable"]).toBe(true);
 
-      (rightPanel["onAddTerminal"] as () => void)();
-      (rightPanel["onAddDiff"] as () => void)();
-      (rightPanel["onAddSourceControl"] as () => void)();
-      (rightPanel["onAddFiles"] as () => void)();
+      (rightPanel["onSelectTerminal"] as () => void)();
+      (rightPanel["onSelectDiff"] as () => void)();
+      (rightPanel["onSelectSourceControl"] as () => void)();
+      (rightPanel["onSelectFiles"] as () => void)();
+      (rightPanel["onSelectGitManager"] as () => void)();
+      (rightPanel["onSelectPipelines"] as () => void)();
+      (rightPanel["onSelectPullRequest"] as () => void)();
 
       expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(1);
       expect(
         (useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces ?? []).map(
           (surface) => surface.kind,
         ),
-      ).toEqual(expect.arrayContaining(["terminal", "diff", "sourceControl", "files"]));
+      ).toEqual(
+        expect.arrayContaining([
+          "terminal",
+          "diff",
+          "sourceControl",
+          "files",
+          "gitManager",
+          "pipelines",
+          "pullRequest",
+        ]),
+      );
     });
   });
 
@@ -5093,7 +5114,7 @@ describe("ChatView", () => {
         { id: "browser:tab-a", kind: "preview", resourceId: "tab-a" },
         { id: "browser:tab-b", kind: "preview", resourceId: "tab-b" },
         {
-          id: "terminal:term-active",
+          id: "terminal",
           kind: "terminal",
           resourceId: "term-active",
           terminalIds: ["term-active"],
@@ -8820,7 +8841,12 @@ describe("ChatView long-lived handlers (#204)", () => {
       providers: [compactingProvider],
       environment: {
         label: "Local",
-        capabilities: { activityProtocolVersion: 2 as const, worktreeCatalog: true },
+        capabilities: {
+          activityProtocolVersion: 2 as const,
+          worktreeCatalog: true,
+          pipelinesReads: true,
+          pullRequestsReads: true,
+        },
       },
     };
     const local = makeEnvironmentPresentation({
@@ -9345,5 +9371,590 @@ describe("ChatView composer model picker provider scope (#347)", () => {
     expect(new Set(await openPickerAndListInstances(container))).toEqual(
       new Set([claudeInstanceId, claudeWorkProvider.instanceId]),
     );
+  });
+
+  it("renders environment, folder, Main checkout, and live branch below ChatComposer for a primary checkout (#428)", async () => {
+    seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+    h.queryDataByKey.set("vcs.status", { isRepo: true, refName: "main" });
+    seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+    seedServerThread(makeThread({ branch: "stale-thread-branch", worktreePath: null }));
+
+    const container = await mount(serverRoute);
+
+    const strip = container.querySelector('[data-testid="composer-context-strip"]');
+    expect(strip).not.toBeNull();
+    expect(strip?.className).toContain("pointer-events-auto");
+    expect(strip?.closest("[data-chat-composer-footer]")).toBeNull();
+    expect(strip?.textContent).toContain("Local");
+    const folder = container.querySelector('[data-testid="composer-context-folder"]');
+    const branch = container.querySelector('[data-testid="composer-context-branch"]');
+    expect(folder?.className).toContain("pointer-events-auto");
+    expect(branch?.className).toContain("pointer-events-auto");
+    expect(folder?.textContent).toBe("bibcode");
+    expect(folder?.getAttribute("title")).toBe("/workspace/bibcode");
+    expect(
+      container.querySelector('[data-testid="composer-context-checkout-kind"]')?.textContent,
+    ).toBe("Main checkout");
+    expect(branch?.textContent).toBe("main");
+  });
+
+  it("derives Worktree for a linked worktree thread (#428)", async () => {
+    seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+    h.queryDataByKey.set("vcs.status", { isRepo: true, refName: "feat/worktree-row" });
+    seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+    seedServerThread(
+      makeThread({
+        branch: "feat/worktree-row",
+        worktreePath: "/workspace/bibcode-worktrees/feat-row",
+      }),
+    );
+
+    const container = await mount(serverRoute);
+
+    expect(container.querySelector('[data-testid="composer-context-folder"]')?.textContent).toBe(
+      "feat-row",
+    );
+    expect(
+      container.querySelector('[data-testid="composer-context-checkout-kind"]')?.textContent,
+    ).toBe("Worktree");
+    expect(container.querySelector('[data-testid="composer-context-branch"]')?.textContent).toBe(
+      "feat/worktree-row",
+    );
+  });
+
+  it("omits the branch segment when completed vcs status is detached HEAD even with a stale thread branch (#428)", async () => {
+    seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+    seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+    seedServerThread(makeThread({ branch: "historical-branch", worktreePath: null }));
+    h.queryDataByKey.set("vcs.status", { isRepo: true, refName: null });
+
+    const container = await mount(serverRoute);
+
+    expect(container.querySelector('[data-testid="composer-context-branch"]')).toBeNull();
+  });
+
+  it("omits the branch segment when completed vcs status is non-repo even with a stale thread branch (#428)", async () => {
+    seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+    seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+    seedServerThread(makeThread({ branch: "historical-branch", worktreePath: null }));
+    h.queryDataByKey.set("vcs.status", { isRepo: false, refName: null });
+
+    const container = await mount(serverRoute);
+
+    expect(container.querySelector('[data-testid="composer-context-branch"]')).toBeNull();
+  });
+
+  it("renders exactly one visible Antigravity usage-limit notice for chunk completion, reset-time enrichment, and pre-update delivery rejection (#429)", async () => {
+    const countOccurrences = (text: string, needle: string) => text.split(needle).length - 1;
+    const notice = "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m).";
+    const initialNotice = "Antigravity usage limit reached. Try again later or switch models.";
+    const turnId = TurnId.make("turn-quota-1");
+
+    const mountFullChat = async (thread: ReturnType<typeof makeThread>) => {
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      h.realChildren = true;
+      h.realTimeline = true;
+      seedEnvironment(makeEnvironmentPresentation({ label: "Local" }));
+      seedProject(makeProject({ workspaceRoot: "/workspace/bibcode" }));
+      seedServerThread(thread);
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(serverRoute);
+        await Promise.resolve();
+      });
+      return {
+        container,
+        unmount: async () => {
+          await act(async () => root.unmount());
+          container.remove();
+        },
+      };
+    };
+
+    // Case 1: quota chunk published as runtime.warning (provider.warning) + turn.completed sets
+    // session.lastError -> rendered ONCE in MessagesTimeline, NOT duplicated in ThreadErrorBanner.
+    const view1 = await mountFullChat(
+      makeThread({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("antigravity"),
+          model: "auto",
+        },
+        latestTurn: {
+          turnId,
+          state: "error",
+          requestedAt: "2026-11-27T18:00:00.000Z",
+          startedAt: "2026-11-27T18:00:00.000Z",
+          completedAt: "2026-11-27T18:00:01.000Z",
+          assistantMessageId: null,
+        },
+        session: {
+          threadId,
+          providerName: "Antigravity",
+          status: "error",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          updatedAt: "2026-11-27T18:00:01.000Z",
+          lastError: notice,
+          lastErrorClass: "provider_error",
+        },
+        messages: [
+          {
+            id: MessageId.make("user-quota-1"),
+            role: "user",
+            text: "Continue refactoring",
+            turnId: null,
+            createdAt: "2026-11-27T18:00:00.000Z",
+            updatedAt: "2026-11-27T18:00:00.000Z",
+            streaming: false,
+          },
+        ],
+        activities: [
+          {
+            id: EventId.make("evt-quota-1"),
+            tone: "warning",
+            kind: "provider.warning",
+            summary: "Usage limit reached",
+            payload: {
+              usageLimit: true,
+              message: notice,
+              detail: notice,
+              resetsAt: "2026-11-27T20:30:00Z",
+              eventType: "runtime.warning",
+            },
+            turnId,
+            sequence: 1,
+            createdAt: "2026-11-27T18:00:00.500Z",
+          },
+        ],
+      }),
+    );
+    try {
+      const text = view1.container.textContent ?? "";
+      expect(countOccurrences(text, notice)).toBe(1);
+      expect(text).toContain("Usage limit reached");
+      expect(capturedProps<Record<string, unknown>>("threadErrorBanner")["error"]).toBeNull();
+    } finally {
+      await view1.unmount();
+    }
+
+    // Case 2: chunk without reset time followed by enriched warning with reset time on same turn
+    // collapses to ONE timeline notice carrying the reset time.
+    const view2 = await mountFullChat(
+      makeThread({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("antigravity"),
+          model: "auto",
+        },
+        latestTurn: {
+          turnId,
+          state: "error",
+          requestedAt: "2026-11-27T18:00:00.000Z",
+          startedAt: "2026-11-27T18:00:00.000Z",
+          completedAt: "2026-11-27T18:00:01.000Z",
+          assistantMessageId: null,
+        },
+        session: {
+          threadId,
+          providerName: "Antigravity",
+          status: "error",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          updatedAt: "2026-11-27T18:00:01.000Z",
+          lastError: notice,
+          lastErrorClass: "provider_error",
+        },
+        messages: [
+          {
+            id: MessageId.make("user-quota-2"),
+            role: "user",
+            text: "Continue refactoring",
+            turnId: null,
+            createdAt: "2026-11-27T18:00:00.000Z",
+            updatedAt: "2026-11-27T18:00:00.000Z",
+            streaming: false,
+          },
+        ],
+        activities: [
+          {
+            id: EventId.make("evt-quota-2a"),
+            tone: "warning",
+            kind: "provider.warning",
+            summary: "Usage limit reached",
+            payload: {
+              usageLimit: true,
+              message: initialNotice,
+              detail: initialNotice,
+              eventType: "runtime.warning",
+            },
+            turnId,
+            sequence: 1,
+            createdAt: "2026-11-27T18:00:00.400Z",
+          },
+          {
+            id: EventId.make("evt-quota-2b"),
+            tone: "warning",
+            kind: "provider.warning",
+            summary: "Usage limit reached",
+            payload: {
+              usageLimit: true,
+              message: notice,
+              detail: notice,
+              resetsAt: "2026-11-27T20:30:00Z",
+              eventType: "runtime.warning",
+            },
+            turnId,
+            sequence: 2,
+            createdAt: "2026-11-27T18:00:00.800Z",
+          },
+        ],
+      }),
+    );
+    try {
+      const text = view2.container.textContent ?? "";
+      expect(countOccurrences(text, notice)).toBe(1);
+      expect(text).not.toContain(initialNotice);
+      expect(capturedProps<Record<string, unknown>>("threadErrorBanner")["error"]).toBeNull();
+    } finally {
+      await view2.unmount();
+    }
+
+    // Case 3: prompt rejected with quota error before first update -> rendered ONCE on the failed
+    // delivery card with Retry and Dismiss recovery controls intact, NOT duplicated in the banner.
+    const view3 = await mountFullChat(
+      makeThread({
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("antigravity"),
+          model: "auto",
+        },
+        session: {
+          threadId,
+          providerName: "Antigravity",
+          status: "error",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          updatedAt: "2026-11-27T18:00:01.000Z",
+          lastError: notice,
+          lastErrorClass: "provider_error",
+        },
+        messages: [
+          {
+            id: MessageId.make("user-quota-3"),
+            role: "user",
+            text: "Continue refactoring",
+            turnId: null,
+            createdAt: "2026-11-27T18:00:00.000Z",
+            updatedAt: "2026-11-27T18:00:00.000Z",
+            streaming: false,
+            delivery: {
+              state: "failed",
+              mode: "start",
+              provider: ProviderDriverKind.make("antigravity"),
+              providerInstanceId: ProviderInstanceId.make("antigravity"),
+              detail: notice,
+            },
+          },
+        ],
+        activities: [],
+      }),
+    );
+    try {
+      const text = view3.container.textContent ?? "";
+      expect(countOccurrences(text, notice)).toBe(1);
+      expect(text).toContain("Delivery failed");
+      const buttonLabels = [...view3.container.querySelectorAll("button")].map(
+        (button) => button.textContent?.trim() ?? "",
+      );
+      expect(buttonLabels).toContain("Retry");
+      expect(buttonLabels).toContain("Dismiss");
+      expect(capturedProps<Record<string, unknown>>("threadErrorBanner")["error"]).toBeNull();
+    } finally {
+      await view3.unmount();
+    }
+
+    // Case 4: subsequent tool calls / session.exited rows never hide the quota notice inside
+    // work-group overflow, AND verbose chat renders the notice ONCE (never duplicated in `<pre>`).
+    const prevSettings = h.settings;
+    for (const verboseChat of [false, true]) {
+      h.settings = { ...prevSettings, verboseChat };
+      const view4 = await mountFullChat(
+        makeThread({
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "auto",
+          },
+          latestTurn: {
+            turnId,
+            state: "error",
+            requestedAt: "2026-11-27T18:00:00.000Z",
+            startedAt: "2026-11-27T18:00:00.000Z",
+            completedAt: "2026-11-27T18:00:02.000Z",
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            providerName: "Antigravity",
+            status: "error",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            updatedAt: "2026-11-27T18:00:02.000Z",
+            lastError: notice,
+            lastErrorClass: "provider_error",
+          },
+          messages: [
+            {
+              id: MessageId.make("user-quota-4"),
+              role: "user",
+              text: "Continue refactoring",
+              turnId: null,
+              createdAt: "2026-11-27T18:00:00.000Z",
+              updatedAt: "2026-11-27T18:00:00.000Z",
+              streaming: false,
+            },
+          ],
+          activities: [
+            {
+              id: EventId.make("evt-quota-4-warning"),
+              tone: "warning",
+              kind: "provider.warning",
+              summary: "Usage limit reached",
+              payload: {
+                usageLimit: true,
+                message: notice,
+                detail: notice,
+                resetsAt: "2026-11-27T20:30:00Z",
+                eventType: "runtime.warning",
+              },
+              turnId,
+              sequence: 1,
+              createdAt: "2026-11-27T18:00:00.500Z",
+            },
+            {
+              id: EventId.make("evt-quota-4-tool"),
+              tone: "tool",
+              kind: "tool.completed",
+              summary: "Shell completed",
+              payload: {
+                itemType: "command_execution",
+                detail: "ls",
+                status: "completed",
+              },
+              turnId,
+              sequence: 2,
+              createdAt: "2026-11-27T18:00:01.000Z",
+            },
+            {
+              id: EventId.make("evt-quota-4-exit"),
+              tone: "info",
+              kind: "provider.session",
+              summary: "Session ended",
+              payload: {
+                reason: "Antigravity session closed",
+                eventType: "session.exited",
+              },
+              turnId: null,
+              sequence: 3,
+              createdAt: "2026-11-27T18:00:02.000Z",
+            },
+          ],
+        }),
+      );
+      try {
+        const text = view4.container.textContent ?? "";
+        expect(countOccurrences(text, notice)).toBe(1);
+        expect(capturedProps<Record<string, unknown>>("threadErrorBanner")["error"]).toBeNull();
+      } finally {
+        await view4.unmount();
+      }
+    }
+    h.settings = prevSettings;
+  });
+
+  describe("right-panel fixed icon bar lazy mounting, terminal capacity, D6 fallback, and v11 overflow cleanup (#426)", () => {
+    it("mounts zero inactive surface bodies and opens zero terminal or preview sessions when opened empty", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useRightPanelStore.getState().toggleVisibility(threadRef);
+      publishSeededStoreState(useRightPanelStore);
+
+      const markup = renderServerRoute();
+
+      expect(markup).toContain('data-mock="right-panel-tabs"');
+      expect(markup).not.toContain('data-mock="thread-terminal-panel"');
+      expect(markup).not.toContain('data-mock="diff-panel"');
+      expect(markup).not.toContain('data-mock="source-control-panel"');
+      expect(markup).not.toContain('data-mock="file-preview-panel"');
+      expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(0);
+      expect(h.commandCalls.filter((call) => call.key === "preview.open")).toHaveLength(0);
+      const rightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      expect(rightPanel["activeSurfaceId"]).toBeNull();
+      expect(rightPanel["surfaces"]).toEqual([]);
+    });
+
+    it("reuses the singleton terminal on repeated Terminal icon clicks and enforces the 4-pane cap on New terminal", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useRightPanelStore.getState().toggleVisibility(threadRef);
+      publishSeededStoreState(useRightPanelStore);
+
+      renderServerRoute();
+      const rightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      const onSelectTerminal = rightPanel["onSelectTerminal"] as () => void;
+
+      // First click opens one shell; repeated icon clicks never open extra shells.
+      onSelectTerminal();
+      onSelectTerminal();
+      onSelectTerminal();
+      expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(1);
+      const terminalSurfaces = (
+        useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces ?? []
+      ).filter((surface) => surface.kind === "terminal");
+      expect(terminalSurfaces).toHaveLength(1);
+      expect(terminalSurfaces[0]?.id).toBe("terminal");
+
+      // Re-render with terminal active to capture onNewTerminal from PersistentThreadTerminalPanel.
+      publishSeededStoreState(useRightPanelStore);
+      renderServerRoute();
+      const terminalProps = capturedProps<Record<string, unknown>>("threadTerminalPanel");
+      const onNewTerminal = terminalProps["onNewTerminal"] as () => void;
+
+      // Split up to 4 panes, then verify a 5th call never opens an extra server session.
+      onNewTerminal();
+      onNewTerminal();
+      onNewTerminal();
+      onNewTerminal();
+      onNewTerminal();
+      expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(4);
+      const afterCap = useRightPanelStore
+        .getState()
+        .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
+          (surface) => surface.kind === "terminal",
+        );
+      expect(afterCap?.kind === "terminal" ? afterCap.terminalIds : []).toHaveLength(4);
+    });
+
+    it("falls back to an available singleton with active id and body when closing the last Browser tab (D6)", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      h.previewState = {
+        ...h.previewState,
+        activeTabId: "tab-only",
+        sessions: {
+          "tab-only": {
+            threadId,
+            tabId: "tab-only",
+            navStatus: { _tag: "Success", url: "https://example.test/", title: "Preview" },
+            canGoBack: false,
+            canGoForward: false,
+            updatedAt: "2026-11-27T18:00:00.000Z",
+          },
+        },
+      };
+      useRightPanelStore.getState().openBrowser(threadRef, "tab-only");
+      publishSeededStoreState(useRightPanelStore);
+
+      await mount(serverRoute);
+      const rightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      const onCloseSurface = rightPanel["onCloseSurface"] as (surface: {
+        id: string;
+        kind: "preview";
+        resourceId: string;
+      }) => void;
+      await act(async () => {
+        onCloseSurface({ id: "browser:tab-only", kind: "preview", resourceId: "tab-only" });
+        publishSeededStoreState(useRightPanelStore);
+      });
+
+      const nextState = useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)];
+      expect(nextState?.isOpen).toBe(true);
+      expect(nextState?.activeSurfaceId).toBe("files");
+      const nextRightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      expect(nextRightPanel["activeSurfaceId"]).toBe("files");
+      expect(nextRightPanel["children"]).not.toBeNull();
+    });
+
+    it("retires v11 migrated overflow terminal IDs on mount", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useRightPanelStore.setState({
+        migratedOverflowTerminalIdsByThreadKey: {
+          [scopedThreadKey(threadRef)]: ["term-overflow-1", "term-overflow-2"],
+        },
+      });
+      publishSeededStoreState(useRightPanelStore);
+
+      await mount(serverRoute);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      const closedIds = h.commandCalls
+        .filter((call) => call.key === "terminal.close")
+        .map((call) => (call.input as { input: { terminalId: string } }).input.terminalId);
+      expect(closedIds).toEqual(expect.arrayContaining(["term-overflow-1", "term-overflow-2"]));
+      expect(useRightPanelStore.getState().consumeMigratedOverflowTerminalIds(threadRef)).toEqual(
+        [],
+      );
+    });
+
+    it("never retires a background Terminal when bulk-closing dynamic file tabs, and preserves child Diff on Diff icon click", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      const childThreadId = ThreadId.make("child-thread-1");
+      useRightPanelStore.getState().openFile(threadRef, "src/a.ts");
+      useRightPanelStore.getState().openTerminal(threadRef, "term-keep-alive");
+      useRightPanelStore.getState().openDiff(threadRef, childThreadId);
+      useRightPanelStore.getState().openFile(threadRef, "src/b.ts");
+      publishSeededStoreState(useRightPanelStore);
+
+      await mount(serverRoute);
+      const rightPanel = capturedProps<Record<string, unknown>>("rightPanelTabs");
+      const onCloseToRight = rightPanel["onCloseSurfacesToRight"] as (surface: {
+        id: string;
+        kind: "file";
+        relativePath: string;
+        revealLine: null;
+        revealRequestId: number;
+      }) => void;
+      await act(async () => {
+        onCloseToRight({
+          id: "file:src/a.ts",
+          kind: "file",
+          relativePath: "src/a.ts",
+          revealLine: null,
+          revealRequestId: 0,
+        });
+        publishSeededStoreState(useRightPanelStore);
+      });
+
+      expect(h.commandCalls.filter((call) => call.key === "terminal.close")).toHaveLength(0);
+      const surfacesAfter =
+        useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces ?? [];
+      expect(surfacesAfter.some((surface) => surface.kind === "terminal")).toBe(true);
+      expect(surfacesAfter.some((surface) => surface.id === "file:src/b.ts")).toBe(false);
+
+      const onSelectDiff = rightPanel["onSelectDiff"] as () => void;
+      await act(async () => {
+        onSelectDiff();
+        publishSeededStoreState(useRightPanelStore);
+      });
+      const diffSurface = useRightPanelStore
+        .getState()
+        .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
+          (surface) => surface.kind === "diff",
+        );
+      expect(diffSurface).toEqual({ id: "diff", kind: "diff", threadId: childThreadId });
+    });
   });
 });

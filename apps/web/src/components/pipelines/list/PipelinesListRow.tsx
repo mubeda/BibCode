@@ -24,6 +24,7 @@ import { Button } from "../../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../../ui/menu";
 import { PipelineActions } from "../actions/PipelineActions";
 import type { RepositoryPermission } from "../actions/pipelineActions.logic";
+import { useEmbeddedPipelinesNavigation } from "../detail/PipelineLinks";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import {
   formatPipelineDuration,
@@ -144,6 +145,7 @@ export const PipelinesListRow = memo(function PipelinesListRow({
   repositoryPermission,
   rowIndex,
 }: PipelinesListRowProps) {
+  const embeddedNavigation = useEmbeddedPipelinesNavigation();
   const hoverPrefetch = usePipelineHoverPrefetch({
     environmentId: scope.environmentId,
     cwd: scope.cwd,
@@ -194,15 +196,27 @@ export const PipelinesListRow = memo(function PipelinesListRow({
       <div role="cell" className="min-w-0 space-y-0.5">
         <p className="truncate text-sm font-medium">
           {/* The title's hit area covers the row, so the whole row opens the pipeline. */}
-          <Link
-            to="/project/$environmentId/$projectId/pipelines/$pipelineId"
-            params={{ ...projectRef, pipelineId: String(row.id) }}
-            // The overlay covers the status cell, so its full text rides on the row's tooltip.
-            title={`${title}\n${status}`}
-            className="underline-offset-2 after:absolute after:inset-0 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
-          >
-            {title}
-          </Link>
+          {embeddedNavigation !== null ? (
+            <button
+              type="button"
+              // The overlay covers the status cell, so its full text rides on the row's tooltip.
+              title={`${title}\n${status}`}
+              className="text-left underline-offset-2 after:absolute after:inset-0 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+              onClick={() => embeddedNavigation.openPipeline(row.id)}
+            >
+              {title}
+            </button>
+          ) : (
+            <Link
+              to="/project/$environmentId/$projectId/pipelines/$pipelineId"
+              params={{ ...projectRef, pipelineId: String(row.id) }}
+              // The overlay covers the status cell, so its full text rides on the row's tooltip.
+              title={`${title}\n${status}`}
+              className="underline-offset-2 after:absolute after:inset-0 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+            >
+              {title}
+            </Link>
+          )}
         </p>
         <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-xs text-muted-foreground">
           <span className="shrink-0 font-medium text-foreground tabular-nums">{row.label}</span>

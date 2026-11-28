@@ -85,26 +85,11 @@ async function openFilesSurface(): Promise<void> {
     await toggle.click();
     await rightPanel.waitForDisplayed();
   }
-  const existingTab = browser.$(
-    '//*[@data-right-panel-tab-list]//button[normalize-space()="Files"]',
+  const filesButton = browser.$(
+    '[data-right-panel-icon-bar] button[aria-label="Files"]:not([aria-disabled="true"])',
   );
-  if (await existingTab.isDisplayed()) {
-    await existingTab.click();
-    return;
-  }
-  const emptyStateAction = browser.$(
-    '//button[.//span[normalize-space()="Files"] and not(@aria-disabled="true")]',
-  );
-  if (await emptyStateAction.isDisplayed()) {
-    await emptyStateAction.click();
-    return;
-  }
-  const addSurface = browser.$('button[aria-label="Add panel surface"]');
-  await addSurface.waitForDisplayed();
-  await addSurface.click();
-  const menuItem = browser.$('//*[@role="menuitem" and normalize-space()="Files"]');
-  await menuItem.waitForDisplayed();
-  await menuItem.click();
+  await filesButton.waitForDisplayed();
+  await filesButton.click();
 }
 
 async function openWorkspaceFile(fileName: string): Promise<void> {

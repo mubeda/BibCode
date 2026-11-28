@@ -10,7 +10,113 @@ pub mod opencode;
 
 use std::fmt;
 
-#[derive(Clone, Copy)]
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// How a user settled a pending clarifying-question request (#430).
+///
+/// Older answers-only callers (including MCP `answer_question`) omit this field and default to
+/// [`UserInputResponseDisposition::Answered`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserInputResponseDisposition {
+    #[default]
+    Answered,
+    Skipped,
+    Cancelled,
+}
+
+impl UserInputResponseDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub const fn is_skip_or_cancel(self) -> bool {
+        matches!(self, Self::Skipped | Self::Cancelled)
+    }
+
+    /// True when the response suppresses answer delivery: either `Cancelled` (whose answers are
+    /// discarded) or `Skipped` with no non-empty answers. A partial `Skipped` response carrying
+    /// non-empty answers still submits those answers and may start a follow-up turn.
+    pub(crate) fn is_effective_skip_or_cancel(self, answers: &Value) -> bool {
+        matches!(self, Self::Cancelled)
+            || (matches!(self, Self::Skipped) && !has_non_empty_user_input_answer(answers))
+    }
+}
+
+/// Returns true when the answer object carries at least one non-empty string answer.
+pub(crate) fn has_non_empty_user_input_answer(answers: &Value) -> bool {
+    let Some(map) = answers.as_object() else {
+        return false;
+    };
+    map.values().any(|value| match value {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|item| !item.trim().is_empty()),
+        Value::Bool(_) | Value::Number(_) => true,
+        _ => false,
+    })
+}
+
+/// Compact question summaries embedded in `user-input.resolved` payloads so windowed history
+/// reloads render concise receipts even when `user-input.requested` lives on an unloaded page.
+pub(crate) fn compact_user_input_question_summaries(questions: &[Value]) -> Vec<Value> {
+    questions
+        .iter()
+        .filter_map(|question| {
+            let id = question
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())?;
+            let prompt = question
+                .get("question")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())?;
+            let header = question
+                .get("header")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            let mut summary = serde_json::Map::new();
+            summary.insert("id".to_owned(), Value::String(id.to_owned()));
+            if let Some(header) = header {
+                summary.insert("header".to_owned(), Value::String(header.to_owned()));
+            }
+            summary.insert("question".to_owned(), Value::String(prompt.to_owned()));
+            Some(Value::Object(summary))
+        })
+        .collect()
+}
+
+/// Builds a self-sufficient `user-input.resolved` payload carrying answers, disposition, and
+/// compact question metadata.
+pub(crate) fn build_user_input_resolved_payload(
+    answers: Value,
+    disposition: UserInputResponseDisposition,
+    questions: &[Value],
+) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("answers".to_owned(), answers);
+    payload.insert(
+        "disposition".to_owned(),
+        Value::String(disposition.as_str().to_owned()),
+    );
+    let summaries = compact_user_input_question_summaries(questions);
+    if !summaries.is_empty() {
+        payload.insert("questions".to_owned(), Value::Array(summaries));
+    }
+    Value::Object(payload)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct RequestScope(uuid::Uuid);
 
 impl RequestScope {
@@ -29,7 +135,8 @@ impl RequestScope {
 
 #[cfg(test)]
 mod request_scope_tests {
-    use super::RequestScope;
+    use super::{RequestScope, UserInputResponseDisposition};
+    use serde_json::json;
 
     #[test]
     fn one_wire_id_is_stable_within_a_connection_and_distinct_across_connections() {
@@ -39,11 +146,84 @@ mod request_scope_tests {
         assert_ne!(first.approval_id("1"), second.approval_id("1"));
         assert_ne!(first.approval_id("1"), first.user_input_id("1"));
     }
+
+    #[test]
+    fn effective_skip_or_cancel_treats_partial_skipped_answers_as_deliverable() {
+        assert!(
+            UserInputResponseDisposition::Cancelled
+                .is_effective_skip_or_cancel(&json!({"q1": "yes"}))
+        );
+        assert!(UserInputResponseDisposition::Skipped.is_effective_skip_or_cancel(&json!({})));
+        assert!(
+            UserInputResponseDisposition::Skipped
+                .is_effective_skip_or_cancel(&json!({"q1": "   "}))
+        );
+        assert!(
+            !UserInputResponseDisposition::Skipped
+                .is_effective_skip_or_cancel(&json!({"q1": "Espresso"}))
+        );
+        assert!(!UserInputResponseDisposition::Answered.is_effective_skip_or_cancel(&json!({})));
+    }
 }
 
-/// Driver-owned capability used by both inventory and durable steer admission.
+/// Minimum `agy` CLI version that supports mid-turn steering via a second concurrent ACP
+/// `session/prompt` (#434).
+pub(crate) const ANTIGRAVITY_MIN_STEER_VERSION: (u64, u64, u64) = (1, 5, 0);
+
+/// Parses the first `major.minor.patch` version triple from a provider version string.
+pub(crate) fn parse_semver_triple(text: &str) -> Option<(u64, u64, u64)> {
+    parse_semver_with_prerelease(text).map(|(triple, _)| triple)
+}
+
+/// Parses the first `major.minor.patch` version triple along with whether a SemVer prerelease
+/// identifier (`-...`) immediately follows it.
+pub(crate) fn parse_semver_with_prerelease(text: &str) -> Option<((u64, u64, u64), bool)> {
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+'))
+    })
+    .find_map(|token| {
+        let token = token.trim_start_matches(['v', 'V']);
+        let without_build = token.split('+').next().unwrap_or(token);
+        let (core, prerelease) = match without_build.split_once('-') {
+            Some((core, pre)) if !pre.is_empty() => (core, true),
+            _ => (without_build, false),
+        };
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(((major, minor, patch), prerelease))
+    })
+}
+
+/// Driver-owned capability used by durable steer admission.
+///
+/// Antigravity is further version-gated (`agy >= 1.5.0`) in provider inventory via
+/// [`supports_turn_steer_for_version`] and inside the Antigravity runtime.
 pub(crate) fn supports_turn_steer(provider: &str) -> bool {
-    matches!(provider, "codex" | "claudeAgent")
+    matches!(provider, "codex" | "claudeAgent" | "antigravity")
+}
+
+/// Version-aware capability advertised as `supportsTurnSteer` in provider inventory.
+///
+/// Follows SemVer 2.0.0 prerelease precedence: `1.5.0-rc.1 < 1.5.0`, while `1.5.0`, `1.5.1-rc.1`,
+/// and `1.5.15` all satisfy `>= 1.5.0`. (Antigravity chat startup independently requires `>= 1.5.4`.)
+pub(crate) fn supports_turn_steer_for_version(provider: &str, version: Option<&str>) -> bool {
+    match provider {
+        "codex" | "claudeAgent" => true,
+        "antigravity" => {
+            version
+                .and_then(parse_semver_with_prerelease)
+                .is_some_and(|(triple, prerelease)| {
+                    triple > ANTIGRAVITY_MIN_STEER_VERSION
+                        || (triple == ANTIGRAVITY_MIN_STEER_VERSION && !prerelease)
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Driver-owned capability used by inventory, `thread.compact` admission and context-limit

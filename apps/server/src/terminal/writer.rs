@@ -109,8 +109,22 @@ impl TerminalWriter {
         data: &str,
         cancel_on_drop: bool,
     ) -> Result<PendingWrite, TerminalError> {
-        self.push(process, data, cancel_on_drop, None)
+        self.push(process, data, cancel_on_drop, false, None)
             .map(|pending| pending.expect("an unguarded write always queues"))
+    }
+
+    /// Queues `data` for `process` without waiting, checking `guard` on the writer's thread
+    /// immediately before `process.write` so a cancelled lease cannot deliver a queued paste
+    /// behind an earlier blocked write (#431).
+    pub(crate) fn enqueue_guarded(
+        &self,
+        process: &Arc<dyn PtyProcess>,
+        data: &str,
+        cancel_on_drop: bool,
+        guard: WriteGuard,
+    ) -> Result<PendingWrite, TerminalError> {
+        self.push(process, data, cancel_on_drop, false, Some(guard))
+            .map(|pending| pending.expect("a non-exclusive write always queues"))
     }
 
     /// Queues `data` only when no input is queued or being written before it, and writes it only
@@ -122,7 +136,7 @@ impl TerminalWriter {
         data: &str,
         guard: WriteGuard,
     ) -> Result<Option<PendingWrite>, TerminalError> {
-        self.push(process, data, true, Some(guard))
+        self.push(process, data, true, true, Some(guard))
     }
 
     fn push(
@@ -130,6 +144,7 @@ impl TerminalWriter {
         process: &Arc<dyn PtyProcess>,
         data: &str,
         cancel_on_drop: bool,
+        alone: bool,
         guard: Option<WriteGuard>,
     ) -> Result<Option<PendingWrite>, TerminalError> {
         let length = data.len();
@@ -140,7 +155,7 @@ impl TerminalWriter {
         if self.stopped.load(Ordering::Acquire) {
             return Err(TerminalError::PublicationCancelled);
         }
-        if guard.is_some() && self.queued.load(Ordering::Acquire) != 0 {
+        if alone && self.queued.load(Ordering::Acquire) != 0 {
             return Ok(None);
         }
         if self.queued.load(Ordering::Acquire) + length > MOST_QUEUED_INPUT_BYTES {

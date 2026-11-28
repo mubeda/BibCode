@@ -992,4 +992,45 @@ describe("createTerminalTranscriptRuntime ordered by server generation (#348)", 
       },
     ]);
   });
+
+  it("preserves DEC ?2004h across clear and renderer remount while running, and drops it on exit", () => {
+    const runtime = createTerminalTranscriptRuntime({ maxBufferBytes: 32 });
+    runtime.ingest(snapshotAt(1, 0, "\u001b[?2004hprompt "));
+    runtime.ingest({
+      type: "output",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      sequence: 1,
+      data: "a".repeat(64),
+    });
+
+    const remounted: TerminalRenderSignal[] = [];
+    const sub1 = runtime.attachRenderer((signal) => remounted.push(signal));
+    expect(remounted[0]?.type).toBe("reset");
+    if (remounted[0]?.type === "reset") {
+      expect(remounted[0].snapshot.endsWith("\u001b[?2004h")).toBe(true);
+    }
+
+    runtime.ingest({
+      type: "cleared",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      sequence: 2,
+    });
+    expect(remounted.at(-1)).toMatchObject({ type: "reset", snapshot: "\u001b[?2004h" });
+    sub1.detach();
+
+    runtime.ingest({
+      type: "exited",
+      threadId: "thread-1",
+      terminalId: "terminal-1",
+      sequence: 3,
+      exitCode: 0,
+      exitSignal: null,
+      generation: generation(1),
+    });
+    const afterExit: TerminalRenderSignal[] = [];
+    runtime.attachRenderer((signal) => afterExit.push(signal));
+    expect(afterExit[0]).toMatchObject({ type: "reset", snapshot: "" });
+  });
 });

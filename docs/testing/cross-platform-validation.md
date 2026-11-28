@@ -347,7 +347,18 @@ In the center terminal, right-panel terminal, and a provider's terminal view,
 select one line of output and copy with **Ctrl+C**, then paste with **Ctrl+V**
 (**Cmd+C/V** on macOS). Verify the exact selected text reaches the destination
 once. Also check **Ctrl+Shift+C/V**, and multiline paste with an application
-that enables bracketed paste. Selecting text must leave keyboard focus in the
+that enables bracketed paste. In an Antigravity AI Terminal (both directly
+launched and revealed by terminal ID without a launch descriptor), test short
+and >16 KiB multiline pastes (and >256 KiB staged pastes) when bracketed paste
+mode is OFF and ON (including clipboard text containing embedded `\x1b[201~`):
+verify zero premature submissions occur before explicit Enter, and exactly one
+complete normalized prompt submits when Enter is pressed. Verify plain shells
+and other provider AI terminals without `?2004h` receive no stray
+`\x1b[200~`/`\x1b[201~` markers, legacy servers without `terminalOrderedInput`
+send complete bracketed pastes up to 64 KiB in a single write (and fail cleanly
+above 64 KiB without sending a partial unclosed envelope), and remounting or
+clearing a running terminal after history eviction preserves active `?2004h`
+mode while exited terminals still reset it. Selecting text must leave keyboard focus in the
 terminal and must not open the **Add to chat** menu or overwrite the clipboard.
 Right-click the selected text and choose **Add to chat**; the selection must
 still attach to the composer. Right-click it again and choose **Copy**; the
@@ -623,6 +634,16 @@ late acceptance must not restore a session that has already settled. Test local
 Claude settlement/interrupt during writer contention, late user echoes, and a
 failed target lookup after a durable claim. Unwritten input returns to the
 queue or pending; input that may have reached the provider stays uncertain.
+For Antigravity, verify the `agy >= 1.5.0` capability gate (`1.5.0-rc.1` and
+`< 1.5.0` omit `supportsTurnSteer`), refusal while the initial start is still
+in flight or any permission request is pending, non-cancelling concurrent
+`session/prompt` delivery that keeps the active turn open when the original
+prompt settles first, preservation of the original prompt (or its single
+deferred `turn.completed`) when a concurrent steer is rejected, fencing of
+previous-prompt updates and permission requests against acknowledging an
+unconfirmed steer, and Stop/Retry behaviour (unanswered cancel retires the
+child as `Ambiguous`, while transport errors settle cleanly and recycle the
+session on Retry).
 
 The native Codex and Claude steer fixtures use subprocess pipes, not real
 providers or sockets. They currently run on Unix; record Windows native-protocol
@@ -922,7 +943,15 @@ screenshots:
    tool-free reply as the next Claude turn. Its matching text echo may include
    attachments and arrive after completion; tool-result lines cannot acknowledge
    it. Verify attribution to the runtime turn current at acknowledgement.
-4. On Cursor, Grok, and OpenCode where available, verify the explanation that
+4. On Antigravity (`agy >= 1.5.4`, the minimum CLI version chat startup accepts),
+   verify head-only Steer sends a concurrent `session/prompt` without cancelling
+   the running turn, refuses while a permission approval is pending or before the
+   initial prompt starts streaming, keeps the running turn alive when the first
+   prompt settles first, returns a rejected steer to the queue without failing the
+   running turn, and cleanly supports Stop and Retry after transport failure.
+   Verify the `1.5.0` capability boundary (including prerelease versions such as
+   `1.5.0-rc.1`) through inventory unit tests rather than live chat startup. On
+   Cursor, Grok, and OpenCode where available, verify the explanation that
    steering is unsupported and confirm automatic sending still works. Record
    unavailable providers explicitly.
 5. Cancel a queued card with another client connected: it disappears in both,
@@ -936,7 +965,15 @@ screenshots:
    becomes an error and the held head shows **Waiting for you**; **Send now**
    must start it. Report unavailable attachment restoration after reload or
    from another client without losing text.
-8. Hold a pending approval or question and verify no automatic sending. After
+8. On Antigravity, confirm **Show Antigravity usage** is absent from
+   **Settings -> Status bar**, the status bar shows no Antigravity usage meter
+   (Claude and Codex meters remain unchanged), and provider usage refreshes
+   never spawn `agy -p "/usage"` or a usage-only `agy --version` probe. When
+   `agy acp` emits a single-line `⚠` quota notice or a quota `session/prompt`
+   error, verify exactly one in-chat **Usage limit reached** notice with the
+   formatted reset time (when present) and one failed turn transition appear
+   while ACP `usage_update` continues reporting context-window tokens.
+9. Hold a pending approval or question and verify no automatic sending. After
    interrupt and error settles, verify **Waiting for you**, persistent holds
    through ready, and explicit **Send now** starting only the head.
    End the provider child mid-turn and verify the next composer send or
@@ -3143,8 +3180,10 @@ starts.
     branches; a rejected push must show an error and leave the dialog closed, and
     cancelling the dialog after the push must not create a request. After the
     request is created or found, **Done** in the dialog opened from Source
-    Control must open it as a right-panel tab beside the thread (one tab per
-    request; Done again does not duplicate it), unless the host is Bitbucket or
+    Control must open or update the singleton **Pull requests** right-panel
+    surface beside the thread with that request selected (opening a second
+    request replaces the selection in the same surface; Done again does not
+    duplicate it), unless the host is Bitbucket or
     Azure DevOps or **Pull requests** is off in Settings, where Done only closes
     the dialog; **Done** from the chat Git action, the Pull Requests page or the
     Git Manager only closes the dialog. A branch
@@ -3254,18 +3293,22 @@ Start with this read-only packaged smoke on each native target; retain the
 screenshots and route evidence in the execution report:
 
 - Open the project's **Pull Requests** sidebar button (accessible label
-  `Pull Requests for <project>`), assert the URL contains `/pull-requests`, and
-  capture the list with the project header still highlighted.
+  `Pull Requests for <project>`). When the project has at least one eligible
+  thread, assert the host thread opens with the right-panel **Pull Request**
+  singleton active (`[data-right-panel-icon-bar] button[aria-label="Pull Request"][data-active-icon="true"]`);
+  when no eligible thread exists, assert the standalone `/pull-requests` route
+  opens with the project header still highlighted.
 - With a configured, authenticated GitHub/GitLab host and a readable request,
   open a row, capture the detail title/state, then select **Files changed** /
-  **Changes**. Verify `?tab=files`, a real text patch rendered by FileDiff and
-  retained selection after reload. An empty or unavailable repository is
-  availability evidence only; it does not pass the list/detail/files smoke.
+  **Changes**. Verify a real text patch rendered by FileDiff and retained
+  selection after reload (and `?tab=files` on standalone detail routes). An
+  empty or unavailable repository is availability evidence only; it does not
+  pass the list/detail/files smoke.
 - With the disposable no-remote packaged fixture, record the actionable
-  unavailable state instead. The Pull Requests sibling beside the Git Manager
-  navigation in `apps/desktop/e2e/specs/pierre-diffs.e2e.ts` checks only route
-  entry and saves `pierre-pull-requests-route.png`; it does not substitute for
-  the authenticated list/detail/files pass or authorize host writes.
+  unavailable state instead. The Pull Requests check beside Git Manager in
+  `apps/desktop/e2e/specs/pierre-diffs.e2e.ts` verifies right-panel entry and
+  saves `pierre-pull-requests-route.png`; it does not substitute for the
+  authenticated list/detail/files pass or authorize host writes.
 
 Run the regression tripwires without a browser:
 
@@ -3339,19 +3382,20 @@ never count a sandbox-denied listener test as passed or skipped.
    refusal after access is revoked or the request changes within that window.
 9. Right-panel requests: with a thread on a branch that has an open request,
    choose **Open MR in panel** (**Open PR in panel** on GitHub) from the
-   Source Control menu; it opens one right-panel tab labelled `!N`/`#N` beside
-   the thread, against the thread's checkout. For a Bitbucket or Azure DevOps
-   repository, or with **Pull requests** off in Settings, the item is absent
-   and Done opens no tab. In the tab, switch tabs, follow a conversation file
-   link (it must select Changes and scroll to the file), reload and confirm the
-   tab and its selected section persist, then use **Open full page** and
-   confirm the `?tab=` URL. On a disposable request, a revert must open the
-   revert request as a second tab and a delete must close only its tab. From
+   Source Control menu; it selects the right panel's singleton **Pull Request**
+   surface on that request against the thread's checkout. For a Bitbucket or
+   Azure DevOps repository, or with **Pull requests** off in Settings, the item
+   is absent and Done opens no request. Inside the surface, switch tabs, follow
+   a conversation file link (it must select Changes and scroll to the file),
+   reload and confirm the selected request and section persist, then use **Open
+   full page** and confirm the `?tab=` URL. On a disposable request, a revert
+   must switch the Pull Request surface to the revert request and a delete must
+   return the surface to the embedded Pull Requests list. From
    the full page, **Open beside a thread…** must list the project's threads
    with those on the request's branch first ("On this branch"), open the
    request in the chosen thread and navigate to it; with no thread it is
-   disabled with its reason. Remove the thread's worktree and confirm the tab
-   shows the unavailable reason instead of an error.
+   disabled with its reason. Remove the thread's worktree and confirm the
+   surface shows the unavailable reason instead of an error.
 10. Verify Commits copy the full SHA and open the host commit. Checks/Pipelines
     group rows with state, duration and links and distinguish the host's empty
     state. Refresh reloads detail plus the active tab (including timeline in
@@ -4854,8 +4898,8 @@ with a pinned (E2EE) profile, and a browser on that machine opening
 `http://<server lan ip>:<port>` (not `localhost`, which is a secure context).
 Record each client's OS, app or browser version, and profile type.
 
-1. **Off by default.** Before turning anything on, the right panel's `+` menu
-   has no **Device** item and the command palette has no **Open device
+1. **Off by default.** Before turning anything on, the right panel's top icon bar
+   has no **Device** icon and the command palette has no **Open device
    preview**. Turn on **Settings → Mobile emulators → Device previews** for the
    environment; both appear.
 2. **Availability.** Open the Device panel: it lists the AVDs. On a host

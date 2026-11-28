@@ -1902,12 +1902,41 @@ describe("MessagesTimeline work entry rows", () => {
 
   it("renders user-input requests with the message icon", async () => {
     const markup = await renderWorkEntry({
-      label: "Question",
-      detail: "Which option?",
+      label: "Waiting for user input",
+      detail: "2 questions awaiting response",
       sourceActivityKind: "user-input.requested",
     });
 
     expect(markup).toContain("lucide-message-circle");
+    expect(markup).toContain("Waiting for user input");
+    expect(markup).toContain("2 questions awaiting response");
+  });
+
+  it("renders concise answered, skipped, and cancelled user-input receipts (#430)", async () => {
+    const answered = await renderWorkEntry({
+      label: "Answered questions",
+      detail: "Scope: Server · Mode: Safe",
+      sourceActivityKind: "user-input.resolved",
+    });
+    expect(answered).toContain("lucide-message-circle");
+    expect(answered).toContain("Answered questions");
+    expect(answered).toContain("Scope: Server · Mode: Safe");
+
+    const skipped = await renderWorkEntry({
+      label: "Skipped questions",
+      detail: "Skipped all questions",
+      sourceActivityKind: "user-input.resolved",
+    });
+    expect(skipped).toContain("Skipped questions");
+    expect(skipped).toContain("Skipped all questions");
+
+    const cancelled = await renderWorkEntry({
+      label: "Cancelled questions",
+      detail: "No answers submitted",
+      sourceActivityKind: "user-input.resolved",
+    });
+    expect(cancelled).toContain("Cancelled questions");
+    expect(cancelled).toContain("No answers submitted");
   });
 
   it("renders provider warnings with an amber alert icon and normal text", async () => {
@@ -1923,6 +1952,23 @@ describe("MessagesTimeline work entry rows", () => {
     expect(markup).toContain("font-medium text-foreground/82");
     expect(markup).not.toContain("lucide-x");
     expect(markup).not.toContain("text-destructive");
+    expect(markup).not.toContain('aria-label="Tool call failed"');
+  });
+
+  it("renders an Antigravity in-chat usage-limit notice with formatted reset time (#429)", async () => {
+    const markup = await renderWorkEntry({
+      label: "Usage limit reached",
+      detail: "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m).",
+      tone: "warning",
+      sourceActivityKind: "provider.warning",
+    });
+
+    expect(markup).toContain("Usage limit reached");
+    expect(markup).toContain(
+      "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m).",
+    );
+    expect(markup).toContain("lucide-circle-alert");
+    expect(markup).toContain("text-warning-foreground");
     expect(markup).not.toContain('aria-label="Tool call failed"');
   });
 

@@ -10,12 +10,14 @@ import { GitBranchIcon, GitPullRequestIcon, TagIcon } from "lucide-react";
 import { memo, type ReactNode } from "react";
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsActor } from "../../pullRequests/shared/PullRequestsActor";
+import { useRepositoryModule } from "../../repositoryModule/RepositoryModule";
 import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
 import { PipelineActions } from "../actions/PipelineActions";
 import type { RepositoryPermission } from "../actions/pipelineActions.logic";
 import { pipelineRowActions } from "../list/pipelinesList.logic";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { formatPipelineDuration, pipelineStatusText } from "../shared/pipelineStatus.logic";
+import { useEmbeddedPipelinesNavigation } from "./PipelineLinks";
 import { pipelineJobCount } from "./pipelineDetail.logic";
 
 const HOST_NAMES: Record<PullRequestsProviderKind, string> = { github: "GitHub", gitlab: "GitLab" };
@@ -34,26 +36,44 @@ function PipelineRef({
   value,
   provider,
   projectRef,
+  cwd,
 }: {
   value: PipelinesRef;
   provider: PullRequestsProviderKind;
   projectRef: ScopedProjectRef;
+  cwd: string;
 }) {
-  if (value.kind === "merge_request" && value.number !== null)
+  const embeddedNavigation = useEmbeddedPipelinesNavigation();
+  if (value.kind === "merge_request" && value.number !== null) {
+    const label = formatChangeRequestNumber(provider, value.number);
     return (
       <span className="inline-flex min-w-0 items-center gap-1">
         <GitPullRequestIcon aria-hidden="true" className="size-3.5 shrink-0" />
-        <Link
-          to="/project/$environmentId/$projectId/pull-requests/$number"
-          params={{ ...projectRef, number: String(value.number) }}
-          search={{ tab: "conversation" }}
-          title={value.name}
-          className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
-        >
-          {formatChangeRequestNumber(provider, value.number)}
-        </Link>
+        {embeddedNavigation?.openMergeRequest ? (
+          <button
+            type="button"
+            title={value.name}
+            className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
+            onClick={() =>
+              embeddedNavigation.openMergeRequest!({ number: value.number!, provider, cwd })
+            }
+          >
+            {label}
+          </button>
+        ) : (
+          <Link
+            to="/project/$environmentId/$projectId/pull-requests/$number"
+            params={{ ...projectRef, number: String(value.number) }}
+            search={{ tab: "conversation" }}
+            title={value.name}
+            className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
+          >
+            {label}
+          </Link>
+        )}
       </span>
     );
+  }
   const Icon = value.kind === "tag" ? TagIcon : value.kind === "branch" ? GitBranchIcon : null;
   return (
     <span className="inline-flex min-w-0 items-center gap-1" title={value.name}>
@@ -84,6 +104,9 @@ export const PipelineDetailHeader = memo(function PipelineDetailHeader({
   /** Controls the page adds beside the actions, such as GitHub's Attempt select. */
   children?: ReactNode;
 }) {
+  const {
+    state: { scope },
+  } = useRepositoryModule();
   const { pipeline, commit } = detail;
   const shownStatus = PipelineActions.useShownStatus(pipeline);
   const status = pipelineStatusText(shownStatus, pipeline.warnings, pipeline.reason);
@@ -183,7 +206,12 @@ export const PipelineDetailHeader = memo(function PipelineDetailHeader({
         <div className="flex min-w-0 items-center">
           <dt className="sr-only">Ref</dt>
           <dd className="min-w-0">
-            <PipelineRef value={pipeline.ref} provider={provider} projectRef={projectRef} />
+            <PipelineRef
+              value={pipeline.ref}
+              provider={provider}
+              projectRef={projectRef}
+              cwd={scope.cwd}
+            />
           </dd>
         </div>
         {jobs !== null ? (

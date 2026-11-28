@@ -53,6 +53,11 @@ import { createEnvironmentPresentationPolicy } from "../connection/environmentPr
 
 const h = vi.hoisted(() => {
   const state = {
+    checkoutSkills: [] as Array<{
+      readonly name: string;
+      readonly description: string;
+      readonly invocation?: string;
+    }>,
     captured: {} as Record<string, Record<string, unknown>>,
     capturedList: [] as Array<{ name: string; props: Record<string, unknown> }>,
     // React's fizz renderer replays a component with empty props while
@@ -183,6 +188,21 @@ vi.mock("../state/use-atom-command", () => ({
       return Promise.resolve(respond(input, runOptions));
     };
   },
+}));
+
+vi.mock("../state/providerCapabilities", () => ({
+  useProviderCapabilities: () => ({
+    data: {
+      slashCommands: [],
+      skills: h.checkoutSkills ?? [],
+      agents: [],
+      issues: [],
+    },
+    error: null,
+    isPending: false,
+    refresh: () => undefined,
+    revalidateIfStale: () => undefined,
+  }),
 }));
 
 vi.mock("../state/threads", () => ({
@@ -700,6 +720,7 @@ const codexInstanceId = ProviderInstanceId.make("codex");
 const codexProvider: ServerProvider = {
   instanceId: codexInstanceId,
   driver: ProviderDriverKind.make("codex"),
+  supportsUserInputDisposition: true,
   enabled: true,
   installed: true,
   version: "1.0.0",
@@ -729,19 +750,24 @@ const HOST_STATE = {
   },
   pendingRevert: { index: 8, expectInitial: isNull },
   maximizedRightPanelThreadKey: { index: 9, expectInitial: isNull },
-  terminalFocusRequestId: { index: 14, expectInitial: (value: unknown) => value === 0 },
-  pullRequestDialogState: { index: 15, expectInitial: isNull },
   pendingUserInputAnswersByRequestId: {
     index: 12,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
-  attachmentPreviewHandoffByMessageId: {
-    index: 16,
+  pendingUserInputCollapsedByRequestId: {
+    index: 14,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
-  composerOverlayElement: { index: 20, expectInitial: isNull },
+  terminalFocusRequestId: { index: 15, expectInitial: (value: unknown) => value === 0 },
+  pullRequestDialogState: { index: 16, expectInitial: isNull },
+  attachmentPreviewHandoffByMessageId: {
+    index: 17,
+    expectInitial: (value: unknown) =>
+      typeof value === "object" && value !== null && Object.keys(value).length === 0,
+  },
+  composerOverlayElement: { index: 21, expectInitial: isNull },
 } as const;
 
 function seedHostState(name: keyof typeof HOST_STATE, value: unknown): void {
@@ -872,7 +898,11 @@ function makeEnvironmentPresentation(
       label: "Local",
       platform: { os: "linux" as const, arch: "x64" as const },
       // An older server: the revert dialog opens without a shared-checkout preview.
-      capabilities: { conversationOnlyRewind: false },
+      capabilities: {
+        conversationOnlyRewind: false,
+        pipelinesReads: true,
+        pullRequestsReads: true,
+      },
     },
   };
   return {
@@ -2006,13 +2036,13 @@ describe("ChatView effects (captured and run manually)", () => {
       getBoundingClientRect: () => ({ height: 42 }),
     };
     seedHostState("composerOverlayElement", overlayElement);
-    h.stateSeeds.set(21, { value: 42, expectInitial: (value) => value === 0 });
+    h.stateSeeds.set(22, { value: 42, expectInitial: (value) => value === 0 });
     vi.stubGlobal("ResizeObserver", undefined);
 
     renderServerRoute();
     const cleanups = runEffects();
 
-    expect(h.setStateCalls.some((call) => call.index === 21 && call.applied === 42)).toBe(true);
+    expect(h.setStateCalls.some((call) => call.index === 22 && call.applied === 42)).toBe(true);
     for (const cleanup of cleanups) cleanup();
   });
 
@@ -2207,8 +2237,8 @@ describe("ChatView effects (captured and run manually)", () => {
     vi.stubGlobal("ResizeObserver", undefined);
     seedHostState("composerOverlayElement", { getBoundingClientRect: () => ({ height: 40 }) });
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
-    // The height is set (state 21) but this render, and its captured props, still hold 0.
-    expect(h.setStateCalls.some((call) => call.index === 21 && call.applied === 40)).toBe(true);
+    // The height is set (state 22) but this render, and its captured props, still hold 0.
+    expect(h.setStateCalls.some((call) => call.index === 22 && call.applied === 40)).toBe(true);
     onAnchorReady(messageId, 2);
     list.scrollNode.fire("scrollend");
 
@@ -2412,7 +2442,7 @@ describe("ChatView effects (captured and run manually)", () => {
         value: false,
         expectInitial: (value) => value === true,
       });
-      h.stateSeeds.set(21, { value: 80, expectInitial: (value) => value === 0 });
+      h.stateSeeds.set(22, { value: 80, expectInitial: (value) => value === 0 });
       renderServerRoute();
       const timeline = capturedProps("messagesTimeline");
       expect(timeline["followsEnd"], layout).toBe(false);
@@ -3269,19 +3299,16 @@ describe("ChatView keydown shortcuts", () => {
   );
 
   it.each([
-    ["terminal.new", "new"],
+    ["terminal.new", "horizontal"],
     ["terminal.split", "horizontal"],
     ["terminal.splitVertical", "vertical"],
-  ] as const)("preserves right-panel %s routing", async (command, expectedAction) => {
+  ] as const)("preserves right-panel %s routing", async (command, expectedDirection) => {
     seedConnectedServerThread();
     useRightPanelStore.getState().openTerminal(threadRef, "terminal-77");
     publishSeededStoreState(useRightPanelStore);
     h.terminalFocusOwner = "right-panel";
     const rightStore = useRightPanelStore.getState();
-    const action =
-      expectedAction === "new"
-        ? vi.spyOn(rightStore, "openTerminal")
-        : vi.spyOn(rightStore, "splitTerminal");
+    const action = vi.spyOn(rightStore, "splitTerminal");
     renderServerRoute();
     installComposerHandle();
     runEffects();
@@ -3291,16 +3318,12 @@ describe("ChatView keydown shortcuts", () => {
     handler(makeKeyEvent({ key: "F1" }));
     await flushTerminalAction();
 
-    if (expectedAction === "new") {
-      expect(action).toHaveBeenCalled();
-    } else {
-      expect(action).toHaveBeenCalledWith(
-        threadRef,
-        expect.any(String),
-        expect.any(String),
-        expectedAction,
-      );
-    }
+    expect(action).toHaveBeenCalledWith(
+      threadRef,
+      "terminal",
+      expect.any(String),
+      expectedDirection,
+    );
     expect(commandCallsFor("terminal.open")).toHaveLength(1);
   });
 
@@ -3516,8 +3539,8 @@ describe("ChatView keydown shortcuts", () => {
     h.commandResults["terminal.open"] = () => AsyncResult.success(undefined);
     const store = useRightPanelStore.getState();
     store.openTerminal(threadRef, "right-seed");
-    store.splitTerminal(threadRef, "terminal:right-seed", "right-2");
-    store.splitTerminal(threadRef, "terminal:right-seed", "right-3");
+    store.splitTerminal(threadRef, "terminal", "right-2");
+    store.splitTerminal(threadRef, "terminal", "right-3");
     publishSeededStoreState(useRightPanelStore);
     h.terminalFocusOwner = "right-panel";
     const { handler } = renderWithKeydown();
@@ -3530,7 +3553,7 @@ describe("ChatView keydown shortcuts", () => {
     const terminalSurface = useRightPanelStore
       .getState()
       .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
-        (surface) => surface.id === "terminal:right-seed" && surface.kind === "terminal",
+        (surface) => surface.id === "terminal" && surface.kind === "terminal",
       );
     expect(terminalSurface).toMatchObject({
       terminalIds: expect.arrayContaining(["right-seed", "right-2", "right-3"]),
@@ -3557,7 +3580,7 @@ describe("ChatView keydown shortcuts", () => {
 
     finishOpen[0]?.(AsyncResult.failure(Cause.fail(new Error("open rejected"))));
     await flushTerminalAction();
-    useRightPanelStore.getState().closeSurface(threadRef, `terminal:${rejectedId}`);
+    useRightPanelStore.getState().closeTerminal(threadRef, "terminal", rejectedId!);
     handler(makeKeyEvent({ key: "F1" }));
 
     expect(openedTerminalIds()[2]).toBe(rejectedId);
@@ -3869,12 +3892,14 @@ describe("ChatView right panel handlers", () => {
     );
   });
 
-  it("closes single, other, right-of, and all surfaces including terminal cleanup", () => {
+  it("closes single terminal surfaces and restricts bulk tab close to dynamic surfaces", () => {
     const props = openedPanelProps((ref) => {
       useRightPanelStore.getState().open(ref, "plan");
       useRightPanelStore.getState().openTerminal(ref, "terminal-1");
       useRightPanelStore.getState().open(ref, "sourceControl");
       useRightPanelStore.getState().open(ref, "files");
+      useRightPanelStore.getState().openFile(ref, "src/a.ts");
+      useRightPanelStore.getState().openFile(ref, "src/b.ts");
     });
     const surfaces = useRightPanelStore.getState().byThreadKey[threadKey]!.surfaces;
     const terminalSurface = surfaces.find((surface) => surface.kind === "terminal")!;
@@ -3896,7 +3921,9 @@ describe("ChatView right panel handlers", () => {
     onCloseOtherSurfaces(planSurface);
     onCloseAllSurfaces();
 
-    expect(useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).toHaveLength(0);
+    expect(
+      (useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).map((s) => s.id),
+    ).toEqual(["sourceControl", "files"]);
   });
 
   it("falls back to terminal exit when right-panel session close fails", async () => {
@@ -3927,23 +3954,36 @@ describe("ChatView right panel handlers", () => {
     expect(useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).toEqual([]);
   });
 
-  it("adds browser/terminal/diff/source-control/files surfaces on demand", () => {
+  it("adds browser/terminal/diff/source-control/files/project surfaces on demand", () => {
     const props = openedPanelProps((ref) => {
       useRightPanelStore.getState().open(ref, "plan");
     });
 
-    (props["onAddBrowser"] as () => void)();
-    (props["onAddTerminal"] as () => void)();
-    (props["onAddDiff"] as () => void)();
-    (props["onAddSourceControl"] as () => void)();
-    (props["onAddFiles"] as () => void)();
+    (props["onSelectBrowser"] as () => void)();
+    (props["onSelectTerminal"] as () => void)();
+    (props["onSelectDiff"] as () => void)();
+    (props["onSelectSourceControl"] as () => void)();
+    (props["onSelectFiles"] as () => void)();
+    (props["onSelectGitManager"] as () => void)();
+    (props["onSelectPipelines"] as () => void)();
+    (props["onSelectPullRequest"] as () => void)();
 
     expect(h.addBrowserSurfaceCalls).toHaveLength(1);
     expect(commandCallsFor("terminal.open")).toHaveLength(1);
     const kinds = (useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).map(
       (surface) => surface.kind,
     );
-    expect(kinds).toEqual(expect.arrayContaining(["terminal", "diff", "sourceControl", "files"]));
+    expect(kinds).toEqual(
+      expect.arrayContaining([
+        "terminal",
+        "diff",
+        "sourceControl",
+        "files",
+        "gitManager",
+        "pipelines",
+        "pullRequest",
+      ]),
+    );
   });
 
   it("copies file paths via the clipboard with success and failure toasts", async () => {
@@ -6462,7 +6502,7 @@ describe("ChatView pending user input", () => {
       ) => void
     )("question-1", "custom answer", 13, 13, false);
 
-    // Both handlers wrote draft answers for the request.
+    // Both handlers wrote draft answers for the request; in-card editing does not hijack composer focus.
     const answerWrites = h.setStateCalls.filter(
       (call) =>
         typeof call.applied === "object" &&
@@ -6470,7 +6510,7 @@ describe("ChatView pending user input", () => {
         "request-1" in (call.applied as Record<string, unknown>),
     );
     expect(answerWrites.length).toBeGreaterThanOrEqual(2);
-    expect(focusAtCalls).toEqual([13]);
+    expect(focusAtCalls).toEqual([]);
   });
 
   it("advances through questions and submits answers on the last one", async () => {
@@ -6486,14 +6526,39 @@ describe("ChatView pending user input", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    // Single question: advancing submits immediately.
+    // Single question: advancing submits immediately with explicit answered disposition.
     expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(1);
+    expect(commandCallsFor("thread.respondToUserInput")[0]?.input).toMatchObject({
+      input: {
+        disposition: "answered",
+        answers: { "question-1": "Yes" },
+      },
+    });
 
     (composer["onPreviousActivePendingUserInputQuestion"] as () => void)();
   });
 
-  it("onSend advances the pending user input instead of sending", async () => {
-    seedConnectedServerThread(threadWithQuestions(1));
+  it("decouples onSend from pending clarifying questions and preserves question picks (#430 D9)", async () => {
+    seedConnectedServerThread(threadWithQuestions(2));
+    seedHostState("pendingUserInputAnswersByRequestId", {
+      "request-1": { "question-1": { customAnswer: "", selectedOptionLabels: ["Yes"] } },
+    });
+    seedHostState("pendingUserInputCollapsedByRequestId", {
+      "request-1": true,
+    });
+    renderServerRoute();
+    const { promptRef } = installComposerHandle();
+    promptRef.current = "ordinary follow-up message";
+
+    const composer = capturedProps("chatComposer");
+    await (composer["onSend"] as () => Promise<void>)();
+
+    expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(0);
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
+  });
+
+  it("dispatches skipped and cancelled dispositions from card Skip and Close actions (#430)", async () => {
+    seedConnectedServerThread(threadWithQuestions(2));
     seedHostState("pendingUserInputAnswersByRequestId", {
       "request-1": { "question-1": { customAnswer: "", selectedOptionLabels: ["Yes"] } },
     });
@@ -6501,14 +6566,127 @@ describe("ChatView pending user input", () => {
     installComposerHandle();
 
     const composer = capturedProps("chatComposer");
-    await (composer["onSend"] as () => Promise<void>)();
+    (composer["onSkipAndSubmitActivePendingUserInput"] as () => void)();
+    await Promise.resolve();
+    await Promise.resolve();
 
-    expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
     expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(1);
+    expect(commandCallsFor("thread.respondToUserInput")[0]?.input).toMatchObject({
+      input: {
+        disposition: "skipped",
+        answers: { "question-1": "Yes" },
+      },
+    });
+
+    // Cursor supports real cancellation; Close dispatches disposition: "cancelled".
+    const cursorInstanceId = ProviderInstanceId.make("cursor-default");
+    const cursorThread = makeThread({
+      modelSelection: { instanceId: cursorInstanceId, model: "auto" },
+      activities: threadWithQuestions(1).activities,
+    });
+    seedConnectedServerThread(cursorThread);
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [
+            codexProvider,
+            {
+              ...codexProvider,
+              instanceId: cursorInstanceId,
+              driver: ProviderDriverKind.make("cursor"),
+            },
+          ],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    renderServerRoute();
+    installComposerHandle();
+
+    const cursorComposer = capturedProps("chatComposer");
+    expect(cursorComposer["activePendingUserInputCanCancel"]).toBe(true);
+    (cursorComposer["onCancelActivePendingUserInput"] as () => void)();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(2);
+    expect(commandCallsFor("thread.respondToUserInput")[1]?.input).toMatchObject({
+      input: {
+        disposition: "cancelled",
+        answers: {},
+      },
+    });
+  });
+
+  it("keeps the active question index stable while typing in a multi-question card and gates disposition on older servers", () => {
+    // 1. Typing 1 character into question 1 locks activePendingQuestionIndex at 0 (no mid-answer jump).
+    seedConnectedServerThread(threadWithQuestions(2));
+    renderServerRoute();
+    const initialComposer = capturedProps("chatComposer");
+    expect(initialComposer["activePendingQuestionIndex"]).toBe(0);
+    (
+      initialComposer["onChangeActivePendingUserInputCardCustomAnswer"] as (
+        id: string,
+        value: string,
+      ) => void
+    )("question-1", "a");
+    const indexWrites = h.setStateCalls.filter(
+      (call) =>
+        call.index === 13 &&
+        typeof call.applied === "object" &&
+        call.applied !== null &&
+        (call.applied as Record<string, unknown>)["request-1"] === 0,
+    );
+    expect(indexWrites.length).toBeGreaterThanOrEqual(1);
+
+    // 2. Older server snapshot without supportsUserInputDisposition disables cancel and skip-all.
+    const cursorInstanceId = ProviderInstanceId.make("cursor-legacy");
+    const cursorThread = makeThread({
+      modelSelection: { instanceId: cursorInstanceId, model: "auto" },
+      activities: threadWithQuestions(1).activities,
+    });
+    seedConnectedServerThread(cursorThread);
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [
+            {
+              ...codexProvider,
+              instanceId: cursorInstanceId,
+              driver: ProviderDriverKind.make("cursor"),
+              supportsUserInputDisposition: undefined,
+            },
+          ],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    renderServerRoute();
+    const legacyComposer = capturedProps("chatComposer");
+    expect(legacyComposer["activePendingUserInputCanCancel"]).toBe(false);
+    expect(legacyComposer["activePendingUserInputCanSkipAll"]).toBe(false);
+
+    // 3. Checkout-scoped project-local skills flow into MessagesTimeline so sent slash chips persist.
+    h.checkoutSkills = [
+      {
+        name: "project-review",
+        description: "Local project skill",
+        invocation: "slash",
+      },
+    ];
+    try {
+      renderServerRoute();
+      const timeline = capturedProps("messagesTimeline");
+      expect(timeline["skills"]).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: "project-review" })]),
+      );
+    } finally {
+      h.checkoutSkills = [];
+    }
   });
 
   it.each(["connected", "disconnected"] as const)(
-    "onSend moves between a multi-step question's steps without replaying a retained send (%s)",
+    "advancing a multi-step question inside the card does not replay a retained send (%s)",
     async (connection) => {
       seedConnectedServerThread();
       renderServerRoute();
@@ -6559,7 +6737,7 @@ describe("ChatView pending user input", () => {
       }
       renderServerRoute();
       installComposerHandle();
-      await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+      (capturedProps("chatComposer")["onAdvanceActivePendingUserInput"] as () => void)();
 
       expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
       expect(commandCallsFor("thread.attachmentAdmissionAuthority")).toHaveLength(authorityReads);

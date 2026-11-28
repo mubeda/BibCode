@@ -1,24 +1,24 @@
 import type { ContextMenuItem, PreviewSessionSnapshot } from "@bibcode/contracts";
-import { formatChangeRequestNumber } from "@bibcode/shared/sourceControl";
-import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
 import {
   ClipboardList,
   FileDiff,
   Files,
+  GitBranch,
   GitPullRequest,
   GitPullRequestArrow,
   Globe2,
-  Plus,
   Smartphone,
   TerminalSquare,
+  Workflow,
   X,
 } from "lucide-react";
 import {
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
-  type ReactElement,
   type ReactNode,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
 } from "react";
 
@@ -27,7 +27,6 @@ import type { DesktopPreviewOverlay } from "~/previewStateStore";
 import { cn } from "~/lib/utils";
 import { readLocalApi } from "~/localApi";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
-import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { useTheme } from "~/hooks/useTheme";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
@@ -35,7 +34,7 @@ import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { PreviewPanelShell, type PreviewPanelMode } from "./preview/PreviewPanelShell";
 import { PierreEntryIcon } from "./chat/PierreEntryIcon";
 
-interface RightPanelTabsProps {
+export interface RightPanelTabsProps {
   mode: PreviewPanelMode;
   maximized?: boolean;
   layoutControls?: ReactNode;
@@ -54,210 +53,58 @@ interface RightPanelTabsProps {
   onCloseSurfacesToRight: (surface: RightPanelSurface) => void;
   onCloseAllSurfaces: () => void;
   onCopyFilePath: (relativePath: string) => void;
-  onAddBrowser: () => void;
-  onAddTerminal: () => void;
-  onAddDiff: () => void;
-  onAddFiles: () => void;
-  onAddSourceControl: () => void;
+  onSelectBrowser: () => void;
+  onSelectTerminal: () => void;
+  onSelectFiles: () => void;
+  onSelectDiff: () => void;
+  onSelectSourceControl: () => void;
   /** Opens the device pane; omitted while device previews are off or unsupported. */
-  onAddDevice?: (() => void) | undefined;
+  onSelectDevice?: (() => void) | undefined;
+  onSelectGitManager: () => void;
+  onSelectPipelines: () => void;
+  onSelectPullRequest: () => void;
   browserAvailable: boolean;
-  diffAvailable: boolean;
+  terminalAvailable?: boolean;
   filesAvailable: boolean;
+  diffAvailable: boolean;
   sourceControlAvailable: boolean;
+  gitManagerAvailable?: boolean;
+  pipelinesAvailable?: boolean;
+  pullRequestAvailable?: boolean;
+  pipelinesDisabledReason?: string;
+  pullRequestDisabledReason?: string;
   children: ReactNode;
 }
 
 const SURFACE_DISABLED_REASONS = {
   browser: "Browser previews are only available in the BiBCode desktop app.",
+  terminal: "Terminal is unavailable while the workspace cannot be opened.",
   files: "Files are only available when a project is open.",
   diff: "Diff is only available for server threads in Git repositories.",
-  sourceControl: "Source control is only available for server threads in Git repositories.",
+  sourceControl: "Source Control is only available for server threads in Git repositories.",
+  gitManager: "Git Manager is only available for server threads in Git repositories.",
+  pipelines: "Pipelines is only available for server threads in Git repositories.",
+  pullRequest: "Pull Request is only available for server threads in Git repositories.",
 } as const;
 
 type TabContextMenuAction = "copy-path" | "close" | "close-others" | "close-to-right" | "close-all";
 
-function DisabledReasonTooltip(props: { reason: string; trigger: ReactElement }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger render={props.trigger} />
-      <TooltipPopup side="top">{props.reason}</TooltipPopup>
-    </Tooltip>
-  );
+type DynamicRightPanelSurface = Extract<RightPanelSurface, { kind: "file" | "preview" | "plan" }>;
+
+function isDynamicTabSurface(surface: RightPanelSurface): surface is DynamicRightPanelSurface {
+  return surface.kind === "file" || surface.kind === "preview" || surface.kind === "plan";
 }
 
-function SurfaceMenuItem(props: {
-  available: boolean;
-  disabledReason?: string;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  const item = (
-    <MenuItem
-      className={!props.available ? "data-disabled:pointer-events-auto" : undefined}
-      onClick={props.onClick}
-      disabled={!props.available}
-    >
-      {props.children}
-    </MenuItem>
-  );
-  if (props.available || !props.disabledReason) return item;
-  return <DisabledReasonTooltip reason={props.disabledReason} trigger={item} />;
-}
-
-function RightPanelEmptyState(props: {
-  onAddBrowser: () => void;
-  onAddTerminal: () => void;
-  onAddDiff: () => void;
-  onAddFiles: () => void;
-  onAddSourceControl: () => void;
-  /** Opens the device pane; omitted while device previews are off or unsupported. */
-  onAddDevice?: (() => void) | undefined;
-  browserAvailable: boolean;
-  diffAvailable: boolean;
-  filesAvailable: boolean;
-  sourceControlAvailable: boolean;
-}) {
-  // Hidden, not disabled, while device previews are off: the setting is the way in.
-  const deviceActions =
-    props.onAddDevice === undefined
-      ? []
-      : ([
-          {
-            label: "Device",
-            description: "Run an Android emulator.",
-            icon: Smartphone,
-            available: true,
-            disabledReason: null,
-            onClick: props.onAddDevice,
-          },
-        ] as const);
-  const actions = [
-    {
-      label: "Browser",
-      description: "Open a local app or URL.",
-      icon: Globe2,
-      available: props.browserAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.browser,
-      onClick: props.onAddBrowser,
-    },
-    {
-      label: "Terminal",
-      description: "Start a shell in this workspace.",
-      icon: TerminalSquare,
-      available: true,
-      disabledReason: null,
-      onClick: props.onAddTerminal,
-    },
-    {
-      label: "Files",
-      description: "Browse and read workspace files.",
-      icon: Files,
-      available: props.filesAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.files,
-      onClick: props.onAddFiles,
-    },
-    {
-      label: "Diff",
-      description: "Review changes in this thread.",
-      icon: FileDiff,
-      available: props.diffAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.diff,
-      onClick: props.onAddDiff,
-    },
-    {
-      label: "Source Control",
-      description: "Stage, commit, and open changes.",
-      icon: GitPullRequestArrow,
-      available: props.sourceControlAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.sourceControl,
-      onClick: props.onAddSourceControl,
-    },
-    ...deviceActions,
-  ] as const;
-
-  return (
-    <div className="flex min-h-0 flex-1 items-center justify-center p-6">
-      <div className="w-full max-w-xl">
-        <div className="mb-5 text-center">
-          <h3 className="text-sm font-medium text-foreground">Open a surface</h3>
-          <p className="mt-1 text-xs text-muted-foreground">
-            Choose what to show in the right panel.
-          </p>
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          {actions.map((action) => {
-            const Icon = action.icon;
-            const content = (
-              <>
-                <Icon className="mb-3 size-5" />
-                <span className="text-sm font-medium">{action.label}</span>
-                <span className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                  {action.description}
-                </span>
-              </>
-            );
-            if (action.available) {
-              return (
-                <button
-                  key={action.label}
-                  type="button"
-                  onClick={action.onClick}
-                  className="flex min-h-28 w-full flex-col items-start rounded-lg border border-border/80 bg-card/40 p-4 text-left transition hover:border-border hover:bg-accent/60"
-                >
-                  {content}
-                </button>
-              );
-            }
-            const disabledCard = (
-              <button
-                type="button"
-                className="flex min-h-28 w-full cursor-not-allowed flex-col items-start rounded-lg border border-border/80 bg-card/40 p-4 text-left opacity-40"
-                aria-disabled="true"
-              >
-                {content}
-              </button>
-            );
-            return (
-              <DisabledReasonTooltip
-                key={action.label}
-                reason={action.disabledReason}
-                trigger={disabledCard}
-              />
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function surfaceTitle(
-  surface: RightPanelSurface,
+function dynamicSurfaceTitle(
+  surface: DynamicRightPanelSurface,
   sessions: Readonly<Record<string, PreviewSessionSnapshot>>,
   desktopByTabId: Readonly<Record<string, DesktopPreviewOverlay>>,
-  terminalLabelsById: ReadonlyMap<string, string>,
 ): string {
   switch (surface.kind) {
-    case "diff":
-      return "Diff";
-    case "sourceControl":
-      return "Source Control";
-    case "files":
-      return "Files";
     case "file":
       return surface.relativePath.slice(surface.relativePath.lastIndexOf("/") + 1);
-    case "terminal":
-      return (
-        terminalLabelsById.get(surface.activeTerminalId) ??
-        getTerminalLabel(surface.activeTerminalId)
-      );
     case "plan":
       return "Plan";
-    case "device":
-      return "Device";
-    case "pullRequest":
-      return formatChangeRequestNumber(surface.provider, surface.number);
     case "preview": {
       const snapshot = surface.resourceId ? sessions[surface.resourceId] : null;
       const desktop = surface.resourceId ? desktopByTabId[surface.resourceId] : null;
@@ -278,16 +125,16 @@ function surfaceTitle(
   }
 }
 
-function SurfaceIcon({ surface, theme }: { surface: RightPanelSurface; theme: "light" | "dark" }) {
+function DynamicSurfaceIcon({
+  surface,
+  theme,
+}: {
+  surface: DynamicRightPanelSurface;
+  theme: "light" | "dark";
+}) {
   switch (surface.kind) {
     case "preview":
-      return <Globe2 className="size-3.5 shrink-0" />;
-    case "diff":
-      return <FileDiff className="size-3.5 shrink-0" />;
-    case "sourceControl":
-      return <GitPullRequestArrow className="size-3.5 shrink-0" />;
-    case "files":
-      return <Files className="size-3.5 shrink-0" />;
+      return <Globe2 className="size-3.5 shrink-0" aria-hidden="true" />;
     case "file":
       return (
         <PierreEntryIcon
@@ -297,30 +144,201 @@ function SurfaceIcon({ surface, theme }: { surface: RightPanelSurface; theme: "l
           className="size-3.5"
         />
       );
-    case "terminal":
-      return <TerminalSquare className="size-3.5 shrink-0" />;
     case "plan":
-      return <ClipboardList className="size-3.5 shrink-0" />;
-    case "device":
-      return <Smartphone className="size-3.5 shrink-0" />;
-    case "pullRequest":
-      return <GitPullRequest className="size-3.5 shrink-0" />;
+      return <ClipboardList className="size-3.5 shrink-0" aria-hidden="true" />;
   }
+}
+
+interface FixedSurfaceIconItem {
+  readonly key:
+    | "browser"
+    | "terminal"
+    | "files"
+    | "diff"
+    | "sourceControl"
+    | "device"
+    | "gitManager"
+    | "pipelines"
+    | "pullRequest";
+  readonly label: string;
+  readonly icon: typeof Globe2;
+  readonly active: boolean;
+  readonly available: boolean;
+  readonly disabledReason: string | null;
+  readonly onSelect: () => void;
 }
 
 export function RightPanelTabs(props: RightPanelTabsProps) {
   const { resolvedTheme } = useTheme();
+  const iconBarRef = useRef<HTMLDivElement>(null);
   const tabListRef = useRef<HTMLDivElement>(null);
 
+  const activeSurface = useMemo(
+    () => props.surfaces.find((entry) => entry.id === props.activeSurfaceId) ?? null,
+    [props.activeSurfaceId, props.surfaces],
+  );
+  const dynamicSurfaces = useMemo(
+    () => props.surfaces.filter(isDynamicTabSurface),
+    [props.surfaces],
+  );
+
+  const terminalAvailable = props.terminalAvailable ?? true;
+  const gitManagerAvailable = props.gitManagerAvailable ?? props.diffAvailable;
+  const pipelinesAvailable = props.pipelinesAvailable ?? props.diffAvailable;
+  const pullRequestAvailable = props.pullRequestAvailable ?? props.diffAvailable;
+
+  const fixedIcons = useMemo<readonly FixedSurfaceIconItem[]>(() => {
+    const activeKind = activeSurface?.kind ?? null;
+    const items: FixedSurfaceIconItem[] = [
+      {
+        key: "files",
+        label: "Files",
+        icon: Files,
+        active: activeKind === "files",
+        available: props.filesAvailable,
+        disabledReason: SURFACE_DISABLED_REASONS.files,
+        onSelect: props.onSelectFiles,
+      },
+      {
+        key: "sourceControl",
+        label: "Source Control",
+        icon: GitPullRequestArrow,
+        active: activeKind === "sourceControl",
+        available: props.sourceControlAvailable,
+        disabledReason: SURFACE_DISABLED_REASONS.sourceControl,
+        onSelect: props.onSelectSourceControl,
+      },
+      {
+        key: "diff",
+        label: "Diff",
+        icon: FileDiff,
+        active: activeKind === "diff",
+        available: props.diffAvailable,
+        disabledReason: SURFACE_DISABLED_REASONS.diff,
+        onSelect: props.onSelectDiff,
+      },
+      {
+        key: "pullRequest",
+        label: "Pull Request",
+        icon: GitPullRequest,
+        active: activeKind === "pullRequest",
+        available: pullRequestAvailable,
+        disabledReason: props.pullRequestDisabledReason ?? SURFACE_DISABLED_REASONS.pullRequest,
+        onSelect: props.onSelectPullRequest,
+      },
+      {
+        key: "gitManager",
+        label: "Git Manager",
+        icon: GitBranch,
+        active: activeKind === "gitManager",
+        available: gitManagerAvailable,
+        disabledReason: SURFACE_DISABLED_REASONS.gitManager,
+        onSelect: props.onSelectGitManager,
+      },
+      {
+        key: "pipelines",
+        label: "Pipelines",
+        icon: Workflow,
+        active: activeKind === "pipelines",
+        available: pipelinesAvailable,
+        disabledReason: props.pipelinesDisabledReason ?? SURFACE_DISABLED_REASONS.pipelines,
+        onSelect: props.onSelectPipelines,
+      },
+    ];
+    // Hidden, not disabled, while device previews are off: Settings is the way in.
+    if (props.onSelectDevice !== undefined) {
+      items.push({
+        key: "device",
+        label: "Device",
+        icon: Smartphone,
+        active: activeKind === "device",
+        available: true,
+        disabledReason: null,
+        onSelect: props.onSelectDevice,
+      });
+    }
+    items.push(
+      {
+        key: "browser",
+        label: "Browser",
+        icon: Globe2,
+        active: activeKind === "preview",
+        available: props.browserAvailable,
+        disabledReason: SURFACE_DISABLED_REASONS.browser,
+        onSelect: props.onSelectBrowser,
+      },
+      {
+        key: "terminal",
+        label: "Terminal",
+        icon: TerminalSquare,
+        active: activeKind === "terminal",
+        available: terminalAvailable,
+        disabledReason: SURFACE_DISABLED_REASONS.terminal,
+        onSelect: props.onSelectTerminal,
+      },
+    );
+    return items;
+  }, [
+    activeSurface?.kind,
+    gitManagerAvailable,
+    pipelinesAvailable,
+    props.browserAvailable,
+    props.diffAvailable,
+    props.filesAvailable,
+    props.onSelectBrowser,
+    props.onSelectDevice,
+    props.onSelectDiff,
+    props.onSelectFiles,
+    props.onSelectGitManager,
+    props.onSelectPipelines,
+    props.onSelectPullRequest,
+    props.onSelectSourceControl,
+    props.onSelectTerminal,
+    props.pipelinesDisabledReason,
+    props.pullRequestDisabledReason,
+    props.sourceControlAvailable,
+    pullRequestAvailable,
+    terminalAvailable,
+  ]);
+
+  const handleIconBarKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (
+      event.key !== "ArrowLeft" &&
+      event.key !== "ArrowRight" &&
+      event.key !== "Home" &&
+      event.key !== "End"
+    ) {
+      return;
+    }
+    const bar = iconBarRef.current;
+    if (!bar) return;
+    const buttons = Array.from(bar.querySelectorAll<HTMLButtonElement>("button"));
+    if (buttons.length === 0) return;
+    const currentIndex = buttons.findIndex((button) => button === document.activeElement);
+    if (currentIndex < 0) return;
+    event.preventDefault();
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight") {
+      nextIndex = (currentIndex + 1) % buttons.length;
+    } else if (event.key === "ArrowLeft") {
+      nextIndex = (currentIndex - 1 + buttons.length) % buttons.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = buttons.length - 1;
+    }
+    buttons[nextIndex]?.focus();
+  }, []);
+
   const handleTabContextMenu = useCallback(
-    async (event: ReactMouseEvent, surface: RightPanelSurface) => {
+    async (event: ReactMouseEvent, surface: DynamicRightPanelSurface) => {
       event.preventDefault();
       event.stopPropagation();
 
       const api = readLocalApi();
       if (!api) return;
 
-      const surfaceIndex = props.surfaces.findIndex((entry) => entry.id === surface.id);
+      const surfaceIndex = dynamicSurfaces.findIndex((entry) => entry.id === surface.id);
       if (surfaceIndex < 0) return;
 
       const items: ContextMenuItem<TabContextMenuAction>[] = [];
@@ -332,17 +350,17 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
         {
           id: "close-others",
           label: "Close others",
-          disabled: props.surfaces.length <= 1,
+          disabled: dynamicSurfaces.length <= 1,
         },
         {
           id: "close-to-right",
           label: "Close to the right",
-          disabled: surfaceIndex >= props.surfaces.length - 1,
+          disabled: surfaceIndex >= dynamicSurfaces.length - 1,
         },
         {
           id: "close-all",
           label: "Close all",
-          disabled: props.surfaces.length === 0,
+          disabled: dynamicSurfaces.length === 0,
         },
       );
 
@@ -367,14 +385,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
           break;
       }
     },
-    [props],
+    [dynamicSurfaces, props],
   );
   const handleTabMouseDown = useCallback((event: ReactMouseEvent) => {
     if (event.button !== 1) return;
     event.preventDefault();
   }, []);
   const handleTabAuxClick = useCallback(
-    (event: ReactMouseEvent, surface: RightPanelSurface) => {
+    (event: ReactMouseEvent, surface: DynamicRightPanelSurface) => {
       if (event.button !== 1) return;
       event.preventDefault();
       event.stopPropagation();
@@ -390,166 +408,164 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     activeTab?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [activeSurfaceId]);
 
+  const showIconBar = props.allowAddSurfaces !== false;
+
+  const dynamicTabList = (
+    <ScrollArea
+      ref={tabListRef}
+      hideScrollbars
+      scrollFade
+      className="min-w-0 flex-1 rounded-none"
+      data-right-panel-tab-list
+    >
+      <div className="flex h-full w-max min-w-full items-center gap-1">
+        {dynamicSurfaces.map((surface) => {
+          const active = surface.id === props.activeSurfaceId;
+          const conflicted = props.conflictSurfaceIds?.has(surface.id) ?? false;
+          const pending = conflicted || props.pendingSurfaceIds.has(surface.id);
+          const title = dynamicSurfaceTitle(
+            surface,
+            props.previewSessions,
+            props.previewDesktopByTabId,
+          );
+          const tabButton = (
+            <button
+              type="button"
+              className="flex min-w-0 flex-1 items-center gap-1.5 focus-visible:outline-none"
+              onClick={() => props.onActivate(surface)}
+            >
+              <DynamicSurfaceIcon surface={surface} theme={resolvedTheme} />
+              <span className="truncate">{title}</span>
+              {conflicted ? <span className="sr-only">(changed on disk)</span> : null}
+            </button>
+          );
+          return (
+            <div
+              key={surface.id}
+              data-active-tab={active}
+              onMouseDown={handleTabMouseDown}
+              onAuxClick={(event) => handleTabAuxClick(event, surface)}
+              onContextMenu={(event) => void handleTabContextMenu(event, surface)}
+              className={cn(
+                "group flex h-7 min-w-24 max-w-44 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs transition-colors focus-within:ring-2 focus-within:ring-ring",
+                active
+                  ? "bg-selected text-selected-foreground"
+                  : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+              )}
+            >
+              <Tooltip>
+                <TooltipTrigger render={tabButton} />
+                <TooltipPopup>{conflicted ? `${title} (changed on disk)` : title}</TooltipPopup>
+              </Tooltip>
+              <button
+                type="button"
+                className={cn(
+                  "relative flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted focus:opacity-100",
+                  pending ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+                )}
+                aria-label={`Close ${title}`}
+                onClick={() => props.onCloseSurface(surface)}
+              >
+                {pending ? (
+                  <>
+                    <span
+                      className={cn(
+                        "size-2 rounded-full group-hover:hidden",
+                        conflicted ? "bg-amber-500" : "bg-current",
+                      )}
+                      data-file-disk-conflict={conflicted ? "" : undefined}
+                      aria-hidden="true"
+                    />
+                    <X className="hidden size-3 group-hover:block" aria-hidden="true" />
+                  </>
+                ) : (
+                  <X className="size-3" aria-hidden="true" />
+                )}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </ScrollArea>
+  );
+
   return (
     <PreviewPanelShell
       mode={props.mode}
       {...(props.maximized !== undefined ? { maximized: props.maximized } : {})}
     >
       <div
-        className={cn(
-          "workspace-topbar gap-1 pl-2",
-          props.mode === "inline" ? "pr-28" : "pr-3",
-          props.mode === "inline" && props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
-        )}
+        className="flex shrink-0 flex-col border-b border-panel-separator bg-background"
         data-right-panel-tabbar
       >
-        <ScrollArea
-          ref={tabListRef}
-          hideScrollbars
-          scrollFade
-          className="min-w-0 flex-1 rounded-none"
-          data-right-panel-tab-list
+        <div
+          className={cn(
+            "workspace-topbar gap-1 pl-2",
+            props.mode === "inline" ? "pr-28" : "pr-3",
+            props.mode === "inline" && props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
+          )}
         >
-          <div className="flex h-full w-max min-w-full items-center gap-1">
-            {props.surfaces.map((surface) => {
-              const active = surface.id === props.activeSurfaceId;
-              const conflicted = props.conflictSurfaceIds?.has(surface.id) ?? false;
-              const pending = conflicted || props.pendingSurfaceIds.has(surface.id);
-              const title = surfaceTitle(
-                surface,
-                props.previewSessions,
-                props.previewDesktopByTabId,
-                props.terminalLabelsById,
-              );
-              const tabButton = (
-                <button
-                  type="button"
-                  className="flex min-w-0 flex-1 items-center gap-1.5"
-                  onClick={() => props.onActivate(surface)}
-                >
-                  <SurfaceIcon surface={surface} theme={resolvedTheme} />
-                  <span className="truncate">{title}</span>
-                  {conflicted ? <span className="sr-only">(changed on disk)</span> : null}
-                </button>
-              );
-              return (
-                <div
-                  key={surface.id}
-                  data-active-tab={active}
-                  onMouseDown={handleTabMouseDown}
-                  onAuxClick={(event) => handleTabAuxClick(event, surface)}
-                  onContextMenu={(event) => void handleTabContextMenu(event, surface)}
-                  className={cn(
-                    "group flex h-7 min-w-25 max-w-44 shrink-0 items-center gap-1.5 rounded-md px-2 text-sm",
-                    active
-                      ? "bg-selected text-selected-foreground"
-                      : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
-                  )}
-                >
-                  <Tooltip>
-                    <TooltipTrigger render={tabButton} />
-                    <TooltipPopup>{conflicted ? `${title} (changed on disk)` : title}</TooltipPopup>
-                  </Tooltip>
+          {showIconBar ? (
+            <div
+              ref={iconBarRef}
+              role="toolbar"
+              aria-label="Right panel surfaces"
+              data-right-panel-icon-bar
+              onKeyDown={handleIconBarKeyDown}
+              className="flex shrink-0 items-center gap-0.5 [-webkit-app-region:no-drag]"
+            >
+              {fixedIcons.map((item) => {
+                const Icon = item.icon;
+                const tooltipText =
+                  !item.available && item.disabledReason ? item.disabledReason : item.label;
+                const iconButton = (
                   <button
                     type="button"
+                    aria-label={item.label}
+                    aria-pressed={item.active}
+                    aria-disabled={!item.available ? "true" : undefined}
+                    data-right-panel-icon={item.key}
+                    data-active-icon={item.active ? "true" : "false"}
+                    onClick={() => {
+                      if (!item.available) return;
+                      item.onSelect();
+                    }}
                     className={cn(
-                      "relative flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted focus:opacity-100",
-                      pending ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+                      "relative inline-flex size-7 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                      !item.available
+                        ? "cursor-not-allowed text-muted-foreground opacity-40"
+                        : item.active
+                          ? "text-foreground after:pointer-events-none after:absolute after:inset-x-1.5 after:bottom-0 after:h-0.5 after:rounded-full after:bg-foreground"
+                          : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
                     )}
-                    aria-label={`Close ${title}`}
-                    onClick={() => props.onCloseSurface(surface)}
                   >
-                    {pending ? (
-                      <>
-                        <span
-                          className={cn(
-                            "size-2 rounded-full group-hover:hidden",
-                            conflicted ? "bg-amber-500" : "bg-current",
-                          )}
-                          data-file-disk-conflict={conflicted ? "" : undefined}
-                          aria-hidden
-                        />
-                        <X className="hidden size-3 group-hover:block" />
-                      </>
-                    ) : (
-                      <X className="size-3" />
-                    )}
+                    <Icon className="size-4 stroke-[1.75]" aria-hidden="true" />
                   </button>
-                </div>
-              );
-            })}
-            {props.surfaces.length > 0 && props.allowAddSurfaces !== false ? (
-              <Menu>
-                <MenuTrigger
-                  className="relative inline-flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-                  aria-label="Add panel surface"
-                >
-                  <Plus className="size-4" />
-                </MenuTrigger>
-                <MenuPopup align="start" side="bottom" sideOffset={6} className="min-w-44">
-                  <SurfaceMenuItem
-                    available={props.browserAvailable}
-                    disabledReason={SURFACE_DISABLED_REASONS.browser}
-                    onClick={props.onAddBrowser}
-                  >
-                    <Globe2 />
-                    Browser
-                  </SurfaceMenuItem>
-                  <SurfaceMenuItem available onClick={props.onAddTerminal}>
-                    <TerminalSquare />
-                    Terminal
-                  </SurfaceMenuItem>
-                  <SurfaceMenuItem
-                    available={props.filesAvailable}
-                    disabledReason={SURFACE_DISABLED_REASONS.files}
-                    onClick={props.onAddFiles}
-                  >
-                    <Files />
-                    Files
-                  </SurfaceMenuItem>
-                  <SurfaceMenuItem
-                    available={props.diffAvailable}
-                    disabledReason={SURFACE_DISABLED_REASONS.diff}
-                    onClick={props.onAddDiff}
-                  >
-                    <FileDiff />
-                    Diff
-                  </SurfaceMenuItem>
-                  <SurfaceMenuItem
-                    available={props.sourceControlAvailable}
-                    disabledReason={SURFACE_DISABLED_REASONS.sourceControl}
-                    onClick={props.onAddSourceControl}
-                  >
-                    <GitPullRequestArrow />
-                    Source Control
-                  </SurfaceMenuItem>
-                  {props.onAddDevice === undefined ? null : (
-                    <SurfaceMenuItem available onClick={props.onAddDevice}>
-                      <Smartphone />
-                      Device
-                    </SurfaceMenuItem>
-                  )}
-                </MenuPopup>
-              </Menu>
-            ) : null}
+                );
+                return (
+                  <Tooltip key={item.key}>
+                    <TooltipTrigger render={iconButton} />
+                    <TooltipPopup side="bottom">{tooltipText}</TooltipPopup>
+                  </Tooltip>
+                );
+              })}
+            </div>
+          ) : (
+            dynamicTabList
+          )}
+          {props.layoutControls}
+        </div>
+        {showIconBar && dynamicSurfaces.length > 0 ? (
+          <div className="flex h-9 min-h-9 shrink-0 items-center border-t border-panel-separator/60 px-2">
+            {dynamicTabList}
           </div>
-        </ScrollArea>
-        {props.layoutControls}
+        ) : null}
       </div>
       <div className="flex min-h-0 flex-1 flex-col">
         {props.activeSurfaceId === null ? (
-          <RightPanelEmptyState
-            onAddBrowser={props.onAddBrowser}
-            onAddTerminal={props.onAddTerminal}
-            onAddDiff={props.onAddDiff}
-            onAddFiles={props.onAddFiles}
-            onAddSourceControl={props.onAddSourceControl}
-            onAddDevice={props.onAddDevice}
-            browserAvailable={props.browserAvailable}
-            diffAvailable={props.diffAvailable}
-            filesAvailable={props.filesAvailable}
-            sourceControlAvailable={props.sourceControlAvailable}
-          />
+          <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+            <p className="text-xs text-muted-foreground">Select a surface from the bar above.</p>
+          </div>
         ) : (
           props.children
         )}

@@ -536,7 +536,17 @@ pub trait ProviderDriver: Send + Sync {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
+    fn answer_with_followup_guard(
+        &self,
+        request_id: String,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+        _followup_guard: Option<crate::provider::codex::runtime::FollowupTurnGuardFn>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        self.answer(request_id, answers, disposition)
+    }
     fn set_mode(&self, mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn set_interaction_mode(
         &self,
@@ -613,6 +623,11 @@ pub trait ProviderDriver: Send + Sync {
     /// Whether the driver retired its process, such as a Cursor whose stopped turn ignored the
     /// cancel: the session takes nothing more, so the next message launches it again.
     fn retired(&self) -> bool {
+        false
+    }
+    /// Whether the underlying transport has already closed and its event pump is draining
+    /// stream-end settlement; new deliveries wait for settlement instead of aborting the pump.
+    fn transport_closed(&self) -> bool {
         false
     }
 }
@@ -3149,6 +3164,14 @@ pub async fn reconcile_abandoned_provider_sessions(
             tracing::warn!(%error, "failed to read running turns for startup reconciliation");
         }
     }
+    // Deleted threads can never accept ThreadMessageAssistantComplete; clear any legacy
+    // orphaned streaming rows left on deleted threads before listing live threads to settle.
+    if let Err(error) = repositories
+        .clear_streaming_assistant_messages_of_deleted_threads()
+        .await
+    {
+        tracing::warn!(%error, "failed to clear streaming assistant messages on deleted threads");
+    }
     // No session is live, so an assistant message still streaming is orphaned too. A stop after
     // a turn ended but before its reply settled leaves no active turn for the loops above to
     // settle. This runs after them, so an abandoned turn is failed before its reply settles;
@@ -3540,6 +3563,7 @@ mod workspace_loss_tests {
             &self,
             _: String,
             _: Value,
+            _: crate::provider::UserInputResponseDisposition,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
             Box::pin(async { Ok(()) })
         }
@@ -8477,6 +8501,136 @@ async fn run_supervisor(
                     }
                     continue;
                 }
+                if let OrchestrationCommand::ThreadUserInputRespond { thread_id, .. } =
+                    command.as_ref()
+                    && let Some(entry) = sessions.get(thread_id)
+                {
+                    let driver = entry.driver.clone();
+                    let provider = entry.launch.provider.clone();
+                    let OrchestrationCommand::ThreadUserInputRespond {
+                        thread_id,
+                        request_id,
+                        answers,
+                        disposition,
+                        ..
+                    } = *command
+                    else {
+                        unreachable!();
+                    };
+                    let engine = engine.clone();
+                    let disposition = disposition.unwrap_or_default();
+                    let answers = if disposition
+                        == crate::provider::UserInputResponseDisposition::Cancelled
+                    {
+                        json!({})
+                    } else {
+                        answers
+                    };
+                    // Run user-input answers off the shared supervisor loop so a slow or wedged
+                    // provider RPC cannot stall other threads. For Codex answers that may start a
+                    // follow-up turn (either post-turn or after a mid-turn steer learns the turn
+                    // just ended), enforce thread reservation, checkpoint settlement, and checkout
+                    // admission right at the follow-up-start decision.
+                    tokio::spawn(async move {
+                        let followup_guard = if provider == "codex"
+                            && !disposition.is_effective_skip_or_cancel(&answers)
+                        {
+                            let guard_engine = engine.clone();
+                            let guard_thread_id = thread_id.clone();
+                            Some(Arc::new(move || {
+                                let engine = guard_engine.clone();
+                                let thread_id = guard_thread_id.clone();
+                                Box::pin(async move {
+                                    let reservation = engine.reserve_thread_turns(&thread_id).await;
+                                    let deadline = tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(10);
+                                    // Wait for any in-flight `turn/completed` projection to settle
+                                    // the session (which installs any checkpoint hold before
+                                    // leaving `running`/`starting`), and then wait for any active
+                                    // checkpoint hold to clear before admitting a follow-up turn.
+                                    loop {
+                                        let session_settling = match engine
+                                            .repositories()
+                                            .get_thread_session(thread_id.clone())
+                                            .await
+                                        {
+                                            Ok(Some(session)) => matches!(
+                                                session.status.as_str(),
+                                                "running" | "starting"
+                                            ),
+                                            Ok(None) => false,
+                                            Err(error) => {
+                                                tracing::warn!(
+                                                    %error,
+                                                    %thread_id,
+                                                    "failed to inspect Codex session state before starting async follow-up turn"
+                                                );
+                                                return Err(format!(
+                                                    "Could not check session state before starting a follow-up turn: {error}"
+                                                ));
+                                            }
+                                        };
+                                        let held_for_checkpoint =
+                                            engine.turns_held_for_checkpoint(&thread_id);
+                                        if !session_settling && !held_for_checkpoint {
+                                            break;
+                                        }
+                                        if tokio::time::Instant::now() >= deadline {
+                                            tracing::warn!(
+                                                %thread_id,
+                                                session_settling,
+                                                held_for_checkpoint,
+                                                "previous Codex turn completion or checkpoint capture did not settle before async follow-up; refusing follow-up turn start"
+                                            );
+                                            return Err(
+                                                "A checkpoint is still being captured for the previous turn. Try submitting your answer again in a moment."
+                                                    .to_owned(),
+                                            );
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(50))
+                                            .await;
+                                    }
+                                    let Some(admission) =
+                                        crate::production::orchestration_effects::admit_thread_turn(
+                                            &engine, &thread_id,
+                                        )
+                                        .await
+                                    else {
+                                        return Err(
+                                            "A workspace restore is in progress. Try submitting your answer again once it finishes."
+                                                .to_owned(),
+                                        );
+                                    };
+                                    Ok(Box::new((reservation, admission))
+                                        as crate::provider::codex::runtime::FollowupTurnGuardHandle)
+                                })
+                                    as std::pin::Pin<
+                                        Box<
+                                            dyn std::future::Future<
+                                                    Output = Result<
+                                                        crate::provider::codex::runtime::FollowupTurnGuardHandle,
+                                                        String,
+                                                    >,
+                                                > + Send,
+                                        >,
+                                    >
+                            })
+                                as crate::provider::codex::runtime::FollowupTurnGuardFn)
+                        } else {
+                            None
+                        };
+                        let result = driver
+                            .answer_with_followup_guard(
+                                request_id,
+                                answers,
+                                disposition,
+                                followup_guard,
+                            )
+                            .await;
+                        let _ = response.send(result);
+                    });
+                    continue;
+                }
                 let result = handle_command(
                     &engine,
                     &factory,
@@ -8785,6 +8939,26 @@ async fn run_supervisor(
                         }
                         entry.pending_stream_settlement = None;
                         entry.event_cancellation.cancel();
+                    }
+                    if sessions.get(&thread_id).is_some_and(|entry| {
+                        !entry.event_task.is_finished()
+                            && !entry.event_cancellation.is_cancelled()
+                            && entry.driver.transport_closed()
+                    }) {
+                        let detail =
+                            "Provider session is still settling after its event stream ended."
+                                .to_owned();
+                        let outcome = if frozen_delivery
+                            .as_ref()
+                            .is_some_and(|row| row.mode == TurnDeliveryMode::Steer)
+                        {
+                            ProviderDeliveryOutcome::Rejected { detail }
+                        } else {
+                            ProviderDeliveryOutcome::DefinitelyNotSent { detail }
+                        };
+                        let (response, completion) = oneshot::channel();
+                        let _ = response.send(outcome);
+                        return Ok(ProviderDeliveryHandle { completion });
                     }
                     if sessions.get(&thread_id).is_some_and(|entry| {
                         entry.event_task.is_finished()
@@ -9731,9 +9905,37 @@ async fn spawn_delivery(
                 .await
             {
                 Ok(Some(turn_id)) => {
-                    driver
-                        .steer(message.text, message.attachments, turn_id, delivery_key)
-                        .await
+                    let blocked_by_open_ask = if row.provider_kind == "antigravity" {
+                        let ask_thread_id = row.thread_id.clone();
+                        repositories
+                            .database()
+                            .call(move |connection| {
+                                crate::agent_messaging::store::has_open_ask(
+                                    connection,
+                                    &ask_thread_id,
+                                )
+                            })
+                            .await
+                    } else {
+                        Ok(false)
+                    };
+                    match blocked_by_open_ask {
+                        Ok(true) => ProviderDeliveryOutcome::Rejected {
+                            detail: "Respond to the pending approval or question before steering."
+                                .to_owned(),
+                        },
+                        Ok(false) => {
+                            driver
+                                .steer(message.text, message.attachments, turn_id, delivery_key)
+                                .await
+                        }
+                        Err(error) => ProviderDeliveryOutcome::DefinitelyNotSent {
+                            detail: delivery_detail(
+                                &ProviderRuntimeError::Persistence(error.to_string()),
+                                None,
+                            ),
+                        },
+                    }
                 }
                 Ok(None) => ProviderDeliveryOutcome::Rejected {
                     detail: STEER_TARGET_GONE_DETAIL.to_owned(),
@@ -12137,8 +12339,18 @@ async fn handle_command(
         OrchestrationCommand::ThreadUserInputRespond {
             request_id,
             answers,
+            disposition,
             ..
-        } => entry.driver.answer(request_id, answers).await,
+        } => {
+            let disposition = disposition.unwrap_or_default();
+            let answers = if disposition == crate::provider::UserInputResponseDisposition::Cancelled
+            {
+                json!({})
+            } else {
+                answers
+            };
+            entry.driver.answer(request_id, answers, disposition).await
+        }
         OrchestrationCommand::ThreadRuntimeModeSet { runtime_mode, .. } => {
             match entry.driver.set_mode(runtime_mode.clone()).await {
                 Ok(()) => {
@@ -13592,6 +13804,7 @@ fn spawn_event_pump(
             settled_tx
         };
         let mut last_exit_reason: Option<String> = None;
+        let mut last_exit_error_reason: Option<String> = None;
         let mut reasoning = ReasoningCoalescer::default();
         // An ask the resumed session recovered could not be recorded (#187).
         let mut recovered_ask_unprojected = false;
@@ -13647,6 +13860,13 @@ fn spawn_event_pump(
                         last_exit_reason = event
                             .payload
                             .get("reason")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|reason| !reason.is_empty())
+                            .map(str::to_owned);
+                        last_exit_error_reason = event
+                            .payload
+                            .get("errorReason")
                             .and_then(Value::as_str)
                             .map(str::trim)
                             .filter(|reason| !reason.is_empty())
@@ -14008,6 +14228,17 @@ fn spawn_event_pump(
             };
             // A provider may already have settled its turn before announcing exit.
             if let Some(turn_id) = active_turn_id {
+                let mut payload = json!({
+                    "state": "failed",
+                    "errorMessage": stream_end_message,
+                    // The provider's stream died under BiBCode;
+                    // that is our transport, not a fault the
+                    // provider reported about the work itself.
+                    "errorClass": "transport_error",
+                });
+                if let Some(error_reason) = &last_exit_error_reason {
+                    payload["errorReason"] = json!(error_reason);
+                }
                 let failure = ProviderEvent {
                     native_event_id: None,
                     event_type: "turn.completed".to_owned(),
@@ -14015,14 +14246,7 @@ fn spawn_event_pump(
                     turn_id: Some(turn_id),
                     item_id: None,
                     request_id: None,
-                    payload: json!({
-                        "state": "failed",
-                        "errorMessage": stream_end_message,
-                        // The provider's stream died under BiBCode;
-                        // that is our transport, not a fault the
-                        // provider reported about the work itself.
-                        "errorClass": "transport_error",
-                    }),
+                    payload,
                     activity: Vec::new(),
                     activity_controls: Default::default(),
                 };
@@ -14657,6 +14881,18 @@ async fn project_provider_event(
     {
         return Ok(());
     }
+    // Avoid duplicate durable `user-input.expired` rows when an earlier Stop/interrupt or
+    // settlement already closed the request before the provider adapter's expiry event arrived.
+    if event.event_type == "user-input.expired"
+        && let Some(request_id) = event.request_id.as_ref()
+        && !engine
+            .repositories()
+            .user_input_request_is_open(launch.thread_id.clone(), request_id.clone())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+    {
+        return Ok(());
+    }
     // A notice about the session itself, such as Cursor keeping its current options, shows on
     // the session whatever its state, until its next update.
     if event.event_type == "session.notice" {
@@ -14807,9 +15043,14 @@ async fn project_provider_event(
         let last_error = failed.then(|| provider_completion_error(&event.payload));
         let last_error_class = failed.then(|| provider_completion_error_class(&event.payload));
         if let Some(class) = &last_error_class {
+            let provider_reason = event
+                .payload
+                .get("providerReason")
+                .and_then(Value::as_str)
+                .or_else(|| event.payload.get("errorReason").and_then(Value::as_str));
             crate::diagnostics::profiler::provider_turns::record_turn_failure(
                 &launch.provider,
-                event.payload.get("providerReason").and_then(Value::as_str),
+                provider_reason,
                 class,
             );
         }
@@ -14903,6 +15144,13 @@ async fn project_provider_event(
                 turn_id = ?event.turn_id,
                 "reasoning remained streaming after terminal projection"
             );
+        }
+        // Usage-limit completions already publish their in-chat notice via `runtime.warning`
+        // (when a quota chunk arrived) or via the failed delivery card / session error (when the
+        // prompt rejected before its first update). Do not append a second timeline activity.
+        if failed && event.payload.get("errorReason").and_then(Value::as_str) == Some("usage_limit")
+        {
+            return Ok(());
         }
     }
     if matches!(
@@ -15106,12 +15354,16 @@ async fn settle_streaming_assistant_message_rows(
     created_at: &str,
 ) -> Result<(), ProviderRuntimeError> {
     let mut first_persistent_error = None;
+    let mut deleted_threads = std::collections::HashSet::<String>::new();
     for (index, message) in messages
         .into_iter()
         .filter(|message| message.role == "assistant" && message.is_streaming)
         .enumerate()
     {
         let thread_id = message.thread_id;
+        if deleted_threads.contains(&thread_id) {
+            continue;
+        }
         let turn_id = message.turn_id;
         let completion = OrchestrationCommand::ThreadMessageAssistantComplete {
             command_id: format!("{command_id}:assistant-complete:{index}"),
@@ -15121,6 +15373,10 @@ async fn settle_streaming_assistant_message_rows(
             created_at: created_at.to_owned(),
         };
         if let Err(error) = engine.dispatch(completion.clone()).await {
+            if provider_thread_was_deleted(&engine.repositories(), &thread_id).await {
+                deleted_threads.insert(thread_id);
+                continue;
+            }
             tracing::warn!(
                 %error,
                 %thread_id,
@@ -15128,6 +15384,10 @@ async fn settle_streaming_assistant_message_rows(
                 "assistant terminal settlement failed; retrying once"
             );
             if let Err(error) = engine.dispatch(completion).await {
+                if provider_thread_was_deleted(&engine.repositories(), &thread_id).await {
+                    deleted_threads.insert(thread_id);
+                    continue;
+                }
                 tracing::warn!(
                     %error,
                     %thread_id,
@@ -15338,6 +15598,11 @@ fn event_activity_summary(event_type: &str, payload: &Value, provider_label: &st
         "thread.started" => "Conversation started",
         "turn.started" => "Turn started",
         "turn.completed" => match payload.get("state").and_then(Value::as_str) {
+            Some("failed")
+                if payload.get("errorReason").and_then(Value::as_str) == Some("usage_limit") =>
+            {
+                "Usage limit reached"
+            }
             Some("failed") => "Turn failed",
             Some("interrupted") => "Turn interrupted",
             Some("cancelled") => "Turn cancelled",
@@ -15363,9 +15628,20 @@ fn event_activity_summary(event_type: &str, payload: &Value, provider_label: &st
         "request.opened" => "Approval requested",
         "request.resolved" => "Approval resolved",
         "user-input.requested" => "Input requested",
-        "user-input.resolved" => "Input received",
+        "user-input.resolved" => match payload.get("disposition").and_then(Value::as_str) {
+            Some("skipped") => "Input skipped",
+            Some("cancelled") => "Input cancelled",
+            _ => "Input received",
+        },
+        "user-input.expired" => "Input expired",
         "mcp.status.updated" => "Tool connections updated",
-        "runtime.warning" => return format!("{provider_label} warning"),
+        "runtime.warning" => {
+            if payload.get("usageLimit").and_then(Value::as_bool) == Some(true) {
+                "Usage limit reached"
+            } else {
+                return format!("{provider_label} warning");
+            }
+        }
         // Includes runtime.error and future error-shaped events classified by
         // the same policy that assigns the activity's tone and kind.
         event if event_activity_shape(event).1 == "provider.error" => {
@@ -15382,6 +15658,7 @@ fn event_activity_shape(event_type: &str) -> (&'static str, &'static str) {
         "request.resolved" => ("approval", "approval.resolved"),
         "user-input.requested" => ("approval", "user-input.requested"),
         "user-input.resolved" => ("approval", "user-input.resolved"),
+        "user-input.expired" => ("approval", "user-input.expired"),
         event if event.contains("error") || event.contains("failed") => ("error", "provider.error"),
         // Provider stderr and upstream retries arrive as `runtime.warning`.
         // Without this arm they fell through to the catch-all and were filed as
@@ -17634,13 +17911,38 @@ impl ProviderDriver for CodexDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.runtime
-                .respond_to_user_input(&request_id, answers)
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
                 .await
                 .map_err(provider_error("codex"))
         })
+    }
+    fn answer_with_followup_guard(
+        &self,
+        request_id: String,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
+        followup_guard: Option<crate::provider::codex::runtime::FollowupTurnGuardFn>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .respond_to_user_input_with_disposition_and_guard(
+                    &request_id,
+                    answers,
+                    disposition,
+                    followup_guard,
+                )
+                .await
+                .map_err(provider_error("codex"))
+        })
+    }
+    fn holds_unsettled_work(&self) -> BoxRuntimeFuture<'_, bool> {
+        // Keep the live Codex runtime alive while it owns an open async/pending request so idle
+        // suspension cannot strand a visible clarifying-questions card.
+        Box::pin(async move { self.runtime.has_pending_requests().await })
     }
     fn set_mode(&self, _mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         unsupported("codex", "post-start runtime mode changes")
@@ -17979,10 +18281,11 @@ impl ProviderDriver for CursorDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.runtime
-                .respond_to_user_input(&request_id, answers)
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
                 .await
                 .map_err(provider_error("cursor"))
         })
@@ -18251,26 +18554,20 @@ fn antigravity_error(error: AntigravityRuntimeError) -> ProviderRuntimeError {
         // Option values stay out of the Display; only the refusal names them.
         AntigravityRuntimeError::UnsupportedOption(_) => option_error("antigravity", error),
         // The CLI's own words reach only the thread's turn error. Logs, delivery details and
-        // launch errors get the method we sent, the code and the class.
+        // launch errors get the method we sent, the code, the class, and the sanitized reason.
         AntigravityRuntimeError::Protocol(error) => {
-            use crate::provider::antigravity::acp::{AcpProtocolError, acp_error_class};
-            let class = acp_error_class(&error);
-            let line_too_long = match &error {
-                AcpProtocolError::LineTooLong { .. } => true,
-                AcpProtocolError::Closed { reason } => {
-                    reason.starts_with("ACP JSON-RPC read line exceeded ")
-                }
-                _ => false,
+            use crate::provider::antigravity::{
+                acp::{AcpProtocolError, acp_error_class, acp_error_reason},
+                runtime::antigravity_transport_message,
             };
+            let class = acp_error_class(&error);
+            let reason = acp_error_reason(&error);
+            let line_too_long = reason == "line_too_long";
             let detail = match &error {
                 AcpProtocolError::RemoteRequest { method, code, .. } => {
                     format!("Antigravity answered {method} with error {code} ({class})")
                 }
-                _ if line_too_long => {
-                    "Antigravity sent a message longer than BiBCode accepts (transport_error)"
-                        .to_owned()
-                }
-                _ => format!("Antigravity connection failed ({class})"),
+                _ => antigravity_transport_message(reason),
             };
             let provider = "antigravity".to_owned();
             if line_too_long {
@@ -18366,13 +18663,71 @@ impl ProviderDriver for AntigravityDriver {
                 Err(error) => return antigravity_unsent_outcome(error),
             };
             let turn_id = receipt.turn_id.clone();
-            match receipt.completion().await {
+            match receipt.accepted().await {
                 Ok(()) => ProviderDeliveryOutcome::Accepted {
                     turn_id: Some(turn_id),
                 },
                 Err(
                     error @ (AntigravityRuntimeError::SignInRequired
                     | AntigravityRuntimeError::AccountDisabled { .. }
+                    | AntigravityRuntimeError::UsageLimitReached { .. }
+                    | AntigravityRuntimeError::Protocol(
+                        crate::provider::antigravity::acp::AcpProtocolError::RemoteRequest {
+                            ..
+                        },
+                    )),
+                ) => ProviderDeliveryOutcome::Rejected {
+                    detail: delivery_detail(&antigravity_error(error), None),
+                },
+                Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: delivery_detail(&antigravity_error(error), None),
+                },
+            }
+        })
+    }
+    fn steer(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        expected_turn_id: String,
+        _: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
+                Ok(input) => input,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: delivery_detail(&error, None),
+                    };
+                }
+            };
+            let receipt = match self
+                .runtime
+                .steer_turn(Some(&text), attachments, &expected_turn_id)
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(AntigravityRuntimeError::SteerUnavailable { detail }) => {
+                    return ProviderDeliveryOutcome::Rejected { detail };
+                }
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: delivery_detail(&antigravity_error(error), None),
+                    };
+                }
+            };
+            let turn_id = receipt.turn_id.clone();
+            match receipt.accepted().await {
+                Ok(()) => ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn_id),
+                },
+                Err(AntigravityRuntimeError::SteerUnavailable { detail }) => {
+                    ProviderDeliveryOutcome::Rejected { detail }
+                }
+                Err(
+                    error @ (AntigravityRuntimeError::SignInRequired
+                    | AntigravityRuntimeError::AccountDisabled { .. }
+                    | AntigravityRuntimeError::UsageLimitReached { .. }
                     | AntigravityRuntimeError::Protocol(
                         crate::provider::antigravity::acp::AcpProtocolError::RemoteRequest {
                             ..
@@ -18407,16 +18762,37 @@ impl ProviderDriver for AntigravityDriver {
             self.runtime
                 .respond_to_request(&request_id, &decision)
                 .await
-                .map_err(antigravity_error)
+                .map_err(|error| match error {
+                    AntigravityRuntimeError::PendingRequestNotFound { request_id } => {
+                        ProviderRuntimeError::Provider {
+                            provider: "antigravity".to_owned(),
+                            detail: format!("Unknown pending approval request: {request_id}"),
+                        }
+                    }
+                    other => antigravity_error(other),
+                })
         })
     }
     fn answer(
         &self,
-        _: String,
-        _: Value,
+        request_id: String,
+        answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
-        // The client advertises no elicitation, so no question is ever pending (D-A7).
-        unsupported("antigravity", "user input answers")
+        Box::pin(async move {
+            self.runtime
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
+                .await
+                .map_err(|error| match error {
+                    AntigravityRuntimeError::PendingRequestNotFound { request_id } => {
+                        ProviderRuntimeError::Provider {
+                            provider: "antigravity".to_owned(),
+                            detail: format!("Unknown pending user-input request: {request_id}"),
+                        }
+                    }
+                    other => antigravity_error(other),
+                })
+        })
     }
     fn set_mode(&self, mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
@@ -18483,6 +18859,12 @@ impl ProviderDriver for AntigravityDriver {
     }
     fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
         Box::pin(std::future::ready(exited_child(&self.child)))
+    }
+    fn retired(&self) -> bool {
+        self.runtime.is_retired()
+    }
+    fn transport_closed(&self) -> bool {
+        self.runtime.is_transport_closed()
     }
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
@@ -18629,10 +19011,11 @@ impl ProviderDriver for GrokDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.runtime
-                .respond_to_user_input(&request_id, answers)
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
                 .await
                 .map_err(provider_error("grok"))
         })
@@ -19023,10 +19406,11 @@ impl ProviderDriver for OpenCodeDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             self.runtime
-                .respond_to_user_input(&request_id, answers)
+                .respond_to_user_input_with_disposition(&request_id, answers, disposition)
                 .await
                 .map_err(provider_error("opencode"))
         })
@@ -22823,13 +23207,14 @@ impl ProviderDriver for ClaudeDriver {
         &self,
         request_id: String,
         answers: Value,
+        disposition: crate::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             let Some(resolved) = self
                 .runtime
                 .lock()
                 .await
-                .resolve_user_input_request(&request_id, answers)
+                .resolve_user_input_request_with_disposition(&request_id, answers, disposition)
             else {
                 return Err(ProviderRuntimeError::Provider {
                     provider: self.provider.clone(),
@@ -24666,6 +25051,7 @@ mod tests {
             &self,
             _: String,
             _: Value,
+            _: crate::provider::UserInputResponseDisposition,
         ) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
             Box::pin(async move {
                 self.state.lock().unwrap().answers += 1;
@@ -30087,6 +30473,294 @@ done
                 false
             )]
         );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_skips_and_clears_streaming_assistant_messages_on_deleted_threads()
+     {
+        use std::io;
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("captured log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+
+        let engine = supervisor_engine().await;
+        for command in [
+            json!({"type":"thread.create","commandId":"thread-deleted","threadId":"t-deleted","projectId":"p1","title":"Deleted","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.create","commandId":"thread-live","threadId":"t-live","projectId":"p1","title":"Live","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-deleted","threadId":"t-deleted","messageId":"msg-deleted","delta":"Partial reply","turnId":"turn-deleted","createdAt":"2026-07-16T00:00:01Z"}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-live","threadId":"t-live","messageId":"msg-live","delta":"Orphaned live reply","turnId":"turn-live","createdAt":"2026-07-16T00:00:01Z"}),
+            json!({"type":"thread.delete","commandId":"delete-t-deleted","threadId":"t-deleted","createdAt":"2026-07-16T00:00:02Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        // Live deletion clears is_streaming immediately through the messages projector.
+        let deleted_immediately = engine
+            .repositories()
+            .get_message("msg-deleted".to_owned())
+            .await
+            .unwrap()
+            .expect("deleted thread message row");
+        assert!(
+            !deleted_immediately.is_streaming,
+            "live thread.deleted must clear is_streaming via projection.thread-messages"
+        );
+
+        // Simulate a legacy pre-fix database where a deleted thread AND a missing parent thread
+        // both still hold is_streaming=1 assistant rows.
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute(
+                    "UPDATE projection_thread_messages SET is_streaming = 1 WHERE message_id = 'msg-deleted'",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at) VALUES ('msg-missing', 't-missing', 'turn-missing', 'assistant', 'Orphaned missing parent', NULL, 1, '2026-07-16T00:00:01Z', '2026-07-16T00:00:01Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Independently of startup cleanup, the candidate query itself must return only msg-live.
+        let candidates = engine
+            .repositories()
+            .list_streaming_assistant_messages()
+            .await
+            .unwrap();
+        let candidate_ids: Vec<&str> = candidates
+            .iter()
+            .map(|row| row.message_id.as_str())
+            .collect();
+        assert_eq!(
+            candidate_ids,
+            vec!["msg-live"],
+            "deleted and missing-parent streaming rows must be excluded by list_streaming_assistant_messages"
+        );
+
+        super::reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .unwrap();
+
+        let deleted_msg = engine
+            .repositories()
+            .get_message("msg-deleted".to_owned())
+            .await
+            .unwrap()
+            .expect("deleted thread message row");
+        assert!(
+            !deleted_msg.is_streaming,
+            "deleted thread's streaming flag should be cleared on startup reconciliation"
+        );
+        let missing_msg = engine
+            .repositories()
+            .get_message("msg-missing".to_owned())
+            .await
+            .unwrap()
+            .expect("missing parent thread message row");
+        assert!(
+            !missing_msg.is_streaming,
+            "missing-parent thread's streaming flag should be cleared on startup reconciliation"
+        );
+        let live_msg = engine
+            .repositories()
+            .get_message("msg-live".to_owned())
+            .await
+            .unwrap()
+            .expect("live thread message row");
+        assert!(
+            !live_msg.is_streaming,
+            "live thread's orphaned streaming assistant message must still settle"
+        );
+
+        // Verify zero completion command receipts for deleted/missing threads and one accepted for t-live.
+        let receipts: Vec<(String, String)> = engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                let mut stmt = connection.prepare(
+                    "SELECT aggregate_id, status FROM orchestration_command_receipts WHERE command_id LIKE 'provider-restart-reconcile-messages:%' ORDER BY aggregate_id",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            receipts,
+            vec![("t-live".to_owned(), "accepted".to_owned())],
+            "only live threads should receive ThreadMessageAssistantComplete during startup reconciliation"
+        );
+
+        let captured =
+            String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8");
+        assert!(
+            !captured.contains("assistant terminal settlement failed"),
+            "unexpected settlement failure warning for deleted thread: {captured}"
+        );
+        assert!(
+            !captured
+                .contains("assistant messages remained streaming after startup reconciliation"),
+            "unexpected remained-streaming warning for deleted thread: {captured}"
+        );
+
+        // Replaying ONLY projection.thread-messages must match live deletion (is_streaming = 0 before provider reconciliation).
+        let database = engine.repositories().database().clone();
+        engine.shutdown().await;
+        database
+            .call(|connection| {
+                connection.execute("DELETE FROM projection_thread_messages", [])?;
+                connection.execute(
+                    "UPDATE projection_state SET last_applied_sequence = 0 WHERE projector = 'projection.thread-messages'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let replayed = super::OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .unwrap();
+        let replayed_deleted = replayed
+            .repositories()
+            .get_message("msg-deleted".to_owned())
+            .await
+            .unwrap()
+            .expect("replayed deleted thread message row");
+        assert!(
+            !replayed_deleted.is_streaming,
+            "rebuilding only projection.thread-messages must clear is_streaming on thread.deleted"
+        );
+        replayed.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn settle_streaming_assistant_message_rows_does_not_retry_deleted_thread() {
+        use std::io;
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("captured log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+
+        let engine = supervisor_engine().await;
+        for command in [
+            json!({"type":"thread.create","commandId":"thread-race","threadId":"t-race","projectId":"p1","title":"Race","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-race-1","threadId":"t-race","messageId":"msg-race-1","delta":"First in flight","turnId":"turn-race-1","createdAt":"2026-07-16T00:00:01Z"}),
+            json!({"type":"thread.message.assistant.delta","commandId":"delta-race-2","threadId":"t-race","messageId":"msg-race-2","delta":"Second in flight","turnId":"turn-race-2","createdAt":"2026-07-16T00:00:01Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        // Snapshot both streaming rows before a concurrent thread deletion arrives.
+        let stale_rows = engine
+            .repositories()
+            .list_streaming_assistant_messages()
+            .await
+            .unwrap();
+        assert_eq!(stale_rows.len(), 2);
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.delete",
+                    "commandId": "delete-t-race",
+                    "threadId": "t-race",
+                    "createdAt": "2026-07-16T00:00:02Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = super::settle_streaming_assistant_message_rows(
+            &engine,
+            stale_rows,
+            "test-concurrent-delete",
+            "2026-07-16T00:00:03Z",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "concurrently deleted thread must not fail assistant settlement: {result:?}"
+        );
+        let race_receipts: Vec<String> = engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                let mut stmt = connection.prepare(
+                    "SELECT command_id FROM orchestration_command_receipts WHERE command_id LIKE 'test-concurrent-delete:assistant-complete:%'",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            race_receipts.len(),
+            1,
+            "once deletion is confirmed on the first row, remaining rows for that thread must be skipped without extra rejected commands: {race_receipts:?}"
+        );
+        let captured =
+            String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8");
+        assert!(
+            !captured.contains("retrying once") && !captured.contains("failed after retry"),
+            "deleted thread must not retry settlement: {captured}"
+        );
+
         engine.shutdown().await;
     }
 
@@ -38771,7 +39445,11 @@ done
         }
         assert!(
             claude
-                .answer("question-0".to_owned(), json!({"answer":"yes"}))
+                .answer(
+                    "question-0".to_owned(),
+                    json!({"answer":"yes"}),
+                    crate::provider::UserInputResponseDisposition::Answered,
+                )
                 .await
                 .expect_err("an unknown question is refused")
                 .to_string()
@@ -38786,7 +39464,11 @@ done
             "question-1",
         );
         claude
-            .answer("question-1".to_owned(), json!({"answer":"yes"}))
+            .answer(
+                "question-1".to_owned(),
+                json!({"answer":"yes"}),
+                crate::provider::UserInputResponseDisposition::Answered,
+            )
             .await
             .expect("Claude user input should resolve");
         claude
@@ -39034,7 +39716,16 @@ done
                 .await
                 .is_err()
         );
-        assert!(codex.answer("unknown".to_owned(), json!({})).await.is_err());
+        assert!(
+            codex
+                .answer(
+                    "unknown".to_owned(),
+                    json!({}),
+                    crate::provider::UserInputResponseDisposition::Answered,
+                )
+                .await
+                .is_err()
+        );
         codex.shutdown().await.expect("Codex should shut down");
 
         let acp_fixture = executable_fixture(&temp, "acp-fixture", ACP_FIXTURE);
@@ -39140,7 +39831,11 @@ done
             );
             assert!(
                 driver
-                    .answer("unknown".to_owned(), json!({}))
+                    .answer(
+                        "unknown".to_owned(),
+                        json!({}),
+                        crate::provider::UserInputResponseDisposition::Answered,
+                    )
                     .await
                     .is_err()
             );
@@ -39572,7 +40267,11 @@ done
         );
         assert!(
             driver
-                .answer("unknown".to_owned(), json!({}))
+                .answer(
+                    "unknown".to_owned(),
+                    json!({}),
+                    crate::provider::UserInputResponseDisposition::Answered,
+                )
                 .await
                 .is_err()
         );
@@ -40317,6 +41016,63 @@ done
                 assert_eq!(activity.payload["detail"], "Connection lost.");
             }
         }
+
+        // Usage-limit runtime.warning projects as "Usage limit reached" (warning), while the
+        // subsequent turn.completed(usage_limit) updates session state without appending a second
+        // activity.
+        let notice = "Antigravity usage limit reached. Resets at 2026-11-27 20:30 UTC (in 2h 30m).";
+        project_work_log_event(
+            &engine,
+            &launch,
+            "runtime.warning",
+            json!({
+                "usageLimit": true,
+                "message": notice,
+                "resetsAt": "2026-11-27T20:30:00Z",
+            }),
+        )
+        .await;
+        let snapshot_after_warning = load_snapshot(&engine.repositories()).await.unwrap();
+        let warning_count = snapshot_after_warning.activities.len();
+        let warning = snapshot_after_warning
+            .activities
+            .last()
+            .expect("usage limit warning activity");
+        assert_eq!(warning.summary, "Usage limit reached");
+        assert_eq!(warning.kind, "provider.warning");
+        assert_eq!(warning.tone, "warning");
+        assert_eq!(warning.payload["usageLimit"], true);
+        assert_eq!(warning.payload["detail"], notice);
+
+        project_work_log_event(
+            &engine,
+            &launch,
+            "turn.completed",
+            json!({
+                "state": "failed",
+                "stopReason": "usage_limit",
+                "errorReason": "usage_limit",
+                "errorClass": "provider_error",
+                "errorMessage": notice,
+                "resetsAt": "2026-11-27T20:30:00Z",
+            }),
+        )
+        .await;
+        let snapshot_after_completion = load_snapshot(&engine.repositories()).await.unwrap();
+        assert_eq!(
+            snapshot_after_completion.activities.len(),
+            warning_count,
+            "turn.completed(usage_limit) must not append a second timeline activity"
+        );
+        let session = engine
+            .repositories()
+            .get_thread_session("t1".to_owned())
+            .await
+            .unwrap()
+            .expect("thread session");
+        assert_eq!(session.status, "error");
+        assert_eq!(session.last_error.as_deref(), Some(notice));
+        assert_eq!(session.last_error_class.as_deref(), Some("provider_error"));
         engine.shutdown().await;
     }
 
@@ -42401,6 +43157,595 @@ done
                 && launch.to_string().contains("-32603"),
             "{launch}"
         );
+    }
+
+    #[test]
+    fn antigravity_transport_errors_surface_distinct_sanitized_reasons() {
+        use crate::provider::antigravity::{
+            AntigravityRuntimeError as Error, acp::AcpProtocolError,
+        };
+        const MARKER: &str = "SYNTHETIC-SECRET-PATH-/workspace/private";
+        let variants = [
+            (
+                AcpProtocolError::Closed {
+                    reason: format!("stdout ended {MARKER}"),
+                },
+                "connection_closed",
+                false,
+            ),
+            (
+                AcpProtocolError::LineTooLong {
+                    stream: "stdout",
+                    maximum: 128 * 1024,
+                },
+                "line_too_long",
+                true,
+            ),
+            (
+                AcpProtocolError::ReadFailure {
+                    stream: "stdout",
+                    message: format!("io err {MARKER}"),
+                },
+                "read_failure",
+                false,
+            ),
+            (
+                AcpProtocolError::WriteFailure {
+                    message: format!("io err {MARKER}"),
+                },
+                "write_failure",
+                false,
+            ),
+            (
+                AcpProtocolError::InvalidMessage {
+                    message: format!("bad json {MARKER}"),
+                },
+                "invalid_message",
+                false,
+            ),
+            (
+                AcpProtocolError::UnknownResponse {
+                    request_id: "404".to_owned(),
+                },
+                "unknown_response",
+                false,
+            ),
+        ];
+
+        let mut seen_details = std::collections::HashSet::new();
+        for (protocol_error, expected_reason, is_line_too_long) in variants {
+            let wrapped = AcpProtocolError::Closed {
+                reason: protocol_error.to_string(),
+            };
+            for candidate in [protocol_error, wrapped] {
+                let mapped = super::antigravity_error(Error::Protocol(candidate));
+                assert_eq!(
+                    matches!(
+                        mapped,
+                        super::ProviderRuntimeError::TransportLineTooLong { .. }
+                    ),
+                    is_line_too_long,
+                    "{expected_reason}: {mapped:?}"
+                );
+                let detail = super::delivery_detail(&mapped, None);
+                assert!(
+                    detail.contains(expected_reason),
+                    "expected {expected_reason} in {detail}"
+                );
+                assert!(!detail.contains(MARKER), "leaked marker in {detail}");
+                assert!(!detail.contains('—'), "em dash in {detail}");
+                if is_line_too_long {
+                    assert!(
+                        detail.contains("longer than BiBCode accepts"),
+                        "dedicated line_too_long wording missing: {detail}"
+                    );
+                }
+                seen_details.insert((expected_reason, detail));
+            }
+        }
+        assert_eq!(
+            seen_details
+                .iter()
+                .map(|(_, detail)| detail.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            6,
+            "every ACP transport error variant must produce a distinct readable detail"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_retry_recycles_broken_session_and_delivers_exact_message() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture = temp.path().join("requests.jsonl");
+        let once_marker = temp.path().join("disconnected-once");
+        let fixture = executable_fixture(&temp, "agy-fixture", ANTIGRAVITY_FIXTURE);
+        let binary = executable_fixture(
+            &temp,
+            "agy",
+            &format!(
+                "#!/bin/sh\nif [ ! -e '{}' ]; then\n  : > '{}'\n  BIBCODE_TEST_DISCONNECT_AFTER_PROMPT=1 BIBCODE_TEST_REQUEST_CAPTURE='{}' exec '{}' \"$@\"\nelse\n  BIBCODE_TEST_REQUEST_CAPTURE='{}' exec '{}' \"$@\"\nfi\n",
+                once_marker.display(),
+                once_marker.display(),
+                capture.display(),
+                fixture.display(),
+                capture.display(),
+                fixture.display(),
+            ),
+        )
+        .to_string_lossy()
+        .into_owned();
+        std::fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&json!({
+                "providerInstances": {
+                    "antigravity": {
+                        "driver": "antigravity",
+                        "enabled": true,
+                        "config": { "binaryPath": binary }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let engine = supervisor_engine().await;
+        for command in [
+            json!({"type":"project.create","commandId":"ag-retry-proj","projectId":"ag-retry","title":"Antigravity","workspaceRoot":temp.path(),"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.create","commandId":"ag-retry-thread","threadId":"ag-retry","projectId":"ag-retry","title":"Thread","kind":"workspace","modelSelection":{"instanceId":"antigravity","model":"auto"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        let prompt_text = "Retry exact prompt payload 433";
+        let command: OrchestrationCommand = serde_json::from_value(json!({
+            "type": "thread.turn.start",
+            "commandId": "retry-cmd-1",
+            "threadId": "ag-retry",
+            "message": { "messageId": "retry-msg-1", "role": "user", "text": prompt_text, "attachments": [] },
+            "modelSelection": { "instanceId": "antigravity", "model": "auto" },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "createdAt": "2026-07-16T00:00:00Z",
+        }))
+        .unwrap();
+        let mut payload = serde_json::to_value(&command).unwrap();
+        super::freeze_delivery_route(&engine, &temp.path().to_path_buf(), &command, &mut payload)
+            .await
+            .expect("freeze Antigravity route");
+        let payload = payload.to_string();
+        engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('retry-cmd-1', 'thread', 'ag-retry', '2026-07-16T00:00:00Z', 0, 'accepted', NULL, 'retry-digest')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('retry-cmd-1', 'ag-retry', 'retry-msg-1', 'antigravity', 'antigravity', NULL, 'retry-key-1', ?, 'pending', 0, NULL, '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z')",
+                    [payload],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed delivery row");
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        let supervisor = Arc::new(antigravity_supervisor(&engine, &temp).await);
+        let service = crate::production::turn_delivery::TurnDeliveryService::start(
+            engine.clone(),
+            supervisor.clone(),
+            temp.path().to_path_buf(),
+        );
+
+        let uncertain_detail = timeout(Duration::from_secs(20), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("retry-cmd-1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if row.state == super::TurnDeliveryState::Uncertain {
+                    return row.last_error.unwrap_or_default();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first delivery transitions to Uncertain in time");
+        assert!(
+            uncertain_detail.contains("connection_closed"),
+            "expected connection_closed detail on broken transport: {uncertain_detail}"
+        );
+        assert!(
+            once_marker.exists(),
+            "first launch should have disconnected"
+        );
+
+        // Verify the production event pump recorded `provider.turn-failed` with the sanitized
+        // `connection_closed` reason (never `null`) before or during stream-end settlement.
+        let turn_failed_evidence = timeout(Duration::from_secs(5), async {
+            loop {
+                let recorded = crate::diagnostics::profiler::provider_turns::take_recorded();
+                if let Some((_, evidence)) = recorded.into_iter().find(|(kind, evidence)| {
+                    *kind == "provider.turn-failed" && evidence["provider"] == "antigravity"
+                }) {
+                    return evidence;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("production event pump records provider.turn-failed");
+        assert_eq!(turn_failed_evidence["errorClass"], "transport_error");
+        assert_eq!(
+            turn_failed_evidence["terminalReason"], "connection_closed",
+            "production pump must preserve sanitized terminalReason instead of null: {turn_failed_evidence}"
+        );
+
+        // Trigger the real Retry outbox transition (`Uncertain` -> `Pending`), wake the delivery
+        // service, and verify it spawns a healthy `agy acp` process and delivers the exact message.
+        engine
+            .dispatch(OrchestrationCommand::ThreadTurnDeliveryResolve {
+                command_id: "retry-resolve-1".to_owned(),
+                thread_id: "ag-retry".to_owned(),
+                message_id: "retry-msg-1".to_owned(),
+                action: crate::orchestration::engine::TurnDeliveryResolutionAction::Retry,
+                created_at: "2026-07-16T00:00:01Z".to_owned(),
+            })
+            .await
+            .expect("retry resolution accepted");
+        service.wake();
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("retry-cmd-1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if row.state == super::TurnDeliveryState::Delivered {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("retried delivery reaches Delivered in time");
+
+        let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+        let prompt_lines: Vec<Value> = captured
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|msg| msg["method"] == "session/prompt")
+            .collect();
+        assert_eq!(
+            prompt_lines.len(),
+            2,
+            "expected initial attempt + retry prompt: {captured}"
+        );
+        assert!(
+            prompt_lines[1]["params"]["prompt"]
+                .to_string()
+                .contains(prompt_text),
+            "retry must send the exact same message: {}",
+            prompt_lines[1]
+        );
+        let init_count = captured_methods(&capture)
+            .iter()
+            .filter(|method| *method == "initialize")
+            .count();
+        assert_eq!(
+            init_count, 2,
+            "retry after broken transport must launch a fresh agy acp process"
+        );
+
+        service.shutdown().await;
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("shutdown in time")
+            .expect("shutdown");
+        engine.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_durable_steer_delivers_second_prompt_without_cancel_and_blocks_on_open_approval()
+     {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture = temp.path().join("requests.jsonl");
+        let steer_fixture = r#"#!/bin/sh
+capture='@CAPTURE@'
+first_prompt_id=''
+prompt_count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$capture"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.15"}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"agy-steer","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"auto","options":[{"value":"auto","name":"Auto"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"default","options":[{"value":"default","name":"default"},{"value":"accept-edits","name":"accept-edits"},{"value":"auto","name":"auto"},{"value":"plan","name":"plan"}]}]}}\n' "$id"
+      ;;
+    *'"method":"session/set_config_option"'*)
+      val=$(printf '%s\n' "$line" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"auto","options":[{"value":"auto","name":"Auto"}]},{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"%s","options":[{"value":"default","name":"default"},{"value":"accept-edits","name":"accept-edits"},{"value":"auto","name":"auto"},{"value":"plan","name":"plan"}]}]}}\n' "$id" "$val"
+      ;;
+    *'"method":"session/prompt"'*)
+      prompt_count=$((prompt_count + 1))
+      if [ "$prompt_count" -eq 1 ]; then
+        first_prompt_id="$id"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-steer","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"First turn working..."}}}}\n'
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$first_prompt_id"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-steer","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Steered answer."}}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      fi
+      ;;
+  esac
+done
+"#
+        .replace("@CAPTURE@", &capture.display().to_string());
+        let binary = executable_fixture(&temp, "agy-steer", &steer_fixture)
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&json!({
+                "providerInstances": {
+                    "antigravity": {
+                        "driver": "antigravity",
+                        "enabled": true,
+                        "config": { "binaryPath": binary }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let engine = supervisor_engine().await;
+        for command in [
+            json!({"type":"project.create","commandId":"ag-steer-proj","projectId":"ag-steer","title":"Antigravity","workspaceRoot":temp.path(),"createdAt":"2026-07-16T00:00:00Z"}),
+            json!({"type":"thread.create","commandId":"ag-steer-thread","threadId":"ag-steer","projectId":"ag-steer","title":"Thread","kind":"workspace","modelSelection":{"instanceId":"antigravity","model":"auto"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).unwrap())
+                .await
+                .unwrap();
+        }
+        let supervisor = Arc::new(antigravity_supervisor(&engine, &temp).await);
+        let service = crate::production::turn_delivery::TurnDeliveryService::start(
+            engine.clone(),
+            supervisor.clone(),
+            temp.path().to_path_buf(),
+        );
+
+        // Start Turn 1 via durable orchestration command.
+        let turn1: OrchestrationCommand = serde_json::from_value(json!({
+            "type": "thread.turn.start",
+            "commandId": "steer-cmd-1",
+            "threadId": "ag-steer",
+            "message": { "messageId": "steer-msg-1", "role": "user", "text": "Start long task", "attachments": [] },
+            "modelSelection": { "instanceId": "antigravity", "model": "auto" },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "createdAt": "2026-07-16T00:00:00Z",
+        }))
+        .unwrap();
+        let mut turn1_payload = serde_json::to_value(&turn1).unwrap();
+        super::freeze_delivery_route(
+            &engine,
+            &temp.path().to_path_buf(),
+            &turn1,
+            &mut turn1_payload,
+        )
+        .await
+        .expect("freeze turn 1");
+        engine
+            .repositories()
+            .database()
+            .call({
+                let payload = turn1_payload.to_string();
+                move |connection| {
+                    connection.execute(
+                        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('steer-cmd-1', 'thread', 'ag-steer', '2026-07-16T00:00:00Z', 0, 'accepted', NULL, 'd1')",
+                        [],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('steer-cmd-1', 'ag-steer', 'steer-msg-1', 'antigravity', 'antigravity', NULL, 'k1', ?, 'pending', 0, NULL, '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z')",
+                        [payload],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("seed turn 1");
+        service.wake();
+
+        // Wait until Turn 1 is Delivered (first update received) while the turn is still running.
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("steer-cmd-1".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let session = engine
+                    .repositories()
+                    .get_thread_session("ag-steer".to_owned())
+                    .await
+                    .unwrap();
+                if row.state == super::TurnDeliveryState::Delivered
+                    && session
+                        .as_ref()
+                        .is_some_and(|session| session.status == "running")
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Turn 1 accepted on first update while still running");
+
+        // Queue follow-up message 2.
+        let turn2: OrchestrationCommand = serde_json::from_value(json!({
+            "type": "thread.turn.start",
+            "commandId": "steer-cmd-2",
+            "threadId": "ag-steer",
+            "message": { "messageId": "steer-msg-2", "role": "user", "text": "Switch to plan B", "attachments": [] },
+            "modelSelection": { "instanceId": "antigravity", "model": "auto" },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "queued": true,
+            "createdAt": "2026-07-16T00:00:01Z",
+        }))
+        .unwrap();
+        let mut turn2_payload = serde_json::to_value(&turn2).unwrap();
+        super::freeze_delivery_route(
+            &engine,
+            &temp.path().to_path_buf(),
+            &turn2,
+            &mut turn2_payload,
+        )
+        .await
+        .expect("freeze turn 2");
+        engine
+            .repositories()
+            .database()
+            .call({
+                let payload = turn2_payload.to_string();
+                move |connection| {
+                    connection.execute(
+                        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('steer-cmd-2', 'thread', 'ag-steer', '2026-07-16T00:00:01Z', 0, 'accepted', NULL, 'd2')",
+                        [],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('steer-cmd-2', 'ag-steer', 'steer-msg-2', 'antigravity', 'antigravity', NULL, 'k2', ?, 'queued', 0, NULL, '2026-07-16T00:00:01Z', '2026-07-16T00:00:01Z')",
+                        [payload],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("seed queued follow-up");
+
+        // While a pending approval exists on the thread, ThreadTurnSteer must be rejected and keep
+        // the follow-up queued.
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute(
+                    "INSERT INTO projection_pending_approvals (request_id, thread_id, turn_id, status, decision, created_at, resolved_at) VALUES ('pending-apr-1', 'ag-steer', 'turn-x', 'pending', NULL, '2026-07-16T00:00:01Z', NULL)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed pending approval");
+        let blocked = engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.turn.steer",
+                    "commandId": "steer-req-blocked",
+                    "threadId": "ag-steer",
+                    "messageId": "steer-msg-2",
+                    "createdAt": "2026-07-16T00:00:02Z",
+                }))
+                .unwrap(),
+            )
+            .await;
+        assert!(
+            blocked.is_err(),
+            "steer must be refused while a pending approval is open: {blocked:?}"
+        );
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute(
+                    "DELETE FROM projection_pending_approvals WHERE request_id = 'pending-apr-1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("clear pending approval");
+
+        // Now steer the queued follow-up mid-turn!
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.turn.steer",
+                    "commandId": "steer-req-ok",
+                    "threadId": "ag-steer",
+                    "messageId": "steer-msg-2",
+                    "createdAt": "2026-07-16T00:00:03Z",
+                }))
+                .unwrap(),
+            )
+            .await
+            .expect("steer admitted");
+        service.wake();
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("steer-cmd-2".to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let session = engine
+                    .repositories()
+                    .get_thread_session("ag-steer".to_owned())
+                    .await
+                    .unwrap();
+                if row.state == super::TurnDeliveryState::Delivered
+                    && session
+                        .as_ref()
+                        .is_some_and(|session| session.status == "ready")
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("steered follow-up delivered and turn settled");
+
+        let methods = captured_methods(&capture);
+        assert_eq!(
+            methods.iter().filter(|m| *m == "session/prompt").count(),
+            2,
+            "expected two concurrent session/prompt calls: {methods:?}"
+        );
+        assert!(
+            !methods.contains(&"session/cancel".to_owned()),
+            "Antigravity steer must never send session/cancel: {methods:?}"
+        );
+        assert_eq!(
+            methods.iter().filter(|m| *m == "initialize").count(),
+            1,
+            "steer must reuse the running agy acp session: {methods:?}"
+        );
+
+        service.shutdown().await;
+        timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .expect("shutdown in time")
+            .expect("shutdown");
+        engine.shutdown().await;
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { projectKey } from "@bibcode/client-runtime/state/entities";
-import type { ScopedProjectRef } from "@bibcode/contracts";
+import type { PullRequestsProviderKind, ScopedProjectRef } from "@bibcode/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { RefreshCwIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -15,7 +15,12 @@ import {
 } from "../repositoryModule/RepositoryModule";
 import { RepositoryModuleExternalLink } from "../repositoryModule/RepositoryModuleExternalLink";
 import { PermissionButton } from "../ui/permission-button";
-import { PipelineLinksProvider, pipelinePageLinks } from "./detail/PipelineLinks";
+import {
+  type EmbeddedPipelinesNavigation,
+  EmbeddedPipelinesNavigationProvider,
+  PipelineLinksProvider,
+  pipelinePageLinks,
+} from "./detail/PipelineLinks";
 import { PipelinesDetailView, type PipelinesDetailViewHandle } from "./detail/PipelinesDetailView";
 import { PipelinesListView, type PipelinesListViewHandle } from "./list/PipelinesListView";
 import {
@@ -29,11 +34,12 @@ import { pipelinesModule, usePipelinesFirstPagePrefetch } from "./pipelinesModul
 const HOST_NAMES = { github: "GitHub", gitlab: "GitLab" } as const;
 
 /** The pipeline a route shows; absent on the list route. */
-interface PipelineRoute {
+export interface PipelineRoute {
   readonly pipelineId: number;
   readonly attempt: number | null;
   /** The job whose log shows beside the stages (`?job=`). */
   readonly jobId: number | null;
+  readonly jobLogOffset?: number | null;
 }
 
 function AvailablePipelines({
@@ -128,41 +134,82 @@ export function PipelinesPanel({
   pipelineId,
   attempt = null,
   jobId = null,
+  mode = "page",
+  embeddedState,
+  onEmbeddedStateChange,
+  onOpenMergeRequest,
 }: {
   projectRef: ScopedProjectRef;
   search?: PipelinesRouteSearch;
   pipelineId?: number;
   attempt?: number | null;
   jobId?: number | null;
+  mode?: "page" | "embedded";
+  embeddedState?: PipelineRoute | null;
+  onEmbeddedStateChange?: (next: PipelineRoute | null) => void;
+  onOpenMergeRequest?: (target: {
+    readonly number: number;
+    readonly provider: PullRequestsProviderKind;
+    readonly cwd?: string;
+  }) => void;
 }) {
   const navigate = useNavigate();
+  const { environmentId, projectId } = projectRef;
+  const embedded = mode === "embedded";
+  const currentScopeKey = `${environmentId}:${projectId}`;
+  const [localEmbeddedState, setLocalEmbeddedState] = useState<{
+    readonly scopeKey: string;
+    readonly route: PipelineRoute | null;
+  }>({
+    scopeKey: currentScopeKey,
+    route: null,
+  });
+  const controlledEmbedded = embedded && onEmbeddedStateChange !== undefined;
+  const embeddedPipeline = controlledEmbedded
+    ? (embeddedState ?? null)
+    : localEmbeddedState.scopeKey === currentScopeKey
+      ? localEmbeddedState.route
+      : null;
+  const updateEmbeddedPipeline = useCallback(
+    (updater: (current: PipelineRoute | null) => PipelineRoute | null) => {
+      if (controlledEmbedded) {
+        onEmbeddedStateChange!(updater(embeddedPipeline));
+        return;
+      }
+      setLocalEmbeddedState((current) => {
+        const base = current.scopeKey === currentScopeKey ? current.route : null;
+        return { scopeKey: currentScopeKey, route: updater(base) };
+      });
+    },
+    [controlledEmbedded, currentScopeKey, embeddedPipeline, onEmbeddedStateChange],
+  );
   const storedFilters = usePipelinesStore(
     (state) => state.byProjectKey[projectKey(projectRef)]?.filters ?? DEFAULT_PIPELINES_FILTERS,
   );
   const shown = shownFilters(search, storedFilters);
   const { scope, ref, workflowId } = shown;
   const filters = useMemo(() => ({ scope, ref, workflowId }), [ref, scope, workflowId]);
+  const pipeline = useMemo<PipelineRoute | null>(() => {
+    if (embedded) return embeddedPipeline;
+    return pipelineId === undefined ? null : { pipelineId, attempt, jobId };
+  }, [attempt, embedded, embeddedPipeline, jobId, pipelineId]);
   const firstPagePrefetch = usePipelinesFirstPagePrefetch(projectRef.environmentId, filters);
   const shell = useRepositoryModuleShell({
     projectRef,
     module: pipelinesModule,
-    view: pipelineId === undefined ? "list" : "detail",
+    view: pipeline === null ? "list" : "detail",
     firstPagePrefetch,
   });
-  const pipeline = useMemo(
-    () => (pipelineId === undefined ? null : { pipelineId, attempt, jobId }),
-    [attempt, jobId, pipelineId],
-  );
   // A copied link or Back opens on the route's filters; remember them for the project.
   useEffect(() => {
     const store = usePipelinesStore.getState();
     if (!sameFilters(store.selectViewState(projectRef).filters, filters))
       store.setFilters(projectRef, filters);
   }, [filters, projectRef]);
-  const { environmentId, projectId } = projectRef;
   const setFilters = useCallback(
     (next: PipelinesFilters) => {
       usePipelinesStore.getState().setFilters({ environmentId, projectId }, next);
+      if (embedded) return;
       void navigate({
         to: "/project/$environmentId/$projectId/pipelines",
         params: { environmentId, projectId },
@@ -170,12 +217,18 @@ export function PipelinesPanel({
         replace: true,
       });
     },
-    [environmentId, navigate, projectId],
+    [embedded, environmentId, navigate, projectId],
   );
   // Opening or closing a log is a history step, so Back undoes it; switching between
   // logs replaces the step instead of stacking one per job.
   const setJob = useCallback(
     (next: number | null) => {
+      if (embedded) {
+        updateEmbeddedPipeline((current) =>
+          current === null ? null : { ...current, jobId: next, jobLogOffset: null },
+        );
+        return;
+      }
       if (pipelineId === undefined) return;
       void navigate({
         to: "/project/$environmentId/$projectId/pipelines/$pipelineId",
@@ -187,9 +240,54 @@ export function PipelinesPanel({
         replace: jobId !== null && next !== null,
       });
     },
-    [attempt, environmentId, jobId, navigate, pipelineId, projectId],
+    [
+      attempt,
+      embedded,
+      environmentId,
+      jobId,
+      navigate,
+      pipelineId,
+      projectId,
+      updateEmbeddedPipeline,
+    ],
   );
-  return (
+  const embeddedJobLogOffset = embeddedPipeline?.jobLogOffset ?? null;
+  const embeddedNavigation = useMemo<EmbeddedPipelinesNavigation | null>(() => {
+    if (!embedded) return null;
+    return {
+      openPipeline: (nextPipelineId, options) => {
+        updateEmbeddedPipeline(() => ({
+          pipelineId: nextPipelineId,
+          attempt: options?.attempt ?? null,
+          jobId: options?.jobId ?? null,
+          jobLogOffset: options?.jobLogOffset ?? null,
+        }));
+      },
+      backToList: () => {
+        updateEmbeddedPipeline(() => null);
+      },
+      selectAttempt: (nextAttempt) => {
+        updateEmbeddedPipeline((current) =>
+          current === null
+            ? null
+            : {
+                pipelineId: current.pipelineId,
+                attempt: nextAttempt,
+                jobId: null,
+                jobLogOffset: null,
+              },
+        );
+      },
+      jobLogOffset: embeddedJobLogOffset,
+      setJobLogOffset: (offset) => {
+        updateEmbeddedPipeline((current) =>
+          current === null ? null : { ...current, jobLogOffset: offset },
+        );
+      },
+      openMergeRequest: onOpenMergeRequest,
+    };
+  }, [embedded, embeddedJobLogOffset, onOpenMergeRequest, updateEmbeddedPipeline]);
+  const content = (
     <RepositoryModule.Provider value={shell}>
       <RepositoryModule.Gate>
         <AvailablePipelines
@@ -200,5 +298,12 @@ export function PipelinesPanel({
         />
       </RepositoryModule.Gate>
     </RepositoryModule.Provider>
+  );
+  return embeddedNavigation !== null ? (
+    <EmbeddedPipelinesNavigationProvider value={embeddedNavigation}>
+      {content}
+    </EmbeddedPipelinesNavigationProvider>
+  ) : (
+    content
   );
 }

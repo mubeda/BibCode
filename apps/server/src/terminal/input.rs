@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
@@ -17,11 +17,40 @@ use super::model::TerminalInputOrigin;
 const MAX_FRAMES: usize = 16;
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_CONNECTION_BYTES: usize = 256 * 1024;
+const MAX_STAGED_PASTE_BYTES: usize = super::writer::MOST_QUEUED_INPUT_BYTES;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_LEASES: usize = 1024;
 const MAX_CONNECTION_LEASES: usize = 64;
 const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
 const GAP_TIMEOUT: Duration = Duration::from_secs(5);
+const STAGED_PASTE_TIMEOUT: Duration = Duration::from_secs(10);
+const BRACKETED_PASTE_START: &str = "\x1b[200~";
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
+
+/// Returns whether `data` forms one valid complete `\x1b[200~...\x1b[201~` envelope with no
+/// embedded `\x1b[201~` closing delimiter inside its body (#431).
+fn is_valid_bracketed_paste_envelope(data: &str) -> bool {
+    if !data.starts_with(BRACKETED_PASTE_START) || !data.ends_with(BRACKETED_PASTE_END) {
+        return false;
+    }
+    let min_len = BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len();
+    if data.len() < min_len {
+        return false;
+    }
+    let body = &data[BRACKETED_PASTE_START.len()..data.len() - BRACKETED_PASTE_END.len()];
+    !body.contains(BRACKETED_PASTE_END)
+}
+
+/// Optional multi-frame bracketed-paste staging marker (#431).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum TerminalPasteStage {
+    /// Appends the frame to the lease's bounded staged paste buffer and acknowledges immediately
+    /// so in-flight frame and byte permits are released before later frames arrive.
+    Chunk,
+    /// Appends the final frame and writes the complete assembled paste atomically to the PTY.
+    Commit,
+}
 
 #[derive(Clone, Debug, thiserror::Error, Serialize)]
 #[error("{message}")]
@@ -230,7 +259,9 @@ impl TerminalInputRegistry {
                 "Too many attached terminal input leases.",
             ));
         }
+        let input_id = Uuid::new_v4().to_string();
         let lease = Arc::new(InputLease {
+            input_id: input_id.clone(),
             connection_id,
             attachment_sequence,
             key: key.clone(),
@@ -253,7 +284,6 @@ impl TerminalInputRegistry {
         if let Some(previous) = previous.and_then(|input_id| state.leases.remove(&input_id)) {
             previous.fail(TerminalInputError::closed());
         }
-        let input_id = Uuid::new_v4().to_string();
         state
             .connections
             .get_mut(&connection_id)
@@ -270,7 +300,11 @@ impl TerminalInputRegistry {
                 let replaced = lease.admission_changed.notified();
                 tokio::pin!(replaced);
                 replaced.as_mut().enable();
+                let paste_changed = lease.changed.notified();
+                tokio::pin!(paste_changed);
+                paste_changed.as_mut().enable();
                 let lost = lease.admission_lost();
+                let paste_deadline = lease.staged_paste_deadline();
                 tokio::select! {
                     () = lease.connection_closed.cancelled() => break,
                     () = lease.generation_closed.cancelled() => break,
@@ -282,7 +316,19 @@ impl TerminalInputRegistry {
                             break;
                         }
                     }
+                    () = async {
+                        if let Some(deadline) = paste_deadline {
+                            sleep_until(deadline).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        if lease.fail_expired_staged_paste() {
+                            break;
+                        }
+                    }
                     () = &mut replaced => {}
+                    () = &mut paste_changed => {}
                 }
             }
             // Removing the lease drops its admission once in-flight frames settle.
@@ -443,6 +489,7 @@ impl TerminalInputRegistry {
             sequence,
             data,
             origin: TerminalInputOrigin::Unmarked,
+            paste_stage: None,
         })
     }
 }
@@ -467,12 +514,19 @@ pub(crate) struct PreparedTerminalInput<'a> {
     sequence: u64,
     data: &'a str,
     origin: TerminalInputOrigin<'a>,
+    paste_stage: Option<TerminalPasteStage>,
 }
 
 impl<'a> PreparedTerminalInput<'a> {
     /// Who produced this frame; unmarked by default, as an older client's.
     pub(crate) fn with_origin(mut self, origin: TerminalInputOrigin<'a>) -> Self {
         self.origin = origin;
+        self
+    }
+
+    /// Multi-frame bracketed-paste staging marker (`chunk` / `commit`), when present (#431).
+    pub(crate) fn with_paste_stage(mut self, paste_stage: Option<TerminalPasteStage>) -> Self {
+        self.paste_stage = paste_stage;
         self
     }
 
@@ -487,7 +541,138 @@ impl<'a> PreparedTerminalInput<'a> {
         let sequence = self.sequence;
         let data = self.data;
         let origin = self.origin;
+        let paste_stage = self.paste_stage;
         lease.wait_turn(sequence).await?;
+
+        let payload_to_write: std::borrow::Cow<'a, str> = match paste_stage {
+            Some(TerminalPasteStage::Chunk) => {
+                let outcome = {
+                    let mut state = lease.state.lock().expect("terminal input sequence");
+                    if let Some(error) = lease.failure(&state) {
+                        Err(error)
+                    } else if state
+                        .staged_paste
+                        .as_ref()
+                        .is_some_and(|staged| staged.deadline <= Instant::now())
+                    {
+                        state.staged_paste = None;
+                        Err(TerminalInputError::new(
+                            "sequence",
+                            "Terminal paste did not finish in time. Reconnect the terminal before typing again.",
+                        ))
+                    } else {
+                        let existing_len = state
+                            .staged_paste
+                            .as_ref()
+                            .map_or(0, |staged| staged.buffer.len());
+                        if state.staged_paste.is_none() && !data.starts_with(BRACKETED_PASTE_START)
+                        {
+                            Err(TerminalInputError::new(
+                                "sequence",
+                                "Terminal paste envelope is malformed. Reconnect the terminal before typing again.",
+                            ))
+                        } else if existing_len.saturating_add(data.len()) > MAX_STAGED_PASTE_BYTES {
+                            state.staged_paste = None;
+                            Err(TerminalInputError::new(
+                                "capacity",
+                                "Terminal paste exceeded the 1 MiB limit. Reconnect the terminal before typing again.",
+                            ))
+                        } else {
+                            let deadline = Instant::now() + STAGED_PASTE_TIMEOUT;
+                            let staged = state.staged_paste.get_or_insert_with(|| StagedPaste {
+                                buffer: String::new(),
+                                deadline,
+                            });
+                            staged.buffer.push_str(data);
+                            staged.deadline = deadline;
+                            state.pending.remove(&sequence);
+                            state.next += 1;
+                            state.writing = false;
+                            state.update_gap();
+                            Ok(())
+                        }
+                    }
+                };
+                if let Err(error) = outcome {
+                    lease.fail(error.clone());
+                    return Err(error.into());
+                }
+                self.frame.settled = true;
+                lease.changed.notify_waiters();
+                return Ok(TerminalInputAcknowledgement {
+                    input_id: self.input_id.to_owned(),
+                    sequence,
+                });
+            }
+            Some(TerminalPasteStage::Commit) => {
+                let assembled = {
+                    let mut state = lease.state.lock().expect("terminal input sequence");
+                    if let Some(error) = lease.failure(&state) {
+                        Err(error)
+                    } else if state
+                        .staged_paste
+                        .as_ref()
+                        .is_some_and(|staged| staged.deadline <= Instant::now())
+                    {
+                        state.staged_paste = None;
+                        Err(TerminalInputError::new(
+                            "sequence",
+                            "Terminal paste did not finish in time. Reconnect the terminal before typing again.",
+                        ))
+                    } else if let Some(mut paste) = state.staged_paste.take() {
+                        if paste.buffer.len().saturating_add(data.len()) > MAX_STAGED_PASTE_BYTES {
+                            Err(TerminalInputError::new(
+                                "capacity",
+                                "Terminal paste exceeded the 1 MiB limit. Reconnect the terminal before typing again.",
+                            ))
+                        } else {
+                            paste.buffer.push_str(data);
+                            if !is_valid_bracketed_paste_envelope(&paste.buffer) {
+                                Err(TerminalInputError::new(
+                                    "sequence",
+                                    "Terminal paste envelope is malformed. Reconnect the terminal before typing again.",
+                                ))
+                            } else {
+                                Ok(std::borrow::Cow::Owned(paste.buffer))
+                            }
+                        }
+                    } else {
+                        Err(TerminalInputError::new(
+                            "sequence",
+                            "Terminal paste commit arrived without a staged prefix. Reconnect the terminal before typing again.",
+                        ))
+                    }
+                };
+                match assembled {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        lease.fail(error.clone());
+                        return Err(error.into());
+                    }
+                }
+            }
+            None => {
+                let interrupted = {
+                    let mut state = lease.state.lock().expect("terminal input sequence");
+                    if state.staged_paste.is_some() {
+                        state.staged_paste = None;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if interrupted {
+                    let error = TerminalInputError::new(
+                        "sequence",
+                        "Terminal paste was interrupted before completion. Reconnect the terminal before typing again.",
+                    );
+                    lease.fail(error.clone());
+                    return Err(error.into());
+                }
+                std::borrow::Cow::Borrowed(data)
+            }
+        };
+
         // Loss of the current admission stops the write at once, without waiting for the
         // cleanup task; a replaced admission's loss does not. The frame is queued once: a
         // replacement before it is queued tries again, and after it only changes whose loss
@@ -497,10 +682,14 @@ impl<'a> PreparedTerminalInput<'a> {
             tokio::pin!(replaced);
             replaced.as_mut().enable();
             let lost = lease.admission_lost();
-            let enqueue =
-                lease
-                    .identity
-                    .enqueue_input(data, origin, &lease.closed, &lease.connection_closed);
+            let enqueue = lease.identity.enqueue_input(
+                payload_to_write.as_ref(),
+                origin,
+                &lease.input_id,
+                paste_stage.is_none(),
+                &lease.closed,
+                &lease.connection_closed,
+            );
             tokio::select! {
                 biased;
                 () = async { if let Some(lost) = &lost { lost.cancelled().await } else { std::future::pending().await } } => {
@@ -522,6 +711,14 @@ impl<'a> PreparedTerminalInput<'a> {
                 let lost = lease.admission_lost();
                 tokio::select! {
                     biased;
+                    () = lease.closed.cancelled() => {
+                        pending.cancel();
+                        break Err(TerminalError::PublicationCancelled);
+                    }
+                    () = lease.connection_closed.cancelled() => {
+                        pending.cancel();
+                        break Err(TerminalError::PublicationCancelled);
+                    }
                     written = pending.wait() => break written,
                     () = async { if let Some(lost) = &lost { lost.cancelled().await } else { std::future::pending().await } } => {
                         if lease.seal_on_current_admission_loss() {
@@ -564,6 +761,11 @@ impl<'a> PreparedTerminalInput<'a> {
     }
 }
 
+struct StagedPaste {
+    buffer: String,
+    deadline: Instant,
+}
+
 #[derive(Default)]
 struct SequenceState {
     next: u64,
@@ -571,6 +773,7 @@ struct SequenceState {
     writing: bool,
     failure: Option<TerminalInputError>,
     gap_deadline: Option<Instant>,
+    staged_paste: Option<StagedPaste>,
 }
 
 impl SequenceState {
@@ -595,6 +798,7 @@ struct LeaseAdmission {
 }
 
 struct InputLease {
+    input_id: String,
     connection_id: Uuid,
     attachment_sequence: u64,
     key: (String, String),
@@ -649,11 +853,39 @@ impl InputLease {
         })
     }
 
+    fn staged_paste_deadline(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .expect("terminal input sequence")
+            .staged_paste
+            .as_ref()
+            .map(|staged| staged.deadline)
+    }
+
+    fn fail_expired_staged_paste(&self) -> bool {
+        let expired = self
+            .state
+            .lock()
+            .expect("terminal input sequence")
+            .staged_paste
+            .as_ref()
+            .is_some_and(|staged| staged.deadline <= Instant::now());
+        if expired {
+            self.fail(TerminalInputError::new(
+                "sequence",
+                "Terminal paste did not finish in time. Reconnect the terminal before typing again.",
+            ));
+        }
+        expired
+    }
+
     fn fail(&self, error: TerminalInputError) {
         let mut state = self.state.lock().expect("terminal input sequence");
         state.failure.get_or_insert(error);
         state.pending.clear();
+        state.staged_paste = None;
         drop(state);
+        self.identity.release_delimiter_fence(&self.input_id);
         self.closed.cancel();
         self.changed.notify_waiters();
     }
@@ -687,6 +919,19 @@ impl InputLease {
         };
         let mut state = self.state.lock().expect("terminal input sequence");
         if let Some(error) = self.failure(&state) {
+            return Err(error);
+        }
+        if state
+            .staged_paste
+            .as_ref()
+            .is_some_and(|staged| staged.deadline <= Instant::now())
+        {
+            drop(state);
+            let error = TerminalInputError::new(
+                "sequence",
+                "Terminal paste did not finish in time. Reconnect the terminal before typing again.",
+            );
+            self.fail(error.clone());
             return Err(error);
         }
         if state

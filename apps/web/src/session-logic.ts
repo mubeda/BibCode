@@ -11,6 +11,8 @@ import {
   ProviderDriverKind,
   type ToolLifecycleItemType,
   type UserInputQuestion,
+  type UserInputResolvedQuestionSummary,
+  type UserInputResponseDisposition,
   type ThreadId,
   type TurnId,
 } from "@bibcode/contracts";
@@ -69,6 +71,8 @@ export interface WorkLogEntry {
   toolLifecycleStatus?: WorkLogToolLifecycleStatus;
   /** Originating orchestration activity kind (e.g. `user-input.requested`) for row chrome. */
   sourceActivityKind?: OrchestrationThreadActivity["kind"];
+  /** True for Antigravity ACP usage-limit warnings so duplicate updates collapse per turn. */
+  usageLimit?: boolean;
 }
 
 interface DerivedWorkLogEntry extends WorkLogEntry {
@@ -88,6 +92,7 @@ export interface PendingUserInput {
   requestId: ApprovalRequestId;
   createdAt: string;
   questions: ReadonlyArray<UserInputQuestion>;
+  isBlocking?: boolean;
 }
 
 export interface ActivePlanState {
@@ -422,11 +427,12 @@ function parseUserInputQuestions(
         typeof question.id !== "string" ||
         typeof question.header !== "string" ||
         typeof question.question !== "string" ||
-        !Array.isArray(question.options)
+        (question.options !== undefined && !Array.isArray(question.options))
       ) {
         return null;
       }
-      const options = question.options
+      const rawOptions = Array.isArray(question.options) ? question.options : [];
+      const options = rawOptions
         .map<UserInputQuestion["options"][number] | null>((option) => {
           if (!option || typeof option !== "object") return null;
           const optionRecord = option as Record<string, unknown>;
@@ -442,7 +448,7 @@ function parseUserInputQuestions(
           };
         })
         .filter((option): option is UserInputQuestion["options"][number] => option !== null);
-      if (options.length === 0) {
+      if (rawOptions.length > 0 && options.length === 0) {
         return null;
       }
       return {
@@ -451,6 +457,7 @@ function parseUserInputQuestions(
         question: question.question,
         options,
         multiSelect: question.multiSelect === true,
+        ...(question.isSecret === true ? { isSecret: true } : {}),
       };
     })
     .filter((question): question is UserInputQuestion => question !== null);
@@ -479,10 +486,13 @@ export function derivePendingUserInputs(
       if (!questions) {
         continue;
       }
+      const isBlocking =
+        payload && typeof payload.isBlocking === "boolean" ? payload.isBlocking : undefined;
       openByRequestId.set(requestId, {
         requestId,
         createdAt: activity.createdAt,
         questions,
+        ...(isBlocking === false ? { isBlocking: false } : {}),
       });
       continue;
     }
@@ -504,9 +514,14 @@ export function derivePendingUserInputs(
     }
   }
 
-  return [...openByRequestId.values()].toSorted((left, right) =>
-    left.createdAt.localeCompare(right.createdAt),
-  );
+  return [...openByRequestId.values()].toSorted((left, right) => {
+    const leftBlockingRank = left.isBlocking === false ? 1 : 0;
+    const rightBlockingRank = right.isBlocking === false ? 1 : 0;
+    if (leftBlockingRank !== rightBlockingRank) {
+      return leftBlockingRank - rightBlockingRank;
+    }
+    return left.createdAt.localeCompare(right.createdAt);
+  });
 }
 
 export function deriveActivePlanState(
@@ -626,18 +641,264 @@ export function hasActionableProposedPlan(
   return proposedPlan !== null && proposedPlan.implementedAt === null;
 }
 
+function parseResolvedQuestionSummaries(
+  payload: Record<string, unknown> | null,
+): ReadonlyArray<UserInputResolvedQuestionSummary> {
+  const raw = payload?.questions;
+  if (!Array.isArray(raw)) return [];
+  const parsed: UserInputResolvedQuestionSummary[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const id = typeof record.id === "string" ? record.id.trim() : "";
+    const question = typeof record.question === "string" ? record.question.trim() : "";
+    const header =
+      typeof record.header === "string" && record.header.trim().length > 0
+        ? record.header.trim()
+        : undefined;
+    if (id.length === 0 || question.length === 0) continue;
+    parsed.push({ id, ...(header ? { header } : {}), question });
+  }
+  return parsed;
+}
+
+function parseUserInputDisposition(
+  payload: Record<string, unknown> | null,
+): UserInputResponseDisposition | null {
+  const raw = payload?.disposition;
+  if (raw === "answered" || raw === "skipped" || raw === "cancelled") {
+    return raw;
+  }
+  if (payload?.cancelled === true) {
+    return "cancelled";
+  }
+  return null;
+}
+
+function formatAnswerValue(value: unknown): string | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (Array.isArray(value)) {
+    const parts = value
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    return parts.length > 0 ? parts.join(", ") : null;
+  }
+  if (typeof value === "boolean" || typeof value === "number") {
+    return String(value);
+  }
+  return null;
+}
+
+function buildUserInputWorkLogSummary(
+  activity: OrchestrationThreadActivity,
+  payload: Record<string, unknown> | null,
+  requestedByRequestId: ReadonlyMap<string, ReadonlyArray<UserInputQuestion>>,
+): { readonly label: string; readonly detail: string | null } | null {
+  if (activity.kind === "user-input.requested") {
+    const questions = parseUserInputQuestions(payload) ?? [];
+    if (questions.length === 0) {
+      return null;
+    }
+    const isNonBlocking = payload?.isBlocking === false;
+    const label = isNonBlocking
+      ? questions.length === 1
+        ? "Question while working: 1 question"
+        : `Question while working: ${questions.length} questions`
+      : questions.length === 1
+        ? "Awaiting user input: 1 question"
+        : `Awaiting user input: ${questions.length} questions`;
+    const detail = questions.map((question) => question.question).join("\n");
+    return { label, detail };
+  }
+  if (activity.kind === "user-input.expired") {
+    const requestId =
+      payload && typeof payload.requestId === "string" && payload.requestId.trim().length > 0
+        ? payload.requestId.trim()
+        : null;
+    const requestedQuestions = requestId ? (requestedByRequestId.get(requestId) ?? []) : [];
+    const detail =
+      requestedQuestions.length > 0
+        ? requestedQuestions.map((question) => question.question).join("\n")
+        : null;
+    const label =
+      requestedQuestions.length > 1
+        ? `Questions expired (${requestedQuestions.length})`
+        : "Question expired";
+    return { label, detail };
+  }
+  if (activity.kind !== "user-input.resolved") {
+    return null;
+  }
+  const requestId =
+    payload && typeof payload.requestId === "string" && payload.requestId.trim().length > 0
+      ? payload.requestId.trim()
+      : null;
+  const answersRecord =
+    payload &&
+    payload.answers &&
+    typeof payload.answers === "object" &&
+    !Array.isArray(payload.answers)
+      ? (payload.answers as Record<string, unknown>)
+      : {};
+  const disposition = parseUserInputDisposition(payload);
+  const embeddedQuestions = parseResolvedQuestionSummaries(payload);
+  const requestedQuestions = requestId ? (requestedByRequestId.get(requestId) ?? []) : [];
+  // Prefer embedded self-sufficient summaries, enriched with any loaded request questions.
+  const mergedQuestions: Array<{
+    readonly id: string;
+    readonly prompt: string;
+    readonly header?: string;
+  }> = [];
+  const seenIds = new Set<string>();
+  const sourceQuestions =
+    embeddedQuestions.length > 0
+      ? embeddedQuestions
+      : requestedQuestions.map((q) => ({ id: q.id, header: q.header, question: q.question }));
+  for (const question of sourceQuestions) {
+    if (seenIds.has(question.id)) continue;
+    seenIds.add(question.id);
+    mergedQuestions.push({
+      id: question.id,
+      prompt: question.question,
+      ...(question.header ? { header: question.header } : {}),
+    });
+  }
+  for (const question of requestedQuestions) {
+    if (seenIds.has(question.id)) continue;
+    seenIds.add(question.id);
+    mergedQuestions.push({
+      id: question.id,
+      prompt: question.question,
+      header: question.header,
+    });
+  }
+
+  const lines: string[] = [];
+  let answeredCount = 0;
+  let skippedCount = 0;
+
+  if (mergedQuestions.length > 0) {
+    for (const question of mergedQuestions) {
+      const formatted =
+        formatAnswerValue(answersRecord[question.id]) ??
+        (question.header ? formatAnswerValue(answersRecord[question.header]) : null) ??
+        formatAnswerValue(answersRecord[question.prompt]);
+      if (formatted) {
+        answeredCount += 1;
+        lines.push(`${question.prompt}: ${formatted}`);
+      } else {
+        skippedCount += 1;
+        lines.push(`${question.prompt}: Skipped`);
+      }
+    }
+  } else {
+    for (const [key, value] of Object.entries(answersRecord)) {
+      const formatted = formatAnswerValue(value);
+      if (formatted) {
+        answeredCount += 1;
+        lines.push(`${key}: ${formatted}`);
+      }
+    }
+  }
+
+  const totalCount = Math.max(mergedQuestions.length, answeredCount);
+  let label: string;
+  if (disposition === "cancelled") {
+    label = totalCount === 1 ? "Cancelled clarifying question" : "Cancelled clarifying questions";
+  } else if (disposition === "skipped" && answeredCount === 0) {
+    label = totalCount === 1 ? "Skipped clarifying question" : "Skipped clarifying questions";
+  } else if (disposition === "skipped" || (answeredCount > 0 && skippedCount > 0)) {
+    label =
+      answeredCount === 1
+        ? "Answered 1 question (others skipped)"
+        : `Answered ${answeredCount} questions (others skipped)`;
+  } else if (answeredCount > 0) {
+    label = answeredCount === 1 ? "Answered 1 question" : `Answered ${answeredCount} questions`;
+  } else if (mergedQuestions.length > 0) {
+    label =
+      mergedQuestions.length === 1 ? "Skipped clarifying question" : "Skipped clarifying questions";
+  } else {
+    return null;
+  }
+
+  return {
+    label,
+    detail: lines.length > 0 ? lines.join("\n") : null,
+  };
+}
+
 export function deriveWorkLogEntries(
   activities: ReadonlyArray<OrchestrationThreadActivity>,
 ): WorkLogEntry[] {
   const ordered = [...activities].toSorted(compareActivitiesByOrder);
+  const requestedByRequestId = new Map<string, ReadonlyArray<UserInputQuestion>>();
+  const resolvedRequestIds = new Set<string>();
+  for (const activity of ordered) {
+    const payload =
+      activity.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : null;
+    const requestId =
+      payload && typeof payload.requestId === "string" && payload.requestId.trim().length > 0
+        ? payload.requestId.trim()
+        : null;
+    if (!requestId) continue;
+    if (activity.kind === "user-input.requested") {
+      const parsed = parseUserInputQuestions(payload);
+      if (parsed) {
+        requestedByRequestId.set(requestId, parsed);
+      }
+    } else if (activity.kind === "user-input.resolved" || activity.kind === "user-input.expired") {
+      resolvedRequestIds.add(requestId);
+    }
+  }
+
   const entries: DerivedWorkLogEntry[] = [];
+  const emittedResolvedRequestIds = new Set<string>();
   for (const activity of ordered) {
     if (activity.kind === "tool.started") continue;
     if (activity.kind === "task.started") continue;
     if (activity.kind === "context-window.updated") continue;
     if (activity.summary === "Checkpoint captured") continue;
     if (isPlanBoundaryToolActivity(activity)) continue;
-    entries.push(toDerivedWorkLogEntry(activity));
+    if (
+      activity.kind === "user-input.requested" ||
+      activity.kind === "user-input.resolved" ||
+      activity.kind === "user-input.expired"
+    ) {
+      const payload =
+        activity.payload && typeof activity.payload === "object"
+          ? (activity.payload as Record<string, unknown>)
+          : null;
+      const requestId =
+        payload && typeof payload.requestId === "string" && payload.requestId.trim().length > 0
+          ? payload.requestId.trim()
+          : null;
+      // Deduplicate: once resolved or expired, suppress the open ask row whether
+      // user-input.requested was in the initial window or loaded from an older page,
+      // and coalesce duplicate terminal rows for the same requestId into one.
+      if (
+        activity.kind === "user-input.requested" &&
+        requestId &&
+        resolvedRequestIds.has(requestId)
+      ) {
+        continue;
+      }
+      if (
+        (activity.kind === "user-input.resolved" || activity.kind === "user-input.expired") &&
+        requestId
+      ) {
+        if (emittedResolvedRequestIds.has(requestId)) {
+          continue;
+        }
+        emittedResolvedRequestIds.add(requestId);
+      }
+    }
+    entries.push(toDerivedWorkLogEntry(activity, requestedByRequestId));
   }
   return collapseDerivedWorkLogEntries(entries).map((entry) => {
     const { activityKind, collapseKey: _collapseKey, ...rest } = entry;
@@ -699,11 +960,15 @@ function extractWorkLogToolLifecycleStatus(
   return undefined;
 }
 
-function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWorkLogEntry {
+function toDerivedWorkLogEntry(
+  activity: OrchestrationThreadActivity,
+  requestedByRequestId: ReadonlyMap<string, ReadonlyArray<UserInputQuestion>>,
+): DerivedWorkLogEntry {
   const payload =
     activity.payload && typeof activity.payload === "object"
       ? (activity.payload as Record<string, unknown>)
       : null;
+  const userInputSummary = buildUserInputWorkLogSummary(activity, payload, requestedByRequestId);
   const commandPreview = extractToolCommand(payload);
   const changedFiles = extractChangedFiles(payload);
   const title = extractToolTitle(payload);
@@ -720,20 +985,22 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
       ? payload.detail
       : null;
   const taskLabel = taskSummary || taskDetailAsLabel;
-  const detail = isTaskActivity
-    ? !taskDetailAsLabel &&
-      payload &&
-      typeof payload.detail === "string" &&
-      payload.detail.length > 0
-      ? stripTrailingExitCode(payload.detail).output
-      : null
-    : extractToolDetail(payload, title ?? activity.summary);
+  const detail = userInputSummary
+    ? userInputSummary.detail
+    : isTaskActivity
+      ? !taskDetailAsLabel &&
+        payload &&
+        typeof payload.detail === "string" &&
+        payload.detail.length > 0
+        ? stripTrailingExitCode(payload.detail).output
+        : null
+      : extractToolDetail(payload, title ?? activity.summary);
   const toolCallId = isTaskActivity ? null : extractToolCallId(payload);
   const entry: DerivedWorkLogEntry = {
     id: activity.id,
     createdAt: activity.createdAt,
     turnId: activity.turnId,
-    label: taskLabel || activity.summary,
+    label: userInputSummary?.label || taskLabel || activity.summary,
     tone:
       activity.kind === "task.progress"
         ? "thinking"
@@ -781,6 +1048,9 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (toolLifecycleStatus) {
     entry.toolLifecycleStatus = toolLifecycleStatus;
   }
+  if (activity.kind === "provider.warning" && payload?.usageLimit === true) {
+    entry.usageLimit = true;
+  }
   const collapseKey = deriveToolLifecycleCollapseKey(entry);
   if (collapseKey) {
     entry.collapseKey = collapseKey;
@@ -793,6 +1063,15 @@ function collapseDerivedWorkLogEntries(
 ): DerivedWorkLogEntry[] {
   const collapsed: DerivedWorkLogEntry[] = [];
   for (const entry of entries) {
+    if (entry.usageLimit === true && entry.turnId != null) {
+      const existingIndex = collapsed.findIndex(
+        (candidate) => candidate.usageLimit === true && candidate.turnId === entry.turnId,
+      );
+      if (existingIndex >= 0) {
+        collapsed[existingIndex] = mergeDerivedWorkLogEntries(collapsed[existingIndex]!, entry);
+        continue;
+      }
+    }
     const previous = collapsed.at(-1);
     if (previous && shouldCollapseToolLifecycleEntries(previous, entry)) {
       collapsed[collapsed.length - 1] = mergeDerivedWorkLogEntries(previous, entry);
@@ -801,6 +1080,53 @@ function collapseDerivedWorkLogEntries(
     collapsed.push(entry);
   }
   return collapsed;
+}
+
+/**
+ * True when `session.lastError` is already rendered inline in the chat timeline — either on the
+ * active failed delivery card or on a usage-limit warning row for the thread's latest turn — so
+ * `ThreadErrorBanner` should not display a duplicate copy. Never suppresses `context_limit`
+ * errors because the banner owns the Compact conversation action.
+ */
+export function isSessionErrorShownInline(input: {
+  readonly sessionLastError: string | null;
+  readonly sessionLastErrorClass: string | null;
+  readonly blockingDeliveryDetail: string | null;
+  readonly workLogEntries: ReadonlyArray<WorkLogEntry>;
+  readonly activities: ReadonlyArray<OrchestrationThreadActivity>;
+  readonly latestTurnId: TurnId | null;
+}): boolean {
+  if (input.sessionLastError === null || input.sessionLastErrorClass === "context_limit") {
+    return false;
+  }
+  const normalized = input.sessionLastError.trim();
+  if (normalized.length === 0) {
+    return false;
+  }
+  if ((input.blockingDeliveryDetail?.trim() ?? null) === normalized) {
+    return true;
+  }
+  let latestTurnId = input.latestTurnId;
+  if (latestTurnId === null && input.activities.length > 0) {
+    const ordered = [...input.activities].toSorted(compareActivitiesByOrder);
+    for (let index = ordered.length - 1; index >= 0; index -= 1) {
+      const turnId = ordered[index]?.turnId ?? null;
+      if (turnId !== null) {
+        latestTurnId = turnId;
+        break;
+      }
+    }
+  }
+  return input.workLogEntries.some(
+    (entry) =>
+      entry.sourceActivityKind === "provider.warning" &&
+      entry.usageLimit === true &&
+      (entry.detail?.trim() ?? null) === normalized &&
+      (latestTurnId === null ||
+        entry.turnId === null ||
+        entry.turnId === undefined ||
+        entry.turnId === latestTurnId),
+  );
 }
 
 function shouldCollapseToolLifecycleEntries(

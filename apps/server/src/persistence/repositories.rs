@@ -1230,7 +1230,7 @@ impl Repositories {
     pub async fn thread_blocks_new_turn(&self, thread_id: String) -> Result<bool> {
         self.database
             .call(move |connection| {
-                let open_user_inputs = open_user_input_requests_sql("?1");
+                let open_user_inputs = open_blocking_user_input_requests_sql("?1");
                 connection
                     .query_row(
                         &format!(
@@ -1295,6 +1295,22 @@ impl Repositories {
                        LIMIT 1), 0)",
                     params![thread_id, request_id],
                     |row| row.get(0),
+                )?)
+            })
+            .await
+    }
+
+    pub(crate) async fn user_input_request_is_open(
+        &self,
+        thread_id: String,
+        request_id: String,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                Ok(user_input_request_is_open_on(
+                    connection,
+                    &thread_id,
+                    &request_id,
                 )?)
             })
             .await
@@ -1635,18 +1651,30 @@ impl Repositories {
             })
             .await
     }
-    /// Every assistant message still streaming, in any thread.
+    /// Every assistant message still streaming on an existing, non-deleted thread.
     pub async fn list_streaming_assistant_messages(&self) -> Result<Vec<ProjectionThreadMessage>> {
         self.database
             .call(move |connection| {
                 collect(
                     connection,
                     &format!(
-                        "{MESSAGE_SELECT} WHERE role = 'assistant' AND is_streaming = 1 ORDER BY thread_id ASC, rowid ASC"
+                        "{MESSAGE_SELECT} WHERE role = 'assistant' AND is_streaming = 1 AND EXISTS (SELECT 1 FROM projection_threads t WHERE t.thread_id = projection_thread_messages.thread_id AND t.deleted_at IS NULL) ORDER BY thread_id ASC, rowid ASC"
                     ),
                     [],
                     decode_message,
                 )
+            })
+            .await
+    }
+    /// Clears `is_streaming` on assistant messages belonging to deleted or missing threads so
+    /// startup reconciliation never retries the deleted/missing-thread invariant across boots.
+    pub async fn clear_streaming_assistant_messages_of_deleted_threads(&self) -> Result<usize> {
+        self.database
+            .call(move |connection| {
+                Ok(connection.execute(
+                    "UPDATE projection_thread_messages SET is_streaming = 0 WHERE role = 'assistant' AND is_streaming = 1 AND NOT EXISTS (SELECT 1 FROM projection_threads t WHERE t.thread_id = projection_thread_messages.thread_id AND t.deleted_at IS NULL)",
+                    [],
+                )?)
             })
             .await
     }
@@ -5400,6 +5428,19 @@ pub(crate) fn queued_provider_turn_head_on(
 /// newest record is the ask itself, or a refused answer the provider did not call stale.
 /// One rule for the queue head and the thread's pending-question count, so a question holds
 /// the queue exactly while the left panel says the agent awaits input.
+pub(crate) fn user_input_request_is_open_on(
+    connection: &Connection,
+    thread_id: &str,
+    request_id: &str,
+) -> rusqlite::Result<bool> {
+    let open = open_user_input_requests_sql("?1");
+    connection.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM ({open}) WHERE request_id = ?2)"),
+        params![thread_id, request_id],
+        |row| row.get(0),
+    )
+}
+
 pub(crate) fn open_user_input_requests_sql(thread_expr: &str) -> String {
     format!(
         "SELECT request_id FROM (
@@ -5417,13 +5458,32 @@ pub(crate) fn open_user_input_requests_sql(thread_expr: &str) -> String {
     )
 }
 
+/// Blocking open user-input requests: excludes non-blocking (`isBlocking: false`) asks that do
+/// not pause the running turn, so the left panel stays in `Working` and new/steered turns are not
+/// held behind an optional background question.
+pub(crate) fn open_blocking_user_input_requests_sql(thread_expr: &str) -> String {
+    let all_open = open_user_input_requests_sql(thread_expr);
+    format!(
+        "SELECT open.request_id FROM ({all_open}) AS open
+         WHERE COALESCE((
+           SELECT json_extract(asked.payload_json, '$.isBlocking')
+           FROM projection_thread_activities AS asked
+           WHERE asked.thread_id = {thread_expr}
+             AND asked.kind = 'user-input.requested'
+             AND json_extract(asked.payload_json, '$.requestId') = open.request_id
+           ORDER BY COALESCE(asked.sequence, 0) DESC, asked.created_at DESC, asked.activity_id DESC
+           LIMIT 1
+         ), 1) != 0"
+    )
+}
+
 pub(crate) fn can_promote_queued_provider_turn_on(
     connection: &Connection,
     thread_id: &str,
     message_id: &str,
     automatic: bool,
 ) -> Result<bool> {
-    let open_user_inputs = open_user_input_requests_sql("queued.thread_id");
+    let open_user_inputs = open_blocking_user_input_requests_sql("queued.thread_id");
     connection.query_row(
         &format!("SELECT EXISTS(
            SELECT 1 FROM provider_turn_outbox AS queued

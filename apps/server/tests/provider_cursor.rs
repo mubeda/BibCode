@@ -1571,7 +1571,12 @@ async fn cursor_extension_requests_emit_plan_todos_and_questions() {
         .expect_response(json!({
             "jsonrpc": "2.0",
             "id": 4002,
-            "result": { "answers": { "scope": "Workspace" } }
+            "result": {
+                "outcome": {
+                    "outcome": "answered",
+                    "answers": [{ "questionId": "scope", "selectedOptionIds": ["workspace"] }]
+                }
+            }
         }))
         .respond(json!({ "stopReason": "end_turn" }));
     let peer_task = tokio::spawn(peer.run());
@@ -2050,10 +2055,22 @@ async fn cursor_code_review_auto_mode_cancels_stray_asks_and_respects_mode_switc
         }))
         .respond(json!({ "stopReason": "end_turn" }));
     // Turns 4-6: all three interactive question methods auto-cancel.
-    for (wire_id, method) in [
-        (5004, "cursor/ask_question"),
-        (5005, "_x.ai/ask_user_question"),
-        (5006, "x.ai/ask_user_question"),
+    for (wire_id, method, expected_result) in [
+        (
+            5004,
+            "cursor/ask_question",
+            json!({ "outcome": { "outcome": "cancelled" } }),
+        ),
+        (
+            5005,
+            "_x.ai/ask_user_question",
+            json!({ "outcome": "cancelled" }),
+        ),
+        (
+            5006,
+            "x.ai/ask_user_question",
+            json!({ "outcome": "cancelled" }),
+        ),
     ] {
         peer.expect_request("session/prompt")
             .emit_request(json!({
@@ -2065,7 +2082,7 @@ async fn cursor_code_review_auto_mode_cancels_stray_asks_and_respects_mode_switc
             .expect_response(json!({
                 "jsonrpc": "2.0",
                 "id": wire_id,
-                "result": { "outcome": "cancelled" }
+                "result": expected_result
             }))
             .respond(json!({ "stopReason": "end_turn" }));
     }
@@ -2089,7 +2106,12 @@ async fn cursor_code_review_auto_mode_cancels_stray_asks_and_respects_mode_switc
         .expect_response(json!({
             "jsonrpc": "2.0",
             "id": 5007,
-            "result": { "answers": { "scope": "Workspace" } }
+            "result": {
+                "outcome": {
+                    "outcome": "answered",
+                    "answers": [{ "questionId": "scope", "selectedOptionIds": ["workspace"] }]
+                }
+            }
         }))
         .respond(json!({ "stopReason": "end_turn" }));
     // Switch back to Full access, then Plan -> reject-only permission opens normal card.
@@ -2628,4 +2650,172 @@ where
         .await
         .expect("write line");
     writer.flush().await.expect("flush");
+}
+
+#[tokio::test]
+async fn cursor_user_input_retains_option_id_description_and_maps_skipped_disposition() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-q-430".to_owned(),
+            cwd: "/tmp/cursor-q".to_owned(),
+            runtime_mode: "approval-required".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+            code_review: false,
+        },
+        connection,
+        incoming,
+    );
+
+    peer.expect_request("initialize")
+        .respond(json!({ "protocolVersion": 1 }));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "cursor-q-session" }));
+    // Turn 1: differing option id (`workspace`) vs label (`Workspace`), description-only Recommended,
+    // plus an optionless question, answered by option ID for partial submit.
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 9101,
+            "method": "cursor/ask_question",
+            "params": {
+                "questions": [
+                    {
+                        "id": "scope",
+                        "prompt": "Which scope?",
+                        "options": [
+                            { "id": "workspace", "label": "Workspace", "description": "Current repo (Recommended)" },
+                            { "id": "global", "label": "Global", "description": "All projects" }
+                        ]
+                    },
+                    {
+                        "id": "notes",
+                        "prompt": "Any extra notes?",
+                        "options": []
+                    }
+                ]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 9101,
+            "result": {
+                "outcome": {
+                    "outcome": "answered",
+                    "answers": [{ "questionId": "scope", "selectedOptionIds": ["workspace"] }]
+                }
+            }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    // Turn 2: skip-all maps to nested `outcome: { outcome: "skipped" }`.
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 9102,
+            "method": "cursor/ask_question",
+            "params": {
+                "questions": [
+                    {
+                        "id": "scope",
+                        "prompt": "Which scope?",
+                        "options": [{ "id": "workspace", "label": "Workspace" }]
+                    }
+                ]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 9102,
+            "result": { "outcome": { "outcome": "skipped" } }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    runtime
+        .send_turn(Some("ask partial"), Vec::new())
+        .await
+        .expect("turn 1");
+    let asked1 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("ev timeout")
+            .expect("ev");
+        if ev.event_type == "user-input.requested" {
+            break ev;
+        }
+    };
+    assert_eq!(
+        asked1.payload["questions"][0]["options"][0]["description"],
+        json!("Current repo (Recommended)")
+    );
+    assert_eq!(asked1.payload["questions"][1]["options"], json!([]));
+    let req1 = asked1.request_id.expect("req1");
+    // Caller submits option ID `workspace` for partial answer -> mapped cleanly to label `Workspace`.
+    runtime
+        .respond_to_user_input_with_disposition(
+            &req1,
+            json!({ "scope": "workspace" }),
+            bibcode_server::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("partial answer");
+    let resolved1 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("resolved1 timeout")
+            .expect("ev");
+        if ev.event_type == "user-input.resolved" {
+            break ev;
+        }
+    };
+    assert_eq!(resolved1.payload["disposition"], json!("answered"));
+    assert_eq!(
+        resolved1.payload["answers"],
+        json!({ "scope": "Workspace" })
+    );
+    assert_eq!(
+        resolved1.payload["questions"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    runtime
+        .send_turn(Some("ask skip"), Vec::new())
+        .await
+        .expect("turn 2");
+    let asked2 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("ev2 timeout")
+            .expect("ev");
+        if ev.event_type == "user-input.requested" {
+            break ev;
+        }
+    };
+    let req2 = asked2.request_id.expect("req2");
+    runtime
+        .respond_to_user_input_with_disposition(
+            &req2,
+            json!({}),
+            bibcode_server::provider::UserInputResponseDisposition::Skipped,
+        )
+        .await
+        .expect("skip answer");
+    let resolved2 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("resolved2 timeout")
+            .expect("ev");
+        if ev.event_type == "user-input.resolved" {
+            break ev;
+        }
+    };
+    assert_eq!(resolved2.payload["disposition"], json!("skipped"));
+    assert_eq!(resolved2.payload["answers"], json!({}));
+
+    peer_task.await.expect("peer");
 }

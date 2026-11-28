@@ -153,26 +153,11 @@ async function openSourceControl(): Promise<void> {
     await toggle.click();
     await rightPanel.waitForDisplayed();
   }
-  const existingTab = browser.$(
-    '//*[@data-right-panel-tab-list]//button[normalize-space()="Source Control"]',
+  const sourceControlButton = browser.$(
+    '[data-right-panel-icon-bar] button[aria-label="Source Control"]:not([aria-disabled="true"])',
   );
-  if (await existingTab.isDisplayed()) {
-    await existingTab.click();
-  } else {
-    const emptyStateAction = browser.$(
-      '//button[.//span[normalize-space()="Source Control"] and not(@aria-disabled="true")]',
-    );
-    if (await emptyStateAction.isDisplayed()) {
-      await emptyStateAction.click();
-    } else {
-      const addSurface = browser.$('button[aria-label="Add panel surface"]');
-      await addSurface.waitForDisplayed();
-      await addSurface.click();
-      const menuItem = browser.$('//*[@role="menuitem" and normalize-space()="Source Control"]');
-      await menuItem.waitForExist();
-      await browser.execute((item: HTMLElement) => item.click(), await menuItem);
-    }
-  }
+  await sourceControlButton.waitForDisplayed();
+  await sourceControlButton.click();
   // Enabled once the status sees the modified file and the thread can host a panel.
   await browser.$('button[aria-label="Review changes"][aria-disabled="false"]').waitForDisplayed({
     timeout: 30_000,

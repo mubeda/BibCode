@@ -120,9 +120,10 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
       }),
     );
 
+    expect(document.body.textContent).toContain("Awaiting user input: 2 questions");
     expect(document.body.textContent).toContain("Header q1");
     expect(document.body.textContent).toContain("Question q1?");
-    expect(document.body.textContent).toContain("1/2");
+    expect(document.body.textContent).toContain("1 of 2");
     expect(document.body.textContent).toContain("First choice");
     expect(document.body.textContent).not.toContain("BetaBeta");
     expect(optionButton("Alpha").querySelector("kbd")?.textContent).toBe("1");
@@ -160,6 +161,41 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
 
     await act(async () => vi.advanceTimersByTime(200));
     expect(onAdvance).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not auto-submit the last single-select question when requireExplicitSubmit is true", async () => {
+    const onToggleOption = vi.fn();
+    const onAdvance = vi.fn();
+    await mount(
+      renderPanel({
+        onToggleOption,
+        onAdvance,
+        requireExplicitSubmit: true,
+      }),
+    );
+
+    await click(optionButton("Beta"));
+    expect(onToggleOption).toHaveBeenCalledWith("q1", "Beta");
+    await act(async () => vi.advanceTimersByTime(500));
+    expect(onAdvance).not.toHaveBeenCalled();
+  });
+
+  it("shows Optional follow-up copy for non-blocking cards when the turn is no longer running", async () => {
+    await mount(
+      renderPanel({
+        isTurnRunning: false,
+        pendingUserInputs: [
+          {
+            ...prompt(question("q1", [{ label: "Alpha" }])),
+            isBlocking: false,
+          },
+        ],
+      }),
+    );
+
+    expect(document.body.textContent).toContain("Follow-up question: 1 question");
+    expect(document.body.textContent).toContain("Optional");
+    expect(document.body.textContent).not.toContain("Agent is still working");
   });
 
   it("replaces a pending single-select timer and uses the latest advance callback", async () => {
@@ -325,5 +361,205 @@ describe("ComposerPendingUserInputPanel mounted behavior", () => {
     expect(onAdvance).not.toHaveBeenCalled();
     expect(removeEventListener).toHaveBeenCalledWith("keydown", keydownHandler);
     expect(onToggleOption).not.toHaveBeenCalled();
+  });
+
+  it("renders Recommended badges, in-card custom answer input for optionless questions, and navigation/skip/collapse/close controls (#430)", async () => {
+    const onToggleOption = vi.fn();
+    const onChangeCustomAnswer = vi.fn();
+    const onAdvance = vi.fn();
+    const onPreviousQuestion = vi.fn();
+    const onSkipAndSubmit = vi.fn();
+    const onToggleCollapsed = vi.fn();
+    const onClose = vi.fn();
+
+    const recommendedQuestion = question("q1", [
+      { label: "Workspace (Recommended)", description: "Keep in repo" },
+      { label: "Global", description: "Install everywhere" },
+    ]);
+    const freeformQuestion = question("q2", [], {
+      header: "Filename",
+      question: "Enter the output file name",
+    });
+
+    const mounted = await mount(
+      renderPanel({
+        pendingUserInputs: [prompt(recommendedQuestion, freeformQuestion)],
+        questionIndex: 0,
+        canCancel: true,
+        onToggleOption,
+        onChangeCustomAnswer,
+        onAdvance,
+        onPreviousQuestion,
+        onSkipAndSubmit,
+        onToggleCollapsed,
+        onClose,
+      }),
+    );
+
+    expect(document.body.textContent).toContain("Recommended");
+    expect(document.body.textContent).not.toContain("Workspace (Recommended)");
+
+    // Skip and submit invokes callback.
+    await click(optionButton("Skip and submit"));
+    expect(onSkipAndSubmit).toHaveBeenCalledTimes(1);
+
+    // Close button invokes onClose when provider supports cancellation.
+    const closeBtn = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Cancel questions"]',
+    );
+    expect(closeBtn).not.toBeNull();
+    await click(closeBtn!);
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    // Non-cancelable providers collapse instead of cancelling on Close.
+    await act(async () => {
+      mounted.root.render(
+        renderPanel({
+          pendingUserInputs: [prompt(recommendedQuestion, freeformQuestion)],
+          questionIndex: 1,
+          canCancel: false,
+          answers: {
+            q1: { selectedOptionLabels: ["Workspace (Recommended)"] },
+            q2: { customAnswer: "report.md" },
+          },
+          onToggleOption,
+          onChangeCustomAnswer,
+          onAdvance,
+          onPreviousQuestion,
+          onSkipAndSubmit,
+          onToggleCollapsed,
+          onClose,
+        }),
+      );
+    });
+
+    const input = document.querySelector<HTMLInputElement>("input[type='text']");
+    expect(input).not.toBeNull();
+    expect(input?.placeholder).toBe("Type your answer...");
+    // Number shortcut inside the in-card input must not fire option selection.
+    await act(async () => {
+      input!.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+    });
+    expect(onToggleOption).not.toHaveBeenCalled();
+
+    // Enter inside the in-card input advances/submits when complete.
+    await act(async () => {
+      input!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    expect(onAdvance).toHaveBeenCalledTimes(1);
+
+    // Back button navigates to previous question.
+    await click(optionButton("Back"));
+    expect(onPreviousQuestion).toHaveBeenCalledTimes(1);
+
+    // Non-cancelable Close collapses rather than cancelling.
+    const collapseCloseBtn = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Collapse questions"]',
+    );
+    expect(collapseCloseBtn).not.toBeNull();
+    await click(collapseCloseBtn!);
+    expect(onToggleCollapsed).toHaveBeenCalledTimes(1);
+
+    // Collapsed mode renders compact reopen chip and preserves text-xs floor.
+    await act(async () => {
+      mounted.root.render(
+        renderPanel({
+          pendingUserInputs: [prompt(recommendedQuestion, freeformQuestion)],
+          collapsed: true,
+          onToggleCollapsed,
+        }),
+      );
+    });
+    expect(document.body.textContent).toContain("Awaiting user input: 2 questions");
+    expect(textSizesBelowTextXs(document.body.innerHTML)).toEqual([]);
+    const reopenBtn = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Open questions"]',
+    );
+    expect(reopenBtn).not.toBeNull();
+    await click(reopenBtn!);
+    expect(onToggleCollapsed).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores digit shortcuts in the host pane when focus is inside a sibling chat surface", async () => {
+    const onHostToggleOption = vi.fn();
+    const onHostAdvance = vi.fn();
+    const q = question("q1", [
+      { label: "Alpha", description: "First" },
+      { label: "Beta", description: "Second" },
+    ]);
+
+    await mount(
+      <div>
+        <button type="button" role="tab" id="split-pane-tab">
+          Side chat tab
+        </button>
+        <div data-chat-surface="">
+          {renderPanel({
+            pendingUserInputs: [prompt(q)],
+            shortcutsEnabled: true,
+            onToggleOption: onHostToggleOption,
+            onAdvance: onHostAdvance,
+          })}
+        </div>
+        <div data-chat-surface="">
+          <button type="button" id="side-chat-action">
+            Side chat button
+          </button>
+        </div>
+      </div>,
+    );
+
+    const sideButton = document.getElementById("side-chat-action") as HTMLButtonElement;
+    expect(sideButton).not.toBeNull();
+    await act(async () => {
+      sideButton.focus();
+      sideButton.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+    });
+    expect(onHostToggleOption).not.toHaveBeenCalled();
+    expect(onHostAdvance).not.toHaveBeenCalled();
+
+    const splitTab = document.getElementById("split-pane-tab") as HTMLButtonElement;
+    expect(splitTab).not.toBeNull();
+    await act(async () => {
+      splitTab.focus();
+      splitTab.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+    });
+    expect(onHostToggleOption).not.toHaveBeenCalled();
+    expect(onHostAdvance).not.toHaveBeenCalled();
+  });
+
+  it("renders non-blocking cue in expanded and collapsed states without blocking controls (#442)", async () => {
+    const q = question("q1", [
+      { label: "Fast", description: "Skip deep checks" },
+      { label: "Thorough", description: "Run full checks" },
+    ]);
+    const nonBlockingPrompt: PendingUserInput = {
+      ...prompt(q),
+      isBlocking: false,
+    };
+
+    const mounted = await mount(
+      renderPanel({
+        pendingUserInputs: [nonBlockingPrompt],
+        collapsed: false,
+        onToggleCollapsed: vi.fn(),
+      }),
+    );
+
+    expect(document.body.textContent).toContain("Question while working: 1 question");
+    expect(document.body.textContent).toContain("Agent is still working");
+    expect(document.querySelector('[data-pending-user-input-non-blocking="true"]')).not.toBeNull();
+    expect(textSizesBelowTextXs(document.body.innerHTML)).toEqual([]);
+
+    await act(async () => {
+      mounted.root.render(
+        renderPanel({
+          pendingUserInputs: [nonBlockingPrompt],
+          collapsed: true,
+          onToggleCollapsed: vi.fn(),
+        }),
+      );
+    });
+    expect(document.body.textContent).toContain("Question while working: 1 question");
   });
 });

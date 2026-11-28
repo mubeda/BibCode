@@ -153,6 +153,10 @@ describe("execution environment contracts", () => {
   });
   it("defaults ordered terminal input support to false when omitted", () => {
     expect(decodeTerminalCapabilities({}).terminalOrderedInput).toBe(false);
+    expect(decodeTerminalCapabilities({}).terminalPasteAssembly).toBe(false);
+    expect(decodeTerminalCapabilities({ terminalPasteAssembly: true }).terminalPasteAssembly).toBe(
+      true,
+    );
   });
   it("defaults clone re-attach off for older servers and preserves advertised support", () => {
     expect(decodeTerminalCapabilities({}).vcsCloneReattach).toBe(false);

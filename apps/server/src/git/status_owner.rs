@@ -2605,6 +2605,7 @@ mod tests {
                 behind_count: 0,
                 ahead_of_default_count: Some(0),
                 pr: None,
+                pr_lookup_error: None,
             },
         }
     }

@@ -539,13 +539,12 @@ impl PullRequestService {
             ),
             ProviderKind::Gitlab => (
                 &self.gitlab_command,
+                // glab defaults to opened MRs; glab 1.114+ has no --state flag.
                 [
                     "mr",
                     "list",
                     "--source-branch",
                     input.reference.as_str(),
-                    "--state",
-                    "opened",
                     "--output",
                     "json",
                 ]
@@ -592,23 +591,28 @@ impl PullRequestService {
             )
             .await?;
         parse_current_provider_list(input.provider, &output.stdout).map_err(|detail| {
-            operation_error(
+            classified_operation_error(
                 input.provider,
                 &input.cwd,
                 "resolveCurrentPullRequest",
                 Some(command.label()),
                 Some(&input.reference),
+                "invalid_response",
                 &detail,
             )
         })
     }
 
     /// [`Self::resolve_current_optional`] for VCS status enrichment: a
-    /// successful answer (including no open pull request) is reused for a few
+    /// successful answer (including no open pull request) is reused for 10
     /// seconds per (worktree, provider, branch), concurrent callers share one
-    /// provider run, and a failure answers for 5 seconds. Callers that must see the
-    /// hosting service's current answer, such as the existence check before
-    /// creating a pull request, use the uncached method.
+    /// provider run, transient failures back off for 5 seconds, persistent
+    /// failure classes (`cli_missing`, `cli_too_old`, `not_authenticated`,
+    /// `forbidden`, `not_found`) back off for 60 seconds, and identical repeated
+    /// failures suppress duplicate `warn` logs until recovery, invalidation, or
+    /// error-class transition. Callers that must see the hosting service's
+    /// current answer, such as the existence check before creating a pull
+    /// request, use the uncached method.
     pub async fn resolve_current_optional_shared(
         &self,
         input: ResolvePullRequestInput,
@@ -1253,12 +1257,13 @@ impl PullRequestService {
             .clone()
             .map(|credentials| credentials.apply(request))
             .ok_or_else(|| {
-                operation_error(
+                classified_operation_error(
                     ProviderKind::Bitbucket,
                     cwd,
                     operation,
                     None,
                     reference,
+                    "not_authenticated",
                     "Set BIBCODE_BITBUCKET_EMAIL and BIBCODE_BITBUCKET_API_TOKEN, or BIBCODE_BITBUCKET_ACCESS_TOKEN.",
                 )
             })?;
@@ -1277,12 +1282,13 @@ impl PullRequestService {
             response = tokio::time::timeout_at(deadline, request.send()) => {
                 match response {
                     Ok(response) => response.map_err(|error| {
-                        operation_error(
+                        classified_operation_error(
                             ProviderKind::Bitbucket,
                             cwd,
                             operation,
                             None,
                             reference,
+                            classify_reqwest_error(&error),
                             &error.to_string(),
                         )
                     })?,
@@ -1379,12 +1385,13 @@ impl PullRequestService {
                 break;
             };
             let chunk = chunk.map_err(|error| {
-                operation_error(
+                classified_operation_error(
                     ProviderKind::Bitbucket,
                     cwd,
                     operation,
                     None,
                     reference,
+                    classify_reqwest_error(&error),
                     &error.to_string(),
                 )
             })?;
@@ -1407,12 +1414,13 @@ impl PullRequestService {
             body.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            return Err(operation_error(
+            return Err(classified_operation_error(
                 ProviderKind::Bitbucket,
                 cwd,
                 operation,
                 None,
                 reference,
+                classify_http_status(status),
                 &format!(
                     "Bitbucket returned HTTP {status}: {}",
                     truncate_detail(&String::from_utf8_lossy(&body))
@@ -1420,12 +1428,13 @@ impl PullRequestService {
             ));
         }
         serde_json::from_slice(&body).map_err(|error| {
-            operation_error(
+            classified_operation_error(
                 ProviderKind::Bitbucket,
                 cwd,
                 operation,
                 None,
                 reference,
+                "invalid_response",
                 &format!("Bitbucket returned invalid JSON: {error}"),
             )
         })
@@ -1487,22 +1496,28 @@ impl PullRequestService {
             )
             .await
             .map_err(|error| {
+                let code = crate::pull_requests::error::classify_process_error(&error, "");
                 process_error(
                     provider,
                     cwd,
                     operation,
                     command.label(),
+                    code,
                     error.safe_facts(),
                 )
             })?;
         if output.exit_code == 0 || allowed_non_zero_exit_codes.contains(&output.exit_code) {
             Ok(output)
         } else {
+            let code = crate::pull_requests::error::classify_stderr_optional(&output.stderr)
+                .or_else(|| crate::pull_requests::error::classify_stderr_optional(&output.stdout))
+                .unwrap_or("host_rejected");
             Err(process_error(
                 provider,
                 cwd,
                 operation,
                 command.label(),
+                code,
                 ProcessFailureFacts::exited(output.exit_code),
             ))
         }
@@ -1870,6 +1885,7 @@ fn process_error(
     cwd: &std::path::Path,
     operation: &str,
     command: &str,
+    code: &'static str,
     facts: ProcessFailureFacts,
 ) -> SourceControlProviderError {
     let mut error = operation_error(
@@ -1881,7 +1897,7 @@ fn process_error(
         &facts.message(provider_program(provider)),
     );
     error.command_failure = Some(Box::new(ProviderCommandFailure {
-        code: "host_rejected",
+        code,
         host_detail: None,
         process_failure: Some(facts),
     }));
@@ -1908,18 +1924,58 @@ fn operation_error(
     }
 }
 
+fn classified_operation_error(
+    provider: ProviderKind,
+    cwd: &std::path::Path,
+    operation: &str,
+    command: Option<&str>,
+    reference: Option<&str>,
+    code: &'static str,
+    detail: &str,
+) -> SourceControlProviderError {
+    let mut error = operation_error(provider, cwd, operation, command, reference, detail);
+    error.command_failure = Some(Box::new(ProviderCommandFailure {
+        code,
+        host_detail: None,
+        process_failure: None,
+    }));
+    error
+}
+
+fn classify_reqwest_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_decode() || error.is_body() {
+        "invalid_response"
+    } else {
+        "host_unreachable"
+    }
+}
+
+fn classify_http_status(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 => "not_authenticated",
+        403 => "forbidden",
+        404 => "not_found",
+        429 => "rate_limited",
+        500..=599 => "host_unreachable",
+        _ => "host_rejected",
+    }
+}
+
 fn bitbucket_deadline_error(
     cwd: &std::path::Path,
     operation: &str,
     reference: Option<&str>,
     timeout: Duration,
 ) -> SourceControlProviderError {
-    operation_error(
+    classified_operation_error(
         ProviderKind::Bitbucket,
         cwd,
         operation,
         None,
         reference,
+        "timeout",
         &format!(
             "Bitbucket request exceeded its {}ms deadline.",
             timeout.as_millis()
@@ -1933,12 +1989,13 @@ fn bitbucket_response_limit_error(
     reference: Option<&str>,
     limit: usize,
 ) -> SourceControlProviderError {
-    operation_error(
+    classified_operation_error(
         ProviderKind::Bitbucket,
         cwd,
         operation,
         None,
         reference,
+        "output_limit",
         &format!("Bitbucket response exceeded the {limit} bytes limit."),
     )
 }
@@ -4039,5 +4096,117 @@ printf '%s\n' '{{"iid":43,"title":"Draft: Add grid","web_url":"https://gitlab.te
             error.detail.contains("reviewer_ids is invalid"),
             "{error:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_current_classifies_gitlab_cli_failures_without_leaking_host_in_detail() {
+        let _fixture_permit = acquire_pull_request_fixture().await;
+        let sandbox = TestSandbox::new("gitlab-open-pr-classify");
+
+        let missing_glab = sandbox.root().join("missing-glab-binary");
+        let missing_service = PullRequestService::with_provider_commands(
+            "unused-gh",
+            missing_glab.to_string_lossy(),
+            "unused-az",
+        );
+        let missing_err = missing_service
+            .resolve_current_optional(
+                ResolvePullRequestInput {
+                    cwd: sandbox.root().to_path_buf(),
+                    provider: ProviderKind::Gitlab,
+                    reference: "main".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("missing glab binary should fail");
+        assert_eq!(
+            missing_err.command_failure.as_deref().map(|f| f.code),
+            Some("cli_missing")
+        );
+
+        let unauth_glab = sandbox.executable_script(
+            "glab-unauth",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$0.args\"\nprintf '%s\\n' 'Warning: config notice' >&2\nprintf '%s\\n' 'no GitLab instances have been authenticated with glab for gitlab.example.test'\nexit 1\n",
+            "",
+        );
+        let unauth_service = PullRequestService::with_provider_commands(
+            "unused-gh",
+            unauth_glab.to_string_lossy(),
+            "unused-az",
+        );
+        let unauth_err = unauth_service
+            .resolve_current_optional(
+                ResolvePullRequestInput {
+                    cwd: sandbox.root().to_path_buf(),
+                    provider: ProviderKind::Gitlab,
+                    reference: "main".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("unauthenticated glab should fail");
+        assert_eq!(
+            unauth_err.command_failure.as_deref().map(|f| f.code),
+            Some("not_authenticated")
+        );
+        assert!(
+            !unauth_err.detail.contains("gitlab.example.test"),
+            "{unauth_err:?}"
+        );
+        let captured_args = std::fs::read_to_string(format!("{}.args", unauth_glab.display()))
+            .expect("glab args captured");
+        assert_eq!(
+            captured_args.trim(),
+            "mr list --source-branch main --output json",
+            "glab mr list must omit unsupported --state flag"
+        );
+
+        // Azure sign-in diagnostic classifies as not_authenticated.
+        let unauth_az = sandbox.executable_script(
+            "az-unauth",
+            "#!/bin/sh\nprintf '%s\\n' 'Before you can run Azure DevOps commands, you need to run the login command(az login if using AAD/MSA identity else az devops login if using PAT token) to setup credentials.' >&2\nexit 1\n",
+            "",
+        );
+        let az_service = PullRequestService::with_provider_commands(
+            "unused-gh",
+            "unused-glab",
+            unauth_az.to_string_lossy(),
+        );
+        let az_err = az_service
+            .resolve_current_optional(
+                ResolvePullRequestInput {
+                    cwd: sandbox.root().to_path_buf(),
+                    provider: ProviderKind::AzureDevops,
+                    reference: "main".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("unauthenticated az should fail");
+        assert_eq!(
+            az_err.command_failure.as_deref().map(|f| f.code),
+            Some("not_authenticated")
+        );
+
+        // Bitbucket without credentials classifies as not_authenticated.
+        let bb_err = PullRequestService::default()
+            .resolve_current_optional(
+                ResolvePullRequestInput {
+                    cwd: sandbox.root().to_path_buf(),
+                    provider: ProviderKind::Bitbucket,
+                    reference: "main".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("bitbucket without credentials or git remote should fail");
+        if bb_err.detail.contains("BIBCODE_BITBUCKET") {
+            assert_eq!(
+                bb_err.command_failure.as_deref().map(|f| f.code),
+                Some("not_authenticated")
+            );
+        }
     }
 }

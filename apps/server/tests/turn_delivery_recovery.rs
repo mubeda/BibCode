@@ -1295,6 +1295,7 @@ impl ProviderDriver for CrashBoundaryDriver {
         &self,
         _request_id: String,
         _answers: Value,
+        _disposition: bibcode_server::provider::UserInputResponseDisposition,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async { Ok(()) })
     }

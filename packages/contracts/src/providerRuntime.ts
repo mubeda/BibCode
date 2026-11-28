@@ -194,6 +194,7 @@ const ProviderRuntimeEventType = Schema.Literals([
   "request.resolved",
   "user-input.requested",
   "user-input.resolved",
+  "user-input.expired",
   "task.started",
   "task.progress",
   "task.completed",
@@ -245,6 +246,7 @@ const RequestOpenedType = Schema.Literal("request.opened");
 const RequestResolvedType = Schema.Literal("request.resolved");
 const UserInputRequestedType = Schema.Literal("user-input.requested");
 const UserInputResolvedType = Schema.Literal("user-input.resolved");
+const UserInputExpiredType = Schema.Literal("user-input.expired");
 const TaskStartedType = Schema.Literal("task.started");
 const TaskProgressType = Schema.Literal("task.progress");
 const TaskCompletedType = Schema.Literal("task.completed");
@@ -305,6 +307,7 @@ const SessionExitedPayload = Schema.Struct({
   reason: Schema.optional(TrimmedNonEmptyStringSchema),
   recoverable: Schema.optional(Schema.Boolean),
   exitKind: Schema.optional(RuntimeSessionExitKind),
+  errorReason: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type SessionExitedPayload = typeof SessionExitedPayload.Type;
 
@@ -399,6 +402,10 @@ const TurnCompletedPayload = Schema.Struct({
   errorClass: Schema.optional(RuntimeErrorClass),
   /** The provider's own name for why a failed turn ended, such as Claude's `terminal_reason`. */
   providerReason: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** BiBCode's sanitized transport or runtime failure reason when the provider gave no `providerReason`. */
+  errorReason: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Optional ISO-8601 timestamp when a provider quota/usage limit resets (#429). */
+  resetsAt: Schema.optional(TrimmedNonEmptyStringSchema),
   /** A `context_limit` failure: the provider refused the input before any output. */
   beforeOutput: Schema.optional(Schema.Boolean),
   /** A `context_limit` failure: `false` when the provider said compacting cannot help. */
@@ -492,18 +499,37 @@ export const UserInputQuestion = Schema.Struct({
   multiSelect: Schema.optional(Schema.Boolean).pipe(
     Schema.withConstructorDefault(Effect.succeed(false)),
   ),
+  isSecret: Schema.optional(Schema.Boolean),
 });
 export type UserInputQuestion = typeof UserInputQuestion.Type;
 
 const UserInputRequestedPayload = Schema.Struct({
   questions: Schema.Array(UserInputQuestion),
+  isBlocking: Schema.optional(Schema.Boolean),
 });
 export type UserInputRequestedPayload = typeof UserInputRequestedPayload.Type;
 
+export const UserInputResponseDisposition = Schema.Literals(["answered", "skipped", "cancelled"]);
+export type UserInputResponseDisposition = typeof UserInputResponseDisposition.Type;
+
+export const UserInputResolvedQuestionSummary = Schema.Struct({
+  id: TrimmedNonEmptyStringSchema,
+  header: Schema.optional(TrimmedNonEmptyStringSchema),
+  question: TrimmedNonEmptyStringSchema,
+});
+export type UserInputResolvedQuestionSummary = typeof UserInputResolvedQuestionSummary.Type;
+
 const UserInputResolvedPayload = Schema.Struct({
   answers: UnknownRecordSchema,
+  disposition: Schema.optional(UserInputResponseDisposition),
+  questions: Schema.optional(Schema.Array(UserInputResolvedQuestionSummary)),
 });
 export type UserInputResolvedPayload = typeof UserInputResolvedPayload.Type;
+
+const UserInputExpiredPayload = Schema.Struct({
+  reason: Schema.optional(TrimmedNonEmptyStringSchema),
+});
+export type UserInputExpiredPayload = typeof UserInputExpiredPayload.Type;
 
 const TaskStartedPayload = Schema.Struct({
   taskId: RuntimeTaskId,
@@ -663,6 +689,8 @@ export type ToolDeniedPayload = typeof ToolDeniedPayload.Type;
 const RuntimeWarningPayload = Schema.Struct({
   message: TrimmedNonEmptyStringSchema,
   detail: Schema.optional(Schema.Unknown),
+  usageLimit: Schema.optional(Schema.Boolean),
+  resetsAt: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type RuntimeWarningPayload = typeof RuntimeWarningPayload.Type;
 
@@ -891,6 +919,13 @@ const ProviderRuntimeUserInputResolvedEvent = Schema.Struct({
 export type ProviderRuntimeUserInputResolvedEvent =
   typeof ProviderRuntimeUserInputResolvedEvent.Type;
 
+const ProviderRuntimeUserInputExpiredEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: UserInputExpiredType,
+  payload: UserInputExpiredPayload,
+});
+export type ProviderRuntimeUserInputExpiredEvent = typeof ProviderRuntimeUserInputExpiredEvent.Type;
+
 const ProviderRuntimeTaskStartedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: TaskStartedType,
@@ -1064,6 +1099,7 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeRequestResolvedEvent,
   ProviderRuntimeUserInputRequestedEvent,
   ProviderRuntimeUserInputResolvedEvent,
+  ProviderRuntimeUserInputExpiredEvent,
   ProviderRuntimeTaskStartedEvent,
   ProviderRuntimeTaskProgressEvent,
   ProviderRuntimeTaskCompletedEvent,

@@ -1,11 +1,19 @@
-import { describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import {
+  buildPartialPendingUserInputSubmission,
   buildPendingUserInputAnswers,
+  clearPendingUserInputDraft,
   countAnsweredPendingUserInputQuestions,
   derivePendingUserInputProgress,
   findFirstUnansweredPendingUserInputQuestionIndex,
+  formatUserInputOptionLabel,
+  isRecommendedUserInputOption,
+  loadPendingUserInputDraft,
+  providerSupportsPendingUserInputCancel,
+  prunePendingUserInputDraftsForThread,
   resolvePendingUserInputAnswer,
+  savePendingUserInputDraft,
   setPendingUserInputCustomAnswer,
   togglePendingUserInputOptionSelection,
 } from "./pendingUserInput";
@@ -246,5 +254,216 @@ describe("pending user input question progress", () => {
       canAdvance: true,
       isComplete: true,
     });
+  });
+
+  it("preserves both selected options and custom text for multi-select questions", () => {
+    const withOptions = togglePendingUserInputOptionSelection(
+      multiSelectQuestion,
+      undefined,
+      "Server",
+    );
+    const withCustom = setPendingUserInputCustomAnswer(withOptions, "CLI", {
+      multiSelect: true,
+    });
+    const withSecondOption = togglePendingUserInputOptionSelection(
+      multiSelectQuestion,
+      withCustom,
+      "Web",
+    );
+    expect(withSecondOption).toEqual({
+      customAnswer: "CLI",
+      selectedOptionLabels: ["Server", "Web"],
+    });
+    expect(resolvePendingUserInputAnswer(multiSelectQuestion, withSecondOption)).toEqual([
+      "Server",
+      "Web",
+      "CLI",
+    ]);
+  });
+});
+
+describe("pending user input Orca helpers and draft persistence (#430)", () => {
+  const originalWindow = globalThis.window;
+  afterEach(() => {
+    if (originalWindow === undefined) {
+      Reflect.deleteProperty(globalThis, "window");
+    } else {
+      Object.defineProperty(globalThis, "window", {
+        value: originalWindow,
+        configurable: true,
+        writable: true,
+      });
+    }
+  });
+
+  function installMemoryStorage(): Map<string, string> {
+    const store = new Map<string, string>();
+    const storage: Storage = {
+      get length() {
+        return store.size;
+      },
+      key(index: number) {
+        return Array.from(store.keys())[index] ?? null;
+      },
+      getItem(key: string) {
+        return store.get(key) ?? null;
+      },
+      setItem(key: string, value: string) {
+        store.set(key, value);
+      },
+      removeItem(key: string) {
+        store.delete(key);
+      },
+      clear() {
+        store.clear();
+      },
+    };
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      writable: true,
+      value: { localStorage: storage },
+    });
+    return store;
+  }
+
+  it("detects provider-sourced Recommended markers without false positives", () => {
+    expect(
+      isRecommendedUserInputOption({ label: "Workspace (Recommended)", description: "" }),
+    ).toBe(true);
+    expect(
+      isRecommendedUserInputOption({
+        label: "Workspace",
+        description: "Keep changes in this repo (recommended)",
+      }),
+    ).toBe(true);
+    expect(isRecommendedUserInputOption({ label: "Global", description: "Install globally" })).toBe(
+      false,
+    );
+    expect(formatUserInputOptionLabel({ label: "Workspace (Recommended)", description: "" })).toBe(
+      "Workspace",
+    );
+    expect(formatUserInputOptionLabel({ label: "Plain option", description: "" })).toBe(
+      "Plain option",
+    );
+  });
+
+  it("reports provider cancel capability accurately", () => {
+    expect(providerSupportsPendingUserInputCancel("antigravity")).toBe(true);
+    expect(providerSupportsPendingUserInputCancel("cursor")).toBe(true);
+    expect(providerSupportsPendingUserInputCancel("opencode")).toBe(true);
+    expect(providerSupportsPendingUserInputCancel("claudeAgent")).toBe(false);
+    expect(providerSupportsPendingUserInputCancel("codex")).toBe(false);
+    expect(providerSupportsPendingUserInputCancel("grok")).toBe(false);
+    expect(providerSupportsPendingUserInputCancel(null)).toBe(false);
+  });
+
+  it("builds partial submissions with skipped or answered disposition", () => {
+    const questions = [singleSelectQuestion, multiSelectQuestion];
+    expect(buildPartialPendingUserInputSubmission(questions, {}, "skip")).toEqual({
+      answers: {},
+      disposition: "skipped",
+    });
+    expect(
+      buildPartialPendingUserInputSubmission(
+        questions,
+        {
+          scope: { selectedOptionLabels: ["Orchestration-first"] },
+        },
+        "skip",
+      ),
+    ).toEqual({
+      answers: { scope: "Orchestration-first" },
+      disposition: "skipped",
+    });
+    expect(
+      buildPartialPendingUserInputSubmission(
+        questions,
+        {
+          scope: { selectedOptionLabels: ["Orchestration-first"] },
+          areas: { selectedOptionLabels: ["Server"] },
+        },
+        "skip",
+      ),
+    ).toEqual({
+      answers: { scope: "Orchestration-first", areas: ["Server"] },
+      disposition: "answered",
+    });
+    expect(
+      buildPartialPendingUserInputSubmission(
+        questions,
+        {
+          scope: { selectedOptionLabels: ["Orchestration-first"] },
+          areas: { selectedOptionLabels: ["Server"] },
+        },
+        "submit",
+      ),
+    ).toEqual({
+      answers: { scope: "Orchestration-first", areas: ["Server"] },
+      disposition: "answered",
+    });
+  });
+
+  it("handles blocked localStorage SecurityError and excludes secret question drafts", () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      writable: true,
+      value: {
+        get localStorage() {
+          throw new Error("SecurityError: storage blocked");
+        },
+      },
+    });
+    expect(loadPendingUserInputDraft("env:thread-1", "req-a")).toBeNull();
+    expect(() =>
+      savePendingUserInputDraft("env:thread-1", "req-a", {
+        scope: { selectedOptionLabels: ["Orchestration-first"] },
+      }),
+    ).not.toThrow();
+
+    installMemoryStorage();
+    savePendingUserInputDraft(
+      "env:thread-1",
+      "req-secret",
+      {
+        scope: { selectedOptionLabels: ["Orchestration-first"] },
+        token: { customAnswer: "super-secret-value" },
+      },
+      new Set(["token"]),
+    );
+    expect(loadPendingUserInputDraft("env:thread-1", "req-secret")).toEqual({
+      scope: { selectedOptionLabels: ["Orchestration-first"] },
+    });
+  });
+
+  it("persists, reloads, clears, and prunes question drafts by thread and request", () => {
+    const store = installMemoryStorage();
+    savePendingUserInputDraft("env:thread-1", "req-a", {
+      scope: { selectedOptionLabels: ["Orchestration-first"] },
+      notes: { customAnswer: "keep strict" },
+    });
+    savePendingUserInputDraft("env:thread-1", "req-b", {
+      scope: { selectedOptionLabels: ["Other"] },
+    });
+
+    const loaded = loadPendingUserInputDraft("env:thread-1", "req-a");
+    expect(loaded).toEqual({
+      scope: { selectedOptionLabels: ["Orchestration-first"] },
+      notes: { customAnswer: "keep strict" },
+    });
+
+    // Reopening after reload lands on the first unanswered question while keeping prior picks.
+    expect(
+      findFirstUnansweredPendingUserInputQuestionIndex(
+        [singleSelectQuestion, multiSelectQuestion],
+        loaded ?? {},
+      ),
+    ).toBe(1);
+
+    prunePendingUserInputDraftsForThread("env:thread-1", new Set(["req-a"]));
+    expect(loadPendingUserInputDraft("env:thread-1", "req-a")).toEqual(loaded);
+    expect(loadPendingUserInputDraft("env:thread-1", "req-b")).toBeNull();
+
+    clearPendingUserInputDraft("env:thread-1", "req-a");
+    expect(store.size).toBe(0);
   });
 });

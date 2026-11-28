@@ -684,6 +684,13 @@ function deriveTurnFolds(input: {
         : group.assistantEntries.filter((entry) => !lateEntries.includes(entry));
 
     const visibleEntryIds = new Set<string>(lateEntries.map((entry) => entry.id));
+    // Usage-limit notices (#429) must remain visible in default (non-verbose) chat after the turn
+    // settles instead of hiding behind a collapsed "Worked for ..." fold.
+    for (const entry of group.entries) {
+      if (entry.kind === "work" && entry.entry.usageLimit === true) {
+        visibleEntryIds.add(entry.id);
+      }
+    }
     const terminalEntry = onTimeEntries.at(-1);
     if (terminalEntry) {
       visibleEntryIds.add(terminalEntry.id);
@@ -839,11 +846,17 @@ function collectWorkRun(
   const first = timelineEntries[startIndex];
   const groupedEntries: WorkLogEntry[] = first?.kind === "work" ? [first.entry] : [];
   let cursor = startIndex + 1;
+  // Keep usage-limit notices standalone so neither subsequent tool calls nor session lifecycle
+  // rows can push them into work-group overflow (#429).
+  if (first?.kind === "work" && first.entry.usageLimit === true) {
+    return { groupedEntries, end: cursor };
+  }
   while (cursor < timelineEntries.length) {
     const nextEntry = timelineEntries[cursor];
     if (
       !nextEntry ||
       nextEntry.kind !== "work" ||
+      nextEntry.entry.usageLimit === true ||
       collapsedEntryIds.has(nextEntry.id) ||
       foldsByAnchorEntryId.has(nextEntry.id)
     ) {

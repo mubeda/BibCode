@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Deferred from "effect/Deferred";
 import type { RpcSession } from "../rpc/session.ts";
+import { withInputAdmission } from "../rpc/inputAdmission.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   createOrderedTerminalInputBinding,
@@ -341,5 +342,127 @@ describe("ordered terminal input binding", () => {
       expect(sequences).toEqual([0, 1, 2]);
       registry.reset("env", target);
     }),
+  );
+
+  it("never splits bracketed-paste opener or closer across 16 KiB frame boundaries", () => {
+    const start = "\u001b[200~";
+    const end = "\u001b[201~";
+    const payload = `${"a".repeat(16 * 1024 - 2)}${start}${"b".repeat(16 * 1024 - 8)}${end}\r`;
+    const frames = splitTerminalInputFrames(payload);
+    expect(frames.join("")).toBe(payload);
+    for (const frame of frames) {
+      expect(new TextEncoder().encode(frame).length).toBeLessThanOrEqual(16 * 1024);
+      expect(frame.endsWith("\u001b")).toBe(false);
+      expect(frame.endsWith("\u001b[")).toBe(false);
+      expect(frame.endsWith("\u001b[2")).toBe(false);
+      expect(frame.endsWith("\u001b[20")).toBe(false);
+      expect(frame.endsWith("\u001b[200")).toBe(false);
+      expect(frame.endsWith("\u001b[201")).toBe(false);
+    }
+  });
+
+  it.effect(
+    "stages >256 KiB multi-frame bracketed pastes with chunk/commit when terminalPasteAssembly is advertised",
+    () =>
+      Effect.gen(function* () {
+        const start = "\u001b[200~";
+        const end = "\u001b[201~";
+        const recorded: Array<{ sequence: number; data: string; pasteStage?: string }> = [];
+        const h = harness(true);
+        (h.session as { initialConfig: RpcSession["initialConfig"] }).initialConfig =
+          Effect.succeed({
+            environment: {
+              capabilities: { terminalOrderedInput: true, terminalPasteAssembly: true },
+            },
+          } as unknown as ServerConfig);
+        (h.session.client as Record<string, unknown>)[WS_METHODS.terminalWriteInput] = (frame: {
+          sequence: number;
+          data: string;
+          pasteStage?: string;
+        }) =>
+          Effect.sync(() => {
+            recorded.push(frame);
+            return { inputId: "lease", sequence: frame.sequence };
+          });
+        const binding = createOrderedTerminalInputBinding(
+          h.session,
+          "env",
+          target,
+          yield* Effect.context(),
+        );
+        const bigBody = "line\r".repeat(60_000); // 300 KiB > 256 KiB window (19+ frames)
+        const payload = `pre${start}${bigBody}${end}\r`;
+        yield* binding.write(payload);
+        expect(recorded.map((f) => f.data).join("")).toBe(payload);
+        expect(recorded[0]).toMatchObject({ sequence: 0, data: "pre" });
+        expect(recorded[0]?.pasteStage).toBeUndefined();
+        const pasteFrames = recorded.slice(1, -1);
+        expect(pasteFrames.length).toBeGreaterThanOrEqual(17);
+        for (const chunk of pasteFrames.slice(0, -1)) {
+          expect(chunk.pasteStage).toBe("chunk");
+        }
+        expect(pasteFrames.at(-1)?.pasteStage).toBe("commit");
+        expect(pasteFrames.at(-1)?.data.endsWith(end)).toBe(true);
+        expect(recorded.at(-1)).toMatchObject({ data: "\r" });
+        expect(recorded.at(-1)?.pasteStage).toBeUndefined();
+        binding.dispose();
+      }),
+  );
+
+  it.effect(
+    "sends legacy terminal.write bracketed pastes up to 64 KiB in one write and fails cleanly above 64 KiB",
+    () =>
+      Effect.gen(function* () {
+        const start = "\u001b[200~";
+        const end = "\u001b[201~";
+        const h = harness(false);
+        const binding = createOrderedTerminalInputBinding(
+          h.session,
+          "env",
+          target,
+          yield* Effect.context(),
+        );
+        const mediumPaste = `${start}${"m".repeat(40_000)}${end}`;
+        yield* binding.write(mediumPaste);
+        expect(h.frames.map((f) => f.data)).toEqual([mediumPaste]);
+
+        const oversizedPaste = `${start}${"z".repeat(70_000)}${end}`;
+        const err = yield* binding.write(oversizedPaste).pipe(Effect.flip);
+        expect(err.code).toBe("capacity");
+        // Must not have sent a partial unclosed bracketed paste envelope.
+        expect(h.frames.map((f) => f.data)).toEqual([mediumPaste]);
+        binding.dispose();
+      }),
+  );
+
+  it.effect(
+    "does not spread >16 KiB write payload into terminal.beginInput on an unprepared binding through withInputAdmission",
+    () =>
+      Effect.gen(function* () {
+        const start = "\u001b[200~";
+        const end = "\u001b[201~";
+        const h = harness(true);
+        (h.session as { initialConfig: RpcSession["initialConfig"] }).initialConfig =
+          Effect.succeed({
+            environment: {
+              capabilities: { terminalOrderedInput: true, terminalPasteAssembly: true },
+            },
+          } as unknown as ServerConfig);
+        const admittedSession: RpcSession = {
+          ...h.session,
+          client: withInputAdmission(
+            h.session.client as unknown as WsRpcProtocolClient,
+          ) as unknown as RpcSession["client"],
+        };
+        const registry = createTerminalInputBindingRegistry();
+        const paste = `${start}${"p".repeat(18 * 1024)}${end}`;
+        // Matches terminal.ts:275 where the whole write input (including `data`) is passed as `target`.
+        const writeInput = { ...target, data: paste } as typeof target;
+        yield* registry.write(admittedSession, "env", writeInput, paste, yield* Effect.context());
+        expect(h.begins()).toBe(1);
+        expect(h.frames.length).toBe(2);
+        expect(h.frames.map((f) => f.data).join("")).toBe(paste);
+        registry.reset("env", target);
+      }),
   );
 });

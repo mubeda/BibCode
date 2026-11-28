@@ -956,3 +956,139 @@ where
         .expect("write line");
     writer.flush().await.expect("flush");
 }
+
+#[tokio::test]
+async fn grok_user_input_with_disposition_maps_partial_and_skipped_answers() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = GrokSessionRuntime::new(
+        GrokSessionOptions {
+            thread_id: "grok-q-430".to_owned(),
+            cwd: "/tmp/grok-q".to_owned(),
+            mcp_servers: Vec::new(),
+            runtime_mode: "approval-required".to_owned(),
+            interaction_mode: "default".to_owned(),
+        },
+        connection,
+        incoming,
+    );
+
+    peer.expect_request("initialize")
+        .respond(json!({ "protocolVersion": 1 }));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/create")
+        .respond(json!({ "sessionId": "grok-q-session" }));
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 9201,
+            "method": "x.ai/ask_user_question",
+            "params": {
+                "questions": [
+                    { "id": "q1", "question": "Which scope?", "options": [{ "label": "Workspace", "description": "Repo" }] },
+                    { "id": "q2", "question": "Extra notes?", "options": [] }
+                ]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 9201,
+            "result": {
+                "outcome": "accepted",
+                "answers": { "q1": ["Workspace"], "q2": [] }
+            }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    peer.expect_request("session/prompt")
+        .emit_request(json!({
+            "jsonrpc": "2.0",
+            "id": 9202,
+            "method": "x.ai/ask_user_question",
+            "params": {
+                "questions": [
+                    { "id": "q1", "question": "Which scope?", "options": [] }
+                ]
+            }
+        }))
+        .expect_response(json!({
+            "jsonrpc": "2.0",
+            "id": 9202,
+            "result": {
+                "outcome": "accepted",
+                "answers": { "q1": [] }
+            }
+        }))
+        .respond(json!({ "stopReason": "end_turn" }));
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    runtime
+        .send_turn(Some("ask partial"), Vec::new())
+        .await
+        .expect("turn 1");
+    let asked1 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("ev1 timeout")
+            .expect("ev1");
+        if ev.event_type == "user-input.requested" {
+            break ev;
+        }
+    };
+    runtime
+        .respond_to_user_input_with_disposition(
+            &asked1.request_id.expect("req1"),
+            json!({ "q1": "Workspace" }),
+            bibcode_server::provider::UserInputResponseDisposition::Answered,
+        )
+        .await
+        .expect("partial grok");
+    let resolved1 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("r1 timeout")
+            .expect("r1");
+        if ev.event_type == "user-input.resolved" {
+            break ev;
+        }
+    };
+    assert_eq!(resolved1.payload["disposition"], json!("answered"));
+    assert_eq!(
+        resolved1.payload["questions"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    runtime
+        .send_turn(Some("ask skip"), Vec::new())
+        .await
+        .expect("turn 2");
+    let asked2 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("ev2 timeout")
+            .expect("ev2");
+        if ev.event_type == "user-input.requested" {
+            break ev;
+        }
+    };
+    runtime
+        .respond_to_user_input_with_disposition(
+            &asked2.request_id.expect("req2"),
+            json!({}),
+            bibcode_server::provider::UserInputResponseDisposition::Skipped,
+        )
+        .await
+        .expect("skip grok");
+    let resolved2 = loop {
+        let ev = timeout(Duration::from_secs(2), runtime.next_event())
+            .await
+            .expect("r2 timeout")
+            .expect("r2");
+        if ev.event_type == "user-input.resolved" {
+            break ev;
+        }
+    };
+    assert_eq!(resolved2.payload["disposition"], json!("skipped"));
+    assert_eq!(resolved2.payload["answers"], json!({}));
+
+    peer_task.await.expect("peer");
+}

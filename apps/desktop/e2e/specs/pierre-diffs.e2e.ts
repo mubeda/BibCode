@@ -261,29 +261,11 @@ async function openRightPanelSurface(label: "Diff" | "Files"): Promise<void> {
     await toggle.click();
     await rightPanel.waitForDisplayed();
   }
-
-  const existingTab = browser.$(
-    `//*[@data-right-panel-tab-list]//button[normalize-space()="${label}"]`,
+  const iconButton = browser.$(
+    `[data-right-panel-icon-bar] button[aria-label="${label}"]:not([aria-disabled="true"])`,
   );
-  if (await existingTab.isDisplayed()) {
-    await existingTab.click();
-    return;
-  }
-
-  const emptyStateAction = browser.$(
-    `//button[.//span[normalize-space()="${label}"] and not(@aria-disabled="true")]`,
-  );
-  if (await emptyStateAction.isDisplayed()) {
-    await emptyStateAction.click();
-    return;
-  }
-
-  const addSurface = browser.$('button[aria-label="Add panel surface"]');
-  await addSurface.waitForDisplayed();
-  await addSurface.click();
-  const menuItem = browser.$(`//*[@role="menuitem" and normalize-space()="${label}"]`);
-  await menuItem.waitForDisplayed();
-  await menuItem.click();
+  await iconButton.waitForDisplayed();
+  await iconButton.click();
 }
 
 async function closeRightPanel(): Promise<void> {
@@ -399,9 +381,11 @@ describe("packaged Pierre diff and editor interactions", () => {
       return button !== null;
     }, desktopUiFixture.projectName);
     expect(pullRequestsOpened).toBe(true);
-    await browser.waitUntil(async () => (await browser.getUrl()).includes("/pull-requests"), {
-      timeoutMsg: "The packaged Pull Requests route did not open.",
-    });
+    await browser
+      .$('[data-right-panel-icon-bar] button[aria-label="Pull Request"][data-active-icon="true"]')
+      .waitForDisplayed({
+        timeoutMsg: "The packaged Pull Requests surface did not open in the right panel.",
+      });
     await saveEvidence("pierre-pull-requests-route");
 
     const gitManagerOpened = await browser.execute((label: string) => {
@@ -412,9 +396,11 @@ describe("packaged Pierre diff and editor interactions", () => {
       return button !== null;
     }, desktopUiFixture.projectName);
     expect(gitManagerOpened).toBe(true);
-    await browser.waitUntil(async () => (await browser.getUrl()).includes("/git"), {
-      timeoutMsg: "The packaged Git Manager route did not open.",
-    });
+    await browser
+      .$('[data-right-panel-icon-bar] button[aria-label="Git Manager"][data-active-icon="true"]')
+      .waitForDisplayed({
+        timeoutMsg: "The packaged Git Manager surface did not open in the right panel.",
+      });
     const changesTab = browser.$('//button[@role="tab" and normalize-space()="Changes"]');
     await changesTab.waitForDisplayed();
     await changesTab.click();
@@ -522,7 +508,7 @@ describe("packaged Pierre diff and editor interactions", () => {
     await browser.$('button[aria-label="Undo"]').waitForEnabled();
     await saveEvidence("pierre-edit-before-tab-switch");
 
-    const diffTab = browser.$('//*[@data-right-panel-tab-list]//button[normalize-space()="Diff"]');
+    const diffTab = browser.$('[data-right-panel-icon-bar] button[aria-label="Diff"]');
     await diffTab.click();
     await browser.$('button[aria-label^="Diff scope:"]').waitForDisplayed();
     const editFileTab = browser.$(

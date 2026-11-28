@@ -3598,6 +3598,7 @@ fn environment_descriptor(
     });
     // Outside the literal above, which is at `json!`'s recursion limit.
     capabilities["terminalUserInputClaim"] = json!(true);
+    capabilities["terminalPasteAssembly"] = json!(true);
     capabilities["agentMessaging"] = json!(true);
     capabilities["sendRequests"] = json!(true);
     capabilities["readOnlyCodexReviews"] = json!(true);
@@ -10695,5 +10696,29 @@ done
         let mut unknown_stream = control.subscribe("unknown", unknown_cancellation);
         assert!(unknown_stream.recv().await.is_none());
         assert!(!now_iso().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_show_antigravity_usage_in_settings_json_preserves_sibling_settings() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({
+                "showAntigravityUsage": true,
+                "enableAssistantStreaming": true
+            }),
+        );
+
+        let control = NativeServerControl::new(config, json!({})).await;
+        assert!(
+            control.settings_load_error.is_none(),
+            "legacy showAntigravityUsage must not cause a settings load error: {:?}",
+            control.settings_load_error
+        );
+        assert_eq!(
+            control.settings.read().await["enableAssistantStreaming"],
+            true
+        );
     }
 }

@@ -47,6 +47,113 @@ export interface TerminalInputScheduler {
 }
 
 export const DEFAULT_MAX_INPUT_FRAME_LENGTH = 16 * 1024;
+export const BRACKETED_PASTE_START = "\u001b[200~";
+export const BRACKETED_PASTE_END = "\u001b[201~";
+
+export interface TerminalInputSegment {
+  readonly kind: "ordinary" | "paste";
+  readonly data: string;
+}
+
+/**
+ * Partitions terminal input in strict stream order into ordinary text and complete
+ * `\x1b[200~...\x1b[201~` bracketed-paste envelopes. Unclosed openers stay ordinary so raw escape
+ * sequences are never trapped in staged paste assembly.
+ */
+export function partitionTerminalInputSegments(data: string): TerminalInputSegment[] {
+  if (data.length === 0) return [];
+  if (!data.includes(BRACKETED_PASTE_START)) {
+    return [{ kind: "ordinary", data }];
+  }
+  const segments: TerminalInputSegment[] = [];
+  let cursor = 0;
+  while (cursor < data.length) {
+    const startIdx = data.indexOf(BRACKETED_PASTE_START, cursor);
+    if (startIdx === -1) {
+      segments.push({ kind: "ordinary", data: data.slice(cursor) });
+      break;
+    }
+    const endIdx = data.indexOf(BRACKETED_PASTE_END, startIdx + BRACKETED_PASTE_START.length);
+    if (endIdx === -1) {
+      segments.push({ kind: "ordinary", data: data.slice(cursor) });
+      break;
+    }
+    if (startIdx > cursor) {
+      segments.push({ kind: "ordinary", data: data.slice(cursor, startIdx) });
+    }
+    const pasteEnd = endIdx + BRACKETED_PASTE_END.length;
+    segments.push({ kind: "paste", data: data.slice(startIdx, pasteEnd) });
+    cursor = pasteEnd;
+  }
+  return segments;
+}
+
+function matchBracketedPasteDelimiter(data: string, index: number): number {
+  if (data.charCodeAt(index) !== 0x1b) return 0;
+  if (
+    data.startsWith(BRACKETED_PASTE_START, index) ||
+    data.startsWith(BRACKETED_PASTE_END, index)
+  ) {
+    return BRACKETED_PASTE_START.length;
+  }
+  return 0;
+}
+
+function takeDelimiterSafePrefixLength(
+  data: string,
+  maxFrameLength: number,
+  maxFrameBytes: number,
+): number {
+  let index = 0;
+  let frameChars = 0;
+  let frameBytes = 0;
+  while (index < data.length) {
+    const delimiterLen = matchBracketedPasteDelimiter(data, index);
+    let unitLen: number;
+    let unitBytes: number;
+    if (delimiterLen > 0) {
+      unitLen = delimiterLen;
+      unitBytes = delimiterLen;
+    } else {
+      const codePoint = data.codePointAt(index)!;
+      unitLen = codePoint > 0xffff ? 2 : 1;
+      unitBytes = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    }
+    if (
+      frameChars > 0 &&
+      (frameChars + unitLen > maxFrameLength || frameBytes + unitBytes > maxFrameBytes)
+    ) {
+      break;
+    }
+    index += unitLen;
+    frameChars += unitLen;
+    frameBytes += unitBytes;
+  }
+  return index;
+}
+
+/**
+ * Splits `data` into UTF-8 and surrogate-pair safe frames without ever splitting a 6-byte
+ * `\x1b[200~` or `\x1b[201~` bracketed-paste delimiter across a frame boundary.
+ */
+export function sliceDelimiterSafeFrames(
+  data: string,
+  maxFrameLength = DEFAULT_MAX_INPUT_FRAME_LENGTH,
+  maxFrameBytes = 16 * 1024,
+): string[] {
+  const frames: string[] = [];
+  let cursor = 0;
+  while (cursor < data.length) {
+    const end = takeDelimiterSafePrefixLength(
+      cursor === 0 ? data : data.slice(cursor),
+      maxFrameLength,
+      maxFrameBytes,
+    );
+    frames.push(data.slice(cursor, cursor + end));
+    cursor += end;
+  }
+  return frames;
+}
 
 export function createTerminalInputScheduler(
   options: TerminalInputSchedulerOptions,
@@ -103,14 +210,31 @@ export function createTerminalInputScheduler(
 
   const takeFrame = (): Segment => {
     const head = pending[0]!;
-    let end = 0;
-    let bytes = 0;
-    for (const character of head.data) {
-      const size = terminalInputCharacterBytes(character);
-      if (end > 0 && (end + character.length > maxFrameLength || bytes + size > maxFrameBytes))
-        break;
-      end += character.length;
-      bytes += size;
+    const startIdx = head.data.indexOf(BRACKETED_PASTE_START);
+    let end: number;
+    if (startIdx !== -1) {
+      const endIdx = head.data.indexOf(
+        BRACKETED_PASTE_END,
+        startIdx + BRACKETED_PASTE_START.length,
+      );
+      if (endIdx !== -1) {
+        if (startIdx === 0) {
+          // Deliver the complete bracketed-paste envelope intact so downstream transport can
+          // stage it atomically (ordered) or send up to 64 KiB in a single write (legacy).
+          end = endIdx + BRACKETED_PASTE_END.length;
+        } else {
+          // Ordinary text before the opener stays separate from the bracketed paste.
+          end = takeDelimiterSafePrefixLength(
+            head.data.slice(0, startIdx),
+            maxFrameLength,
+            maxFrameBytes,
+          );
+        }
+      } else {
+        end = takeDelimiterSafePrefixLength(head.data, maxFrameLength, maxFrameBytes);
+      }
+    } else {
+      end = takeDelimiterSafePrefixLength(head.data, maxFrameLength, maxFrameBytes);
     }
 
     const frame = { data: head.data.slice(0, end), origin: head.origin };
