@@ -15149,7 +15149,9 @@ while True:
         let conn_a = CancellationToken::new();
         let conn_b = CancellationToken::new();
 
-        let task_a = tokio::spawn(async move {
+        // Pin and poll both enqueue futures to Pending while holding `publication`, guaranteeing
+        // both have registered as waiters on `publication` before any fence exists.
+        let mut fut_a = Box::pin(async move {
             lease_a
                 .enqueue_input(
                     "\x1b[200",
@@ -15165,9 +15167,7 @@ while True:
                 .await
                 .expect("owner-a write completes");
         });
-        tokio::task::yield_now().await;
-
-        let task_b = tokio::spawn(async move {
+        let mut fut_b = Box::pin(async move {
             lease_b
                 .enqueue_input(
                     "interloper",
@@ -15183,6 +15183,13 @@ while True:
                 .await
                 .expect("owner-b write completes");
         });
+        let noop_waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(noop_waker);
+        assert!(fut_a.as_mut().poll(&mut cx).is_pending());
+        assert!(fut_b.as_mut().poll(&mut cx).is_pending());
+
+        let task_a = tokio::spawn(fut_a);
+        let task_b = tokio::spawn(fut_b);
         tokio::task::yield_now().await;
 
         drop(held_publication);

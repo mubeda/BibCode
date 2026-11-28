@@ -453,6 +453,12 @@ impl GrokSessionRuntime {
             .ok_or_else(|| GrokRuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
             })?;
+        let answers =
+            if disposition == Some(crate::provider::UserInputResponseDisposition::Cancelled) {
+                json!({})
+            } else {
+                answers
+            };
         let skip_all = disposition.is_some_and(|disp| {
             disp.is_skip_or_cancel() && !crate::provider::has_non_empty_user_input_answer(&answers)
         });

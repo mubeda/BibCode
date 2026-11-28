@@ -218,6 +218,12 @@ export const ServerProvider = Schema.Struct({
    * sends `/compact` instead.
    */
   supportsCompaction: Schema.optional(Schema.Boolean),
+  /**
+   * The server accepts explicit `disposition` (`answered | skipped | cancelled`) on
+   * `thread.user-input.respond`. Absent from older servers, where skip-all and cancel
+   * must not dispatch empty replies.
+   */
+  supportsUserInputDisposition: Schema.optional(Schema.Boolean),
   enabled: Schema.Boolean,
   installed: Schema.Boolean,
   version: Schema.NullOr(TrimmedNonEmptyString),

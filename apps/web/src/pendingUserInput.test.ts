@@ -356,11 +356,56 @@ describe("pending user input Orca helpers and draft persistence (#430)", () => {
           scope: { selectedOptionLabels: ["Orchestration-first"] },
           areas: { selectedOptionLabels: ["Server"] },
         },
+        "skip",
+      ),
+    ).toEqual({
+      answers: { scope: "Orchestration-first", areas: ["Server"] },
+      disposition: "answered",
+    });
+    expect(
+      buildPartialPendingUserInputSubmission(
+        questions,
+        {
+          scope: { selectedOptionLabels: ["Orchestration-first"] },
+          areas: { selectedOptionLabels: ["Server"] },
+        },
         "submit",
       ),
     ).toEqual({
       answers: { scope: "Orchestration-first", areas: ["Server"] },
       disposition: "answered",
+    });
+  });
+
+  it("handles blocked localStorage SecurityError and excludes secret question drafts", () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      writable: true,
+      value: {
+        get localStorage() {
+          throw new Error("SecurityError: storage blocked");
+        },
+      },
+    });
+    expect(loadPendingUserInputDraft("env:thread-1", "req-a")).toBeNull();
+    expect(() =>
+      savePendingUserInputDraft("env:thread-1", "req-a", {
+        scope: { selectedOptionLabels: ["Orchestration-first"] },
+      }),
+    ).not.toThrow();
+
+    installMemoryStorage();
+    savePendingUserInputDraft(
+      "env:thread-1",
+      "req-secret",
+      {
+        scope: { selectedOptionLabels: ["Orchestration-first"] },
+        token: { customAnswer: "super-secret-value" },
+      },
+      new Set(["token"]),
+    );
+    expect(loadPendingUserInputDraft("env:thread-1", "req-secret")).toEqual({
+      scope: { selectedOptionLabels: ["Orchestration-first"] },
     });
   });
 

@@ -2617,10 +2617,10 @@ export function TerminalViewport({
         }
         // On an ID-only reveal whose live summary has not arrived yet, reserve the paste's
         // queue slot until summary metadata confirms whether this is an Antigravity terminal
-        // so an immediate multiline paste cannot bypass bracketed-paste protection (#431).
+        // so an immediate multiline paste (or one containing `\x1b[201~`) cannot bypass
+        // bracketed-paste protection or delimiter sanitization (#431).
         if (
           readDriverKindPending() &&
-          !terminal.modes.bracketedPasteMode &&
           (text.includes("\n") || text.includes("\r") || text.includes(BRACKETED_PASTE_END))
         ) {
           event.preventDefault();
@@ -2668,7 +2668,19 @@ export function TerminalViewport({
             pendingIdentityPasteTimers.delete(timer);
             fill(null);
           };
-          const timer = window.setTimeout(() => finish(readDriverKind()), 1500);
+          const timer = window.setTimeout(() => {
+            if (readDriverKindPending()) {
+              cancel();
+              if (!disposed) {
+                writeSystemMessage(
+                  terminal,
+                  "Paste cancelled because terminal identity did not arrive in time. Retry pasting.",
+                );
+              }
+              return;
+            }
+            finish(readDriverKind());
+          }, 1500);
           pendingIdentityPasteTimers.add(timer);
           pendingDriverKindPastesRef.current.push({ resolve: finish, cancel });
         }

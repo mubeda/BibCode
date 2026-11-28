@@ -26,6 +26,8 @@ export interface PendingUserInputPanelProps {
   questionIndex: number;
   collapsed?: boolean | undefined;
   canCancel?: boolean | undefined;
+  canSkipAll?: boolean | undefined;
+  shortcutsEnabled?: boolean | undefined;
   environmentUnavailableReason?: string | null | undefined;
   onToggleOption: (questionId: string, optionLabel: string) => void;
   onChangeCustomAnswer?: ((questionId: string, value: string) => void) | undefined;
@@ -44,6 +46,8 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
   questionIndex,
   collapsed = false,
   canCancel = false,
+  canSkipAll = true,
+  shortcutsEnabled = true,
   environmentUnavailableReason = null,
   onToggleOption,
   onChangeCustomAnswer,
@@ -67,6 +71,8 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
       questionIndex={questionIndex}
       collapsed={collapsed}
       canCancel={canCancel}
+      canSkipAll={canSkipAll}
+      shortcutsEnabled={shortcutsEnabled}
       environmentUnavailableReason={environmentUnavailableReason}
       onToggleOption={onToggleOption}
       onChangeCustomAnswer={onChangeCustomAnswer}
@@ -87,6 +93,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   questionIndex,
   collapsed,
   canCancel,
+  canSkipAll,
+  shortcutsEnabled,
   environmentUnavailableReason,
   onToggleOption,
   onChangeCustomAnswer,
@@ -103,6 +111,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   questionIndex: number;
   collapsed: boolean;
   canCancel: boolean;
+  canSkipAll: boolean;
+  shortcutsEnabled: boolean;
   environmentUnavailableReason: string | null;
   onToggleOption: (questionId: string, optionLabel: string) => void;
   onChangeCustomAnswer?: ((questionId: string, value: string) => void) | undefined;
@@ -175,8 +185,10 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     [clearAutoAdvance],
   );
 
-  // Keyboard shortcuts: digits 1-9 select corresponding options only while expanded and
-  // when focus is outside editable fields.
+  const cardRef = useRef<HTMLDivElement | null>(null);
+
+  // Keyboard shortcuts: digits 1-9 select corresponding options only while expanded,
+  // scoped to the focused card in split chats (or the host pane when focus is outside cards).
   useEffect(() => {
     if (collapsed || !activeQuestion || isResponding) return;
     const handler = (event: globalThis.KeyboardEvent) => {
@@ -191,6 +203,18 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       ) {
         return;
       }
+      const activeElement = document.activeElement;
+      const focusedCard =
+        activeElement instanceof HTMLElement
+          ? activeElement.closest('[data-pending-user-input-card="true"]')
+          : null;
+      if (focusedCard) {
+        if (focusedCard !== cardRef.current) {
+          return;
+        }
+      } else if (!shortcutsEnabled) {
+        return;
+      }
       const digit = Number.parseInt(event.key, 10);
       if (Number.isNaN(digit) || digit < 1 || digit > 9) return;
       const optionIndex = digit - 1;
@@ -202,7 +226,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [activeQuestion, collapsed, isResponding, selectOption]);
+  }, [activeQuestion, collapsed, isResponding, selectOption, shortcutsEnabled]);
 
   if (!activeQuestion) {
     return null;
@@ -310,6 +334,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
 
   return (
     <div
+      ref={cardRef}
       data-pending-user-input-card="true"
       className="rounded-t-[19px] border-b border-amber-500/30 bg-amber-500/[0.06] px-4 py-3 dark:bg-amber-500/[0.08] sm:px-5"
     >
@@ -462,7 +487,8 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
 
       <div className="mt-3">
         <input
-          type="text"
+          type={activeQuestion.isSecret ? "password" : "text"}
+          autoComplete={activeQuestion.isSecret ? "off" : undefined}
           data-pending-user-input-free-text="true"
           value={progress.customAnswer}
           disabled={isResponding}
@@ -496,7 +522,9 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
           ) : null}
         </div>
         <div className="flex items-center gap-2">
-          {onSkipAndSubmit ? (
+          {onSkipAndSubmit &&
+          !progress.isComplete &&
+          (canSkipAll || progress.answeredQuestionCount > 0) ? (
             <Button
               type="button"
               size="sm"

@@ -1571,7 +1571,12 @@ async fn cursor_extension_requests_emit_plan_todos_and_questions() {
         .expect_response(json!({
             "jsonrpc": "2.0",
             "id": 4002,
-            "result": { "answers": { "scope": "Workspace" } }
+            "result": {
+                "outcome": {
+                    "outcome": "answered",
+                    "answers": [{ "questionId": "scope", "selectedOptionIds": ["workspace"] }]
+                }
+            }
         }))
         .respond(json!({ "stopReason": "end_turn" }));
     let peer_task = tokio::spawn(peer.run());
@@ -2050,10 +2055,22 @@ async fn cursor_code_review_auto_mode_cancels_stray_asks_and_respects_mode_switc
         }))
         .respond(json!({ "stopReason": "end_turn" }));
     // Turns 4-6: all three interactive question methods auto-cancel.
-    for (wire_id, method) in [
-        (5004, "cursor/ask_question"),
-        (5005, "_x.ai/ask_user_question"),
-        (5006, "x.ai/ask_user_question"),
+    for (wire_id, method, expected_result) in [
+        (
+            5004,
+            "cursor/ask_question",
+            json!({ "outcome": { "outcome": "cancelled" } }),
+        ),
+        (
+            5005,
+            "_x.ai/ask_user_question",
+            json!({ "outcome": "cancelled" }),
+        ),
+        (
+            5006,
+            "x.ai/ask_user_question",
+            json!({ "outcome": "cancelled" }),
+        ),
     ] {
         peer.expect_request("session/prompt")
             .emit_request(json!({
@@ -2065,7 +2082,7 @@ async fn cursor_code_review_auto_mode_cancels_stray_asks_and_respects_mode_switc
             .expect_response(json!({
                 "jsonrpc": "2.0",
                 "id": wire_id,
-                "result": { "outcome": "cancelled" }
+                "result": expected_result
             }))
             .respond(json!({ "stopReason": "end_turn" }));
     }
@@ -2089,7 +2106,12 @@ async fn cursor_code_review_auto_mode_cancels_stray_asks_and_respects_mode_switc
         .expect_response(json!({
             "jsonrpc": "2.0",
             "id": 5007,
-            "result": { "answers": { "scope": "Workspace" } }
+            "result": {
+                "outcome": {
+                    "outcome": "answered",
+                    "answers": [{ "questionId": "scope", "selectedOptionIds": ["workspace"] }]
+                }
+            }
         }))
         .respond(json!({ "stopReason": "end_turn" }));
     // Switch back to Full access, then Plan -> reject-only permission opens normal card.
@@ -2681,10 +2703,15 @@ async fn cursor_user_input_retains_option_id_description_and_maps_skipped_dispos
         .expect_response(json!({
             "jsonrpc": "2.0",
             "id": 9101,
-            "result": { "answers": { "scope": "Workspace" } }
+            "result": {
+                "outcome": {
+                    "outcome": "answered",
+                    "answers": [{ "questionId": "scope", "selectedOptionIds": ["workspace"] }]
+                }
+            }
         }))
         .respond(json!({ "stopReason": "end_turn" }));
-    // Turn 2: skip-all maps to `outcome: "skipped"`.
+    // Turn 2: skip-all maps to nested `outcome: { outcome: "skipped" }`.
     peer.expect_request("session/prompt")
         .emit_request(json!({
             "jsonrpc": "2.0",
@@ -2703,7 +2730,7 @@ async fn cursor_user_input_retains_option_id_description_and_maps_skipped_dispos
         .expect_response(json!({
             "jsonrpc": "2.0",
             "id": 9102,
-            "result": { "outcome": "skipped" }
+            "result": { "outcome": { "outcome": "skipped" } }
         }))
         .respond(json!({ "stopReason": "end_turn" }));
     let peer_task = tokio::spawn(peer.run());

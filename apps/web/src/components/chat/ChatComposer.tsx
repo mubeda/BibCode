@@ -621,6 +621,8 @@ export interface ChatComposerProps {
   activePendingQuestionIndex: number;
   activePendingCollapsed?: boolean;
   activePendingUserInputCanCancel?: boolean;
+  activePendingUserInputCanSkipAll?: boolean;
+  activePendingUserInputShortcutsEnabled?: boolean;
   respondingRequestIds: ApprovalRequestId[];
   respondingUserInputRequestIds?: ApprovalRequestId[];
 
@@ -753,6 +755,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activePendingQuestionIndex,
     activePendingCollapsed = false,
     activePendingUserInputCanCancel = false,
+    activePendingUserInputCanSkipAll = true,
+    activePendingUserInputShortcutsEnabled = true,
     respondingRequestIds,
     respondingUserInputRequestIds,
     showPlanFollowUpPrompt,
@@ -2389,6 +2393,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 questionIndex={activePendingQuestionIndex}
                 collapsed={activePendingCollapsed}
                 canCancel={activePendingUserInputCanCancel}
+                canSkipAll={activePendingUserInputCanSkipAll}
+                shortcutsEnabled={activePendingUserInputShortcutsEnabled}
                 environmentUnavailableReason={environmentSendBlockedReason}
                 onToggleOption={onSelectActivePendingUserInputOption}
                 onChangeCustomAnswer={onChangeActivePendingUserInputCardCustomAnswer}
@@ -2435,6 +2441,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 questionIndex={activePendingQuestionIndex}
                 collapsed={activePendingCollapsed}
                 canCancel={activePendingUserInputCanCancel}
+                canSkipAll={activePendingUserInputCanSkipAll}
+                shortcutsEnabled={activePendingUserInputShortcutsEnabled}
                 environmentUnavailableReason={environmentSendBlockedReason}
                 onToggleOption={onSelectActivePendingUserInputOption}
                 onChangeCustomAnswer={onChangeActivePendingUserInputCardCustomAnswer}
@@ -2517,7 +2525,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
             {!isComposerCollapsedMobile &&
               !isComposerApprovalState &&
-              pendingUserInputs.length === 0 &&
               composerPreviewAnnotations.length > 0 && (
                 <ComposerPreviewAnnotationCards
                   annotations={composerPreviewAnnotations}
@@ -2542,7 +2549,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
             {!isComposerCollapsedMobile &&
               !isComposerApprovalState &&
-              pendingUserInputs.length === 0 &&
               composerReviewComments.length > 0 && (
                 <ComposerPendingReviewComments
                   comments={composerReviewComments}
@@ -2556,7 +2562,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
             {!isComposerCollapsedMobile &&
               !isComposerApprovalState &&
-              pendingUserInputs.length === 0 &&
               composerElementContexts.length > 0 && (
                 <ComposerPendingElementContexts
                   contexts={composerElementContexts}
@@ -2570,7 +2575,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
             {!isComposerCollapsedMobile &&
               !isComposerApprovalState &&
-              pendingUserInputs.length === 0 &&
               composerAttachments.some(
                 (attachment) =>
                   attachment.type === "file" ||

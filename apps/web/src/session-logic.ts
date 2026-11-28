@@ -456,6 +456,7 @@ function parseUserInputQuestions(
         question: question.question,
         options,
         multiSelect: question.multiSelect === true,
+        ...(question.isSecret === true ? { isSecret: true } : {}),
       };
     })
     .filter((question): question is UserInputQuestion => question !== null);
@@ -659,6 +660,9 @@ function parseUserInputDisposition(
   if (raw === "answered" || raw === "skipped" || raw === "cancelled") {
     return raw;
   }
+  if (payload?.cancelled === true) {
+    return "cancelled";
+  }
   return null;
 }
 
@@ -825,13 +829,14 @@ export function deriveWorkLogEntries(
   }
 
   const entries: DerivedWorkLogEntry[] = [];
+  const emittedResolvedRequestIds = new Set<string>();
   for (const activity of ordered) {
     if (activity.kind === "tool.started") continue;
     if (activity.kind === "task.started") continue;
     if (activity.kind === "context-window.updated") continue;
     if (activity.summary === "Checkpoint captured") continue;
     if (isPlanBoundaryToolActivity(activity)) continue;
-    if (activity.kind === "user-input.requested") {
+    if (activity.kind === "user-input.requested" || activity.kind === "user-input.resolved") {
       const payload =
         activity.payload && typeof activity.payload === "object"
           ? (activity.payload as Record<string, unknown>)
@@ -840,10 +845,21 @@ export function deriveWorkLogEntries(
         payload && typeof payload.requestId === "string" && payload.requestId.trim().length > 0
           ? payload.requestId.trim()
           : null;
-      // Deduplicate: once resolved, only the single user-input.resolved receipt is rendered
-      // whether user-input.requested was in the initial window or loaded from an older page.
-      if (requestId && resolvedRequestIds.has(requestId)) {
+      // Deduplicate: once resolved, only a single user-input.resolved receipt is rendered
+      // whether user-input.requested was in the initial window or loaded from an older page,
+      // and duplicate resolved rows for the same requestId coalesce into one.
+      if (
+        activity.kind === "user-input.requested" &&
+        requestId &&
+        resolvedRequestIds.has(requestId)
+      ) {
         continue;
+      }
+      if (activity.kind === "user-input.resolved" && requestId) {
+        if (emittedResolvedRequestIds.has(requestId)) {
+          continue;
+        }
+        emittedResolvedRequestIds.add(requestId);
       }
     }
     entries.push(toDerivedWorkLogEntry(activity, requestedByRequestId));

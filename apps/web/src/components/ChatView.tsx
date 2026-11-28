@@ -345,6 +345,7 @@ import { environmentConnectionActions } from "../connection/environmentPresentat
 import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { projectEnvironment } from "../state/projects";
 import { useEnvironmentQuery } from "../state/query";
+import { useProviderCapabilities } from "../state/providerCapabilities";
 import {
   primaryServerAvailableEditorsAtom,
   primaryServerKeybindingsAtom,
@@ -2500,6 +2501,18 @@ function ChatViewContent(props: ChatViewProps) {
     [threadActivities],
   );
   const activePendingUserInput = pendingUserInputs[0] ?? null;
+  const activePendingSecretQuestionIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!activePendingUserInput) {
+      return ids;
+    }
+    for (const question of activePendingUserInput.questions) {
+      if (question.isSecret) {
+        ids.add(question.id);
+      }
+    }
+    return ids;
+  }, [activePendingUserInput]);
   const activePendingDraftAnswers = useMemo(() => {
     if (!activePendingUserInput) {
       return EMPTY_PENDING_USER_INPUT_ANSWERS;
@@ -2510,23 +2523,69 @@ function ChatViewContent(props: ChatViewProps) {
       EMPTY_PENDING_USER_INPUT_ANSWERS
     );
   }, [activePendingUserInput, pendingUserInputAnswersByRequestId, routeThreadKey]);
-  const activePendingQuestionIndex = activePendingUserInput
-    ? (pendingUserInputQuestionIndexByRequestId[activePendingUserInput.requestId] ??
-      findFirstUnansweredPendingUserInputQuestionIndex(
-        activePendingUserInput.questions,
-        activePendingDraftAnswers,
-      ))
+  const activePendingRequestId = activePendingUserInput?.requestId ?? null;
+  const activePendingQuestions = activePendingUserInput?.questions ?? null;
+  // Compute the initial first-unanswered index only when a request opens or restores;
+  // live edits lock the index in `pendingUserInputQuestionIndexByRequestId` so typing or
+  // toggling multi-select options never jumps between questions mid-answer.
+  const initialPendingQuestionIndex = useMemo(() => {
+    if (!activePendingRequestId || !activePendingQuestions) {
+      return 0;
+    }
+    const restoredDraft =
+      loadPendingUserInputDraft(routeThreadKey, activePendingRequestId) ??
+      EMPTY_PENDING_USER_INPUT_ANSWERS;
+    return findFirstUnansweredPendingUserInputQuestionIndex(activePendingQuestions, restoredDraft);
+  }, [activePendingQuestions, activePendingRequestId, routeThreadKey]);
+  const activePendingQuestionIndex = activePendingRequestId
+    ? (pendingUserInputQuestionIndexByRequestId[activePendingRequestId] ??
+      initialPendingQuestionIndex)
     : 0;
   const activePendingCollapsed = activePendingUserInput
     ? Boolean(pendingUserInputCollapsedByRequestId[activePendingUserInput.requestId])
     : false;
-  const activePendingUserInputCanCancel = providerSupportsPendingUserInputCancel(
-    activeThread?.session?.providerName ?? selectedProvider,
-  );
+  const supportsUserInputDisposition =
+    providerBinding.status?.supportsUserInputDisposition === true;
+  const activePendingUserInputCanCancel =
+    supportsUserInputDisposition &&
+    providerSupportsPendingUserInputCancel(activeThread?.session?.providerName ?? selectedProvider);
+  const activePendingUserInputCanSkipAll = supportsUserInputDisposition;
   useEffect(() => {
+    // Clear drafts explicitly for requests confirmed resolved or expired in loaded activities.
+    for (const activity of threadActivities) {
+      if (activity.kind !== "user-input.resolved" && activity.kind !== "user-input.expired") {
+        continue;
+      }
+      const payload =
+        activity.payload && typeof activity.payload === "object"
+          ? (activity.payload as Record<string, unknown>)
+          : null;
+      const requestId =
+        payload && typeof payload.requestId === "string" && payload.requestId.trim().length > 0
+          ? payload.requestId.trim()
+          : null;
+      if (requestId) {
+        clearPendingUserInputDraft(routeThreadKey, requestId);
+      }
+    }
+    // Only prune remaining drafts once thread detail has actually hydrated (never while a
+    // shell-only cold reload still has empty activities and messages).
+    const detailHydrated =
+      routeKind !== "server" ||
+      threadActivities.length > 0 ||
+      (activeThread?.messages.length ?? 0) > 0;
+    if (!detailHydrated) {
+      return;
+    }
     const openIds = new Set(pendingUserInputs.map((entry) => entry.requestId));
     prunePendingUserInputDraftsForThread(routeThreadKey, openIds);
-  }, [pendingUserInputs, routeThreadKey]);
+  }, [
+    activeThread?.messages.length,
+    pendingUserInputs,
+    routeKind,
+    routeThreadKey,
+    threadActivities,
+  ]);
   const activePendingProgress = useMemo(
     () =>
       activePendingUserInput
@@ -3108,6 +3167,23 @@ function ChatViewContent(props: ChatViewProps) {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const availableEditors = useAtomValue(primaryServerAvailableEditorsAtom);
   const activeProviderStatus = providerBinding.status;
+  const timelineProviderCapabilities = useProviderCapabilities({
+    environmentId,
+    instanceId: providerBinding.instanceId,
+    cwd: gitCwd,
+  });
+  const timelineSkills = useMemo<ServerProvider["skills"]>(() => {
+    const checkoutSkills = timelineProviderCapabilities.data?.skills;
+    const globalSkills = activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS;
+    if (!checkoutSkills || checkoutSkills.length === 0) {
+      return globalSkills;
+    }
+    if (globalSkills.length === 0) {
+      return checkoutSkills;
+    }
+    const seen = new Set(checkoutSkills.map((skill) => skill.name));
+    return [...checkoutSkills, ...globalSkills.filter((skill) => !seen.has(skill.name))];
+  }, [activeProviderStatus?.skills, timelineProviderCapabilities.data?.skills]);
   const centerHostLabel = activeProviderStatus
     ? activeProviderStatus.displayName?.trim() || providerDriverLabel(activeProviderStatus.driver)
     : lockedProviderInstanceId
@@ -7666,6 +7742,11 @@ function ChatViewContent(props: ChatViewProps) {
       }
       const activeQuestion = activePendingProgress?.activeQuestion;
       const requestId = activePendingUserInput.requestId;
+      setPendingUserInputQuestionIndexByRequestId((existing) =>
+        existing[requestId] !== undefined
+          ? existing
+          : { ...existing, [requestId]: activePendingQuestionIndex },
+      );
       setPendingUserInputAnswersByRequestId((existing) => {
         const question =
           (activeQuestion?.id === questionId ? activeQuestion : undefined) ??
@@ -7683,14 +7764,25 @@ function ChatViewContent(props: ChatViewProps) {
             optionLabel,
           ),
         };
-        savePendingUserInputDraft(routeThreadKey, requestId, nextForRequest);
+        savePendingUserInputDraft(
+          routeThreadKey,
+          requestId,
+          nextForRequest,
+          activePendingSecretQuestionIds,
+        );
         return {
           ...existing,
           [requestId]: nextForRequest,
         };
       });
     },
-    [activePendingProgress?.activeQuestion, activePendingUserInput, routeThreadKey],
+    [
+      activePendingProgress?.activeQuestion,
+      activePendingQuestionIndex,
+      activePendingSecretQuestionIds,
+      activePendingUserInput,
+      routeThreadKey,
+    ],
   );
 
   const onChangeActivePendingUserInputCardCustomAnswer = useCallback(
@@ -7699,6 +7791,11 @@ function ChatViewContent(props: ChatViewProps) {
         return;
       }
       const requestId = activePendingUserInput.requestId;
+      setPendingUserInputQuestionIndexByRequestId((existing) =>
+        existing[requestId] !== undefined
+          ? existing
+          : { ...existing, [requestId]: activePendingQuestionIndex },
+      );
       setPendingUserInputAnswersByRequestId((existing) => {
         const baseAnswers =
           existing[requestId] ?? loadPendingUserInputDraft(routeThreadKey, requestId) ?? {};
@@ -7706,14 +7803,24 @@ function ChatViewContent(props: ChatViewProps) {
           ...baseAnswers,
           [questionId]: setPendingUserInputCustomAnswer(baseAnswers[questionId], value),
         };
-        savePendingUserInputDraft(routeThreadKey, requestId, nextForRequest);
+        savePendingUserInputDraft(
+          routeThreadKey,
+          requestId,
+          nextForRequest,
+          activePendingSecretQuestionIds,
+        );
         return {
           ...existing,
           [requestId]: nextForRequest,
         };
       });
     },
-    [activePendingUserInput, routeThreadKey],
+    [
+      activePendingQuestionIndex,
+      activePendingSecretQuestionIds,
+      activePendingUserInput,
+      routeThreadKey,
+    ],
   );
 
   const onChangeActivePendingUserInputCustomAnswer = useCallback(
@@ -8663,7 +8770,7 @@ function ChatViewContent(props: ChatViewProps) {
                       timestampFormat={timestampFormat}
                       verboseChat={settings.verboseChat}
                       workspaceRoot={activeWorkspaceRoot}
-                      skills={activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS}
+                      skills={timelineSkills}
                       isCodeReview={isCodeReviewThread}
                       anchorMessageId={timelineAnchorMessageId}
                       onAnchorReady={onTimelineAnchorReady}
@@ -8781,6 +8888,8 @@ function ChatViewContent(props: ChatViewProps) {
                             activePendingQuestionIndex={activePendingQuestionIndex}
                             activePendingCollapsed={activePendingCollapsed}
                             activePendingUserInputCanCancel={activePendingUserInputCanCancel}
+                            activePendingUserInputCanSkipAll={activePendingUserInputCanSkipAll}
+                            activePendingUserInputShortcutsEnabled={!isPanel}
                             respondingRequestIds={respondingRequestIds}
                             respondingUserInputRequestIds={respondingUserInputRequestIds}
                             showPlanFollowUpPrompt={showPlanFollowUpPrompt}

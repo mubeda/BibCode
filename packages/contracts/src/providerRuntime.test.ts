@@ -337,4 +337,78 @@ describe("ProviderRuntimeEvent", () => {
       { id: "notes", question: "Any notes?" },
     ]);
   });
+
+  it("preserves Antigravity quota, transport errorReason, and Codex isSecret metadata", () => {
+    const warning = decodeRuntimeEvent({
+      type: "runtime.warning",
+      eventId: "event-ag-warning",
+      provider: "antigravity",
+      createdAt: "2026-11-28T00:00:00.000Z",
+      threadId: "thread-1",
+      payload: {
+        message: "Usage limit reached.",
+        usageLimit: true,
+        resetsAt: "2026-11-28T02:00:00.000Z",
+      },
+    });
+    expect(warning.type).toBe("runtime.warning");
+    if (warning.type !== "runtime.warning") throw new Error("expected runtime.warning");
+    expect(warning.payload.usageLimit).toBe(true);
+    expect(warning.payload.resetsAt).toBe("2026-11-28T02:00:00.000Z");
+
+    const completed = decodeRuntimeEvent({
+      type: "turn.completed",
+      eventId: "event-ag-completed",
+      provider: "antigravity",
+      createdAt: "2026-11-28T00:00:01.000Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: {
+        state: "failed",
+        errorMessage: "Usage limit reached.",
+        resetsAt: "2026-11-28T02:00:00.000Z",
+      },
+    });
+    expect(completed.type).toBe("turn.completed");
+    if (completed.type !== "turn.completed") throw new Error("expected turn.completed");
+    expect(completed.payload.resetsAt).toBe("2026-11-28T02:00:00.000Z");
+
+    const exited = decodeRuntimeEvent({
+      type: "session.exited",
+      eventId: "event-ag-exited",
+      provider: "antigravity",
+      createdAt: "2026-11-28T00:00:02.000Z",
+      threadId: "thread-1",
+      payload: {
+        reason: "Transport closed",
+        errorReason: "transport_closed",
+      },
+    });
+    expect(exited.type).toBe("session.exited");
+    if (exited.type !== "session.exited") throw new Error("expected session.exited");
+    expect(exited.payload.errorReason).toBe("transport_closed");
+
+    const asked = decodeRuntimeEvent({
+      type: "user-input.requested",
+      eventId: "event-secret-q",
+      provider: "codex",
+      createdAt: "2026-11-28T00:00:03.000Z",
+      threadId: "thread-1",
+      requestId: "req-secret",
+      payload: {
+        questions: [
+          {
+            id: "token",
+            header: "API Token",
+            question: "Paste token",
+            options: [],
+            isSecret: true,
+          },
+        ],
+      },
+    });
+    expect(asked.type).toBe("user-input.requested");
+    if (asked.type !== "user-input.requested") throw new Error("expected user-input.requested");
+    expect(asked.payload.questions[0]?.isSecret).toBe(true);
+  });
 });

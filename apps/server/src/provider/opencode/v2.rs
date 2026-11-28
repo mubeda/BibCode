@@ -404,6 +404,8 @@ pub(crate) enum V2Output {
     },
     FormSettled {
         form_id: String,
+        cancelled: bool,
+        answers: Value,
     },
     /// A root step's context usage (a `thread.token-usage.updated` usage without its maximum),
     /// with the model the step ran on once a step reported it.
@@ -553,11 +555,23 @@ impl V2TurnTranslator {
                     },
                 }]
             }
-            "form.replied" | "form.cancelled" => data
+            "form.replied" => data
                 .get("id")
                 .and_then(Value::as_str)
                 .map(|form_id| V2Output::FormSettled {
                     form_id: form_id.to_owned(),
+                    cancelled: false,
+                    answers: data.get("answer").cloned().unwrap_or_else(|| json!({})),
+                })
+                .into_iter()
+                .collect(),
+            "form.cancelled" => data
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|form_id| V2Output::FormSettled {
+                    form_id: form_id.to_owned(),
+                    cancelled: true,
+                    answers: json!({}),
                 })
                 .into_iter()
                 .collect(),

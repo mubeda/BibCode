@@ -943,15 +943,17 @@ screenshots:
    tool-free reply as the next Claude turn. Its matching text echo may include
    attachments and arrive after completion; tool-result lines cannot acknowledge
    it. Verify attribution to the runtime turn current at acknowledgement.
-4. On Antigravity (`agy >= 1.5.0`), verify head-only Steer sends a concurrent
-   `session/prompt` without cancelling the running turn, refuses while a
-   permission approval is pending or before the initial prompt starts streaming,
-   keeps the running turn alive when the first prompt settles first, returns a
-   rejected steer to the queue without failing the running turn, and cleanly
-   supports Stop and Retry after transport failure. On older Antigravity
-   (`agy < 1.5.0`), Cursor, Grok, and OpenCode where available, verify the
-   explanation that steering is unsupported and confirm automatic sending still
-   works. Record unavailable providers explicitly.
+4. On Antigravity (`agy >= 1.5.4`, the minimum CLI version chat startup accepts),
+   verify head-only Steer sends a concurrent `session/prompt` without cancelling
+   the running turn, refuses while a permission approval is pending or before the
+   initial prompt starts streaming, keeps the running turn alive when the first
+   prompt settles first, returns a rejected steer to the queue without failing the
+   running turn, and cleanly supports Stop and Retry after transport failure.
+   Verify the `1.5.0` capability boundary (including prerelease versions such as
+   `1.5.0-rc.1`) through inventory unit tests rather than live chat startup. On
+   Cursor, Grok, and OpenCode where available, verify the explanation that
+   steering is unsupported and confirm automatic sending still works. Record
+   unavailable providers explicitly.
 5. Cancel a queued card with another client connected: it disappears in both,
    while only the cancelling client's draft receives its text and locally cached
    attachments. Preserve an existing draft and report unavailable or excess files.
@@ -3178,8 +3180,10 @@ starts.
     branches; a rejected push must show an error and leave the dialog closed, and
     cancelling the dialog after the push must not create a request. After the
     request is created or found, **Done** in the dialog opened from Source
-    Control must open it as a right-panel tab beside the thread (one tab per
-    request; Done again does not duplicate it), unless the host is Bitbucket or
+    Control must open or update the singleton **Pull requests** right-panel
+    surface beside the thread with that request selected (opening a second
+    request replaces the selection in the same surface; Done again does not
+    duplicate it), unless the host is Bitbucket or
     Azure DevOps or **Pull requests** is off in Settings, where Done only closes
     the dialog; **Done** from the chat Git action, the Pull Requests page or the
     Git Manager only closes the dialog. A branch

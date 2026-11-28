@@ -12203,10 +12203,14 @@ async fn handle_command(
             disposition,
             ..
         } => {
-            entry
-                .driver
-                .answer(request_id, answers, disposition.unwrap_or_default())
-                .await
+            let disposition = disposition.unwrap_or_default();
+            let answers = if disposition == crate::provider::UserInputResponseDisposition::Cancelled
+            {
+                json!({})
+            } else {
+                answers
+            };
+            entry.driver.answer(request_id, answers, disposition).await
         }
         OrchestrationCommand::ThreadRuntimeModeSet { runtime_mode, .. } => {
             match entry.driver.set_mode(runtime_mode.clone()).await {

@@ -53,6 +53,11 @@ import { createEnvironmentPresentationPolicy } from "../connection/environmentPr
 
 const h = vi.hoisted(() => {
   const state = {
+    checkoutSkills: [] as Array<{
+      readonly name: string;
+      readonly description: string;
+      readonly invocation?: string;
+    }>,
     captured: {} as Record<string, Record<string, unknown>>,
     capturedList: [] as Array<{ name: string; props: Record<string, unknown> }>,
     // React's fizz renderer replays a component with empty props while
@@ -183,6 +188,21 @@ vi.mock("../state/use-atom-command", () => ({
       return Promise.resolve(respond(input, runOptions));
     };
   },
+}));
+
+vi.mock("../state/providerCapabilities", () => ({
+  useProviderCapabilities: () => ({
+    data: {
+      slashCommands: [],
+      skills: h.checkoutSkills ?? [],
+      agents: [],
+      issues: [],
+    },
+    error: null,
+    isPending: false,
+    refresh: () => undefined,
+    revalidateIfStale: () => undefined,
+  }),
 }));
 
 vi.mock("../state/threads", () => ({
@@ -700,6 +720,7 @@ const codexInstanceId = ProviderInstanceId.make("codex");
 const codexProvider: ServerProvider = {
   instanceId: codexInstanceId,
   driver: ProviderDriverKind.make("codex"),
+  supportsUserInputDisposition: true,
   enabled: true,
   installed: true,
   version: "1.0.0",
@@ -6595,6 +6616,73 @@ describe("ChatView pending user input", () => {
         answers: {},
       },
     });
+  });
+
+  it("keeps the active question index stable while typing in a multi-question card and gates disposition on older servers", () => {
+    // 1. Typing 1 character into question 1 locks activePendingQuestionIndex at 0 (no mid-answer jump).
+    seedConnectedServerThread(threadWithQuestions(2));
+    renderServerRoute();
+    const initialComposer = capturedProps("chatComposer");
+    expect(initialComposer["activePendingQuestionIndex"]).toBe(0);
+    (
+      initialComposer["onChangeActivePendingUserInputCardCustomAnswer"] as (
+        id: string,
+        value: string,
+      ) => void
+    )("question-1", "a");
+    const indexWrites = h.setStateCalls.filter(
+      (call) =>
+        call.index === 13 &&
+        typeof call.applied === "object" &&
+        call.applied !== null &&
+        (call.applied as Record<string, unknown>)["request-1"] === 0,
+    );
+    expect(indexWrites.length).toBeGreaterThanOrEqual(1);
+
+    // 2. Older server snapshot without supportsUserInputDisposition disables cancel and skip-all.
+    const cursorInstanceId = ProviderInstanceId.make("cursor-legacy");
+    const cursorThread = makeThread({
+      modelSelection: { instanceId: cursorInstanceId, model: "auto" },
+      activities: threadWithQuestions(1).activities,
+    });
+    seedConnectedServerThread(cursorThread);
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [
+            {
+              ...codexProvider,
+              instanceId: cursorInstanceId,
+              driver: ProviderDriverKind.make("cursor"),
+              supportsUserInputDisposition: undefined,
+            },
+          ],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    renderServerRoute();
+    const legacyComposer = capturedProps("chatComposer");
+    expect(legacyComposer["activePendingUserInputCanCancel"]).toBe(false);
+    expect(legacyComposer["activePendingUserInputCanSkipAll"]).toBe(false);
+
+    // 3. Checkout-scoped project-local skills flow into MessagesTimeline so sent slash chips persist.
+    h.checkoutSkills = [
+      {
+        name: "project-review",
+        description: "Local project skill",
+        invocation: "slash",
+      },
+    ];
+    try {
+      renderServerRoute();
+      const timeline = capturedProps("messagesTimeline");
+      expect(timeline["skills"]).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: "project-review" })]),
+      );
+    } finally {
+      h.checkoutSkills = [];
+    }
   });
 
   it.each(["connected", "disconnected"] as const)(

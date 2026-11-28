@@ -798,7 +798,7 @@ async fn dispatch_prepared_command(
             OrchestrationCommand::ThreadMetaUpdate {
                 model_selection: Some(_),
                 ..
-            }
+            } | OrchestrationCommand::ThreadUserInputRespond { .. }
         ) {
         dispatch
             .reserve_generic_command_admission(&command_claim, &command, &payload_digest)

@@ -305,6 +305,7 @@ const SessionExitedPayload = Schema.Struct({
   reason: Schema.optional(TrimmedNonEmptyStringSchema),
   recoverable: Schema.optional(Schema.Boolean),
   exitKind: Schema.optional(RuntimeSessionExitKind),
+  errorReason: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type SessionExitedPayload = typeof SessionExitedPayload.Type;
 
@@ -401,6 +402,8 @@ const TurnCompletedPayload = Schema.Struct({
   providerReason: Schema.optional(TrimmedNonEmptyStringSchema),
   /** BiBCode's sanitized transport or runtime failure reason when the provider gave no `providerReason`. */
   errorReason: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Optional ISO-8601 timestamp when a provider quota/usage limit resets (#429). */
+  resetsAt: Schema.optional(TrimmedNonEmptyStringSchema),
   /** A `context_limit` failure: the provider refused the input before any output. */
   beforeOutput: Schema.optional(Schema.Boolean),
   /** A `context_limit` failure: `false` when the provider said compacting cannot help. */
@@ -494,6 +497,7 @@ export const UserInputQuestion = Schema.Struct({
   multiSelect: Schema.optional(Schema.Boolean).pipe(
     Schema.withConstructorDefault(Effect.succeed(false)),
   ),
+  isSecret: Schema.optional(Schema.Boolean),
 });
 export type UserInputQuestion = typeof UserInputQuestion.Type;
 
@@ -677,6 +681,8 @@ export type ToolDeniedPayload = typeof ToolDeniedPayload.Type;
 const RuntimeWarningPayload = Schema.Struct({
   message: TrimmedNonEmptyStringSchema,
   detail: Schema.optional(Schema.Unknown),
+  usageLimit: Schema.optional(Schema.Boolean),
+  resetsAt: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type RuntimeWarningPayload = typeof RuntimeWarningPayload.Type;
 

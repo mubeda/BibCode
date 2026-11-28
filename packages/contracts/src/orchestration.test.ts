@@ -2147,9 +2147,12 @@ describe("thread.user-input.respond disposition contract (#430)", () => {
     },
   );
 
-  it("rejects unknown dispositions on thread.user-input.respond", () => {
+  it("rejects unknown or explicit null dispositions on thread.user-input.respond", () => {
     expect(() =>
       decodeUserInputRespondClientCommand({ ...baseCommand, disposition: "ignored" }),
+    ).toThrow();
+    expect(() =>
+      decodeUserInputRespondClientCommand({ ...baseCommand, disposition: null }),
     ).toThrow();
   });
 });

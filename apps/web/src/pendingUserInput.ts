@@ -50,6 +50,10 @@ export function buildPartialPendingUserInputSubmission(
     }
   }
   const hasAnswers = Object.keys(answers).length > 0;
+  const allAnswered = questions.length > 0 && Object.keys(answers).length === questions.length;
+  if (allAnswered) {
+    return { answers, disposition: "answered" };
+  }
   if (mode === "skip") {
     return { answers, disposition: "skipped" };
   }
@@ -68,12 +72,24 @@ function draftStorageKey(threadKey: string, requestId: string): string {
   return `${threadKey}::${requestId}`;
 }
 
+function getBrowserLocalStorage(): Storage | null {
+  try {
+    if (typeof window === "undefined") {
+      return null;
+    }
+    return window.localStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function readDraftStore(): Record<string, PersistedDraftEntry> {
-  if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+  const storage = getBrowserLocalStorage();
+  if (!storage) {
     return {};
   }
   try {
-    const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
+    const raw = storage.getItem(DRAFT_STORAGE_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -114,13 +130,14 @@ function readDraftStore(): Record<string, PersistedDraftEntry> {
 }
 
 function writeDraftStore(store: Record<string, PersistedDraftEntry>): void {
-  if (typeof window === "undefined" || typeof window.localStorage === "undefined") {
+  const storage = getBrowserLocalStorage();
+  if (!storage) {
     return;
   }
   try {
     const entries = Object.entries(store);
     if (entries.length === 0) {
-      window.localStorage.removeItem(DRAFT_STORAGE_KEY);
+      storage.removeItem(DRAFT_STORAGE_KEY);
       return;
     }
     const trimmed =
@@ -131,7 +148,7 @@ function writeDraftStore(store: Record<string, PersistedDraftEntry>): void {
               .slice(0, MAX_STORED_DRAFTS),
           )
         : store;
-    window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(trimmed));
+    storage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(trimmed));
   } catch {
     // Ignore storage quota or private-mode failures.
   }
@@ -149,10 +166,18 @@ export function savePendingUserInputDraft(
   threadKey: string,
   requestId: string,
   answers: Record<string, PendingUserInputDraftAnswer>,
+  secretQuestionIds?: ReadonlySet<string>,
 ): void {
   const store = readDraftStore();
   const key = draftStorageKey(threadKey, requestId);
-  const hasContent = Object.values(answers).some(
+  const filteredAnswers: Record<string, PendingUserInputDraftAnswer> = {};
+  for (const [questionId, entry] of Object.entries(answers)) {
+    if (secretQuestionIds?.has(questionId)) {
+      continue;
+    }
+    filteredAnswers[questionId] = entry;
+  }
+  const hasContent = Object.values(filteredAnswers).some(
     (entry) =>
       (entry.customAnswer?.trim().length ?? 0) > 0 || (entry.selectedOptionLabels?.length ?? 0) > 0,
   );
@@ -163,7 +188,7 @@ export function savePendingUserInputDraft(
     }
     return;
   }
-  store[key] = { answers, updatedAt: Date.now() };
+  store[key] = { answers: filteredAnswers, updatedAt: Date.now() };
   writeDraftStore(store);
 }
 

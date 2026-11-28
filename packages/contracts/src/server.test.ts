@@ -144,6 +144,17 @@ describe("ServerProvider", () => {
     ).toThrow();
   });
 
+  it("keeps older snapshots compatible with the optional user-input disposition capability (#430)", () => {
+    expect(decodeServerProvider(baseProviderSnapshot).supportsUserInputDisposition).toBeUndefined();
+    expect(
+      decodeServerProvider({ ...baseProviderSnapshot, supportsUserInputDisposition: true })
+        .supportsUserInputDisposition,
+    ).toBe(true);
+    expect(() =>
+      decodeServerProvider({ ...baseProviderSnapshot, supportsUserInputDisposition: "true" }),
+    ).toThrow();
+  });
+
   it("defaults capability arrays when decoding provider snapshots", () => {
     const parsed = decodeServerProvider({
       instanceId: "codex",

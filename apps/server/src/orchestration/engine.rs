@@ -774,7 +774,7 @@ pub enum OrchestrationCommand {
         #[serde(rename = "requestId")]
         request_id: String,
         answers: Value,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_non_null_disposition")]
         disposition: Option<crate::provider::UserInputResponseDisposition>,
         #[serde(rename = "createdAt")]
         created_at: String,
@@ -16282,6 +16282,15 @@ mod tests {
     }
 }
 
+fn deserialize_non_null_disposition<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::provider::UserInputResponseDisposition>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    crate::provider::UserInputResponseDisposition::deserialize(deserializer).map(Some)
+}
+
 #[cfg(test)]
 mod timestamp_tie_tests {
     use super::*;
@@ -16370,5 +16379,19 @@ mod timestamp_tie_tests {
                 } if actual == expected
             ));
         }
+
+        let explicit_null: Result<OrchestrationCommand, _> = serde_json::from_value(json!({
+            "type": "thread.user-input.respond",
+            "commandId": "cmd-null",
+            "threadId": "thread-1",
+            "requestId": "req-1",
+            "answers": {},
+            "disposition": null,
+            "createdAt": "2026-11-28T00:00:00.000Z"
+        }));
+        assert!(
+            explicit_null.is_err(),
+            "explicit null disposition must be rejected to match the TS wire contract"
+        );
     }
 }

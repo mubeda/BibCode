@@ -1754,6 +1754,12 @@ impl CodexSessionRuntime {
             .ok_or_else(|| RuntimeError::PendingRequestNotFound {
                 request_id: request_id.to_owned(),
             })?;
+        let answers =
+            if disposition == Some(crate::provider::UserInputResponseDisposition::Cancelled) {
+                json!({})
+            } else {
+                answers
+            };
         let skip_all = disposition.is_some_and(|disp| {
             disp.is_skip_or_cancel() && !crate::provider::has_non_empty_user_input_answer(&answers)
         });
@@ -3148,13 +3154,46 @@ impl CodexSessionRuntime {
                     .map(str::to_owned);
                 let questions =
                     normalize_questions(params.get("questions").cloned().unwrap_or(Value::Null));
+                let question_list = questions.as_array().cloned().unwrap_or_default();
+                if question_list
+                    .iter()
+                    .any(|question| question.get("isSecret").and_then(Value::as_bool) == Some(true))
+                {
+                    let mut empty_answers = serde_json::Map::new();
+                    for question in &question_list {
+                        if let Some(question_id) = question
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                        {
+                            empty_answers.insert(question_id.to_owned(), json!({ "answers": [] }));
+                        }
+                    }
+                    self.inner
+                        .connection
+                        .lock()
+                        .await
+                        .clone()
+                        .respond(wire_id, json!({ "answers": Value::Object(empty_answers) }))
+                        .await?;
+                    self.emit(
+                        "runtime.warning",
+                        turn_id,
+                        None,
+                        json!({
+                            "message": "Codex requested a secret input, which BiBCode declined to avoid storing secrets in thread history.",
+                        }),
+                    )
+                    .await;
+                    return Ok(());
+                }
                 self.inner.pending_requests.lock().await.insert(
                     request_id.clone(),
                     PendingRequest {
                         kind: PendingRequestKind::UserInput,
                         wire_id,
                         turn_id: turn_id.clone(),
-                        questions: questions.as_array().cloned().unwrap_or_default(),
+                        questions: question_list,
                     },
                 );
                 self.emit(
@@ -4271,13 +4310,21 @@ fn normalize_questions(value: Value) -> Value {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                Some(json!({
+                let is_secret = question
+                    .get("isSecret")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut normalized = json!({
                     "id": id,
                     "header": header,
                     "question": prompt,
                     "options": options,
                     "multiSelect": false,
-                }))
+                });
+                if is_secret {
+                    normalized["isSecret"] = json!(true);
+                }
+                Some(normalized)
             })
             .collect(),
     )

@@ -7262,6 +7262,33 @@ describe("TerminalViewport mounted lifecycle", () => {
       expect(sentData()).toBe("\x1b[200~first\rsecond\x1b[201~\r");
     });
 
+    it("cancels a pending multiline paste visibly on timeout if driverKind stays unknown instead of writing raw carriage returns", async () => {
+      vi.useFakeTimers();
+      try {
+        const mounted = await mount(
+          <TerminalViewport {...viewportProps()} driverKind={null} driverKindPending />,
+        );
+        const terminal = xtermState.terminals[0]!;
+        terminal.modes.bracketedPasteMode = false;
+        const screen = mounted.container.querySelector(".xterm-screen")!;
+
+        await act(async () => {
+          screen.dispatchEvent(pasteEvent("first\nsecond", []));
+        });
+        expect(sentData()).toBe("");
+
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1600);
+        });
+        expect(sentData()).toBe("");
+        expect(terminal.writes.join("")).toContain(
+          "Paste cancelled because terminal identity did not arrive in time",
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("releases pending metadata-paste reservations when cancelling an image upload so subsequent typing is not blocked", async () => {
       withCapabilities({ terminalImagePaste: true });
       testState.stageImagePasteCommand.mockImplementation(

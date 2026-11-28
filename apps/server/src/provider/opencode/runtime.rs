@@ -511,6 +511,12 @@ struct RuntimeInner {
 /// OpenCode 2 session state: the root-turn translator, the asks waiting for an answer (keyed by
 /// request or form id, with the turn and the session that asked), and the model and agent last
 /// sent to the session.
+#[derive(Clone, Debug)]
+struct SettledOutcome {
+    disposition: crate::provider::UserInputResponseDisposition,
+    answers: Value,
+}
+
 #[derive(Default)]
 struct V2State {
     translator: Option<V2TurnTranslator>,
@@ -521,8 +527,8 @@ struct V2State {
     /// the resolution carries BiBCode's decision and is reported once.
     answering: HashSet<String>,
     /// Asks OpenCode settled while BiBCode's reply was in flight: the reply succeeded even if its
-    /// HTTP response was lost.
-    settled_while_answering: HashSet<String>,
+    /// HTTP response was lost, carrying the provider-confirmed SSE outcome for forms.
+    settled_while_answering: HashMap<String, Option<SettledOutcome>>,
     synced_model: Option<(String, String, Option<String>)>,
     synced_agent: bool,
     /// The runtime mode whose permission rules the session has.
@@ -640,7 +646,32 @@ struct V2PendingForm {
 #[derive(Default)]
 struct V1QuestionSync {
     answering: HashSet<String>,
-    settled_while_answering: HashSet<String>,
+    settled_while_answering: HashMap<String, SettledOutcome>,
+    /// Bounded record of v1 questions confirmed settled by HTTP reply/reject or SSE, consulted
+    /// under lock by recovery so a racing `/question` list cannot reopen a settled prompt.
+    recently_settled: std::collections::VecDeque<String>,
+}
+
+impl V1QuestionSync {
+    fn mark_settled(&mut self, request_id: &str) {
+        if self
+            .recently_settled
+            .iter()
+            .any(|entry| entry == request_id)
+        {
+            return;
+        }
+        if self.recently_settled.len() >= 256 {
+            self.recently_settled.pop_front();
+        }
+        self.recently_settled.push_back(request_id.to_owned());
+    }
+
+    fn is_recently_settled(&self, request_id: &str) -> bool {
+        self.recently_settled
+            .iter()
+            .any(|entry| entry == request_id)
+    }
 }
 
 struct RuntimeOwnerState {
@@ -2032,7 +2063,7 @@ impl OpenCodeSessionRuntime {
             let pending = {
                 let mut v2 = self.inner.v2.lock().await;
                 v2.answering.remove(request_id);
-                if !v2.settled_while_answering.remove(request_id) {
+                if v2.settled_while_answering.remove(request_id).is_none() {
                     sent?;
                 }
                 v2.permissions.remove(request_id)
@@ -2143,6 +2174,12 @@ impl OpenCodeSessionRuntime {
         answers: Value,
         disposition: Option<crate::provider::UserInputResponseDisposition>,
     ) -> Result<(), OpenCodeRuntimeError> {
+        let answers =
+            if disposition == Some(crate::provider::UserInputResponseDisposition::Cancelled) {
+                json!({})
+            } else {
+                answers
+            };
         let is_skip_or_cancel_only = disposition.is_some_and(|disp| {
             disp.is_skip_or_cancel() && !crate::provider::has_non_empty_user_input_answer(&answers)
         });
@@ -2167,13 +2204,10 @@ impl OpenCodeSessionRuntime {
                 pending
             };
             let sent = async {
-                let response = if is_skip_or_cancel_only {
+                let request = if is_skip_or_cancel_only {
                     self.inner
                         .client
                         .delete(self.v2_url(&["session", &session_id, "form", request_id], false)?)
-                        .send()
-                        .await
-                        .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?
                 } else {
                     self.inner
                         .client
@@ -2182,10 +2216,20 @@ impl OpenCodeSessionRuntime {
                             false,
                         )?)
                         .json(&json!({ "answer": answer }))
-                        .send()
-                        .await
-                        .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?
                 };
+                let response = tokio::time::timeout(SIDE_REQUEST_TIMEOUT, request.send())
+                    .await
+                    .map_err(|_| {
+                        OpenCodeRuntimeError::Http(format!(
+                            "form {} timed out",
+                            if is_skip_or_cancel_only {
+                                "dismiss"
+                            } else {
+                                "reply"
+                            }
+                        ))
+                    })?
+                    .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?;
                 if !response.status().is_success() {
                     return Err(OpenCodeRuntimeError::Http(format!(
                         "form {} returned HTTP {}",
@@ -2200,23 +2244,35 @@ impl OpenCodeSessionRuntime {
                 Ok(())
             }
             .await;
-            let pending = {
+            let (pending, sse_outcome) = {
                 let mut v2 = self.inner.v2.lock().await;
                 v2.answering.remove(request_id);
-                if !v2.settled_while_answering.remove(request_id) {
+                let settled = v2.settled_while_answering.remove(request_id);
+                if settled.is_none() {
                     sent?;
                 }
-                v2.forms.remove(request_id)
+                (v2.forms.remove(request_id), settled.flatten())
             };
             let Some(form) = pending else {
                 return Ok(());
             };
-            let recorded_answers = if is_skip_or_cancel_only {
-                json!({})
-            } else {
-                answers
+            let (recorded_answers, final_disposition) = match sse_outcome {
+                Some(outcome) if outcome.disposition.is_skip_or_cancel() => {
+                    (json!({}), Some(outcome.disposition))
+                }
+                Some(outcome) if is_skip_or_cancel_only => {
+                    (outcome.answers, Some(outcome.disposition))
+                }
+                _ => (
+                    if is_skip_or_cancel_only {
+                        json!({})
+                    } else {
+                        answers
+                    },
+                    disposition,
+                ),
             };
-            let resolved_payload = match disposition {
+            let resolved_payload = match final_disposition {
                 Some(disp) => crate::provider::build_user_input_resolved_payload(
                     recorded_answers,
                     disp,
@@ -2270,22 +2326,29 @@ impl OpenCodeSessionRuntime {
             })
             .collect::<Vec<_>>();
         let sent = async {
-            let response = if is_skip_or_cancel_only {
+            let request = if is_skip_or_cancel_only {
                 self.inner
                     .client
                     .post(self.request_url(&format!("/question/{request_id}/reject"))?)
-                    .send()
-                    .await
-                    .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?
             } else {
                 self.inner
                     .client
                     .post(self.request_url(&format!("/question/{request_id}/reply"))?)
                     .json(&json!({ "answers": normalized }))
-                    .send()
-                    .await
-                    .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?
             };
+            let response = tokio::time::timeout(SIDE_REQUEST_TIMEOUT, request.send())
+                .await
+                .map_err(|_| {
+                    OpenCodeRuntimeError::Http(format!(
+                        "question {} timed out",
+                        if is_skip_or_cancel_only {
+                            "reject"
+                        } else {
+                            "reply"
+                        }
+                    ))
+                })?
+                .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?;
             if !response.status().is_success() {
                 return Err(OpenCodeRuntimeError::Http(format!(
                     "question {} returned HTTP {}",
@@ -2300,24 +2363,35 @@ impl OpenCodeSessionRuntime {
             Ok(())
         }
         .await;
-        let pending = {
+        let (pending, sse_outcome) = {
             let mut pending_map = self.inner.pending_questions.lock().await;
             let mut sync = self.inner.v1_question_sync.lock().await;
             sync.answering.remove(request_id);
-            if !sync.settled_while_answering.remove(request_id) {
+            let settled = sync.settled_while_answering.remove(request_id);
+            if settled.is_none() {
                 sent?;
             }
-            pending_map.remove(request_id)
+            sync.mark_settled(request_id);
+            (pending_map.remove(request_id), settled)
         };
         let Some(pending) = pending else {
             return Ok(());
         };
-        let recorded_answers = if is_skip_or_cancel_only {
-            json!({})
-        } else {
-            answers
+        let (recorded_answers, final_disposition) = match sse_outcome {
+            Some(outcome) if outcome.disposition.is_skip_or_cancel() => {
+                (json!({}), Some(outcome.disposition))
+            }
+            Some(outcome) if is_skip_or_cancel_only => (outcome.answers, Some(outcome.disposition)),
+            _ => (
+                if is_skip_or_cancel_only {
+                    json!({})
+                } else {
+                    answers
+                },
+                disposition,
+            ),
         };
-        let resolved_payload = match disposition {
+        let resolved_payload = match final_disposition {
             Some(disp) => crate::provider::build_user_input_resolved_payload(
                 recorded_answers,
                 disp,
@@ -3199,23 +3273,35 @@ impl OpenCodeSessionRuntime {
                             &request_id,
                         )
                         .await;
+                    sync.mark_settled(&request_id);
+                    let disposition = if event_type == "question.rejected" {
+                        crate::provider::UserInputResponseDisposition::Skipped
+                    } else {
+                        crate::provider::UserInputResponseDisposition::Answered
+                    };
+                    let sse_answers = properties
+                        .get("answers")
+                        .cloned()
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| json!({}));
                     if sync.answering.contains(&request_id) {
-                        sync.settled_while_answering.insert(request_id.clone());
+                        sync.settled_while_answering.insert(
+                            request_id.clone(),
+                            SettledOutcome {
+                                disposition,
+                                answers: sse_answers,
+                            },
+                        );
                         None
                     } else {
                         pending
                             .remove(&request_id)
                             .map(|question| {
-                                let disposition = if event_type == "question.rejected" {
-                                    crate::provider::UserInputResponseDisposition::Skipped
-                                } else {
-                                    crate::provider::UserInputResponseDisposition::Answered
-                                };
                                 (
                                     "user-input.resolved",
                                     question.turn_id,
                                     crate::provider::build_user_input_resolved_payload(
-                                        json!({}),
+                                        sse_answers,
                                         disposition,
                                         &question.questions,
                                     ),
@@ -3427,7 +3513,7 @@ impl OpenCodeSessionRuntime {
                             &request_id,
                         );
                         let pending = if v2.answering.contains(&request_id) {
-                            v2.settled_while_answering.insert(request_id.clone());
+                            v2.settled_while_answering.insert(request_id.clone(), None);
                             None
                         } else {
                             v2.permissions.remove(&request_id)
@@ -3512,7 +3598,20 @@ impl OpenCodeSessionRuntime {
                     self.spawn_v2_cancel_unanswerable_form(form_id, session_id, turn_id)
                         .await;
                 }
-                V2Output::FormSettled { form_id } => {
+                V2Output::FormSettled {
+                    form_id,
+                    cancelled,
+                    answers,
+                } => {
+                    let disposition = if cancelled {
+                        crate::provider::UserInputResponseDisposition::Cancelled
+                    } else {
+                        crate::provider::UserInputResponseDisposition::Answered
+                    };
+                    let outcome = SettledOutcome {
+                        disposition,
+                        answers: if cancelled { json!({}) } else { answers },
+                    };
                     let (pending, auto_settled) = {
                         let mut v2 = self.inner.v2.lock().await;
                         let was_in_flight = v2
@@ -3526,7 +3625,8 @@ impl OpenCodeSessionRuntime {
                             &form_id,
                         );
                         let pending = if v2.answering.contains(&form_id) {
-                            v2.settled_while_answering.insert(form_id.clone());
+                            v2.settled_while_answering
+                                .insert(form_id.clone(), Some(outcome.clone()));
                             None
                         } else {
                             v2.forms.remove(&form_id)
@@ -3539,8 +3639,8 @@ impl OpenCodeSessionRuntime {
                             form.turn_id,
                             Some(form_id),
                             crate::provider::build_user_input_resolved_payload(
-                                json!({}),
-                                crate::provider::UserInputResponseDisposition::Answered,
+                                outcome.answers,
+                                outcome.disposition,
                                 &form.questions,
                             ),
                         )
@@ -4570,9 +4670,14 @@ impl OpenCodeSessionRuntime {
                 continue;
             }
             let mut pending = self.inner.pending_questions.lock().await;
-            if pending.contains_key(&request_id) || settled(&request_id).await {
+            let sync = self.inner.v1_question_sync.lock().await;
+            if pending.contains_key(&request_id)
+                || sync.is_recently_settled(&request_id)
+                || settled(&request_id).await
+            {
                 continue;
             }
+            drop(sync);
             let questions = v1_questions(&request);
             pending.insert(
                 request_id.clone(),

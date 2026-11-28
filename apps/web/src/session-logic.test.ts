@@ -2137,6 +2137,37 @@ describe("malformed orchestration payload handling", () => {
       label: "Cancelled clarifying question",
       detail: "Pick mode?: Skipped",
     });
+
+    // Legacy Claude withdrawal payload (`cancelled: true` without `disposition`) and duplicate
+    // resolved rows for the same requestId coalesce into one cancelled receipt.
+    const legacyCancelledAndDuplicate = deriveWorkLogEntries([
+      makeActivity({
+        id: "evt-legacy-cancel-1",
+        kind: "user-input.resolved",
+        summary: "User input cancelled",
+        createdAt: "2026-02-23T00:00:06.000Z",
+        payload: {
+          requestId: "req-legacy-cancel",
+          answers: {},
+          cancelled: true,
+        },
+      }),
+      makeActivity({
+        id: "evt-legacy-cancel-2",
+        kind: "user-input.resolved",
+        summary: "User input cancelled",
+        createdAt: "2026-02-23T00:00:07.000Z",
+        payload: {
+          requestId: "req-legacy-cancel",
+          answers: {},
+          cancelled: true,
+        },
+      }),
+    ]);
+    expect(legacyCancelledAndDuplicate).toHaveLength(1);
+    expect(legacyCancelledAndDuplicate[0]).toMatchObject({
+      label: "Cancelled clarifying questions",
+    });
   });
 
   it("ignores null payloads and non-stale provider response failures", () => {

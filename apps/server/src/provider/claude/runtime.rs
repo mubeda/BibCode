@@ -2836,6 +2836,12 @@ impl ClaudeProviderRuntime {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let answers =
+            if disposition == Some(crate::provider::UserInputResponseDisposition::Cancelled) {
+                json!({})
+            } else {
+                answers
+            };
         let mut wire_answers = answers.as_object().cloned().unwrap_or_default();
         if let Some(disp) = disposition {
             if disp.is_skip_or_cancel()
@@ -2907,12 +2913,26 @@ impl ClaudeProviderRuntime {
             )];
         }
         if let Some(pending) = self.pending_user_inputs.remove(request_id) {
+            let pending_questions = pending
+                .raw
+                .get("questions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut payload = crate::provider::build_user_input_resolved_payload(
+                json!({}),
+                crate::provider::UserInputResponseDisposition::Cancelled,
+                &pending_questions,
+            );
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("cancelled".to_owned(), json!(true));
+            }
             return vec![self.event(
                 "user-input.resolved",
                 pending.turn_id,
                 Some(request_id.to_owned()),
                 Some(json!({ "providerItemId": pending.provider_item_id })),
-                json!({ "answers": {}, "cancelled": true }),
+                payload,
             )];
         }
         Vec::new()
